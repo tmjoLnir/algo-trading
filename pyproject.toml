@@ -86,6 +86,13 @@ runtime-evaluated-base-classes = [
 # ─────────────────────────── mypy ───────────────────────────
 [tool.mypy]
 python_version = "3.12"
+# src-layout monorepo: tell mypy where the roots are instead of letting it infer
+# them. Without this it resolved `atp_core` from the installed editable package
+# on CI but from source locally — 61 files checked there, 66 here, and an
+# import-untyped error that only ever appeared on CI.
+mypy_path = "libs/core/src:apps/api/src:apps/worker/src"
+explicit_package_bases = true
+namespace_packages = true
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
