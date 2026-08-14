@@ -64,6 +64,14 @@ ignore = [
 # because handlers are plain functions, not Pydantic models.
 "apps/api/**" = ["TC"]
 
+[tool.ruff.lint.isort]
+# Declare the workspace packages EXPLICITLY. Left to inference, ruff classifies
+# them by probing the `src` paths on disk, which resolved differently on a CI
+# runner than locally — identical commit, identical ruff version, one green and
+# one red on I001. Import grouping should not depend on the filesystem it runs
+# on, so name them.
+known-first-party = ["atp_core", "atp_api", "atp_worker"]
+
 [tool.ruff.lint.flake8-type-checking]
 # Pydantic and SQLAlchemy resolve annotations at RUNTIME to build validators and
 # column types. Moving these imports into `if TYPE_CHECKING` would satisfy the
