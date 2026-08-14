@@ -41,7 +41,10 @@ jobs:
         with:
           enable-cache: true
       - run: uv python install 3.12
-      - run: uv sync --all-packages
+      # --frozen: the lockfile is authoritative. If pyproject.toml changed
+      # without `uv lock` being re-run, fail here rather than silently
+      # resolving something different from what anyone tested against.
+      - run: uv sync --all-packages --frozen
 
       - name: Lint
         run: |
@@ -58,7 +61,12 @@ jobs:
         env:
           DATABASE_URL: postgresql+asyncpg://atp:atp@localhost:5432/atp_test
           REDIS_URL: redis://localhost:6379/0
-        run: uv run pytest tests/integration -m integration
+        # There are no integration tests yet (Phase 1). pytest exits 5 on an
+        # empty collection, which would fail the job for the wrong reason.
+        # Tolerate ONLY exit 5 — every real failure still fails the build, and
+        # this starts asserting the moment the first integration test lands.
+        run: |
+          uv run pytest tests/integration -m integration || [ $? -eq 5 ]
 
   web:
     runs-on: ubuntu-latest

@@ -22,7 +22,7 @@ paper and live with no branch inside it.
 @register
 class MyStrategy(Strategy):
     name = "my_strategy"
-    params_schema = {...}          # drives UI form + validation
+    params_schema = {...}  # drives UI form + validation
 
     @property
     def warmup_bars(self) -> int:

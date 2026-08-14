@@ -9,8 +9,9 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from atp_core.config import Settings, get_settings
 from fastapi import Depends
+
+from atp_core.config import Settings, get_settings
 
 
 async def get_db() -> AsyncIterator[object]:

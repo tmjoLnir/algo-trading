@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
 
 
 async def main() -> None:
-    args = parse_args()
+    parse_args()
     raise NotImplementedError(
         "Fetch via AlpacaHistoricalProvider, upsert via BarRepository, then "
         "run find_gaps() when --verify. See docs/DATA.md."

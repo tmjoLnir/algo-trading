@@ -13,7 +13,7 @@ _REGISTRY: dict[str, type[Strategy]] = {}
 S = TypeVar("S", bound="type[Strategy]")
 
 
-def register(cls: S) -> S:
+def register[S: "type[Strategy]"](cls: S) -> S:
     """Class decorator. Duplicate names are an error, not a silent overwrite —
     two strategies sharing a name would make backtest results ambiguous.
 
@@ -34,9 +34,7 @@ def get(name: str) -> type[Strategy]:
     try:
         return _REGISTRY[name]
     except KeyError:
-        raise StrategyError(
-            f"unknown strategy {name!r}; registered: {sorted(_REGISTRY)}"
-        ) from None
+        raise StrategyError(f"unknown strategy {name!r}; registered: {sorted(_REGISTRY)}") from None
 
 
 def all_strategies() -> dict[str, type[Strategy]]:

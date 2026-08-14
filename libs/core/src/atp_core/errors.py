@@ -50,7 +50,7 @@ class InsufficientFundsError(BrokerError): ...
 class RiskError(ATPError): ...
 
 
-class RiskLimitBreached(RiskError):
+class RiskLimitBreachedError(RiskError):
     """A pre-trade check failed. Expected in normal operation, not a bug."""
 
     def __init__(self, rule: str, detail: str) -> None:
@@ -59,7 +59,7 @@ class RiskLimitBreached(RiskError):
         super().__init__(f"risk rule '{rule}' blocked the order: {detail}")
 
 
-class KillSwitchEngaged(RiskError):
+class KillSwitchEngagedError(RiskError):
     """Trading is halted platform-wide. Requires explicit human clearance."""
 
 
@@ -86,7 +86,7 @@ class LookaheadError(BacktestError):
 class ExecutionError(ATPError): ...
 
 
-class InvalidStateTransition(ExecutionError):
+class InvalidStateTransitionError(ExecutionError):
     def __init__(self, from_status: str, to_status: str) -> None:
         super().__init__(f"illegal order transition {from_status} → {to_status}")
 

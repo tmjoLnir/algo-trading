@@ -18,8 +18,8 @@ class ManualOrderRequest(BaseModel):
     order_type: str = "market"
     limit_price: Decimal | None = None
     stop_loss_price: Decimal | None = None
-    reason: str            # required: a manual order with no stated reason is
-                           # unreviewable a week later
+    reason: str  # required: a manual order with no stated reason is
+    # unreviewable a week later
 
 
 @router.get("")

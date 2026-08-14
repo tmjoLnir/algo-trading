@@ -17,11 +17,12 @@ there should never be one.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
-from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from datetime import datetime
+    from decimal import Decimal
+
     from atp_core.domain import Order, Position
 
 

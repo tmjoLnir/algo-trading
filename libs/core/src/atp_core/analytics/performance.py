@@ -9,11 +9,12 @@ separate implementations would make that comparison meaningless.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
-from decimal import Decimal
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from datetime import date, datetime
+    from decimal import Decimal
+
     from atp_core.backtest.metrics import PerformanceMetrics
     from atp_core.domain import Order
 
@@ -73,7 +74,9 @@ class PerformanceAnalyzer:
         """
         raise NotImplementedError
 
-    def metrics(self, trades: list[TradeRecord], equity_curve: list[tuple[datetime, Decimal]]) -> PerformanceMetrics:
+    def metrics(
+        self, trades: list[TradeRecord], equity_curve: list[tuple[datetime, Decimal]]
+    ) -> PerformanceMetrics:
         raise NotImplementedError
 
     def attribution(self, trades: list[TradeRecord], by: str) -> list[AttributionRow]:

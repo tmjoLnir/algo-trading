@@ -14,10 +14,11 @@ enforced, one place a bug can hide.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from decimal import Decimal
+
     from atp_core.brokers.ports import BrokerPort
     from atp_core.domain import Order, OrderRequest, Portfolio, Signal
     from atp_core.risk.engine import RiskDecision, RiskEngine
@@ -59,7 +60,9 @@ class OrderRouter:
         """Submit a concrete request. THE submission path — do not add another."""
         raise NotImplementedError
 
-    async def submit_protective_orders(self, entry_order: Order, portfolio: Portfolio) -> list[Order]:
+    async def submit_protective_orders(
+        self, entry_order: Order, portfolio: Portfolio
+    ) -> list[Order]:
         """Attach stop-loss and take-profit children after an entry fills.
 
         Submit these immediately on fill, before anything else. The window

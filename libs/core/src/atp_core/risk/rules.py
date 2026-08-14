@@ -12,11 +12,10 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from atp_core.risk.engine import RiskDecision
-
 if TYPE_CHECKING:
     from atp_core.config import RiskLimits
     from atp_core.domain import Order, Portfolio
+    from atp_core.risk.engine import RiskDecision
 
 
 @dataclass(slots=True)

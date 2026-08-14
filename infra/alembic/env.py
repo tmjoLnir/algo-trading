@@ -11,9 +11,10 @@ import os
 from logging.config import fileConfig
 
 from alembic import context
-from atp_core.persistence.models import Base
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
+
+from atp_core.persistence.models import Base
 
 config = context.config
 if config.config_file_name:
@@ -33,9 +34,7 @@ def include_object(obj, name, type_, reflected, compare_to):
     Without this, every `make revision` proposes dropping the hypertable chunks —
     and one day someone will accept it.
     """
-    if type_ == "table" and name.startswith(("_hyper_", "_timescaledb")):
-        return False
-    return True
+    return not (type_ == "table" and name.startswith(("_hyper_", "_timescaledb")))
 
 
 def run_migrations_offline() -> None:

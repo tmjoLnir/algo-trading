@@ -59,8 +59,16 @@ export function useLiveDashboard() {
 export function useDashboardStream(symbols: string[]) {
   const queryClient = useQueryClient()
 
+  // Depend on a stable primitive, not the array. A new array literal is never
+  // referentially equal to the last one, so depending on `symbols` directly
+  // would tear down and reopen the socket on every single render.
+  const symbolKey = symbols.join(',')
+
   useEffect(() => {
-    if (symbols.length === 0) return
+    if (!symbolKey) return
+    // Rebuild the list from the key rather than closing over `symbols`, so the
+    // effect's dependencies are genuinely exhaustive and cannot go stale.
+    const subscribed = symbolKey.split(',')
 
     const url = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8000/ws'
     let ws: WebSocket | null = null
@@ -73,7 +81,9 @@ export function useDashboardStream(symbols: string[]) {
 
       ws.onopen = () => {
         attempt = 0
-        ws?.send(JSON.stringify({ type: 'subscribe', channels: ['quotes', 'fills'], symbols }))
+        ws?.send(
+          JSON.stringify({ type: 'subscribe', channels: ['quotes', 'fills'], symbols: subscribed }),
+        )
       }
 
       ws.onmessage = (event) => {
@@ -106,5 +116,5 @@ export function useDashboardStream(symbols: string[]) {
       clearTimeout(reconnectTimer)
       ws?.close()
     }
-  }, [symbols.join(','), queryClient])
+  }, [symbolKey, queryClient])
 }

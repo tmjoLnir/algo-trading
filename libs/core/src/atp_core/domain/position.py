@@ -7,10 +7,13 @@ it before approving anything; the analytics layer reads its equity curve.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
-from atp_core.domain.order import Fill
+if TYPE_CHECKING:
+    from datetime import datetime
+
+    from atp_core.domain.order import Fill
 
 
 @dataclass(slots=True)

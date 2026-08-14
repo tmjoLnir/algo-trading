@@ -31,6 +31,8 @@ async def search_symbols(q: str, limit: int = 20) -> list[dict[str, str]]:
 
 
 @router.get("/calendar")
-async def get_market_calendar(start: datetime | None = None, end: datetime | None = None) -> list[dict[str, object]]:
+async def get_market_calendar(
+    start: datetime | None = None, end: datetime | None = None
+) -> list[dict[str, object]]:
     """Sessions, holidays and early closes."""
     raise NotImplementedError

@@ -23,7 +23,7 @@ class StrategyCreate(BaseModel):
     kind: str  # "coded" (registered class) | "ruleset" (declarative)
     class_name: str | None = None
     params: dict[str, Any] = {}
-    ruleset: dict[str, Any] | None = None   # validated against RuleSet
+    ruleset: dict[str, Any] | None = None  # validated against RuleSet
     universe: list[str]
     timeframe: str = "1d"
     risk_config: dict[str, Any] = {}
