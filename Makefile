@@ -62,7 +62,26 @@ fmt:  ## Auto-format everything
 	uv run ruff format .
 	npm --prefix $(WEB) run format
 
-check: lint typecheck test  ## Everything CI runs — green before you push
+check-tracked:  ## Fail if any source file is excluded by .gitignore
+	@# CI only ever sees committed files, so an over-broad ignore rule looks
+	@# like a passing local build and a broken pipeline. An unanchored `data/`
+	@# once hid the whole market-data package this way. Catch it before pushing.
+	@# Scoped to the actual source roots — node_modules and .venv are ignored
+	@# on purpose and must not trip this.
+	@ignored=$$(git ls-files --others --ignored --exclude-standard \
+	    -- 'libs/core/src/**/*.py' 'apps/api/src/**/*.py' 'apps/worker/src/**/*.py' \
+	       'tests/**/*.py' 'scripts/**/*.py' \
+	       'apps/web/src/**/*.ts' 'apps/web/src/**/*.tsx' \
+	       'infra/**/*.sql' 'infra/**/*.py' 'docs/**/*.md'); \
+	if [ -n "$$ignored" ]; then \
+	  echo "ERROR: source files excluded by .gitignore (CI will not see these):"; \
+	  echo "$$ignored" | sed 's/^/  /'; \
+	  echo "Anchor the offending rule with a leading slash (e.g. /data/ not data/)."; \
+	  exit 1; \
+	fi; \
+	echo "check-tracked: no source files are gitignored"
+
+check: check-tracked lint typecheck test  ## Everything CI runs — green before you push
 
 gen-types:  ## Regenerate TS API types from the live OpenAPI schema
 	npm --prefix $(WEB) run gen:types
