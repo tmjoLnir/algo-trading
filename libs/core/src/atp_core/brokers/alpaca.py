@@ -20,13 +20,14 @@ Alpaca specifics worth knowing before implementing:
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
-from atp_core.brokers.ports import AccountSnapshot
 from atp_core.domain.enums import RunMode
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from atp_core.brokers.ports import AccountSnapshot
     from atp_core.config import Settings
     from atp_core.domain import Order, Position
 

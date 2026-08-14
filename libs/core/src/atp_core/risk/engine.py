@@ -11,10 +11,11 @@ allows. An unpriced position is exactly when you least want to be trading.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from decimal import Decimal
+
     from atp_core.config import RiskLimits
     from atp_core.domain import Order, Portfolio
 
@@ -66,7 +67,7 @@ class RiskEngine:
         )
 
     def validate_or_raise(self, order: Order, portfolio: Portfolio) -> None:
-        """As `validate`, but raises `RiskLimitBreached` on denial."""
+        """As `validate`, but raises `RiskLimitBreachedError` on denial."""
         raise NotImplementedError
 
 

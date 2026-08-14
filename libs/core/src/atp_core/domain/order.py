@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from atp_core.domain.enums import OrderStatus, OrderType, Side, TimeInForce
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 
 @dataclass(frozen=True, slots=True)

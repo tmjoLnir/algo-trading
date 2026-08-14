@@ -48,7 +48,9 @@ def atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) 
     raise NotImplementedError
 
 
-def bollinger(values: np.ndarray, period: int = 20, num_std: float = 2.0) -> tuple[float, float, float]:
+def bollinger(
+    values: np.ndarray, period: int = 20, num_std: float = 2.0
+) -> tuple[float, float, float]:
     """(lower, middle, upper)."""
     raise NotImplementedError
 

@@ -8,11 +8,12 @@ convention a strategy author has to remember (docs/BACKTESTING.md).
 
 from __future__ import annotations
 
-from datetime import datetime
-from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from datetime import datetime
+    from decimal import Decimal
+
     import numpy as np
 
     from atp_core.domain import Bar, Position, Timeframe
@@ -31,9 +32,7 @@ class StrategyContext(Protocol):
         """The universe this strategy trades."""
         ...
 
-    def history(
-        self, symbol: str, timeframe: Timeframe, lookback: int
-    ) -> list[Bar]:
+    def history(self, symbol: str, timeframe: Timeframe, lookback: int) -> list[Bar]:
         """The last `lookback` completed bars, oldest first.
 
         Never includes a bar that closes after `now`. Raises `DataGapError` if

@@ -11,9 +11,12 @@ annualises (252 for daily bars, 252×390 for US equity minute bars).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from typing import TYPE_CHECKING
 
-import numpy as np
+if TYPE_CHECKING:
+    from decimal import Decimal
+
+    import numpy as np
 
 TRADING_DAYS_PER_YEAR = 252
 

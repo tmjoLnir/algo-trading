@@ -20,7 +20,7 @@ class TestRiskRules:
     def test_daily_loss_limit_blocks_entries(self) -> None:
         pytest.skip("TODO")
 
-    def test_daily_loss_limit_ALLOWS_exits(self) -> None:
+    def test_daily_loss_limit_allows_exits(self) -> None:
         """Critical: blocking an exit traps you in a losing position and turns
         a bad day into an unbounded one."""
         pytest.skip("TODO")

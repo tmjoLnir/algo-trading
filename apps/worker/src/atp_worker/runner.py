@@ -19,10 +19,11 @@ Stops before signals, same as the backtest. Never reorder one without the other.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from atp_core.clock import Clock, TradingCalendar
     from atp_core.data.ports import BarRepository, QuoteCache
     from atp_core.domain import Portfolio

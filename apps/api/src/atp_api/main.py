@@ -15,9 +15,6 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from atp_core.config import get_settings
-from atp_core.logging import configure as configure_logging
-from atp_core.logging import get_logger
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -33,6 +30,9 @@ from atp_api.routers import (
     strategies,
 )
 from atp_api.ws import router as ws_router
+from atp_core.config import get_settings
+from atp_core.logging import configure as configure_logging
+from atp_core.logging import get_logger
 
 log = get_logger(__name__)
 
@@ -79,6 +79,12 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Health probes and the WebSocket are deliberately UNVERSIONED. Orchestrators
+    # hit /healthz directly — including this repo's own Docker HEALTHCHECK and
+    # compose `depends_on: service_healthy` gates — and a probe URL that moves
+    # when the API version bumps is a probe that fails for no real reason.
+    unversioned = (health.router, ws_router)
+
     for router in (
         health.router,
         dashboard.router,
@@ -91,7 +97,7 @@ def create_app() -> FastAPI:
         risk.router,
         ws_router,
     ):
-        app.include_router(router, prefix="/api/v1" if router is not ws_router else "")
+        app.include_router(router, prefix="" if router in unversioned else "/api/v1")
 
     return app
 

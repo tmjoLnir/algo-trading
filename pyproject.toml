@@ -46,15 +46,53 @@ select = [
   "PTH",              # pathlib
   "RUF",
 ]
-ignore = ["E501"]     # line length is handled by the formatter
+ignore = [
+  "E501",     # line length is handled by the formatter
+  # Prose in this repo deliberately uses typographic characters (— → ≤ ×) in
+  # docstrings and comments. They are not confusable ASCII lookalikes here.
+  "RUF002",
+  "RUF003",
+]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]
 "scripts/**" = ["T201"]   # prints are fine in operator scripts
+# FastAPI resolves route-handler annotations at RUNTIME to build request
+# validators and the OpenAPI schema. Moving those imports into `if
+# TYPE_CHECKING` type-checks fine and then fails when a request arrives or
+# /openapi.json is generated — the base-class exemption below does not help,
+# because handlers are plain functions, not Pydantic models.
+"apps/api/**" = ["TC"]
+
+[tool.ruff.lint.isort]
+# Declare the workspace packages EXPLICITLY. Left to inference, ruff classifies
+# them by probing the `src` paths on disk, which resolved differently on a CI
+# runner than locally — identical commit, identical ruff version, one green and
+# one red on I001. Import grouping should not depend on the filesystem it runs
+# on, so name them.
+known-first-party = ["atp_core", "atp_api", "atp_worker"]
+
+[tool.ruff.lint.flake8-type-checking]
+# Pydantic and SQLAlchemy resolve annotations at RUNTIME to build validators and
+# column types. Moving these imports into `if TYPE_CHECKING` would satisfy the
+# linter and break every model in the repo at import time — so exempt any class
+# deriving from them.
+runtime-evaluated-base-classes = [
+  "pydantic.BaseModel",
+  "pydantic_settings.BaseSettings",
+  "sqlalchemy.orm.DeclarativeBase",
+]
 
 # ─────────────────────────── mypy ───────────────────────────
 [tool.mypy]
 python_version = "3.12"
+# src-layout monorepo: tell mypy where the roots are instead of letting it infer
+# them. Without this it resolved `atp_core` from the installed editable package
+# on CI but from source locally — 61 files checked there, 66 here, and an
+# import-untyped error that only ever appeared on CI.
+mypy_path = "libs/core/src:apps/api/src:apps/worker/src"
+explicit_package_bases = true
+namespace_packages = true
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
@@ -68,7 +106,11 @@ module = "atp_core.*"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["alpaca.*", "pandas.*", "structlog.*"]
+# Add third-party modules here only once something actually imports them —
+# `warn_unused_configs` reports overrides that match nothing, and a config full
+# of pre-emptive entries trains everyone to ignore mypy's output.
+# `pandas.*` belongs here when the backtest engine lands (Phase 2).
+module = ["structlog.*"]
 ignore_missing_imports = true
 
 # ────────────────────────── pytest ──────────────────────────

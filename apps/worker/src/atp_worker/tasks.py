@@ -24,6 +24,8 @@ async def backfill_symbol_task(ctx: dict[str, Any], symbol: str, start: str, end
     raise NotImplementedError
 
 
-async def generate_report_task(ctx: dict[str, Any], report_type: str, params: dict[str, Any]) -> str:
+async def generate_report_task(
+    ctx: dict[str, Any], report_type: str, params: dict[str, Any]
+) -> str:
     """Render a report (CSV/PDF); return its storage key."""
     raise NotImplementedError

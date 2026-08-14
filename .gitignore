@@ -29,14 +29,19 @@ apps/web/.vite/
 npm-debug.log*
 
 # --- data & artifacts ---
+# ANCHOR THESE WITH A LEADING SLASH. An unanchored `data/` matches at every
+# depth, and this repo has a source package at libs/core/src/atp_core/data/ —
+# the entire market-data layer was silently excluded from the repository until
+# CI, which only ever sees committed files, failed to import it. A leading
+# slash restricts the rule to the repo root, where the artifacts actually live.
 # Market data is large and reproducible via backfill; do not version it.
-data/
+/data/
 *.parquet
 *.duckdb
 *.sqlite3
-backtest_results/
-reports/out/
-logs/
+/backtest_results/
+/reports/out/
+/logs/
 *.log
 
 # --- editors / os ---

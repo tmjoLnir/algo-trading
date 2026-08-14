@@ -18,11 +18,12 @@ backtested strategy be trusted in paper and live.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from atp_core.backtest.costs import CostModel
     from atp_core.domain import Bar, Order, Portfolio, Signal, Timeframe
     from atp_core.risk.engine import RiskEngine

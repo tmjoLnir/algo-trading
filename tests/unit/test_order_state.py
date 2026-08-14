@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from atp_core.domain.enums import OrderStatus
-from atp_core.errors import InvalidStateTransition
+from atp_core.errors import InvalidStateTransitionError
 from atp_core.execution.state import assert_transition, can_transition, is_stale_event
 
 
@@ -15,7 +15,7 @@ def test_legal_transition() -> None:
 
 def test_terminal_states_go_nowhere() -> None:
     assert not can_transition(OrderStatus.FILLED, OrderStatus.CANCELLED)
-    with pytest.raises(InvalidStateTransition):
+    with pytest.raises(InvalidStateTransitionError):
         assert_transition(OrderStatus.FILLED, OrderStatus.SUBMITTED)
 
 

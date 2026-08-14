@@ -9,7 +9,7 @@ of bug that makes a position appear to vanish.
 from __future__ import annotations
 
 from atp_core.domain.enums import OrderStatus
-from atp_core.errors import InvalidStateTransition
+from atp_core.errors import InvalidStateTransitionError
 
 #: Legal transitions. Anything absent is rejected.
 TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
@@ -27,7 +27,12 @@ TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
         }
     ),
     OrderStatus.PARTIALLY_FILLED: frozenset(
-        {OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.EXPIRED}
+        {
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+            OrderStatus.CANCELLED,
+            OrderStatus.EXPIRED,
+        }
     ),
     # Terminal states go nowhere.
     OrderStatus.FILLED: frozenset(),
@@ -43,13 +48,13 @@ def can_transition(current: OrderStatus, target: OrderStatus) -> bool:
 
 
 def assert_transition(current: OrderStatus, target: OrderStatus) -> None:
-    """Raise `InvalidStateTransition` if the move is illegal.
+    """Raise `InvalidStateTransitionError` if the move is illegal.
 
     Note PARTIALLY_FILLED → PARTIALLY_FILLED is legal: an order fills in many
     pieces and each is a real event.
     """
     if not can_transition(current, target):
-        raise InvalidStateTransition(current.value, target.value)
+        raise InvalidStateTransitionError(current.value, target.value)
 
 
 def is_stale_event(current: OrderStatus, incoming: OrderStatus) -> bool:

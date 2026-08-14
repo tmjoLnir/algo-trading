@@ -14,11 +14,12 @@ order. Stopping is cheap; being wrong about the book is not.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
-from decimal import Decimal
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from datetime import datetime
+    from decimal import Decimal
+
     from atp_core.brokers.ports import BrokerPort
     from atp_core.domain import Portfolio
     from atp_core.risk.killswitch import KillSwitch
@@ -49,7 +50,9 @@ class Reconciler:
         self.broker = broker
         self.kill_switch = kill_switch
 
-    async def reconcile(self, portfolio: Portfolio, *, halt_on_mismatch: bool = True) -> ReconciliationReport:
+    async def reconcile(
+        self, portfolio: Portfolio, *, halt_on_mismatch: bool = True
+    ) -> ReconciliationReport:
         """Compare our state with the broker's.
 
         Checks:

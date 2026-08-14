@@ -23,7 +23,7 @@ class BacktestRequest(BaseModel):
     end: datetime
     timeframe: str = "1d"
     starting_cash: Decimal = Decimal("100000")
-    cost_model: str = "alpaca_equities"   # never default to zero-cost
+    cost_model: str = "alpaca_equities"  # never default to zero-cost
 
 
 class BacktestOut(BaseModel):

@@ -19,13 +19,13 @@ price to avoid being hit is how a small loss becomes an account.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from atp_core.domain.enums import Side, StopType
-
 if TYPE_CHECKING:
+    from decimal import Decimal
+
     from atp_core.domain import Bar, Position
+    from atp_core.domain.enums import Side, StopType
 
 
 @dataclass(frozen=True, slots=True)

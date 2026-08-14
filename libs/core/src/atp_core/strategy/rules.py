@@ -30,14 +30,19 @@ untrusted input that arrives over HTTP.
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
 from atp_core.domain.enums import StopType, Timeframe
 
 Comparator = Literal[
-    "<", "<=", ">", ">=", "==", "!=",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "==",
+    "!=",
     "crosses_above",  # was <= on the previous bar, is > on this one
     "crosses_below",
 ]
@@ -65,7 +70,7 @@ class ConstantOperand(BaseModel):
 
 
 Operand = Annotated[
-    Union[IndicatorOperand, PriceOperand, ConstantOperand], Field(union_mode="left_to_right")
+    IndicatorOperand | PriceOperand | ConstantOperand, Field(union_mode="left_to_right")
 ]
 
 
@@ -88,11 +93,13 @@ class ConditionGroup(BaseModel):
     def _exactly_one(self) -> ConditionGroup:
         set_fields = [f for f in ("all", "any", "none") if getattr(self, f) is not None]
         if len(set_fields) != 1:
-            raise ValueError(f"a condition group needs exactly one of all/any/none, got {set_fields}")
+            raise ValueError(
+                f"a condition group needs exactly one of all/any/none, got {set_fields}"
+            )
         return self
 
 
-ConditionNode = Annotated[Union[Condition, ConditionGroup], Field(union_mode="left_to_right")]
+ConditionNode = Annotated[Condition | ConditionGroup, Field(union_mode="left_to_right")]
 ConditionGroup.model_rebuild()
 
 

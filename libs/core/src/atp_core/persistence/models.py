@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     JSON,
@@ -32,6 +33,11 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 MONEY = Numeric(20, 8)
+
+#: JSON columns hold arbitrary decoded JSON. Naming the shape beats a bare
+#: `dict`, which mypy --strict rejects as an untyped generic.
+type JsonDict = dict[str, Any]
+type JsonList = list[Any]
 
 
 class Base(DeclarativeBase):
@@ -70,12 +76,12 @@ class StrategyRow(Base):
     #: Either a registered class name + params, or an inline declarative RuleSet.
     kind: Mapped[str] = mapped_column(String(20))  # "coded" | "ruleset"
     class_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    params: Mapped[dict] = mapped_column(JSON, default=dict)
-    ruleset: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    params: Mapped[JsonDict] = mapped_column(JSON, default=dict)
+    ruleset: Mapped[JsonDict | None] = mapped_column(JSON, nullable=True)
     state: Mapped[str] = mapped_column(String(20), default="draft")
-    universe: Mapped[list] = mapped_column(JSON, default=list)
+    universe: Mapped[JsonList] = mapped_column(JSON, default=list)
     timeframe: Mapped[str] = mapped_column(String(8), default="1d")
-    risk_config: Mapped[dict] = mapped_column(JSON, default=dict)
+    risk_config: Mapped[JsonDict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
@@ -97,7 +103,7 @@ class SignalRow(Base):
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     strength: Mapped[Decimal] = mapped_column(MONEY, default=Decimal(1))
     reason: Mapped[str] = mapped_column(Text, default="")
-    indicators: Mapped[dict] = mapped_column(JSON, default=dict)
+    indicators: Mapped[JsonDict] = mapped_column(JSON, default=dict)
     acted_on: Mapped[bool] = mapped_column(Boolean, default=False)
     rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -190,10 +196,10 @@ class BacktestRunRow(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     strategy_id: Mapped[str] = mapped_column(ForeignKey("strategies.id"))
-    config: Mapped[dict] = mapped_column(JSON)
+    config: Mapped[JsonDict] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(20))  # queued|running|done|failed
-    metrics: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    equity_curve: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    metrics: Mapped[JsonDict | None] = mapped_column(JSON, nullable=True)
+    equity_curve: Mapped[JsonList | None] = mapped_column(JSON, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -210,4 +216,4 @@ class AuditLogRow(Base):
     actor: Mapped[str] = mapped_column(String(100))
     action: Mapped[str] = mapped_column(String(50))
     target: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    detail: Mapped[dict] = mapped_column(JSON, default=dict)
+    detail: Mapped[JsonDict] = mapped_column(JSON, default=dict)

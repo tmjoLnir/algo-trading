@@ -9,8 +9,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
-from atp_core.domain.enums import Timeframe
+if TYPE_CHECKING:
+    from atp_core.domain.enums import Timeframe
 
 
 def _require_utc(ts: datetime, field: str) -> None:
