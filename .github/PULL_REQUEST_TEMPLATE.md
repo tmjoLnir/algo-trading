@@ -34,6 +34,8 @@
 <!-- What you actually ran. Paste output for anything numerical. -->
 
 - [ ] `make check` passes
+- [ ] `docs/ROADMAP.md` ticked in this diff if this completes a roadmap item
+      (or the item claimed as wip / corrected — see the top of that file)
 
 ## Risk
 

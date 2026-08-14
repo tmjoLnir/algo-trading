@@ -132,8 +132,21 @@ migration. Bar tables are TimescaleDB hypertables — see `infra/db/init/`.
 
 A change is done when: `make check` passes; new logic has unit tests; anything touching
 order flow, risk or P&L has tests for the failure path, not only the happy path; public
-functions have docstrings explaining *why*; docs are updated if behaviour changed; and an
-ADR exists if you made an architectural decision.
+functions have docstrings explaining *why*; docs are updated if behaviour changed; an ADR
+exists if you made an architectural decision; and the roadmap is ticked.
+
+**Ticking the roadmap.** `docs/ROADMAP.md` is the only record of what this platform has
+and has not built, which makes it worthless the moment it lags the code. Before opening a
+PR, check whether the change completes a roadmap item; if it does, flip `- [ ]` to `- [x]`
+and annotate it with your handle and the PR number **in the same diff**, so the tick lands
+with the merge. Format and conventions are at the top of `docs/ROADMAP.md`. If the merge
+happened without the tick, tick it immediately afterwards rather than leaving it for a
+cleanup PR — a roadmap corrected later is a roadmap that was lying in between.
+
+Tick only against the phase's *Verifiable:* line, not against effort. Code that compiles,
+or a subsystem that is half-built, stays unticked; claim it as work-in-progress instead so
+nobody builds it twice. If the PR shows the roadmap is missing an item, has one in the
+wrong phase, or has one already ticked that does not hold, correct it in the same diff.
 
 ## 7. For AI agents specifically
 
@@ -141,6 +154,8 @@ ADR exists if you made an architectural decision.
   are not reconstructable from the code alone.
 - Prefer filling in an existing `NotImplementedError` stub over inventing a new module.
   The skeleton's shape is deliberate.
+- Read `docs/ROADMAP.md` before you start — it is state, not decoration. It tells you what
+  is actually built and what the current phase is; update it as you land work (§6).
 - If a requirement seems to conflict with a rule in §1, stop and ask. §1 wins by default.
 - Do not weaken a guardrail, a validation, or a test assertion to make something pass.
   Report the conflict instead.
