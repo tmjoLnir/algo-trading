@@ -3,8 +3,24 @@
 Build order matters: each phase produces something verifiable, and the risk
 layer lands before anything can place an order.
 
+## How this file is maintained
+
+This is the only record of what is built. It is updated by the PR that does the
+work, in the same diff — see `CLAUDE.md` §6. Conventions:
+
+| Line | Means |
+|---|---|
+| `- [ ] item` | Not started, unclaimed |
+| `- [ ] item — @who (wip #12)` | Claimed and in progress, so nobody duplicates it |
+| `- [x] item — @who (#12)` | Done, demonstrated, and merged in that PR |
+
+A box is ticked only when the phase's *Verifiable:* line has actually been shown
+— not when the code compiles, and not when the tests pass in isolation. If an
+item turns out to be wrong, in the wrong phase, or ticked when it should not be,
+fix it here in the PR that discovered it.
+
 ## Phase 0 — Foundations (skeleton is here)
-- [x] Repo structure, tooling, docs, CI
+- [x] Repo structure, tooling, docs, CI (#1, #2)
 - [ ] `make install` and `make up` work end to end
 - [ ] Alembic initial migration; TimescaleDB hypertable created
 - [ ] `Position.apply_fill` + `Order.apply_fill` implemented and property-tested
