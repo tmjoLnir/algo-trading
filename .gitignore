@@ -1,0 +1,45 @@
+# --- secrets: never commit these ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+
+# --- node ---
+node_modules/
+apps/web/dist/
+apps/web/.vite/
+*.tsbuildinfo
+npm-debug.log*
+
+# --- data & artifacts ---
+# Market data is large and reproducible via backfill; do not version it.
+data/
+*.parquet
+*.duckdb
+*.sqlite3
+backtest_results/
+reports/out/
+logs/
+*.log
+
+# --- editors / os ---
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,87 @@
+name: atp
+
+services:
+  db:
+    # TimescaleDB: OHLCV bars are the one table that grows without bound.
+    # Hypertables + native compression keep years of minute bars queryable.
+    image: timescale/timescaledb:2.15.2-pg16
+    environment:
+      POSTGRES_USER: atp
+      POSTGRES_PASSWORD: atp
+      POSTGRES_DB: atp
+    ports: ["5432:5432"]
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./infra/db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U atp -d atp"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    # Latest-quote cache, pub/sub fan-out of market data to the API's WebSocket,
+    # and the job queue for scheduled backtests/reports.
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    ports: ["6379:6379"]
+    volumes: [redis_data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://atp:atp@db:5432/atp
+      REDIS_URL: redis://redis:6379/0
+    ports: ["8000:8000"]
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    volumes:
+      - ./libs:/app/libs
+      - ./apps/api:/app/apps/api
+    command: uvicorn atp_api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    # Market-data ingestion + the live strategy loop. Deliberately a separate
+    # process from the API: a strategy must not be able to stall HTTP requests,
+    # and the two scale on different axes.
+    build:
+      context: .
+      dockerfile: infra/docker/worker.Dockerfile
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://atp:atp@db:5432/atp
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    volumes:
+      - ./libs:/app/libs
+      - ./apps/worker:/app/apps/worker
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: ../../infra/docker/web.Dockerfile
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+      VITE_WS_URL: ws://localhost:8000/ws
+    ports: ["5173:5173"]
+    depends_on: [api]
+    volumes:
+      - ./apps/web:/app
+      - /app/node_modules
+    command: npm run dev -- --host 0.0.0.0
+
+volumes:
+  db_data:
+  redis_data:

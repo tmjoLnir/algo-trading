@@ -1,0 +1,19 @@
+[project]
+name = "atp-api"
+version = "0.1.0"
+description = "ATP HTTP + WebSocket API"
+requires-python = ">=3.12"
+dependencies = [
+  "atp-core",
+  "fastapi>=0.111",
+  "uvicorn[standard]>=0.30",
+  "python-jose[cryptography]>=3.3",
+  "passlib[bcrypt]>=1.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/atp_api"]
