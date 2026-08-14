@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # This repository's default branch is `claude/main`; `main` is listed too so
+    # the trigger survives a rename. Watching only `main` meant merges to the
+    # actual default branch ran no CI at all — code was verified on the PR and
+    # then never again on the branch it landed in.
+    branches: [main, claude/main]
   pull_request:
 
 concurrency:
