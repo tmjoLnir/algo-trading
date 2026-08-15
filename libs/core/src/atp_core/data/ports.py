@@ -51,8 +51,15 @@ class RealtimeDataFeed(Protocol):
 
     async def unsubscribe(self, symbols: list[str]) -> None: ...
 
-    async def stream(self) -> AsyncIterator[Bar | Quote | Trade]:
+    def stream(self) -> AsyncIterator[Bar | Quote | Trade]:
         """Yield events as they arrive.
+
+        Deliberately not `async def`. An `async def` returning `AsyncIterator`
+        is a *coroutine* that returns an iterator, so callers would have to
+        write `async for e in await feed.stream()` and no async generator could
+        ever satisfy it. Declared this way, the natural implementation — an
+        `async def` with `yield` in it — conforms, and callers write
+        `async for e in feed.stream()`.
 
         Implementations must reconnect with exponential backoff and, on
         reconnect, backfill the gap via the historical provider before resuming
