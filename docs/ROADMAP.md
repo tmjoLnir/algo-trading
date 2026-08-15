@@ -23,7 +23,7 @@ fix it here in the PR that discovered it.
 - [x] Repo structure, tooling, docs, CI (#1, #2)
 - [ ] `make install` and `make up` work end to end
 - [ ] Alembic initial migration; TimescaleDB hypertable created
-- [ ] `Position.apply_fill` + `Order.apply_fill` implemented and property-tested
+- [x] `Position.apply_fill` + `Order.apply_fill` implemented and property-tested — @claude (#4)
 
 **Do these two first.** Everything downstream computes P&L from them; a bug here
 is invisible and poisons every number the platform produces.

@@ -80,12 +80,73 @@ class Position:
         opening/adding re-averages the cost basis; reducing realises P&L against
         the existing basis and leaves the basis alone; a flip does both, closing
         the old side before opening the new at the fill price.
+
+        `signed_qty` carries the direction that a `Fill` does not: positive adds
+        to the position, negative reduces it. Its magnitude must equal
+        `fill.qty`, which is always unsigned — passing the two separately is
+        what lets a fill be applied without the position knowing about `Side`.
+
+        Returns realised P&L *gross of fees*. Fees accumulate into `fees_paid`
+        instead, because `total_pnl` already subtracts that; netting them here
+        as well would charge every fee twice.
         """
-        raise NotImplementedError(
-            "Implement with care — see docs/RISK.md 'Position accounting'. "
-            "Must handle: add to existing, partial reduce, full close, and flip "
-            "through zero. Property-tested in tests/unit/test_position.py."
-        )
+        if fill.qty <= 0:
+            raise ValueError(f"fill qty must be positive, got {fill.qty}")
+        if signed_qty == 0:
+            raise ValueError("signed_qty must be non-zero — a fill always moves the position")
+        if abs(signed_qty) != fill.qty:
+            raise ValueError(
+                f"signed_qty magnitude {abs(signed_qty)} does not match fill qty {fill.qty}"
+            )
+
+        old_qty = self.qty
+        price = fill.price
+        realized = Decimal(0)
+
+        if old_qty == 0:
+            # Opening from flat: the fill price *is* the basis.
+            self.avg_entry_price = price
+            self.opened_at = fill.ts
+        elif (old_qty > 0) == (signed_qty > 0):
+            # Adding to the side we already hold: re-average over both legs.
+            old_abs, add_abs = abs(old_qty), abs(signed_qty)
+            self.avg_entry_price = (self.avg_entry_price * old_abs + price * add_abs) / (
+                old_abs + add_abs
+            )
+        else:
+            # Reducing, closing, or flipping. P&L is realised against the OLD
+            # basis and the basis does NOT move — docs/RISK.md case 2. A short
+            # realises the mirror image, hence the direction factor rather than
+            # a bare (price - basis).
+            direction = Decimal(1) if old_qty > 0 else Decimal(-1)
+            closed_qty = min(abs(signed_qty), abs(old_qty))
+            realized = closed_qty * (price - self.avg_entry_price) * direction
+            self.realized_pnl += realized
+
+            if abs(signed_qty) > abs(old_qty):
+                # Flip through zero: the new side opens at the fill price. It is
+                # emphatically not re-averaged against the side just closed.
+                self.avg_entry_price = price
+                self.opened_at = fill.ts
+
+        self.qty = old_qty + signed_qty
+        self.fees_paid += fill.fee
+        # A fill is an observed print. Marking to it keeps `unrealized_pnl`
+        # honest between explicit `Portfolio.mark()` calls; without it a freshly
+        # opened position reports zero market value until the next tick arrives.
+        self.last_price = price
+
+        if self.qty == 0:
+            # Flat: no basis, and no protective levels. A stop left behind here
+            # would arm itself against whatever position opens next in this
+            # symbol — a live order at a price that means nothing to it.
+            self.avg_entry_price = Decimal(0)
+            self.opened_at = None
+            self.stop_loss_price = None
+            self.take_profit_price = None
+            self.high_water_mark = None
+
+        return realized
 
 
 @dataclass(slots=True)
