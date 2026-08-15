@@ -149,23 +149,31 @@ async def test_compression_is_enabled_with_a_policy(migrated: str) -> None:
     assert policies == 1
 
 
-async def test_bars_carries_no_duplicate_index(migrated: str) -> None:
-    """The natural key is the primary key, and nothing else indexes those
-    columns. A second btree on them would be maintained on every chunk of the
-    largest table while serving no query the primary key does not.
+async def test_bars_carries_exactly_one_index(migrated: str) -> None:
+    """The primary key on the natural key, and nothing else.
 
-    Counting all indexes would be the wrong assertion: Timescale adds its own
-    `bars_ts_idx` on (ts DESC), because `create_default_indexes` is on by
-    default and our primary key leads with `symbol` rather than the
-    partitioning column. That index is not a duplicate — it serves time-ranged
-    scans across symbols — so it is left alone.
+    Two things would break this. A second declaration on the same columns —
+    the `UniqueConstraint` and `Index` this table used to carry — is a btree
+    maintained per chunk of the largest table for no query the primary key
+    does not already serve. And Timescale's own `bars_ts_idx`, which appears
+    unless `create_default_indexes` is switched off in the migration.
+
+    The count matters as much as the columns: an index created behind
+    Alembic's back is one `models.py` cannot declare, and its absence from the
+    model is drift that `alembic check` reports forever.
     """
+    total = await _fetchval(
+        migrated,
+        "SELECT count(*) FROM pg_indexes WHERE tablename = 'bars' AND schemaname = 'public'",
+    )
     on_natural_key = await _fetchval(
         migrated,
         "SELECT count(*) FROM pg_indexes "
         "WHERE tablename = 'bars' AND schemaname = 'public' "
         "AND indexdef LIKE '%(symbol, timeframe, ts)%'",
     )
+
+    assert total == 1, "bars should carry only its primary key"
     assert on_natural_key == 1
 
 

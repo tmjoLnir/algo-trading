@@ -235,14 +235,23 @@ def upgrade() -> None:
     # (symbol, timeframe, ts) already does — that is why `ts` is in the primary
     # key rather than the table carrying a surrogate id.
     #
-    # `create_default_indexes` is left on, so Timescale also builds `bars_ts_idx`
-    # on (ts DESC). The primary key cannot stand in for it: that key leads with
-    # `symbol`, so it cannot serve a scan ranged over time across all symbols.
+    # `create_default_indexes` is off. Left on, Timescale builds `bars_ts_idx` on
+    # (ts DESC) — a third btree on the largest table, maintained per chunk. It
+    # buys very little here: chunk exclusion already prunes by time from the
+    # partitioning metadata rather than from an index, so a time-ranged scan
+    # reads only the chunks it needs either way, and every query the platform
+    # actually issues is scoped to a symbol and served by the primary key.
+    #
+    # It also cannot be left on without lying about the schema. Timescale creates
+    # that index behind Alembic's back, `models.py` has no matching declaration,
+    # and so `alembic check` reports drift on a clean database forever — which
+    # would make the drift check useless exactly when it is needed.
     op.execute(
         sa.text(
             "SELECT create_hypertable("
             "  'bars', 'ts',"
             f"  chunk_time_interval => INTERVAL '{CHUNK_INTERVAL}',"
+            "  create_default_indexes => FALSE,"
             "  if_not_exists => TRUE"
             ")"
         )
