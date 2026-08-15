@@ -81,6 +81,7 @@ env flag plus a typed confirmation.
 | [STRATEGY_AUTHORING.md](docs/STRATEGY_AUTHORING.md) | Writing a new strategy or rule set |
 | [BACKTESTING.md](docs/BACKTESTING.md) | Running backtests; avoiding lookahead bias |
 | [RISK.md](docs/RISK.md) | Configuring stops, sizing and limits |
+| [RISK_IMPLEMENTATION_NOTES.md](docs/RISK_IMPLEMENTATION_NOTES.md) | Implementing Phase 3 — where RISK.md and the code disagree |
 | [DATA.md](docs/DATA.md) | Market-data ingestion, storage, backfill |
 | [DASHBOARD.md](docs/DASHBOARD.md) | Frontend conventions, the 5-min refresh |
 | [API.md](docs/API.md) | REST/WS surface and conventions |
