@@ -65,12 +65,14 @@ jobs:
         env:
           DATABASE_URL: postgresql+asyncpg://atp:atp@localhost:5432/atp_test
           REDIS_URL: redis://localhost:6379/0
-        # There are no integration tests yet (Phase 1). pytest exits 5 on an
-        # empty collection, which would fail the job for the wrong reason.
-        # Tolerate ONLY exit 5 — every real failure still fails the build, and
-        # this starts asserting the moment the first integration test lands.
+        # The exit-5 tolerance that used to live here is gone: integration tests
+        # exist now, so an empty collection means they stopped being collected,
+        # which is a failure and not something to wave through. These are the
+        # only tests that run the migrations against a real TimescaleDB — the
+        # hypertable, its chunk interval and its compression policy cannot be
+        # asserted anywhere else.
         run: |
-          uv run pytest tests/integration -m integration || [ $? -eq 5 ]
+          uv run pytest tests/integration -m integration
 
   web:
     runs-on: ubuntu-latest

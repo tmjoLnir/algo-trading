@@ -5,8 +5,8 @@ Schema notes that matter:
 - **Money is NUMERIC, never DOUBLE PRECISION** (rule §1.1). `NUMERIC(20, 8)`
   handles equity prices, crypto, and fractional shares.
 - **Every timestamp is TIMESTAMPTZ** (rule §1.2).
-- **`bars` is a TimescaleDB hypertable** partitioned on `ts` — see
-  `infra/db/init/01-timescale.sql`. It is the only unbounded table.
+- **`bars` is a TimescaleDB hypertable** partitioned on `ts`, converted by the
+  initial migration. It is the only unbounded table.
 - **Orders and fills are append-mostly and never hard-deleted.** They are the
   audit trail; if a regulator or a post-mortem asks what happened, this is the
   answer. Cancel by status, not by DELETE.
@@ -49,10 +49,16 @@ class BarRow(Base):
     partitions on `ts` and the natural key is (symbol, timeframe, ts)."""
 
     __tablename__ = "bars"
-    __table_args__ = (
-        UniqueConstraint("symbol", "timeframe", "ts", name="uq_bars_symbol_tf_ts"),
-        Index("ix_bars_symbol_tf_ts", "symbol", "timeframe", "ts"),
-    )
+    # The composite primary key below IS the natural key, so this table
+    # deliberately declares nothing else on those columns. It previously carried
+    # a matching UniqueConstraint and Index as well, which cost more than the
+    # duplication suggests: the index is a second btree maintained on every
+    # chunk of the one table that grows without bound, and the constraint was
+    # never a separate object at all — SQLAlchemy folds it into the primary key,
+    # so autogenerate reflected a plain PK, failed to find the unique constraint
+    # it expected, and proposed adding it on every single `make revision`.
+    # Upserts infer the arbiter from the columns — `ON CONFLICT (symbol,
+    # timeframe, ts)` — so nothing needs the constraint name.
 
     symbol: Mapped[str] = mapped_column(String(20), primary_key=True)
     timeframe: Mapped[str] = mapped_column(String(8), primary_key=True)
