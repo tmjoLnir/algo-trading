@@ -48,8 +48,9 @@ runs unmodified against live data. `apps/api` (FastAPI) serves the dashboard and
 ## Quickstart
 
 ```bash
-cp .env.example .env          # then fill in ALPACA_API_KEY / ALPACA_API_SECRET
-make up                       # postgres+timescale, redis, api, worker, web
+make up                       # postgres+timescale, redis, api, web
+                              # writes .env from .env.example on first run —
+                              # fill in ALPACA_* before leaving backtest mode
 make migrate                  # create schema
 make seed                     # backfill a little bar history
 open http://localhost:5173    # dashboard

@@ -21,7 +21,10 @@ fix it here in the PR that discovered it.
 
 ## Phase 0 — Foundations (skeleton is here)
 - [x] Repo structure, tooling, docs, CI (#1, #2)
-- [ ] `make install` and `make up` work end to end
+- [x] `make install` and `make up` work end to end — @claude (#7).
+  Demonstrated by the `stack` CI job, which runs both on a clean checkout.
+  `make up` starts db, redis, api and web; the worker is behind a compose
+  profile until its entry point stops raising `NotImplementedError` (Phase 4).
 - [x] Alembic initial migration; TimescaleDB hypertable created — @claude (#6)
 - [x] `Position.apply_fill` + `Order.apply_fill` implemented and property-tested — @claude (#4)
 
@@ -59,7 +62,8 @@ is invisible and poisons every number the platform produces.
 - [ ] `OrderRouter`, order state machine
 - [ ] `SimulatedBroker`
 - [ ] Reconciliation
-- [ ] `StrategyRunner` live loop
+- [ ] `StrategyRunner` live loop — also drop the `worker` compose profile (#7),
+      so the worker rejoins the default stack once it can actually start
 - [ ] Trade-updates WS with reconnect
 
 *Verifiable:* a strategy trades the paper account for a week and reconciles clean.

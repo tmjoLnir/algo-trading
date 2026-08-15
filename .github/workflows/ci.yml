@@ -92,6 +92,71 @@ jobs:
       - run: npm run test -- --run
       - run: npm run build
 
+  # `make up` is a roadmap deliverable in its own right, and it is the one thing
+  # in this repository that no unit or integration test can speak for: it builds
+  # three images and starts four containers. It breaks in ways the Python suite
+  # cannot see — a Dockerfile that no longer copies a package, a compose file
+  # referencing a gitignored env_file, an entry point that exits on boot — and
+  # it breaks silently, because nobody runs it until the day they need it.
+  stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # No `.env` is created first, deliberately: this must work on a clone with
+      # nothing but the tracked files, which is exactly what a new contributor
+      # has. `make up` is responsible for producing one from .env.example.
+      - name: make up
+        run: make up
+
+      - name: Wait for the API to report healthy
+        # Polls the published port rather than the container HEALTHCHECK, whose
+        # 30s interval would dominate the wall clock here.
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/healthz | grep -q '"ok"'; then
+              echo "api healthy after ~${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "api never became healthy"; exit 1
+
+      - name: The app is actually mounted, not just the process alive
+        # /healthz answers from a bare router; /docs only renders once every
+        # router in create_app() has imported and mounted cleanly.
+        run: curl -fsS -o /dev/null -w 'docs %{http_code}\n' http://localhost:8000/docs
+
+      - name: Wait for the web dev server
+        run: |
+          for i in $(seq 1 90); do
+            if curl -fsS -o /dev/null http://localhost:5173; then
+              echo "web responding after ~${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "web dev server never responded"; exit 1
+
+      - name: Every default service is up, and none is restarting
+        # Catches the failure mode this job was written for: a container that
+        # boots, dies and is restarted forever still looks "started" to compose.
+        run: |
+          docker compose ps
+          not_running=$(docker compose ps --format '{{.Service}} {{.State}}' \
+            | awk '$2 != "running" { print $1 " is " $2 }')
+          if [ -n "$not_running" ]; then
+            echo "::error::expected every service to be running -- $not_running"
+            exit 1
+          fi
+
+      - name: Container logs
+        if: failure()
+        run: docker compose logs --tail=120
+
+      - name: make down
+        if: always()
+        run: make down
+
   secrets:
     runs-on: ubuntu-latest
     steps:
