@@ -13,10 +13,18 @@ install:  ## Install Python + Node dependencies
 	npm --prefix $(WEB) install
 
 # ── docker ──────────────────────────────────────────────────────────────────
-up:  ## Start the full stack
+# A file target, so it runs exactly once — when .env is genuinely absent — and
+# never overwrites a developer's filled-in credentials.
+.env:
+	@cp .env.example $@
+	@echo "wrote $@ from .env.example — fill in ALPACA_* and API_SECRET_KEY"
+	@echo "before switching ATP_RUN_MODE off backtest."
+
+up: .env  ## Start the full stack
 	docker compose up -d --build
 	@echo "api  → http://localhost:8000/docs"
 	@echo "web  → http://localhost:5173"
+	@echo "worker is not in the default stack — see docker-compose.yml"
 
 down:  ## Stop the stack
 	docker compose down

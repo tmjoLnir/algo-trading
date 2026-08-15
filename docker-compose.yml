@@ -36,7 +36,14 @@ services:
     build:
       context: .
       dockerfile: infra/docker/api.Dockerfile
-    env_file: [.env]
+    # Optional on purpose. `.env` is gitignored, so it does not exist in a fresh
+    # clone — and a required env_file that is missing makes every compose
+    # command fail at parse time, `down` and `ps` included. `make up` writes one
+    # from .env.example; without it the services fall back to their defaults,
+    # which are the safe ones (see atp_core.config.Settings).
+    env_file:
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgresql+asyncpg://atp:atp@db:5432/atp
       REDIS_URL: redis://redis:6379/0
@@ -56,7 +63,18 @@ services:
     build:
       context: .
       dockerfile: infra/docker/worker.Dockerfile
-    env_file: [.env]
+    # Not started by default: `atp_worker.main` is still a stub that raises
+    # NotImplementedError, and `restart: unless-stopped` would turn that into an
+    # endless crash-loop on every developer's machine — noise that teaches people
+    # to ignore a red container. Opt in once there is something to run:
+    #
+    #     docker compose --profile worker up -d
+    #
+    # Delete this profile when the StrategyRunner live loop lands (Phase 4).
+    profiles: [worker]
+    env_file:
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgresql+asyncpg://atp:atp@db:5432/atp
       REDIS_URL: redis://redis:6379/0

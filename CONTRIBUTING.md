@@ -3,12 +3,14 @@
 ## Setup
 
 ```bash
-cp .env.example .env      # fill in ALPACA_* (paper keys)
 make install
-make up
+make up                   # writes .env from .env.example if you have none
 make migrate
 make test
 ```
+
+Fill in `ALPACA_*` (paper keys) in `.env` before moving `ATP_RUN_MODE` off
+`backtest`. The worker is not in the default stack — see `docker-compose.yml`.
 
 ## Workflow
 
