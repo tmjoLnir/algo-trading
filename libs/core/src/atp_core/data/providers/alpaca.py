@@ -105,12 +105,19 @@ class AlpacaHistoricalProvider:
         *,
         client: httpx.AsyncClient | None = None,
         backoff_base_seconds: float = _BACKOFF_BASE_SECONDS,
+        min_request_interval_seconds: float = 0.0,
     ) -> None:
         self._settings = settings
         self._client = client
         #: Only close what we opened — an injected client belongs to its owner.
         self._owns_client = client is None
         self._backoff_base_seconds = backoff_base_seconds
+        #: Proactive pacing, off by default. Retrying a 429 is correct but
+        #: expensive: the request is spent, and `Retry-After` is typically
+        #: longer than the gap that would have avoided it. A backfill sets this
+        #: from the vendor's published ceiling and mostly never sees a 429.
+        self._min_request_interval = min_request_interval_seconds
+        self._next_request_at = 0.0
 
     # ── plumbing ────────────────────────────────────────────────────────────
 
@@ -138,6 +145,20 @@ class AlpacaHistoricalProvider:
 
     async def __aexit__(self, *exc: object) -> None:
         await self.aclose()
+
+    async def _await_rate_limit(self) -> None:
+        """Space requests out by at least `min_request_interval_seconds`.
+
+        Serial by construction — this class issues one request at a time — so a
+        single next-allowed timestamp is enough and there is no bucket to share.
+        """
+        if self._min_request_interval <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if now < self._next_request_at:
+            await asyncio.sleep(self._next_request_at - now)
+        self._next_request_at = loop.time() + self._min_request_interval
 
     async def _sleep_before_retry(self, attempt: int, response: httpx.Response | None) -> None:
         """Honour `Retry-After` when the server sets it, else exponential backoff.
@@ -169,6 +190,7 @@ class AlpacaHistoricalProvider:
         for attempt in range(_MAX_ATTEMPTS):
             response: httpx.Response | None = None
             try:
+                await self._await_rate_limit()
                 response = await client.get(url, params=params, headers=self._auth_headers())
             except httpx.HTTPError as exc:  # timeouts, connection resets, DNS
                 last_error = exc
