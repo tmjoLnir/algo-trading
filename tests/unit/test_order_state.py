@@ -2,11 +2,27 @@
 
 from __future__ import annotations
 
-import pytest
+from datetime import UTC, datetime
+from decimal import Decimal
 
-from atp_core.domain.enums import OrderStatus
+import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
+
+from atp_core.domain.enums import OrderStatus, Side
+from atp_core.domain.order import Fill, Order
 from atp_core.errors import InvalidStateTransitionError
 from atp_core.execution.state import assert_transition, can_transition, is_stale_event
+
+TS = datetime(2024, 6, 3, 14, 30, tzinfo=UTC)
+
+
+def _order(qty: str) -> Order:
+    return Order(symbol="SPY", side=Side.BUY, qty=Decimal(qty), status=OrderStatus.SUBMITTED)
+
+
+def _fill(order: Order, qty: str, price: str, fee: str = "0") -> Fill:
+    return Fill(order_id=order.id, ts=TS, qty=Decimal(qty), price=Decimal(price), fee=Decimal(fee))
 
 
 def test_legal_transition() -> None:
@@ -33,10 +49,80 @@ def test_stale_event_after_terminal_is_detected() -> None:
 class TestOrderFills:
     def test_partial_fill_updates_vwap(self) -> None:
         """50 @ $10 then 50 @ $12 → filled 100 @ $11."""
-        pytest.skip("TODO")
+        order = _order(qty="100")
+
+        order.apply_fill(_fill(order, "50", "10"))
+        assert order.status is OrderStatus.PARTIALLY_FILLED
+        assert order.filled_qty == Decimal(50)
+        assert order.avg_fill_price == Decimal(10)
+        assert order.remaining_qty == Decimal(50)
+        assert not order.is_complete
+
+        order.apply_fill(_fill(order, "50", "12"))
+        assert order.status is OrderStatus.FILLED
+        assert order.filled_qty == Decimal(100)
+        assert order.avg_fill_price == Decimal(11)
+        assert order.remaining_qty == Decimal(0)
+        assert order.filled_at == TS
+        assert order.is_complete
+
+    def test_uneven_partials_weight_by_quantity(self) -> None:
+        """VWAP is volume-weighted, not an average of prices: 90 @ $10 and
+        10 @ $20 is $11, not $15."""
+        order = _order(qty="100")
+
+        order.apply_fill(_fill(order, "90", "10"))
+        order.apply_fill(_fill(order, "10", "20"))
+
+        assert order.avg_fill_price == Decimal(11)
 
     def test_overfill_rejected(self) -> None:
-        pytest.skip("TODO")
+        order = _order(qty="100")
+        order.apply_fill(_fill(order, "60", "10"))
 
-    def test_vwap_between_min_and_max_fill(self) -> None:
-        pytest.skip("TODO: hypothesis")
+        with pytest.raises(ValueError, match="overfill"):
+            order.apply_fill(_fill(order, "50", "10"))
+
+        # The rejected fill must leave no trace behind.
+        assert order.filled_qty == Decimal(60)
+        assert order.avg_fill_price == Decimal(10)
+        assert len(order.fills) == 1
+        assert order.status is OrderStatus.PARTIALLY_FILLED
+
+    def test_non_positive_fill_qty_rejected(self) -> None:
+        order = _order(qty="100")
+        with pytest.raises(ValueError, match="fill qty must be positive"):
+            order.apply_fill(_fill(order, "0", "10"))
+
+    def test_total_fees_accumulate_across_fills(self) -> None:
+        order = _order(qty="100")
+        order.apply_fill(_fill(order, "50", "10", fee="0.75"))
+        order.apply_fill(_fill(order, "50", "12", fee="0.30"))
+
+        assert order.total_fees == Decimal("1.05")
+
+    @settings(max_examples=200)
+    @given(
+        lots=st.lists(
+            st.tuples(
+                st.integers(min_value=1, max_value=100),  # qty
+                st.integers(min_value=1, max_value=1000),  # price
+            ),
+            min_size=1,
+            max_size=20,
+        )
+    )
+    def test_vwap_between_min_and_max_fill(self, lots: list[tuple[int, int]]) -> None:
+        """A weighted average cannot escape the range it averages over.
+
+        If it does, the weighting is wrong — which is exactly the bug that
+        misprices a position built out of many prints.
+        """
+        order = _order(qty=str(sum(qty for qty, _ in lots)))
+
+        for qty, price in lots:
+            order.apply_fill(_fill(order, str(qty), str(price)))
+
+        prices = [Decimal(price) for _, price in lots]
+        assert order.avg_fill_price is not None
+        assert min(prices) <= order.avg_fill_price <= max(prices)
