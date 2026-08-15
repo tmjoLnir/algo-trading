@@ -22,7 +22,7 @@ fix it here in the PR that discovered it.
 ## Phase 0 — Foundations (skeleton is here)
 - [x] Repo structure, tooling, docs, CI (#1, #2)
 - [ ] `make install` and `make up` work end to end
-- [x] Alembic initial migration; TimescaleDB hypertable created — @claude (#4)
+- [x] Alembic initial migration; TimescaleDB hypertable created — @claude (#6)
 - [x] `Position.apply_fill` + `Order.apply_fill` implemented and property-tested — @claude (#4)
 
 **Do these two first.** Everything downstream computes P&L from them; a bug here
