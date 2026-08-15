@@ -1,0 +1,214 @@
+"""Bar storage — the `BarRepository` port over the TimescaleDB hypertable.
+
+Backfills overlap constantly: an operator re-runs a window, a reconnect
+backfills a gap that partly exists, a corporate action makes yesterday's
+adjusted prices wrong. So every write here is an upsert on the natural key
+`(symbol, timeframe, ts)`, and re-running a backfill is expected rather than
+exceptional (docs/DATA.md).
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, cast
+
+from sqlalchemy import CursorResult, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from atp_core.domain import Bar, Timeframe
+from atp_core.logging import get_logger
+from atp_core.persistence.db import session_scope
+from atp_core.persistence.models import BarRow
+
+if TYPE_CHECKING:
+    from datetime import datetime
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from atp_core.data.ports import BarRepository
+
+log = get_logger(__name__)
+
+#: Rows per INSERT. PostgreSQL caps a statement at 65535 bind parameters and a
+#: bar binds 11, so the hard ceiling is ~5900 rows; 2000 leaves room and keeps
+#: any single statement short enough not to hold a lock while a five-year
+#: minute backfill (roughly 500k bars per symbol) streams through.
+_UPSERT_CHUNK_ROWS = 2000
+
+
+class PostgresBarRepository:
+    """`BarRepository` over PostgreSQL/TimescaleDB.
+
+    Postgres-specific rather than portable: the idempotency this table needs is
+    `INSERT ... ON CONFLICT`, and emulating it with a read-then-write would race
+    two backfills against each other.
+
+    Takes a session factory rather than a session. Ingestion is the caller here
+    — a backfill loop or the stream consumer — and neither wants to own a
+    transaction spanning hundreds of thousands of rows.
+    """
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    # ── writes ──────────────────────────────────────────────────────────────
+
+    async def upsert_bars(self, bars: list[Bar]) -> int:
+        """Insert or update, keyed on `(symbol, timeframe, ts)`.
+
+        Returns the number of rows written — inserted and updated together,
+        because a re-run of an existing window legitimately touches every row
+        and reporting 0 for it would read as "nothing happened".
+
+        `adj_close`, `vwap` and `trade_count` are merged with COALESCE rather
+        than overwritten. This is the subtle one: a raw-only fetch carries no
+        `adj_close`, and a plain overwrite would silently erase the adjusted
+        prices an earlier pass stored — leaving backtests to run on NULLs. A
+        *present* incoming value still wins, because a corporate action makes
+        every historical `adj_close` for that symbol stale and the newer figure
+        is the correct one.
+        """
+        if not bars:
+            return 0
+
+        rows = [self._to_row(bar) for bar in bars]
+        written = 0
+
+        async with session_scope(self._session_factory) as session:
+            for start in range(0, len(rows), _UPSERT_CHUNK_ROWS):
+                chunk = rows[start : start + _UPSERT_CHUNK_ROWS]
+                stmt = pg_insert(BarRow).values(chunk)
+                columns = BarRow.__table__.c
+                stmt = stmt.on_conflict_do_update(
+                    # Inferred from the columns, not a constraint name: the
+                    # natural key is the primary key and carries no name of its
+                    # own worth depending on (see the initial migration).
+                    index_elements=["symbol", "timeframe", "ts"],
+                    set_={
+                        "open": stmt.excluded.open,
+                        "high": stmt.excluded.high,
+                        "low": stmt.excluded.low,
+                        "close": stmt.excluded.close,
+                        "volume": stmt.excluded.volume,
+                        "adj_close": func.coalesce(stmt.excluded.adj_close, columns.adj_close),
+                        "vwap": func.coalesce(stmt.excluded.vwap, columns.vwap),
+                        "trade_count": func.coalesce(
+                            stmt.excluded.trade_count, columns.trade_count
+                        ),
+                    },
+                )
+                # `execute` is typed as returning `Result`, which has no
+                # rowcount; DML genuinely returns a `CursorResult`, which does.
+                result = cast("CursorResult[Any]", await session.execute(stmt))
+                written += result.rowcount
+
+        log.info("data.bars.upserted", rows=written, batches=-(-len(rows) // _UPSERT_CHUNK_ROWS))
+        return written
+
+    # ── reads ───────────────────────────────────────────────────────────────
+
+    async def get_bars(
+        self, symbol: str, timeframe: Timeframe, start: datetime, end: datetime
+    ) -> list[Bar]:
+        """Bars in `[start, end)`, chronological.
+
+        Half-open deliberately: consecutive windows chained end-to-start then
+        cover the range exactly once. A closed interval double-counts the
+        boundary bar, which is one duplicated candle in every indicator
+        computed across the seam.
+        """
+        _require_utc(start, "start")
+        _require_utc(end, "end")
+
+        stmt = (
+            select(BarRow)
+            .where(
+                BarRow.symbol == symbol,
+                BarRow.timeframe == timeframe.value,
+                BarRow.ts >= start,
+                BarRow.ts < end,
+            )
+            .order_by(BarRow.ts)
+        )
+        async with self._session_factory() as session:
+            result = await session.execute(stmt)
+            return [self._to_bar(row) for row in result.scalars()]
+
+    async def get_last_n_bars(self, symbol: str, timeframe: Timeframe, n: int) -> list[Bar]:
+        """The most recent `n` bars, returned chronological.
+
+        Fetched newest-first so the database reads `n` rows rather than the
+        symbol's whole history, then reversed — indicators are defined over a
+        forward series and handing them a reversed one produces numbers that
+        look plausible and are wrong.
+        """
+        if n < 1:
+            raise ValueError(f"n must be at least 1, got {n}")
+
+        stmt = (
+            select(BarRow)
+            .where(BarRow.symbol == symbol, BarRow.timeframe == timeframe.value)
+            .order_by(BarRow.ts.desc())
+            .limit(n)
+        )
+        async with self._session_factory() as session:
+            result = await session.execute(stmt)
+            return [self._to_bar(row) for row in reversed(list(result.scalars()))]
+
+    async def find_gaps(
+        self, symbol: str, timeframe: Timeframe, start: datetime, end: datetime
+    ) -> list[tuple[datetime, datetime]]:
+        """Missing windows, excluding legitimate market closures.
+
+        Not implemented here on purpose. Answering this needs the trading
+        calendar — without it every weekend and holiday reads as a gap, and an
+        alert that fires every Saturday is ignored by the second week. That is
+        its own roadmap item ("Gap detection, calendar-aware"), and a
+        non-calendar version now would be worse than none: it would look like
+        gap detection while crying wolf.
+        """
+        raise NotImplementedError("see docs/DATA.md 'Gaps' — needs the trading calendar")
+
+    # ── mapping ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _to_row(bar: Bar) -> dict[str, Any]:
+        return {
+            "symbol": bar.symbol,
+            "timeframe": bar.timeframe.value,
+            "ts": bar.ts,
+            "open": bar.open,
+            "high": bar.high,
+            "low": bar.low,
+            "close": bar.close,
+            "volume": bar.volume,
+            "adj_close": bar.adj_close,
+            "vwap": bar.vwap,
+            "trade_count": bar.trade_count,
+        }
+
+    @staticmethod
+    def _to_bar(row: BarRow) -> Bar:
+        return Bar(
+            symbol=row.symbol,
+            ts=row.ts,
+            timeframe=Timeframe(row.timeframe),
+            open=row.open,
+            high=row.high,
+            low=row.low,
+            close=row.close,
+            volume=row.volume,
+            adj_close=row.adj_close,
+            vwap=row.vwap,
+            trade_count=row.trade_count,
+        )
+
+
+def _require_utc(ts: datetime, field: str) -> None:
+    if ts.tzinfo is None:
+        raise ValueError(f"{field} must be timezone-aware (rule §1.2), got naive {ts!r}")
+
+
+if TYPE_CHECKING:
+    # mypy enforces that the adapter still satisfies its port.
+    def _conforms(adapter: PostgresBarRepository) -> BarRepository:
+        return adapter
