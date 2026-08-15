@@ -1,20 +1,17 @@
 -- Runs once on first container start.
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
--- The hypertable itself is created by an Alembic migration, after the table
--- exists. Keeping schema in migrations and only the extension here means one
--- source of truth for the schema.
+-- That is deliberately all this file does.
 --
--- The migration should run:
+-- The `bars` hypertable, its chunk interval and its compression policy live in
+-- the initial Alembic migration, because the table has to exist before it can
+-- be partitioned and because keeping schema in migrations means one source of
+-- truth for it. The extension is different: it is a property of the database,
+-- not of the schema, and creating it needs privileges a migration should not
+-- assume it has.
 --
---   SELECT create_hypertable('bars', 'ts', chunk_time_interval => INTERVAL '7 days');
---
---   ALTER TABLE bars SET (
---     timescaledb.compress,
---     timescaledb.compress_segmentby = 'symbol, timeframe'
---   );
---   SELECT add_compression_policy('bars', INTERVAL '30 days');
---
--- 7-day chunks suit minute bars; use 30 days if you only store dailies.
--- Compression after 30 days typically gives 10-20x on OHLCV, and old bars are
--- read for backtests but never updated.
+-- The migration checks for this extension and refuses to run without it rather
+-- than quietly creating `bars` as an ordinary table. Anything that provisions a
+-- database outside compose — a CI service container, a managed instance — has
+-- to create the extension itself; see tests/integration/test_migrations.py,
+-- which does exactly that before migrating.
