@@ -32,7 +32,11 @@ fix it here in the PR that discovered it.
 is invisible and poisons every number the platform produces.
 
 ## Phase 1 — Data (requirement #4)
-- [ ] Alpaca historical provider with pagination
+- [ ] Alpaca historical provider with pagination — @claude (wip #8).
+  `AlpacaHistoricalProvider` is implemented and unit-tested against recorded
+  responses. Deliberately **not** ticked: the phase's *Verifiable:* line has not
+  been shown, and cannot be until `BarRepository` and the backfill script exist
+  to run it against the real feed. No bar has been fetched from Alpaca yet.
 - [ ] `BarRepository` + backfill script
 - [ ] Gap detection, calendar-aware
 - [ ] Real-time WS ingestor, reconnect + gap backfill
