@@ -37,12 +37,14 @@ is invisible and poisons every number the platform produces.
   responses. Deliberately **not** ticked: the phase's *Verifiable:* line has not
   been shown, and cannot be until `BarRepository` and the backfill script exist
   to run it against the real feed. No bar has been fetched from Alpaca yet.
-- [ ] `BarRepository` + backfill script — @claude (wip #9).
-  `PostgresBarRepository` is implemented and integration-tested against the real
-  hypertable: idempotent upsert, half-open reads, last-n. The backfill script is
-  the other half of this item and is not written, so the phase's *Verifiable:*
-  line still has nothing to run. `find_gaps` stays deliberately unimplemented —
-  it belongs to the calendar-aware item below.
+- [ ] `BarRepository` + backfill script — @claude (wip #10).
+  Both halves are now built: `PostgresBarRepository` (#9, integration-tested
+  against the real hypertable) and `scripts/backfill_bars.py` over
+  `atp_core.data.backfill`. Still unticked — the phase's *Verifiable:* line
+  needs the script run against the live feed, and nothing here has fetched a
+  bar from Alpaca yet. `find_gaps` stays deliberately unimplemented; it belongs
+  to the calendar-aware item below, and `--verify` refuses up front rather than
+  pretending to check.
 - [ ] Gap detection, calendar-aware
 - [ ] Real-time WS ingestor, reconnect + gap backfill
 - [ ] Redis quote cache, staleness monitor

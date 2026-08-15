@@ -8,9 +8,10 @@ things being tested.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
@@ -21,6 +22,9 @@ from atp_core.config import Settings
 from atp_core.data.providers.alpaca import AlpacaHistoricalProvider
 from atp_core.domain import Timeframe
 from atp_core.errors import DataError, DataGapError
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 BARS_URL = "https://data.alpaca.markets/v2/stocks/bars"
 START = datetime(2024, 1, 2, tzinfo=UTC)
@@ -36,9 +40,29 @@ def make_settings() -> Settings:
     )
 
 
+#: Clients handed to providers under test, closed after each test by the autouse
+#: fixture below. Left open, they keep the event loop's transports alive past the
+#: end of the test and the next module's first test never starts.
+_OPEN_CLIENTS: list[httpx.AsyncClient] = []
+
+
+@pytest.fixture(autouse=True)
+async def _close_clients() -> AsyncIterator[None]:
+    yield
+    for client in _OPEN_CLIENTS:
+        await client.aclose()
+    _OPEN_CLIENTS.clear()
+
+
 def provider(**kwargs: Any) -> AlpacaHistoricalProvider:
     #: Zero backoff: the retry paths are under test, not the wall clock.
-    return AlpacaHistoricalProvider(make_settings(), backoff_base_seconds=0.0, **kwargs)
+    #: The client is injected rather than lazily created so that the fixture
+    #: above has something to close — the provider only closes what it opened.
+    client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0))
+    _OPEN_CLIENTS.append(client)
+    return AlpacaHistoricalProvider(
+        make_settings(), backoff_base_seconds=0.0, client=client, **kwargs
+    )
 
 
 def bar(day: int, close: float | str = 101.5, *, hour: int = 0) -> dict[str, Any]:
@@ -392,6 +416,63 @@ class TestInputValidation:
     async def test_lowercase_symbol_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="uppercase"):
             await provider().get_bars(["spy"], Timeframe.D1, START, END, adjusted=False)
+
+
+class TestRateLimiting:
+    """Retrying a 429 is correct but expensive — the request is spent and
+    `Retry-After` is usually longer than the gap that would have avoided it."""
+
+    @staticmethod
+    def _spy_on_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+        """Record requested delays instead of serving them.
+
+        Asserting on wall-clock time here would be flaky in both directions —
+        a loaded runner drifts long, and "did not sleep" cannot be proven by a
+        stopwatch at all. The delay the code *asks* for is the actual contract.
+        """
+        delays: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def spy(delay: float, *args: Any, **kwargs: Any) -> Any:
+            delays.append(delay)
+            return await real_sleep(0)
+
+        monkeypatch.setattr(asyncio, "sleep", spy)
+        return delays
+
+    @respx.mock
+    async def test_requests_are_spaced_when_an_interval_is_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        respx.get(BARS_URL).mock(
+            side_effect=[
+                httpx.Response(200, json=page({"SPY": [bar(2)]}, token="p2")),
+                httpx.Response(200, json=page({"SPY": [bar(3)]})),
+            ]
+        )
+        delays = self._spy_on_sleep(monkeypatch)
+        paced = provider(min_request_interval_seconds=0.05)
+
+        await paced.get_bars(["SPY"], Timeframe.D1, START, END, adjusted=False)
+
+        # Two paginated requests, so exactly one gap between them.
+        assert [d for d in delays if d > 0], "the second request was not paced"
+
+    @respx.mock
+    async def test_pacing_is_off_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Nothing pays for the limiter unless it asks for it — a one-off fetch
+        should not sleep at all."""
+        respx.get(BARS_URL).mock(
+            side_effect=[
+                httpx.Response(200, json=page({"SPY": [bar(2)]}, token="p2")),
+                httpx.Response(200, json=page({"SPY": [bar(3)]})),
+            ]
+        )
+        delays = self._spy_on_sleep(monkeypatch)
+
+        await provider().get_bars(["SPY"], Timeframe.D1, START, END, adjusted=False)
+
+        assert [d for d in delays if d > 0] == []
 
 
 class TestLatestBar:
