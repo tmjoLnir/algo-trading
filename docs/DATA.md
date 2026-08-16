@@ -46,6 +46,14 @@ uv run python scripts/backfill_bars.py --symbols SPY --start 2020-01-01 --verify
 It exits non-zero when it finds any, so a pipeline cannot mistake a partial
 dataset for a clean one.
 
+A nightly job (`atp_worker.scheduler.backfill_missing_bars`) runs the same check
+unattended over the last 7 days, for every `(symbol, timeframe)` already stored,
+and fetches what is missing. It re-checks afterwards and logs a WARNING naming
+anything it could not fill — "fetched 3 windows" and "the holes are gone" are
+different claims, and a job that cannot tell them apart reports success every
+night while the hole stays put. Anything older than the lookback is an operator
+job: `--verify` over the range in question.
+
 **What is expected.** One daily bar per session; for intraday, one bar per
 interval from the session open for as many whole intervals as fit before the
 close — 13 half-hours in a regular session, 7 in a 13:00 early close. A bar is

@@ -317,6 +317,30 @@ def half_hour_bar(ts: datetime, *, symbol: str = "SPY") -> Bar:
     )
 
 
+class TestStoredSeries:
+    """What the nightly gap sweep iterates over. Needs a database because the
+    question is `DISTINCT` over the hypertable's key, not Python."""
+
+    async def test_lists_each_symbol_and_timeframe_once(self, repo: PostgresBarRepository) -> None:
+        await repo.upsert_bars(
+            [
+                make_bar(0),
+                make_bar(1),  # same series, second bar
+                make_bar(0, symbol="QQQ"),
+                half_hour_bar(SESSION_OPEN),
+            ]
+        )
+
+        assert await repo.stored_series() == [
+            ("QQQ", Timeframe.D1),
+            ("SPY", Timeframe.D1),
+            ("SPY", Timeframe.M30),
+        ]
+
+    async def test_an_empty_store_has_no_series(self, repo: PostgresBarRepository) -> None:
+        assert await repo.stored_series() == []
+
+
 class TestFindGaps:
     """Whether what we hold covers every session the exchange was open for.
 
