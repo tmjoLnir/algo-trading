@@ -5,9 +5,4 @@
       "Bash(git push:*)"
     ]
   }
-  "network": {
-    "allowedDomains": [
-      "data.alpaca.markets"
-    ]
-  }
 }
