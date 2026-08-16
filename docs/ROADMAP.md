@@ -45,16 +45,18 @@ is invisible and poisons every number the platform produces.
   bar from Alpaca yet. `find_gaps` stays deliberately unimplemented; it belongs
   to the calendar-aware item below, and `--verify` refuses up front rather than
   pretending to check.
-- [ ] Gap detection, calendar-aware — @claude (wip #15).
+- [ ] Gap detection, calendar-aware — @claude (wip #15, #16).
   `TradingCalendar` is implemented over `pandas_market_calendars` (sessions,
   holidays, early closes, `next_open`, `minutes_to_close`), `find_gaps` is
-  implemented on top of it, and `--verify` now runs instead of refusing. Still
-  unticked for the same reason as the two items above: the phase's *Verifiable:*
-  line needs a real 5-year SPY backfill, and no bar has been fetched from Alpaca
-  yet — so the one assumption this rests on, that daily bars arrive stamped at
-  00:00 New York, has been pinned by tests and documented but not yet seen on
-  live data. `1h`/`4h` gap detection is deliberately refused rather than
-  guessed (docs/DATA.md 'Gaps').
+  implemented on top of it, and `--verify` now runs instead of refusing (#15).
+  The nightly sweep that consumes it — `backfill_missing_bars`, over every
+  stored series for the last 7 days, re-checking and naming what it could not
+  fill — landed in #16. Still unticked for the same reason as the two items
+  above: the phase's *Verifiable:* line needs a real 5-year SPY backfill, and no
+  bar has been fetched from Alpaca yet — so the one assumption this rests on,
+  that daily bars arrive stamped at 00:00 New York, has been pinned by tests and
+  documented but not yet seen on live data. `1h`/`4h` gap detection is
+  deliberately refused rather than guessed (docs/DATA.md 'Gaps').
 - [ ] Real-time WS ingestor, reconnect + gap backfill
 - [ ] Redis quote cache, staleness monitor
 
@@ -90,6 +92,12 @@ is invisible and poisons every number the platform produces.
 
 ## Phase 5 — Dashboard & analytics (requirements #6, #7)
 - [ ] `/dashboard/live` aggregate endpoint
+- [ ] `/market-data/calendar` sessions endpoint — @claude (#16).
+  Implemented and tested: sessions, holidays and early closes over a range,
+  straight from the exchange rules. Unticked because this phase states no
+  *Verifiable:* line to tick against and nothing consumes it yet — the
+  dashboard that would is not built. Worth a *Verifiable:* line of its own when
+  someone writes one.
 - [ ] React dashboard, 5-min refresh + WS
 - [ ] Trade reconstruction, attribution, MAE/MFE
 - [ ] Live-vs-backtest comparison

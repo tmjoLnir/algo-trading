@@ -108,6 +108,16 @@ class BarRepository(Protocol):
         """
         ...
 
+    async def stored_series(self) -> list[tuple[str, Timeframe]]:
+        """Every `(symbol, timeframe)` this store holds bars for.
+
+        What the nightly gap check sweeps. Deliberately the stored series rather
+        than the strategies' universes: this job keeps the dataset we already
+        have complete, and a symbol no bar exists for yet needs an initial
+        backfill, not a gap fill.
+        """
+        ...
+
 
 class QuoteCache(Protocol):
     """Latest quote per symbol (Redis). Read on every risk check, so it must be

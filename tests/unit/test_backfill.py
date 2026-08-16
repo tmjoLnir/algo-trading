@@ -17,7 +17,9 @@ import pytest
 
 from atp_core.data.backfill import (
     BackfillResult,
+    GapBackfillResult,
     backfill_bars,
+    backfill_gaps,
     iter_windows,
     window_days_for,
 )
@@ -75,8 +77,26 @@ class FakeProvider:
 
 
 class FakeRepository:
-    def __init__(self) -> None:
+    """Records writes, and answers `find_gaps` from a script.
+
+    The script has two halves because `backfill_gaps` asks twice: once to find
+    out what is missing, and once afterwards to find out whether the fetch
+    actually fixed it. `remaining` is what the second call returns — empty by
+    default, which is the fetch having worked.
+    """
+
+    def __init__(
+        self,
+        *,
+        gaps: Sequence[tuple[datetime, datetime]] = (),
+        remaining: Sequence[tuple[datetime, datetime]] | None = None,
+        series: Sequence[tuple[str, Timeframe]] = (),
+    ) -> None:
         self.batches: list[list[Bar]] = []
+        self._gaps = list(gaps)
+        self._remaining = [] if remaining is None else list(remaining)
+        self._series = list(series)
+        self.find_gaps_calls: list[str] = []
 
     async def upsert_bars(self, bars: list[Bar]) -> int:
         self.batches.append(list(bars))
@@ -93,7 +113,12 @@ class FakeRepository:
     async def find_gaps(
         self, symbol: str, timeframe: Timeframe, start: datetime, end: datetime
     ) -> list[tuple[datetime, datetime]]:
-        raise NotImplementedError
+        self.find_gaps_calls.append(symbol)
+        first_ask = self.find_gaps_calls.count(symbol) == 1
+        return list(self._gaps if first_ask else self._remaining)
+
+    async def stored_series(self) -> list[tuple[str, Timeframe]]:
+        return list(self._series)
 
 
 async def run(
@@ -277,6 +302,168 @@ class TestEmptyWindows:
         provider, repo = FakeProvider(), FakeRepository()
 
         assert (await run(provider, repo, days=3, window_days=1)).ok
+
+
+GAP_A = (START + timedelta(days=1), START + timedelta(days=2))
+GAP_B = (START + timedelta(days=5), START + timedelta(days=6))
+
+
+async def run_gaps(
+    provider: FakeProvider,
+    repo: FakeRepository,
+    *,
+    symbols: Sequence[str] = ("SPY",),
+    days: int = 10,
+    **kwargs: object,
+) -> GapBackfillResult:
+    return await backfill_gaps(
+        provider,
+        repo,
+        symbols=list(symbols),
+        timeframe=Timeframe.D1,
+        start=START,
+        end=START + timedelta(days=days),
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+class TestBackfillGaps:
+    """The nightly pass: fetch what the calendar says is missing, then check
+    whether it is actually there now."""
+
+    async def test_nothing_missing_costs_nothing(self) -> None:
+        """The normal night. A job that re-fetches a week every time it finds
+        nothing wrong is a job that gets turned off."""
+        provider, repo = FakeProvider(), FakeRepository()
+
+        result = await run_gaps(provider, repo)
+
+        assert provider.calls == []
+        assert repo.batches == []
+        assert result.ok
+
+    async def test_fetches_exactly_the_gap_window(self) -> None:
+        provider, repo = FakeProvider(), FakeRepository(gaps=[GAP_A])
+
+        await run_gaps(provider, repo)
+
+        assert [(call[1], call[2]) for call in provider.calls] == [GAP_A]
+
+    async def test_writes_what_it_fetched(self) -> None:
+        provider, repo = FakeProvider(bars_per_window=3), FakeRepository(gaps=[GAP_A, GAP_B])
+
+        result = await run_gaps(provider, repo)
+
+        assert result.gaps_found == 2
+        assert result.bars_written == 6
+        assert result.requests == 2
+
+    async def test_each_symbol_gets_its_own_windows(self) -> None:
+        provider, repo = FakeProvider(), FakeRepository(gaps=[GAP_A])
+
+        await run_gaps(provider, repo, symbols=("SPY", "QQQ"))
+
+        assert [call[0] for call in provider.calls] == [("SPY",), ("QQQ",)]
+
+    async def test_a_filled_gap_is_not_reported(self) -> None:
+        provider, repo = FakeProvider(), FakeRepository(gaps=[GAP_A])
+
+        result = await run_gaps(provider, repo)
+
+        assert result.remaining == ()
+        assert result.ok
+
+    async def test_a_gap_the_vendor_cannot_fill_is_reported(self) -> None:
+        """The claim that matters. "Fetched 1 window" is not "the hole is
+        gone" — a symbol that had not listed yet leaves it exactly where it
+        was, and a job that cannot tell those apart reports success forever."""
+        provider = FakeProvider(empty={"NEWCO"})
+        repo = FakeRepository(gaps=[GAP_A], remaining=[GAP_A])
+
+        result = await run_gaps(provider, repo, symbols=("NEWCO",))
+
+        assert result.remaining == (("NEWCO", *GAP_A),)
+        assert not result.ok
+
+    async def test_a_symbol_the_vendor_has_nothing_for_does_not_abort_the_sweep(self) -> None:
+        """One symbol's permanent hole must not stop the others being checked."""
+        provider = FakeProvider(empty={"NEWCO"})
+        repo = FakeRepository(gaps=[GAP_A])
+
+        result = await run_gaps(provider, repo, symbols=("NEWCO", "SPY"))
+
+        assert [call[0] for call in provider.calls] == [("NEWCO",), ("SPY",)]
+        assert result.bars_written == 1, "SPY was still filled"
+
+    async def test_the_recheck_reads_rather_than_assumes(self) -> None:
+        provider, repo = FakeProvider(), FakeRepository(gaps=[GAP_A])
+
+        await run_gaps(provider, repo)
+
+        assert repo.find_gaps_calls == ["SPY", "SPY"], "found, fetched, then confirmed"
+
+    async def test_a_symbol_with_no_gaps_is_not_re_read(self) -> None:
+        provider, repo = FakeProvider(), FakeRepository()
+
+        await run_gaps(provider, repo)
+
+        assert repo.find_gaps_calls == ["SPY"]
+
+    async def test_too_many_gaps_is_capped_and_said_out_loud(self) -> None:
+        """Hundreds of gaps is an un-backfilled symbol, not an incident to fix a
+        window at a time. Capping is fine; capping silently is not."""
+        provider = FakeProvider()
+        repo = FakeRepository(gaps=[GAP_A] * 10)
+
+        result = await run_gaps(provider, repo, max_gaps_per_symbol=3)
+
+        assert len(provider.calls) == 3
+        assert result.truncated == ("SPY",)
+        assert not result.ok, "a truncated pass must not read as a clean one"
+
+    async def test_adjusted_is_passed_through(self) -> None:
+        provider, repo = FakeProvider(), FakeRepository(gaps=[GAP_A])
+
+        await run_gaps(provider, repo, adjusted=False)
+
+        assert provider.calls[0][3] is False
+
+    async def test_duplicate_symbols_are_collapsed(self) -> None:
+        provider, repo = FakeProvider(), FakeRepository()
+
+        result = await run_gaps(provider, repo, symbols=("SPY", "SPY"))
+
+        assert result.symbols == ("SPY",)
+
+    async def test_an_uncheckable_timeframe_is_refused(self) -> None:
+        """`1h` has no known bar grid, so `find_gaps` cannot answer for it. The
+        caller sweeping several timeframes filters and says what it skipped;
+        this refuses rather than inventing an answer."""
+        with pytest.raises(ValueError, match="does not support"):
+            await backfill_gaps(
+                FakeProvider(),
+                FakeRepository(),
+                symbols=["SPY"],
+                timeframe=Timeframe.H1,
+                start=START,
+                end=START + timedelta(days=1),
+            )
+
+    async def test_no_symbols_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="no symbols"):
+            await run_gaps(FakeProvider(), FakeRepository(), symbols=())
+
+    async def test_inverted_range_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="start must be before end"):
+            await run_gaps(FakeProvider(), FakeRepository(), days=-1)
+
+    async def test_lowercase_symbol_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="uppercase"):
+            await run_gaps(FakeProvider(), FakeRepository(), symbols=("spy",))
+
+    async def test_zero_gap_cap_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="at least 1"):
+            await run_gaps(FakeProvider(), FakeRepository(), max_gaps_per_symbol=0)
 
 
 class TestInputValidation:

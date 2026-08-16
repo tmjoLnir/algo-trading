@@ -7,16 +7,45 @@ touching a router. This is where the hexagonal architecture actually pays off.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from functools import lru_cache
 from typing import Annotated
 
 from fastapi import Depends
 
+from atp_core.clock import Clock, SystemClock, TradingCalendar
 from atp_core.config import Settings, get_settings
 
 
 async def get_db() -> AsyncIterator[object]:
     """Request-scoped database session."""
     raise NotImplementedError
+
+
+async def get_clock() -> Clock:
+    """Wall-clock time, behind the port.
+
+    Every read of "now" goes through this rather than `datetime.now()`, so a
+    test can pin it and nothing in a handler has to reach for the system clock
+    itself (CLAUDE.md §1.2).
+    """
+    return SystemClock()
+
+
+@lru_cache(maxsize=1)
+def _trading_calendar() -> TradingCalendar:
+    """One calendar for the process.
+
+    Cached because it caches: sessions are materialised a year at a time and
+    kept on the instance, so a per-request calendar would rebuild the same year
+    on every request. Built lazily rather than at import — constructing one
+    pulls in pandas, and an API that never asks about sessions should not pay
+    for it at startup.
+    """
+    return TradingCalendar()
+
+
+async def get_calendar() -> TradingCalendar:
+    return _trading_calendar()
 
 
 async def get_redis() -> object:

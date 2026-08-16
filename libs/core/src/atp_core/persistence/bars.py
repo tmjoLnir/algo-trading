@@ -231,6 +231,40 @@ class PostgresBarRepository:
         )
         return list(scan.windows)
 
+    async def stored_series(self) -> list[tuple[str, Timeframe]]:
+        """Every `(symbol, timeframe)` held — what a sweep iterates.
+
+        Ordered by symbol and then by the stored timeframe string: deterministic
+        rather than meaningful, so a sweep covers the same ground in the same
+        order every night and its logs can be diffed.
+
+        A `DISTINCT` over the leading columns of the primary key, which
+        PostgreSQL answers by walking that index rather than the table. It is
+        still proportional to the index, not to the number of distinct series,
+        so this belongs in a nightly job and not on a request path; if it ever
+        becomes the slow part, the fix is a recursive skip-scan over the same
+        index rather than a second table to keep in sync.
+
+        A timeframe the enum does not know is skipped rather than raising: it
+        can only come from a hand-written row, and one bad row should not stop
+        the sweep from checking every other series.
+        """
+        stmt = (
+            select(BarRow.symbol, BarRow.timeframe)
+            .distinct()
+            .order_by(BarRow.symbol, BarRow.timeframe)
+        )
+        async with self._session_factory() as session:
+            rows = (await session.execute(stmt)).all()
+
+        series: list[tuple[str, Timeframe]] = []
+        for symbol, timeframe in rows:
+            try:
+                series.append((symbol, Timeframe(timeframe)))
+            except ValueError:
+                log.warning("data.bars.unknown_timeframe", symbol=symbol, timeframe=timeframe)
+        return series
+
     async def _stored_timestamps(
         self, symbol: str, timeframe: Timeframe, start: datetime, end: datetime
     ) -> list[datetime]:

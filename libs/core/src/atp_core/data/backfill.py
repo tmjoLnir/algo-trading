@@ -4,6 +4,11 @@ Pure coordination over the two data ports: it decides *what* to ask for and in
 what order, and hands the answers to storage. No I/O of its own, so it stays in
 core (CLAUDE.md §1.3) and is testable without a network or a database.
 
+Two entry points, for two different jobs. `backfill_bars` re-fetches a whole
+range and is how a dataset is built; `backfill_gaps` asks the calendar what is
+missing and fetches only that, which is what makes it cheap enough to run every
+night (`atp_worker.scheduler.backfill_missing_bars`).
+
 The awkward parts of a real backfill, and what this does about them:
 
 - **Memory.** Five years of minute bars is roughly 500k rows per symbol. Asking
@@ -24,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
+from atp_core.data.gaps import require_supported
 from atp_core.domain import Timeframe
 from atp_core.errors import DataGapError
 from atp_core.logging import get_logger
@@ -55,6 +61,13 @@ _WINDOW_DAYS: dict[Timeframe, int] = {
 #: batching is the single biggest lever on how long a wide backfill takes.
 DEFAULT_BATCH_SIZE = 20
 
+#: How many gap windows one pass will chase per symbol. A symbol with hundreds
+#: of gaps is not a data incident to fix a window at a time — it is an illiquid
+#: minute series or a symbol that was never fully backfilled, and either way the
+#: answer is one ranged re-run rather than 300 requests a night against the rate
+#: limit. Hitting this is reported, never silent.
+DEFAULT_MAX_GAPS_PER_SYMBOL = 50
+
 
 @dataclass(frozen=True, slots=True)
 class EmptyWindow:
@@ -62,8 +75,8 @@ class EmptyWindow:
 
     Not necessarily a fault: a symbol that had not listed yet, or was halted,
     legitimately has no bars. It is reported rather than raised so the operator
-    can tell the difference — and until calendar-aware gap detection lands, this
-    list is the closest thing to a coverage report.
+    can tell the difference. It is a coarse signal — a whole window returned
+    nothing — where `find_gaps` answers the same question per session.
     """
 
     symbol: str
@@ -83,6 +96,29 @@ class BackfillResult:
     def ok(self) -> bool:
         """True when every symbol returned data for every window asked for."""
         return not self.empty_windows
+
+
+@dataclass(frozen=True, slots=True)
+class GapBackfillResult:
+    """What one pass of `backfill_gaps` found and what it could fix."""
+
+    symbols: tuple[str, ...]
+    timeframe: Timeframe
+    gaps_found: int
+    bars_written: int
+    requests: int
+    #: `(symbol, start, end)` for every gap still open after the fetch. Not a
+    #: failure by itself — a symbol that had not listed yet has no bars to get —
+    #: but it is the only thing that distinguishes "fixed" from "tried".
+    remaining: tuple[tuple[str, datetime, datetime], ...] = field(default=())
+    #: Symbols with more gaps than one pass would attempt. Reported rather than
+    #: swallowed: a truncated pass that says nothing reads as a complete one.
+    truncated: tuple[str, ...] = field(default=())
+
+    @property
+    def ok(self) -> bool:
+        """True when nothing is missing any more and nothing was left untried."""
+        return not self.remaining and not self.truncated
 
 
 def window_days_for(timeframe: Timeframe) -> int:
@@ -219,5 +255,117 @@ async def backfill_bars(
         windows=windows,
         requests=requests,
         empty_windows=len(empty),
+    )
+    return result
+
+
+async def backfill_gaps(
+    provider: HistoricalDataProvider,
+    repository: BarRepository,
+    *,
+    symbols: Sequence[str],
+    timeframe: Timeframe,
+    start: datetime,
+    end: datetime,
+    adjusted: bool = True,
+    max_gaps_per_symbol: int = DEFAULT_MAX_GAPS_PER_SYMBOL,
+) -> GapBackfillResult:
+    """Fetch exactly what the trading calendar says is missing.
+
+    The nightly counterpart to `backfill_bars`. That one re-fetches a whole
+    range and is the right tool for building a dataset; this one asks
+    `find_gaps` what is absent and fetches only those windows, which is what
+    makes it cheap enough to run every night against a rate limit.
+
+    Each gap is re-checked after the fetch. Reporting "fetched 3 windows" is not
+    the same claim as "the holes are gone": the vendor may simply not have the
+    data — a symbol that had not listed yet is the common case — and a job that
+    cannot tell those apart will report success every night while the hole stays
+    put. Whatever is still missing comes back in `remaining`.
+
+    Raises `ValueError` for a timeframe `find_gaps` cannot speak for (`1h`,
+    `4h`). A caller sweeping several timeframes should filter on
+    `gaps.SUPPORTED_TIMEFRAMES` and say which ones it skipped.
+    """
+    if not symbols:
+        raise ValueError("no symbols to backfill")
+    if start >= end:
+        raise ValueError(f"start must be before end, got start={start} end={end}")
+    for symbol in symbols:
+        if symbol != symbol.upper():
+            raise ValueError(f"symbol must be uppercase, got {symbol!r}")
+    if max_gaps_per_symbol < 1:
+        raise ValueError(f"max_gaps_per_symbol must be at least 1, got {max_gaps_per_symbol}")
+    require_supported(timeframe)
+
+    ordered = tuple(dict.fromkeys(symbols))
+    written = 0
+    requests = 0
+    found = 0
+    remaining: list[tuple[str, datetime, datetime]] = []
+    truncated: list[str] = []
+
+    for symbol in ordered:
+        gaps = await repository.find_gaps(symbol, timeframe, start, end)
+        found += len(gaps)
+        if not gaps:
+            continue
+
+        attempted = gaps[:max_gaps_per_symbol]
+        if len(gaps) > max_gaps_per_symbol:
+            truncated.append(symbol)
+            log.warning(
+                "data.backfill.gaps_truncated",
+                symbol=symbol,
+                timeframe=timeframe.value,
+                gaps=len(gaps),
+                attempting=len(attempted),
+            )
+
+        for gap_start, gap_end in attempted:
+            requests += 1
+            try:
+                fetched = await provider.get_bars([symbol], timeframe, gap_start, gap_end, adjusted)
+            except DataGapError:
+                # The vendor has nothing there either. Expected before a listing
+                # and while a symbol was halted; the re-check below is what says
+                # whether it mattered.
+                log.debug(
+                    "data.backfill.gap_unavailable",
+                    symbol=symbol,
+                    start=gap_start.isoformat(),
+                    end=gap_end.isoformat(),
+                )
+                continue
+
+            bars = [bar for series in fetched.values() for bar in series]
+            if bars:
+                written += await repository.upsert_bars(bars)
+
+        # Re-read rather than assume. Only for symbols something was attempted
+        # for — the rest are already known to be missing.
+        remaining.extend(
+            (symbol, gap_start, gap_end)
+            for gap_start, gap_end in await repository.find_gaps(symbol, timeframe, start, end)
+        )
+
+    result = GapBackfillResult(
+        symbols=ordered,
+        timeframe=timeframe,
+        gaps_found=found,
+        bars_written=written,
+        requests=requests,
+        remaining=tuple(remaining),
+        truncated=tuple(truncated),
+    )
+    log.info(
+        "data.backfill.gaps_done",
+        symbols=len(ordered),
+        timeframe=timeframe.value,
+        gaps_found=found,
+        bars=written,
+        requests=requests,
+        remaining=len(remaining),
+        truncated=len(truncated),
     )
     return result

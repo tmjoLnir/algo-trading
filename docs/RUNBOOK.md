@@ -23,6 +23,9 @@ existing P&L and is a separate decision.
 3. Positions keep their **broker-side** stops — those are unaffected by our
    downtime. This is why they exist.
 4. On recovery: confirm backfill ran, verify no gap, reconcile, then clear.
+   Do not wait for the nightly sweep to prove it — run the check yourself over
+   the outage window:
+   `uv run python scripts/backfill_bars.py --symbols SPY,... --start <outage day> --verify`
 
 **Do not** clear the halt to "keep trading" on the last known price.
 
