@@ -68,6 +68,12 @@ in its adapter rather than loosening the rule. `find_gaps` logs a warning when
 stored bars land outside every session, which is what that mistake looks like
 from the inside.
 
+Confirmed on live data, not just asserted: SPY dailies arrive at 05:00Z in
+winter and 04:00Z in summer. It is genuinely 00:00 *New York* and not a fixed
+UTC offset that happens to look right for half the year — a distinction worth
+keeping, because an offset hard-coded from a January sample misattributes every
+bar from March to November.
+
 **`1h` and `4h` are refused.** Neither divides a 390-minute session, and where
 the vendor puts the remainder is unverified. A misaligned grid reports every
 session as a gap, which is worse than answering "I cannot check this".
