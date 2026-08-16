@@ -131,10 +131,54 @@ dashboard down buys nothing — but by engaging the kill switch. The stream is
 healthy; the history has a known hole in it, and trading across that hole is the
 exact failure this pipeline is built to prevent.
 
+## Quote cache and fan-out
+
+`RedisQuoteCache` holds one key per symbol — `atp:md:quote:<SYMBOL>` — containing
+a small JSON document with every number rendered as a **string**. JSON has one
+numeric type and it is a binary float, so a price stored as a JSON number comes
+back subtly wrong and comes back silently. Reads are a single `GET`, or one
+`MGET` for a whole watchlist, because this is read on every risk check.
+
+**The TTL is garbage collection, not freshness.** It is seven days — long enough
+to span a three-day weekend plus a holiday. Freshness is judged from the `ts`
+inside the payload, by `StaleDataRule`. If expiry were the freshness mechanism
+then a dead feed would turn into `get_quote() -> None`, and "I have no quote for
+AAPL" and "my AAPL quote is four hours old" would become the same answer. They
+are not: the second one means something is broken and has to say so.
+
+`RedisEventPublisher` is the pub/sub leg. It refuses to publish a Python float —
+the last place a price can be checked before it leaves the process. Redis pub/sub
+has no persistence and no delivery guarantee, which is the right trade for tick
+traffic and the wrong one for anything that must not be lost: a fill, a halt or a
+position change goes to the database first and onto a channel second.
+
+## Staleness
+
 **Staleness is not silence.** A frozen feed looks identical to a quiet market
 from the inside. `StalenessMonitor` is calendar-aware — silence at 02:00 Sunday
 is correct, the same silence at 14:30 Tuesday means something is broken.
 `StaleDataRule` refuses to trade on a quote older than 30s.
+
+It is the only thing that catches a feed that is *connected and frozen*. A
+dropped socket is the feed adapter's problem and it reconnects; a socket that
+stays open and stops delivering looks healthy from every other vantage point.
+
+Silence is measured from the **latest** of three instants, and each one stops a
+specific false alarm:
+
+| Instant | Without it |
+|---|---|
+| last message received | — the obvious baseline |
+| `connected_since` | a worker started at 11:00 is accused of missing the 09:30 open it was never running for |
+| the session open | a feed that died at yesterday's close registers as silent for eighteen hours the moment the bell rings |
+
+Take the earliest instead and the watchdog fires on every restart and every
+morning. Take only the last message and it cannot speak before the day's first
+tick — exactly when a broken feed most needs reporting.
+
+It halts once per outage and **never clears**. Engaging is reflexive, clearing is
+deliberate and needs a named human (docs/SAFETY.md). A watchdog that un-halted
+itself would let a feed flapping every thirty seconds trade through every gap.
 
 ## Corporate actions
 
