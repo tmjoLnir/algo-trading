@@ -57,8 +57,25 @@ is invisible and poisons every number the platform produces.
   that daily bars arrive stamped at 00:00 New York, has been pinned by tests and
   documented but not yet seen on live data. `1h`/`4h` gap detection is
   deliberately refused rather than guessed (docs/DATA.md 'Gaps').
-- [ ] Real-time WS ingestor, reconnect + gap backfill
-- [ ] Redis quote cache, staleness monitor
+- [ ] Real-time WS ingestor, reconnect + gap backfill — @claude (wip).
+  Both halves are built and unit-tested against scripted fakes.
+  `AlpacaRealtimeFeed` owns the socket — auth handshake, subscription replay,
+  exponential backoff with jitter, and a refusal to loop on an error another
+  connection would not fix (bad credentials, plan, or the one-connection limit).
+  `StreamIngestor` owns the fan-out and the data gap: it caches quotes,
+  persists bars, and on `FeedReconnected` re-fetches `[last message, last
+  completed bar)` before handling anything from the new connection. A gap it
+  cannot close engages the kill switch instead of trading across the hole.
+  Unticked for the same reason as the three items above: the phase's
+  *Verifiable:* line is still unshown and nothing here has yet held a socket
+  open to Alpaca, so the reconnect ladder and the bar-message shape are pinned
+  by tests rather than by live data.
+- [ ] Redis quote cache, pub/sub publisher, staleness monitor.
+  The publisher was not previously named here. It is the third leg of the
+  real-time diagram in docs/DATA.md — the dashboard's live path — and the
+  ingestor above already writes to its port (`EventPublisher`), so it needed an
+  owner rather than to keep being nobody's item. `StalenessMonitor` is still a
+  stub, deliberately: it is this item, not the one above.
 
 *Verifiable:* backfill 5 years of SPY dailies; no gaps outside holidays.
 

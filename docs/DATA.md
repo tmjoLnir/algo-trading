@@ -88,10 +88,48 @@ Alpaca WS → StreamIngestor ─┬→ Redis quote cache   (risk checks read thi
 
 One process owns the upstream connection: Alpaca limits connections per key, and
 more importantly gap detection and reconnect logic belong in exactly one place.
+A second process asking for the same key is refused with code 406, and
+`AlpacaRealtimeFeed` treats that as permanent rather than retrying — two
+ingestors fighting over one connection is worse than one that fails loudly.
+
+**Reconnecting and gap-filling are split, deliberately.** The feed adapter owns
+the socket: exponential backoff 1s → 60s with jitter, subscriptions replayed on
+the way back up, and it gives up rather than looping forever on an error another
+connection would not fix (bad credentials, a plan that does not cover the feed,
+the connection limit). The `StreamIngestor` owns the *data* gap, because the
+historical provider and the bar store are its dependencies, not the feed's.
 
 **On reconnect, backfill before resuming.** Events during the gap are gone, and
 indicators computed across an unfilled hole are wrong in a way nothing
-downstream can detect.
+downstream can detect. The two halves meet at `FeedReconnected`, which the feed
+yields *into the event stream* rather than onto a callback: one `async for` body
+runs to completion before the next event is delivered, so the backfill provably
+finishes before anything from the new connection is handled. A callback could
+not promise that ordering, and the ordering is the whole requirement.
+
+The re-fetch window is `[last message, last completed bar)`, both ends snapped
+to the bar grid. The start, because a drop at 10:30:45 lost part of the 10:30
+bar and the socket will never re-send it. The end, because the bar in progress
+is not missing — we are subscribed again before it closes and the feed will
+deliver it whole, so pulling a partial one from REST would be a downgrade. An
+outage that opens and closes inside one bar therefore costs nothing: a blip is
+not a data incident.
+
+Bars fetched this way are **raw, not adjusted**. That halves the requests, and
+raw is what the live path compares against anyway; the nightly sweep re-fetches
+the same range adjusted, so nothing stays raw-only.
+
+One reconnect chases at most `MAX_RECONNECT_BACKFILL` of history. A
+`last_message_at` from three days ago means the process was down, and turning
+that into a three-day minute backfill would block the live stream behind
+thousands of requests at exactly the moment it recovered. What is dropped is
+named in the log and swept up by the nightly job.
+
+**A gap that cannot be closed halts trading.** Not by killing the ingestor —
+quotes and bars keep flowing to the cache and the table, and taking the
+dashboard down buys nothing — but by engaging the kill switch. The stream is
+healthy; the history has a known hole in it, and trading across that hole is the
+exact failure this pipeline is built to prevent.
 
 **Staleness is not silence.** A frozen feed looks identical to a quiet market
 from the inside. `StalenessMonitor` is calendar-aware — silence at 02:00 Sunday

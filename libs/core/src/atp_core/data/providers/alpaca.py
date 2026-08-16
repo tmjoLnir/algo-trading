@@ -10,8 +10,10 @@ Practical notes:
   build against; expect fills and volumes to differ from SIP in production.
 - The free tier also withholds the most recent 15 minutes of SIP data. Do not
   build a strategy whose edge lives inside that window and then discover this.
-- Streaming: one connection per key. Subscribe in batches; the server caps
-  symbols per message.
+- Streaming: one connection per key — a second is refused with code 406, and
+  that is load-bearing (see `data.stream`). Subscriptions are sent in frames
+  of bounded size: the cap is on the message, so a universe of a few thousand
+  tickers in one frame is how you find it in production.
 """
 
 from __future__ import annotations
@@ -19,22 +21,25 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import random
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import httpx
 
-from atp_core.domain import Bar, Timeframe
+from atp_core.clock import SystemClock
+from atp_core.data.ports import FeedReconnected
+from atp_core.domain import Bar, Quote, Timeframe, Trade
 from atp_core.errors import DataError, DataGapError
 from atp_core.logging import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 
+    from atp_core.clock import Clock
     from atp_core.config import Settings
-    from atp_core.data.ports import HistoricalDataProvider, RealtimeDataFeed
-    from atp_core.domain import Quote, Trade
+    from atp_core.data.ports import HistoricalDataProvider, RealtimeDataFeed, StreamEvent
 
 log = get_logger(__name__)
 
@@ -408,28 +413,179 @@ class AlpacaHistoricalProvider:
         return self._to_bars(symbol, timeframe, raw_bars[:1], {})[0]
 
 
-class AlpacaRealtimeFeed:
-    """`RealtimeDataFeed` over Alpaca's market-data WebSocket."""
+#: Alpaca's message tags. `d` (daily bar) and `u` (corrected bar) exist too and
+#: arrive only for subscriptions this class does not make.
+_TAG_TRADE = "t"
+_TAG_QUOTE = "q"
+_TAG_BAR = "b"
 
-    def __init__(self, settings: Settings) -> None:
+#: The subscription channels this class speaks, spelled exactly as Alpaca's
+#: subscribe frame expects them.
+_CHANNELS = ("bars", "quotes", "trades")
+
+#: Error codes worth reconnecting for. 407 is "slow client" — the server hung up
+#: because we could not keep up, and coming back is the right response. 500 is
+#: theirs. Everything else Alpaca documents is a credential, a plan, a syntax or
+#: a connection-limit problem, and reconnecting just performs it again.
+#:
+#: An *unrecognised* code is treated as permanent on purpose. A loop against an
+#: error the server keeps returning burns the rate limit and buries the reason
+#: in a scrolling log; stopping puts it in front of somebody.
+_TRANSIENT_ERROR_CODES = frozenset({407, 500})
+
+#: Symbols per subscribe frame. Self-imposed rather than a published vendor
+#: ceiling: Alpaca caps the *message*, not the symbol count, and a universe of a
+#: few thousand tickers in one frame is how you find that limit in production.
+_MAX_SYMBOLS_PER_FRAME = 250
+
+#: How long the auth/subscribe exchange may take before the connection is
+#: written off and retried. Alpaca answers in milliseconds; ten seconds of
+#: silence is a half-open socket, which otherwise hangs the ingestor for as long
+#: as the OS keep-alive takes to notice.
+_HANDSHAKE_TIMEOUT_SECONDS = 10.0
+
+#: Frames the handshake will read before giving up. Bounded so a server that
+#: chats without ever saying "authenticated" cannot spin here.
+_MAX_HANDSHAKE_FRAMES = 20
+
+_STREAM_BACKOFF_BASE_SECONDS = 1.0
+_STREAM_BACKOFF_MAX_SECONDS = 60.0
+_MAX_RECONNECT_ATTEMPTS = 8
+
+
+class _PermanentFeedError(DataError):
+    """The feed refused in a way another connection would not fix.
+
+    Internal: callers see `DataError`. It exists so the reconnect loop can tell
+    "try again" from "stop and tell somebody" without inspecting messages.
+    """
+
+
+class _WebSocketConnection(Protocol):
+    """The slice of a `websockets` client this class actually uses.
+
+    Narrow on purpose: it is what lets the tests drive the whole reconnect and
+    handshake state machine off a scripted fake, with no network anywhere
+    (CLAUDE.md §1.7).
+    """
+
+    async def send(self, message: str) -> None: ...
+
+    async def recv(self) -> str | bytes: ...
+
+    async def close(self) -> None: ...
+
+
+class AlpacaRealtimeFeed:
+    """`RealtimeDataFeed` over Alpaca's market-data WebSocket.
+
+    Owns the transport and nothing else: it connects, authenticates, restores
+    its subscriptions after a drop, and reports the outage as a
+    `FeedReconnected` event so the ingestor can close the data gap before
+    handling anything from the new connection (see `data.ports`).
+
+    One connection per key. Alpaca refuses a second one with code 406, which
+    this treats as permanent rather than retrying — the "one process owns the
+    upstream connection" invariant in `data.stream` is only worth anything if a
+    second process fails loudly instead of racing the first.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        connect: Callable[[str], Awaitable[_WebSocketConnection]] | None = None,
+        clock: Clock | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        rng: random.Random | None = None,
+        backoff_base_seconds: float = _STREAM_BACKOFF_BASE_SECONDS,
+        backoff_max_seconds: float = _STREAM_BACKOFF_MAX_SECONDS,
+        max_reconnect_attempts: int = _MAX_RECONNECT_ATTEMPTS,
+        handshake_timeout_seconds: float = _HANDSHAKE_TIMEOUT_SECONDS,
+    ) -> None:
         self._settings = settings
+        self._connect: Callable[[str], Awaitable[_WebSocketConnection]] = (
+            connect if connect is not None else _connect_websocket
+        )
+        self._clock: Clock = clock if clock is not None else SystemClock()
+        self._sleep: Callable[[float], Awaitable[None]] = (
+            sleep if sleep is not None else _sleep_seconds
+        )
+        #: Jitter, not cryptography — `random` is the right tool and a seeded one
+        #: is what makes the backoff schedule assertable in a test.
+        self._rng = rng if rng is not None else random.Random()
+        self._backoff_base_seconds = backoff_base_seconds
+        self._backoff_max_seconds = backoff_max_seconds
+        self._max_reconnect_attempts = max_reconnect_attempts
+        self._handshake_timeout_seconds = handshake_timeout_seconds
+
         self._connected = False
         self._last_message_at: datetime | None = None
+        #: Desired state, not confirmed state. This is what gets replayed on
+        #: reconnect, which is the only reason a dropped socket comes back
+        #: subscribed to the same symbols it went down with.
+        self._subscriptions: dict[str, set[str]] = {channel: set() for channel in _CHANNELS}
+        self._connection: _WebSocketConnection | None = None
+        self._disconnect_callbacks: list[Callable[[Exception], None]] = []
+
+    # ── RealtimeDataFeed ────────────────────────────────────────────────────
 
     async def subscribe(
         self, symbols: list[str], *, bars: bool = True, quotes: bool = True, trades: bool = False
     ) -> None:
-        raise NotImplementedError
+        """Add symbols, and tell the server now if we are already connected.
+
+        Safe to call before `stream()`: the subscription set is what the stream
+        replays once it has a socket.
+        """
+        for symbol in symbols:
+            if symbol != symbol.upper():
+                raise ValueError(f"symbol must be uppercase, got {symbol!r}")
+
+        wanted = {"bars": bars, "quotes": quotes, "trades": trades}
+        added: dict[str, set[str]] = {}
+        for channel, requested in wanted.items():
+            if not requested:
+                continue
+            new = set(symbols) - self._subscriptions[channel]
+            self._subscriptions[channel] |= set(symbols)
+            if new:
+                added[channel] = new
+
+        if added and self._connection is not None:
+            await self._send_subscription_frames(self._connection, "subscribe", added)
 
     async def unsubscribe(self, symbols: list[str]) -> None:
-        raise NotImplementedError
+        """Drop symbols from every channel."""
+        removed: dict[str, set[str]] = {}
+        for channel, subscribed in self._subscriptions.items():
+            gone = subscribed & set(symbols)
+            if gone:
+                removed[channel] = gone
+                subscribed -= gone
 
-    async def stream(self) -> AsyncIterator[Bar | Quote | Trade]:
-        raise NotImplementedError
-        yield  # pragma: no cover
+        if removed and self._connection is not None:
+            await self._send_subscription_frames(self._connection, "unsubscribe", removed)
+
+    async def stream(self) -> AsyncIterator[StreamEvent]:
+        """Events as they arrive, across reconnects.
+
+        Structured so that no `yield` sits inside a `try`. A consumer that
+        raises while this generator is suspended would otherwise have its
+        exception delivered *at the yield*, caught by the reconnect handler, and
+        turned into a reconnect — a downstream bug silently becoming a
+        connection retry is a very hard thing to find later.
+        """
+        try:
+            async for event in self._stream():
+                yield event
+        finally:
+            await self._close_connection()
 
     def on_disconnect(self, callback: Callable[[Exception], None]) -> None:
-        raise NotImplementedError
+        """Register a handler. A feed loss should engage the kill switch:
+        no data means no basis for a trading decision."""
+        self._disconnect_callbacks.append(callback)
 
     @property
     def is_connected(self) -> bool:
@@ -438,6 +594,337 @@ class AlpacaRealtimeFeed:
     @property
     def last_message_at(self) -> datetime | None:
         return self._last_message_at
+
+    # ── reconnect loop ──────────────────────────────────────────────────────
+
+    async def _stream(self) -> AsyncIterator[StreamEvent]:
+        attempts = 0
+        #: The last instant the data is known good. Seeded with "now" rather
+        #: than left empty: before the first message there is nothing to be
+        #: missing, and a first connection that takes four attempts to come up
+        #: has genuinely lost whatever traded while it was struggling.
+        gap_since = self._clock.now()
+        reconnecting = False
+
+        while True:
+            try:
+                connection = await self._open()
+            except _PermanentFeedError:
+                raise
+            except Exception as exc:  # every transport failure retries alike
+                attempts += 1
+                self._note_disconnect(exc)
+                if attempts > self._max_reconnect_attempts:
+                    raise DataError(
+                        f"Alpaca stream did not come back after {self._max_reconnect_attempts} "
+                        f"attempts: {exc}"
+                    ) from exc
+                log.warning("data.alpaca.stream_reconnecting", attempt=attempts, error=str(exc))
+                await self._sleep(self._backoff_delay(attempts))
+                reconnecting = True
+                continue
+
+            if reconnecting:
+                reconnecting = False
+                yield FeedReconnected(
+                    gap_since=gap_since,
+                    reconnected_at=self._clock.now(),
+                    attempts=attempts + 1,
+                )
+
+            #: Reset only once the connection has proved itself by delivering
+            #: something. Resetting on connect alone would turn a server that
+            #: accepts and immediately drops us — a connection-limit fight, a
+            #: flapping upstream — into a hot loop that never backs off.
+            delivered = False
+
+            while True:
+                frame = await self._receive(connection)
+                if frame is None:
+                    break
+                if not delivered:
+                    delivered = True
+                    attempts = 0
+                for event in frame:
+                    yield event
+                gap_since = self._last_message_at or gap_since
+
+            reconnecting = True
+
+    async def _receive(self, connection: _WebSocketConnection) -> list[StreamEvent] | None:
+        """One frame's worth of events, or None once the connection has gone.
+
+        Parsing happens here rather than at the call site so that the two kinds
+        of server error land in the right place. A permanent one — bad
+        credentials, a plan that does not cover this feed, somebody else already
+        holding the key's one connection — propagates out of the reconnect loop,
+        because trying again would only perform it again. A transient one
+        ("slow client", an internal error) is the server hanging up on us in
+        words instead of at the socket, and is handled exactly like a drop.
+        """
+        try:
+            raw = await connection.recv()
+        except Exception as exc:  # a closed socket arrives in many shapes
+            await self._drop(connection, exc)
+            return None
+
+        self._last_message_at = self._clock.now()
+        try:
+            return self._parse_frame(raw)
+        except _PermanentFeedError:
+            raise
+        except DataError as exc:
+            await self._drop(connection, exc)
+            return None
+
+    async def _drop(self, connection: _WebSocketConnection, exc: Exception) -> None:
+        """Tear the connection down and tell whoever registered to be told."""
+        self._connected = False
+        self._connection = None
+        self._note_disconnect(exc)
+        log.warning("data.alpaca.stream_disconnected", error=str(exc))
+        await _close_quietly(connection)
+
+    def _backoff_delay(self, attempt: int) -> float:
+        """Exponential, capped, jittered.
+
+        Jitter is not decoration: every consumer of a vendor that just came back
+        reconnects at the same instant otherwise, and the thundering herd is why
+        it goes down again.
+        """
+        delay = min(self._backoff_base_seconds * (2 ** (attempt - 1)), self._backoff_max_seconds)
+        return delay * (0.5 + self._rng.random() / 2)
+
+    def _note_disconnect(self, exc: Exception) -> None:
+        self._connected = False
+        for callback in self._disconnect_callbacks:
+            try:
+                callback(exc)
+            except Exception as callback_error:
+                # A broken handler must not take the reconnect loop with it —
+                # this is the path that leads to the kill switch.
+                log.error("data.alpaca.disconnect_callback_failed", error=str(callback_error))
+
+    # ── connection lifecycle ────────────────────────────────────────────────
+
+    async def _open(self) -> _WebSocketConnection:
+        """Connect, authenticate and restore subscriptions, or clean up trying."""
+        connection = await self._connect(self._settings.alpaca_stream_url)
+        try:
+            async with asyncio.timeout(self._handshake_timeout_seconds):
+                await self._authenticate(connection)
+                await self._send_subscription_frames(
+                    connection, "subscribe", {k: v for k, v in self._subscriptions.items() if v}
+                )
+        except BaseException:
+            # Includes the timeout and a cancellation. A half-authenticated
+            # socket left open still counts against the one-connection limit,
+            # so the retry would be refused with 406 by our own leak.
+            await _close_quietly(connection)
+            raise
+
+        self._connection = connection
+        self._connected = True
+        log.info(
+            "data.alpaca.stream_connected",
+            feed=self._settings.alpaca_data_feed,
+            symbols=len(_union(self._subscriptions.values())),
+        )
+        return connection
+
+    async def _authenticate(self, connection: _WebSocketConnection) -> None:
+        """Send credentials and wait for the server to accept them.
+
+        The key never reaches a log line or an exception message here (rule
+        §1.6) — the auth frame is built inline and the errors below quote only
+        the server's own code and message.
+        """
+        await connection.send(
+            json.dumps(
+                {
+                    "action": "auth",
+                    "key": self._settings.alpaca_api_key.get_secret_value(),
+                    "secret": self._settings.alpaca_api_secret.get_secret_value(),
+                }
+            )
+        )
+
+        for _ in range(_MAX_HANDSHAKE_FRAMES):
+            for message in _iter_messages(await connection.recv()):
+                tag = message.get("T")
+                if tag == "error":
+                    raise self._error_for(message)
+                if tag == "success" and message.get("msg") == "authenticated":
+                    return
+                # `{"T":"success","msg":"connected"}` is the server's greeting
+                # and arrives before the auth reply.
+                log.debug("data.alpaca.stream_handshake", tag=tag, msg=message.get("msg"))
+
+        raise _PermanentFeedError(
+            f"Alpaca stream sent {_MAX_HANDSHAKE_FRAMES} frames without authenticating"
+        )
+
+    async def _send_subscription_frames(
+        self,
+        connection: _WebSocketConnection,
+        action: str,
+        channels: dict[str, set[str]],
+    ) -> None:
+        """Send `subscribe`/`unsubscribe` in frames of bounded size."""
+        ordered = sorted(_union(channels.values()))
+        for offset in range(0, len(ordered), _MAX_SYMBOLS_PER_FRAME):
+            chunk = set(ordered[offset : offset + _MAX_SYMBOLS_PER_FRAME])
+            frame: dict[str, Any] = {"action": action}
+            for channel, wanted in channels.items():
+                overlap = sorted(wanted & chunk)
+                if overlap:
+                    frame[channel] = overlap
+            if len(frame) > 1:
+                await connection.send(json.dumps(frame))
+
+    async def _close_connection(self) -> None:
+        connection, self._connection = self._connection, None
+        self._connected = False
+        if connection is not None:
+            await _close_quietly(connection)
+
+    # ── parsing ─────────────────────────────────────────────────────────────
+
+    def _parse_frame(self, raw: str | bytes) -> list[StreamEvent]:
+        """One WebSocket frame → domain events.
+
+        Alpaca batches: a frame is a JSON *array* of messages. Parsed with
+        `parse_float=Decimal` for the same reason the REST client is — a price
+        that arrives as a float has already lost the precision rule §1.1 exists
+        to keep.
+        """
+        events: list[StreamEvent] = []
+        for message in _iter_messages(raw):
+            tag = message.get("T")
+            if tag == "error":
+                raise self._error_for(message)
+            if tag == "subscription":
+                log.info(
+                    "data.alpaca.stream_subscribed",
+                    bars=len(message.get("bars") or []),
+                    quotes=len(message.get("quotes") or []),
+                    trades=len(message.get("trades") or []),
+                )
+                continue
+            if tag not in {_TAG_QUOTE, _TAG_BAR, _TAG_TRADE}:
+                log.debug("data.alpaca.stream_ignored", tag=tag)
+                continue
+            event = self._to_event(tag, message)
+            if event is not None:
+                events.append(event)
+        return events
+
+    def _to_event(self, tag: str, message: dict[str, Any]) -> StreamEvent | None:
+        """Build one domain object, or None if the message will not make one.
+
+        A malformed or self-contradictory print is dropped with a warning rather
+        than raised. `Bar.__post_init__` rejects `low > high`, and one bad tick
+        is not a reason to tear down the connection every other symbol is
+        riding on — but it is absolutely a reason to be able to find it later.
+        """
+        try:
+            symbol = message["S"]
+            ts = _parse_ts(message["t"])
+            if tag == _TAG_QUOTE:
+                return Quote(
+                    symbol=symbol,
+                    ts=ts,
+                    bid=_as_decimal(message["bp"]),
+                    ask=_as_decimal(message["ap"]),
+                    bid_size=_as_decimal(message.get("bs", 0)),
+                    ask_size=_as_decimal(message.get("as", 0)),
+                )
+            if tag == _TAG_TRADE:
+                return Trade(
+                    symbol=symbol,
+                    ts=ts,
+                    price=_as_decimal(message["p"]),
+                    size=_as_decimal(message["s"]),
+                    conditions=tuple(message.get("c") or ()),
+                )
+            return Bar(
+                symbol=symbol,
+                #: Alpaca stamps a streamed bar at its open, which is what
+                #: `Bar.ts` means — so no adjustment here. `adj_close` is left
+                #: empty: adjustment is a corporate-action fact that does not
+                #: exist yet for a bar that closed a second ago.
+                ts=ts,
+                timeframe=Timeframe.M1,
+                open=_as_decimal(message["o"]),
+                high=_as_decimal(message["h"]),
+                low=_as_decimal(message["l"]),
+                close=_as_decimal(message["c"]),
+                volume=_as_decimal(message["v"]),
+                vwap=_as_decimal(message["vw"]) if message.get("vw") is not None else None,
+                trade_count=int(message["n"]) if message.get("n") is not None else None,
+            )
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            log.warning(
+                "data.alpaca.stream_message_dropped",
+                tag=tag,
+                symbol=message.get("S"),
+                error=str(exc),
+            )
+            return None
+
+    def _error_for(self, message: dict[str, Any]) -> DataError:
+        """Turn an `{"T":"error"}` message into the right kind of failure."""
+        code = message.get("code")
+        detail = f"Alpaca stream error {code}: {message.get('msg')}"
+        if isinstance(code, int) and code in _TRANSIENT_ERROR_CODES:
+            return DataError(detail)
+        return _PermanentFeedError(
+            f"{detail}. Retrying would repeat it — check the credentials, the data "
+            f"plan, and that no other process holds this key's one connection."
+        )
+
+
+def _iter_messages(raw: str | bytes) -> list[dict[str, Any]]:
+    """A frame's messages. Alpaca sends an array; tolerate a bare object."""
+    payload = json.loads(raw, parse_float=Decimal)
+    if isinstance(payload, dict):
+        return [payload]
+    return [m for m in payload if isinstance(m, dict)]
+
+
+async def _close_quietly(connection: _WebSocketConnection) -> None:
+    """Close, ignoring the failure. The socket is already going away."""
+    try:
+        await connection.close()
+    except Exception as exc:
+        log.debug("data.alpaca.stream_close_failed", error=str(exc))
+
+
+async def _connect_websocket(url: str) -> _WebSocketConnection:
+    """Open the real socket.
+
+    `websockets` is imported here rather than at module scope so that importing
+    this module for its REST provider — which is what a backfill or a backtest
+    does — does not pull the WebSocket stack in.
+    """
+    from websockets.asyncio.client import connect
+
+    # Cast rather than a type: ignore — the client's `send`/`recv`/`close` do
+    # satisfy the protocol above, and an ignore that stops being needed is an
+    # error in itself here (`warn_unused_ignores`).
+    return cast("_WebSocketConnection", await connect(url))
+
+
+async def _sleep_seconds(seconds: float) -> None:
+    """The default backoff sleep, wrapped so the injected one has a plain type."""
+    await asyncio.sleep(seconds)
+
+
+def _union(groups: Iterable[set[str]]) -> set[str]:
+    symbols: set[str] = set()
+    for group in groups:
+        symbols |= group
+    return symbols
 
 
 if TYPE_CHECKING:
