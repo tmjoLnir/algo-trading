@@ -8,9 +8,10 @@ whether COALESCE preserves a column a later write left null.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -269,10 +270,151 @@ class TestBulkWrites:
         assert len(await repo.get_bars("SPY", Timeframe.D1, T0, T0 + timedelta(days=5000))) == 4500
 
 
+#: The first two weeks of 2024, as stored: 1 January is New Year's Day, 6-7
+#: January a weekend. A gap finder without the calendar reports three holes here
+#: on a dataset that is complete.
+WEEK = [date(2024, 1, d) for d in (2, 3, 4, 5, 8, 9, 10, 11, 12)]
+WEEK_START = datetime(2024, 1, 1, tzinfo=UTC)
+WEEK_END = datetime(2024, 1, 13, tzinfo=UTC)
+
+#: 3 January 2024, a regular session: 14:30-21:00 UTC, thirteen 30-minute bars.
+SESSION_OPEN = datetime(2024, 1, 3, 14, 30, tzinfo=UTC)
+SESSION_DAY_START = datetime(2024, 1, 3, tzinfo=UTC)
+SESSION_DAY_END = datetime(2024, 1, 4, tzinfo=UTC)
+
+
+def daily_bar(day: date, *, symbol: str = "SPY") -> Bar:
+    """A daily bar stamped where Alpaca stamps one: 00:00 America/New_York.
+
+    Deliberately not `make_bar`'s UTC midnight. Which session a stored daily bar
+    belongs to is decided by the exchange-local date its timestamp falls in, so
+    the five-hour difference is the difference between a clean dataset and one
+    that reports a gap every Friday (docs/DATA.md 'Gaps').
+    """
+    ts = datetime.combine(day, time(0, 0), tzinfo=ZoneInfo("America/New_York"))
+    return Bar(
+        symbol=symbol,
+        ts=ts.astimezone(UTC),
+        timeframe=Timeframe.D1,
+        open=Decimal("100"),
+        high=Decimal("101"),
+        low=Decimal("99"),
+        close=Decimal("100.5"),
+        volume=Decimal("1000"),
+    )
+
+
+def half_hour_bar(ts: datetime, *, symbol: str = "SPY") -> Bar:
+    return Bar(
+        symbol=symbol,
+        ts=ts,
+        timeframe=Timeframe.M30,
+        open=Decimal("100"),
+        high=Decimal("101"),
+        low=Decimal("99"),
+        close=Decimal("100.5"),
+        volume=Decimal("1000"),
+    )
+
+
 class TestFindGaps:
-    async def test_is_not_implemented_yet(self, repo: PostgresBarRepository) -> None:
-        """Guards the boundary rather than the behaviour: a non-calendar-aware
-        gap finder would flag every weekend, and this must stay unimplemented
-        until the calendar work lands rather than acquiring a naive version."""
-        with pytest.raises(NotImplementedError, match="calendar"):
-            await repo.find_gaps("SPY", Timeframe.D1, T0, T0 + timedelta(days=5))
+    """Whether what we hold covers every session the exchange was open for.
+
+    The calendar reasoning is unit-tested in `tests/unit/test_gaps.py`; what
+    needs a database is the other half — that the right timestamps come back
+    out of the hypertable, in order, filtered to one symbol and one timeframe.
+    """
+
+    async def test_a_complete_week_has_no_gaps(self, repo: PostgresBarRepository) -> None:
+        """The test that matters most: a holiday and a weekend inside the range
+        and nothing reported. An alert firing every Saturday is ignored by the
+        second week."""
+        await repo.upsert_bars([daily_bar(day) for day in WEEK])
+
+        assert await repo.find_gaps("SPY", Timeframe.D1, WEEK_START, WEEK_END) == []
+
+    async def test_a_missing_session_is_reported_as_its_local_day(
+        self, repo: PostgresBarRepository
+    ) -> None:
+        await repo.upsert_bars([daily_bar(day) for day in WEEK if day != date(2024, 1, 4)])
+
+        assert await repo.find_gaps("SPY", Timeframe.D1, WEEK_START, WEEK_END) == [
+            (datetime(2024, 1, 4, 5, tzinfo=UTC), datetime(2024, 1, 5, 5, tzinfo=UTC))
+        ]
+
+    async def test_consecutive_missing_sessions_are_one_window(
+        self, repo: PostgresBarRepository
+    ) -> None:
+        """One outage is one window — and one range to re-fetch."""
+        missing = {date(2024, 1, 4), date(2024, 1, 5), date(2024, 1, 8)}
+        await repo.upsert_bars([daily_bar(day) for day in WEEK if day not in missing])
+
+        assert await repo.find_gaps("SPY", Timeframe.D1, WEEK_START, WEEK_END) == [
+            (datetime(2024, 1, 4, 5, tzinfo=UTC), datetime(2024, 1, 9, 5, tzinfo=UTC))
+        ]
+
+    async def test_an_empty_store_reports_every_session(self, repo: PostgresBarRepository) -> None:
+        assert await repo.find_gaps("SPY", Timeframe.D1, WEEK_START, WEEK_END) == [
+            (datetime(2024, 1, 2, 5, tzinfo=UTC), datetime(2024, 1, 13, 5, tzinfo=UTC))
+        ]
+
+    async def test_another_symbols_bars_do_not_count(self, repo: PostgresBarRepository) -> None:
+        await repo.upsert_bars([daily_bar(day, symbol="QQQ") for day in WEEK])
+
+        assert await repo.find_gaps("SPY", Timeframe.D1, WEEK_START, WEEK_END) != []
+
+    async def test_another_timeframes_bars_do_not_count(self, repo: PostgresBarRepository) -> None:
+        """The same symbol at two timeframes shares the table. A 30-minute bar
+        is not evidence that the daily bar arrived."""
+        await repo.upsert_bars([half_hour_bar(SESSION_OPEN)])
+
+        assert await repo.find_gaps("SPY", Timeframe.D1, WEEK_START, WEEK_END) != []
+
+    async def test_a_missing_intraday_bar_is_reported(self, repo: PostgresBarRepository) -> None:
+        session = [half_hour_bar(SESSION_OPEN + timedelta(minutes=30 * i)) for i in range(13)]
+        await repo.upsert_bars([b for b in session if b.ts != datetime(2024, 1, 3, 17, tzinfo=UTC)])
+
+        assert await repo.find_gaps("SPY", Timeframe.M30, SESSION_DAY_START, SESSION_DAY_END) == [
+            (datetime(2024, 1, 3, 17, tzinfo=UTC), datetime(2024, 1, 3, 17, 30, tzinfo=UTC))
+        ]
+
+    async def test_a_complete_session_of_intraday_bars_has_no_gaps(
+        self, repo: PostgresBarRepository
+    ) -> None:
+        await repo.upsert_bars(
+            [half_hour_bar(SESSION_OPEN + timedelta(minutes=30 * i)) for i in range(13)]
+        )
+
+        assert await repo.find_gaps("SPY", Timeframe.M30, SESSION_DAY_START, SESSION_DAY_END) == []
+
+    async def test_an_extended_hours_bar_does_not_cover_a_session_bar(
+        self, repo: PostgresBarRepository
+    ) -> None:
+        """Pre-market bars are stored too. They are extra data, not a stand-in
+        for the regular-session bar that is actually missing."""
+        session = [half_hour_bar(SESSION_OPEN + timedelta(minutes=30 * i)) for i in range(13)]
+        await repo.upsert_bars([half_hour_bar(datetime(2024, 1, 3, 13, tzinfo=UTC)), *session[1:]])
+
+        assert await repo.find_gaps("SPY", Timeframe.M30, SESSION_DAY_START, SESSION_DAY_END) == [
+            (SESSION_OPEN, SESSION_OPEN + timedelta(minutes=30))
+        ]
+
+    async def test_an_unsupported_timeframe_is_refused(self, repo: PostgresBarRepository) -> None:
+        """Hourly bars do not divide a 390-minute session and the vendor's
+        alignment for the remainder is unverified. Refusing beats reporting
+        every session as a gap."""
+        with pytest.raises(ValueError, match="does not support"):
+            await repo.find_gaps("SPY", Timeframe.H1, WEEK_START, WEEK_END)
+
+    async def test_naive_bounds_are_rejected(self, repo: PostgresBarRepository) -> None:
+        with pytest.raises(ValueError, match="timezone-aware"):
+            await repo.find_gaps(
+                "SPY",
+                Timeframe.D1,
+                datetime(2024, 1, 1),  # noqa: DTZ001 — the naive input under test
+                WEEK_END,
+            )
+
+    async def test_an_inverted_range_is_rejected(self, repo: PostgresBarRepository) -> None:
+        with pytest.raises(ValueError, match="start must be before end"):
+            await repo.find_gaps("SPY", Timeframe.D1, WEEK_END, WEEK_START)

@@ -28,13 +28,47 @@ reconciled against the broker.
 
 ## Gaps
 
-`BarRepository.find_gaps()` must consult the trading calendar. Every weekend and
+`BarRepository.find_gaps()` consults the trading calendar (`atp_core.clock
+.TradingCalendar`, backed by `pandas_market_calendars`). Every weekend and
 holiday looks like a gap otherwise, and an alert that fires every Saturday is
 ignored by the second week.
 
 Real gaps: vendor outages, our downtime, halted symbols, newly listed tickers.
 Never backtest across an unfilled gap — a hole treated as "no movement" produces
 a flattering, fictional equity curve. `DataGapError` exists to stop this.
+
+```bash
+make backfill sym=SPY from=2020-01-01            # fetch
+uv run python scripts/backfill_bars.py --symbols SPY --start 2020-01-01 --verify
+```
+
+`--verify` re-reads what was stored and reports the sessions that have no bar.
+It exits non-zero when it finds any, so a pipeline cannot mistake a partial
+dataset for a clean one.
+
+**What is expected.** One daily bar per session; for intraday, one bar per
+interval from the session open for as many whole intervals as fit before the
+close — 13 half-hours in a regular session, 7 in a 13:00 early close. A bar is
+only expected once the range being checked covers the whole of it, so an
+in-progress session is never reported as a hole.
+
+**The daily anchor.** Alpaca stamps a daily bar at 00:00 New York, not at the
+session open, so a stored daily bar is matched to a session by the
+exchange-local date its timestamp falls in. A feed that stamped daily bars at
+00:00 UTC would attribute every bar to the *previous* session — normalise that
+in its adapter rather than loosening the rule. `find_gaps` logs a warning when
+stored bars land outside every session, which is what that mistake looks like
+from the inside.
+
+**`1h` and `4h` are refused.** Neither divides a 390-minute session, and where
+the vendor puts the remainder is unverified. A misaligned grid reports every
+session as a gap, which is worse than answering "I cannot check this".
+
+**A missing intraday bar is not always missing data.** Alpaca emits no bar for a
+minute in which nothing traded, so on an illiquid symbol these are ordinary. The
+same is not true of daily bars: a session with no daily bar is a real hole.
+Bars at the very end of a range may also simply not have been published yet —
+the free tier withholds the most recent 15 minutes.
 
 ## Real-time pipeline
 
@@ -75,7 +109,7 @@ via `next_page_token` to exhaustion, and backs off on 429.
 
 ## Sanity checks before trusting a dataset
 
-- [ ] No gaps outside market closures
+- [ ] No gaps outside market closures — `backfill_bars.py --verify`
 - [ ] No duplicate `(symbol, timeframe, ts)`
 - [ ] OHLC consistent: `low ≤ open,close ≤ high`
 - [ ] No zero or negative prices
