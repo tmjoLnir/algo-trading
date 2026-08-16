@@ -691,8 +691,15 @@ class AlpacaRealtimeFeed:
         Jitter is not decoration: every consumer of a vendor that just came back
         reconnects at the same instant otherwise, and the thundering herd is why
         it goes down again.
+
+        The base is `2.0` rather than `2` because `int ** int` is typed `Any`:
+        a negative exponent makes it a float, so typeshed cannot promise an int
+        and hands back `Any`, which would then leak out of this function's
+        declared `float` under `--strict`.
         """
-        delay = min(self._backoff_base_seconds * (2 ** (attempt - 1)), self._backoff_max_seconds)
+        delay: float = min(
+            self._backoff_base_seconds * (2.0 ** (attempt - 1)), self._backoff_max_seconds
+        )
         return delay * (0.5 + self._rng.random() / 2)
 
     def _note_disconnect(self, exc: Exception) -> None:
