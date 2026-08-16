@@ -48,20 +48,48 @@ jobs:
       # --frozen: the lockfile is authoritative. If pyproject.toml changed
       # without `uv lock` being re-run, fail here rather than silently
       # resolving something different from what anyone tested against.
-      - run: uv sync --all-packages --frozen
+      - id: sync
+        run: uv sync --all-packages --frozen
+
+      # ── the four gates ──────────────────────────────────────────────────
+      #
+      # Each one runs even when an earlier one failed, and each one still
+      # fails the job on its own. That combination is the point.
+      #
+      # By default a failing step aborts the rest, so `mypy` going red took
+      # both test steps down as "skipped" and the job reported one generic
+      # failure. #18 merged that way: it looked like a lone type error, and
+      # in fact nothing had been tested at all. A red gate must never be able
+      # to disguise the gates behind it as passing — or, worse, as absent.
+      #
+      # `!cancelled()` rather than `always()`: this workflow sets
+      # cancel-in-progress, and `always()` would keep grinding through the
+      # suite of a run that has already been superseded.
+      #
+      # Both conditions matter. Dropping the `steps.sync` clause would run
+      # every gate against an environment that failed to install, turning one
+      # honest lockfile error into four misleading ones.
+      #
+      # Note this is deliberately NOT `continue-on-error`. That would let the
+      # job go green with a type error in it, which is weakening the gate
+      # rather than reporting it (CLAUDE.md §7).
 
       - name: Lint
+        if: ${{ !cancelled() && steps.sync.conclusion == 'success' }}
         run: |
           uv run ruff check .
           uv run ruff format --check .
 
       - name: Type check
+        if: ${{ !cancelled() && steps.sync.conclusion == 'success' }}
         run: uv run mypy libs apps
 
       - name: Unit tests
+        if: ${{ !cancelled() && steps.sync.conclusion == 'success' }}
         run: uv run pytest tests/unit --cov --cov-report=xml
 
       - name: Integration tests
+        if: ${{ !cancelled() && steps.sync.conclusion == 'success' }}
         env:
           DATABASE_URL: postgresql+asyncpg://atp:atp@localhost:5432/atp_test
           REDIS_URL: redis://localhost:6379/0
@@ -86,11 +114,28 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
-      - run: npm ci
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm run test -- --run
-      - run: npm run build
+      - id: install
+        run: npm ci
+
+      # Same four-gates arrangement as the `python` job above, for the same
+      # reason — a failing `npm run lint` used to hide whether the tests and
+      # the build were even viable. Named, because a skipped step reads very
+      # differently from a step that never got the chance to run.
+      - name: Lint
+        if: ${{ !cancelled() && steps.install.conclusion == 'success' }}
+        run: npm run lint
+
+      - name: Type check
+        if: ${{ !cancelled() && steps.install.conclusion == 'success' }}
+        run: npm run typecheck
+
+      - name: Unit tests
+        if: ${{ !cancelled() && steps.install.conclusion == 'success' }}
+        run: npm run test -- --run
+
+      - name: Build
+        if: ${{ !cancelled() && steps.install.conclusion == 'success' }}
+        run: npm run build
 
   # `make up` is a roadmap deliverable in its own right, and it is the one thing
   # in this repository that no unit or integration test can speak for: it builds
