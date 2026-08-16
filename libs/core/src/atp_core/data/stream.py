@@ -20,6 +20,7 @@ the new connection is handled (CLAUDE.md §5, docs/DATA.md 'Real-time pipeline')
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -34,9 +35,9 @@ from atp_core.logging import get_logger
 from atp_core.risk.killswitch import HaltReason, HaltScope
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Awaitable, Callable, Sequence
 
-    from atp_core.clock import Clock
+    from atp_core.clock import Clock, TradingCalendar
     from atp_core.data.ports import (
         BarRepository,
         EventPublisher,
@@ -57,6 +58,11 @@ CHANNEL_SIGNALS = "atp:exec:signals"
 #: Who a halt engaged from here is attributed to. A halt is cleared by a named
 #: human, so the record has to say plainly what stopped trading.
 HALT_ACTOR = "stream_ingestor"
+
+#: Ditto for the watchdog. Distinct from `HALT_ACTOR` on purpose: "the feed gave
+#: up" and "the feed went quiet without saying so" are different incidents and
+#: the halt record should not make an operator guess which one happened.
+STALENESS_ACTOR = "staleness_monitor"
 
 #: The most history one reconnect will chase before handing the rest to the
 #: nightly sweep. A minute-long blip is the case this is built for; a
@@ -349,18 +355,184 @@ class StreamIngestor:
         log.critical("data.stream.halted", reason=reason.value, detail=detail)
 
 
+@dataclass(frozen=True, slots=True)
+class StalenessVerdict:
+    """One reading of the watchdog. Pure data, so the decision is testable
+    without a clock, a calendar or a running ingestor."""
+
+    stale: bool
+    #: How long the feed has been silent *within the current session*, or None
+    #: when the market is shut and silence carries no information.
+    silent_for_seconds: float | None
+    market_open: bool
+    reason: str
+
+
 class StalenessMonitor:
     """Watchdog: alert and halt when data stops arriving during market hours.
 
     Must be calendar-aware. Silence at 02:00 on a Sunday is correct; the same
     silence at 14:30 on a Tuesday means something is broken.
+
+    This is the only thing that catches a feed which is *connected and frozen*.
+    A dropped socket is the feed adapter's problem and it reconnects; a socket
+    that stays open and stops delivering looks perfectly healthy from every
+    other vantage point in the system, and a quiet market looks identical to it
+    from the inside. Hence a clock and a calendar rather than a connection
+    check.
     """
 
-    def __init__(self, max_silence_seconds: int = 60) -> None:
+    def __init__(
+        self,
+        max_silence_seconds: int = 60,
+        *,
+        kill_switch: KillSwitch | None = None,
+        calendar: TradingCalendar | None = None,
+        clock: Clock | None = None,
+        poll_interval_seconds: float = 5.0,
+        exchange: str = "NYSE",
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+    ) -> None:
+        if max_silence_seconds < 1:
+            raise ValueError(f"max_silence_seconds must be at least 1, got {max_silence_seconds}")
+        if poll_interval_seconds <= 0:
+            raise ValueError(f"poll_interval_seconds must be positive, got {poll_interval_seconds}")
         self.max_silence_seconds = max_silence_seconds
+        self.kill_switch = kill_switch
+        self.poll_interval_seconds = poll_interval_seconds
+        self._calendar = calendar
+        self._exchange = exchange
+        self._clock: Clock = clock if clock is not None else SystemClock()
+        self._sleep: Callable[[float], Awaitable[None]] = (
+            sleep if sleep is not None else _sleep_seconds
+        )
+        #: Whether the current outage has already been reported. Without it a
+        #: 5-second poll would engage the same halt twelve times a minute and
+        #: bury the first, most useful log line under the rest.
+        self._alerted = False
+
+    def evaluate(self, ingestor: StreamIngestor, now: datetime) -> StalenessVerdict:
+        """Is the feed too quiet, right now?
+
+        Silence is measured from the latest of three instants, and all three
+        matter:
+
+        - the last message actually received — the obvious one;
+        - when the current connection came up (`connected_since`), so a worker
+          started at 11:00 is not immediately accused of having missed the
+          09:30 open it was never running for;
+        - the session open, so a feed that died at yesterday's close does not
+          register as silent for eighteen hours the moment the bell rings —
+          the fifteen hours the market was shut were not an outage.
+
+        Take the earliest of them instead and the watchdog fires on every
+        restart and every morning. Take only `last_message_at` and it cannot
+        speak at all before the first tick of the day, which is exactly when a
+        broken feed most needs reporting.
+        """
+        if now.tzinfo is None:
+            raise ValueError(f"now must be timezone-aware (rule §1.2), got naive {now!r}")
+        now = now.astimezone(UTC)
+
+        calendar = self._get_calendar()
+        # One lookup rather than `is_open()` followed by `session_on()`: the
+        # session object is needed either way, and asking twice leaves a window
+        # where the two answers could be reasoned about separately.
+        session = calendar.session_on(now.astimezone(calendar.tz).date())
+        if session is None or not (session.open_at <= now < session.close_at):
+            return StalenessVerdict(
+                stale=False,
+                silent_for_seconds=None,
+                market_open=False,
+                reason="market is shut — silence is expected",
+            )
+
+        baseline = max(
+            [session.open_at]
+            + [
+                ts
+                for ts in (ingestor.stats.last_message_at, ingestor.stats.connected_since)
+                if ts is not None
+            ]
+        )
+        silent_for = (now - baseline).total_seconds()
+        stale = silent_for > self.max_silence_seconds
+        return StalenessVerdict(
+            stale=stale,
+            silent_for_seconds=silent_for,
+            market_open=True,
+            reason=(
+                f"no market data for {silent_for:.0f}s during the session"
+                if stale
+                else "feed is current"
+            ),
+        )
 
     async def watch(self, ingestor: StreamIngestor) -> None:
-        raise NotImplementedError
+        """Poll until cancelled, halting the first time the feed goes quiet.
+
+        Halts once per outage and never clears: engaging is reflexive and
+        clearing is deliberate (`risk.killswitch`). When data resumes this
+        re-arms so the *next* outage is reported too, and says so — but the halt
+        it engaged stays engaged until a human clears it. A watchdog that
+        un-halted itself would let a feed flapping every thirty seconds trade
+        through every one of the gaps.
+        """
+        log.info(
+            "data.staleness.watching",
+            max_silence_seconds=self.max_silence_seconds,
+            poll_interval_seconds=self.poll_interval_seconds,
+            exchange=self._exchange,
+        )
+        while True:
+            await self._sleep(self.poll_interval_seconds)
+            verdict = self.evaluate(ingestor, self._clock.now())
+
+            if verdict.stale and not self._alerted:
+                self._alerted = True
+                log.critical(
+                    "data.staleness.detected",
+                    silent_for_seconds=round(verdict.silent_for_seconds or 0.0, 1),
+                    max_silence_seconds=self.max_silence_seconds,
+                    symbols=sorted(ingestor.stats.symbols),
+                )
+                self._halt(verdict)
+            elif not verdict.stale and self._alerted:
+                self._alerted = False
+                log.warning(
+                    "data.staleness.recovered",
+                    msg="market data is flowing again — the halt it engaged is still engaged",
+                )
+
+    def _halt(self, verdict: StalenessVerdict) -> None:
+        if self.kill_switch is None:
+            log.critical(
+                "data.staleness.halt_unavailable",
+                detail=verdict.reason,
+                msg="no kill switch bound — TRADING IS NOT HALTED",
+            )
+            return
+        self.kill_switch.engage(
+            HaltScope.GLOBAL,
+            HaltReason.DATA_FEED_LOST,
+            engaged_by=STALENESS_ACTOR,
+            detail=verdict.reason,
+        )
+        log.critical("data.staleness.halted", detail=verdict.reason)
+
+    def _get_calendar(self) -> TradingCalendar:
+        """Built on first use — constructing one imports pandas, and a process
+        that never asks about sessions should not pay for it at startup."""
+        if self._calendar is None:
+            from atp_core.clock import TradingCalendar
+
+            self._calendar = TradingCalendar(self._exchange)
+        return self._calendar
+
+
+async def _sleep_seconds(seconds: float) -> None:
+    """The watchdog's poll sleep, wrapped so the injected one has a plain type."""
+    await asyncio.sleep(seconds)
 
 
 def _floor_to_grid(ts: datetime, timeframe: Timeframe) -> datetime:

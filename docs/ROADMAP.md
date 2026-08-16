@@ -70,12 +70,18 @@ is invisible and poisons every number the platform produces.
   *Verifiable:* line is still unshown and nothing here has yet held a socket
   open to Alpaca, so the reconnect ladder and the bar-message shape are pinned
   by tests rather than by live data.
-- [ ] Redis quote cache, pub/sub publisher, staleness monitor.
-  The publisher was not previously named here. It is the third leg of the
-  real-time diagram in docs/DATA.md — the dashboard's live path — and the
-  ingestor above already writes to its port (`EventPublisher`), so it needed an
-  owner rather than to keep being nobody's item. `StalenessMonitor` is still a
-  stub, deliberately: it is this item, not the one above.
+- [ ] Redis quote cache, pub/sub publisher, staleness monitor — @claude (wip).
+  All three are built. `RedisQuoteCache` (one key per symbol, `MGET` for a
+  watchlist, every number stored as a string, TTL as garbage collection rather
+  than as freshness) and `RedisEventPublisher` (which refuses to publish a
+  float) are unit-tested against a fake and integration-tested against a real
+  Redis — TTL expiry, `MGET` hole alignment and a genuine cross-connection
+  publish/subscribe are behaviours of Redis rather than of Python, and a fake
+  agreeing with us about them would prove nothing. `StalenessMonitor` is
+  calendar-aware and measures silence from the latest of last-message,
+  connect-time and session-open; it halts once per outage and never clears.
+  Unticked for the same reason as everything above it: Phase 1's *Verifiable:*
+  line still has not been shown.
 
 *Verifiable:* backfill 5 years of SPY dailies; no gaps outside holidays.
 
