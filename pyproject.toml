@@ -110,7 +110,7 @@ strict = true
 # `warn_unused_configs` reports overrides that match nothing, and a config full
 # of pre-emptive entries trains everyone to ignore mypy's output.
 # `pandas.*` belongs here when the backtest engine lands (Phase 2).
-module = ["structlog.*"]
+module = ["structlog.*", "pandas_market_calendars.*"]
 ignore_missing_imports = true
 
 # ────────────────────────── pytest ──────────────────────────
