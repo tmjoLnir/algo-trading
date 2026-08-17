@@ -62,6 +62,62 @@ TRADE_MSG = {
     "t": "2024-06-03T14:30:00.5Z",
 }
 
+# ── frames captured verbatim from the live IEX stream, 2026-08-17 14:11 UTC ──
+#
+# The three above were written from Alpaca's documentation. These were pasted
+# unedited off the wire, vendor fields and all — see `TestRealWireFormat`.
+
+#: `bx`/`ax` (quoting exchange), `z` (tape) and `c` (quote condition) are fields
+#: the parser ignores. A parser that rejected unknown keys rather than ignoring
+#: them would break on every real message.
+REAL_QUOTE_MSG = {
+    "T": "q",
+    "S": "SPY",
+    "bx": "V",
+    "bp": 775.29,
+    "bs": 40,
+    "ax": "V",
+    "ap": 775.58,
+    "as": 240,
+    "c": ["R"],
+    "z": "B",
+    "t": "2026-08-17T14:11:05.168570617Z",
+}
+REAL_TRADE_MSG = {
+    "T": "t",
+    "S": "SPY",
+    "i": 52983562843699,
+    "x": "V",
+    "p": 775.545,
+    "s": 100,
+    "c": [" "],
+    "z": "B",
+    "t": "2026-08-17T14:11:06.103625135Z",
+}
+REAL_BAR_MSG = {
+    "T": "b",
+    "S": "SPY",
+    "o": 775.59,
+    "h": 775.62,
+    "l": 775.425,
+    "c": 775.425,
+    "v": 3407,
+    "t": "2026-08-17T14:11:00Z",
+    "n": 43,
+    "vw": 775.528336,
+}
+
+#: The server confirms channels nobody asked for: `corrections` and
+#: `cancelErrors` come back on any subscription.
+REAL_SUBSCRIPTION_MSG = {
+    "T": "subscription",
+    "trades": ["SPY"],
+    "quotes": ["SPY"],
+    "bars": ["SPY"],
+    "corrections": ["SPY"],
+    "cancelErrors": ["SPY"],
+}
+
 
 class DroppedError(Exception):
     """Stands in for `websockets.ConnectionClosed`, which the adapter only ever
@@ -309,6 +365,114 @@ class TestParsing:
                     [{"T": "d", "S": "SPY"}],
                     [QUOTE_MSG],
                 ]
+            )
+        )
+        await feed.subscribe(["SPY"])
+
+        events, _ = await collect(feed)
+
+        assert [type(e).__name__ for e in events] == ["Quote"]
+
+
+class TestRealWireFormat:
+    """Frames captured verbatim from the live IEX stream, 2026-08-17 14:11 UTC.
+
+    Every other fixture in this file was written from Alpaca's documentation,
+    which is how they came to differ from the wire in three ways that all look
+    like nothing and are not. A socket was held open during the session, and the
+    `REAL_*_MSG` fixtures above are what actually arrived, pasted unedited —
+    vendor fields and all — so that the next person to touch the parser is
+    checked against the feed rather than against our reading of the docs.
+
+    The adapter already handles all three. These pin that, because each is a
+    change someone could make while the rest of this file stayed green — as one
+    did: a `strptime`-based parser accepting an optional six-digit fraction
+    passes every other test in this suite and rejects every real quote.
+    """
+
+    async def collect_real(self) -> list[StreamEvent]:
+        feed, _, _ = build(
+            FakeConnection(
+                [
+                    [CONNECTED],
+                    [AUTHENTICATED],
+                    [REAL_QUOTE_MSG, REAL_TRADE_MSG, REAL_BAR_MSG],
+                ]
+            )
+        )
+        await feed.subscribe(["SPY"], trades=True)
+        events, _ = await collect(feed)
+        return events
+
+    async def test_nanosecond_timestamps_are_truncated_not_rejected(self) -> None:
+        """Quotes and trades are stamped to the nanosecond — nine fractional
+        digits — while bars carry none at all.
+
+        `datetime` holds microseconds, so the extra three digits have to go
+        somewhere. `fromisoformat` truncates, which is the right direction: a
+        quote is an observation at an instant, and rounding it *up* would move
+        it to a microsecond it was not observed in. The wrong `%f`-based
+        `strptime` accepts at most six digits and raises on all of these, and
+        every other fixture in this file is six or fewer — so that regression
+        would break every live message and pass this file without this test.
+        """
+        quote, trade, bar = await self.collect_real()
+
+        assert isinstance(quote, Quote)
+        assert quote.ts == datetime(2026, 8, 17, 14, 11, 5, 168570, tzinfo=UTC)
+        assert quote.ts.microsecond == 168570, "truncated, not rounded to 168571"
+        assert isinstance(trade, Trade)
+        assert trade.ts == datetime(2026, 8, 17, 14, 11, 6, 103625, tzinfo=UTC)
+        # A streamed bar is stamped at its open, to the second, no fraction.
+        assert isinstance(bar, Bar)
+        assert bar.ts == datetime(2026, 8, 17, 14, 11, tzinfo=UTC)
+
+    async def test_sub_cent_prices_survive_exactly(self) -> None:
+        """Real prices are not two-decimal. This bar's low and close are
+        775.425 and its VWAP carries six decimals; the trade printed at
+        775.545. Rule §1.1 is only kept here by `parse_float=Decimal`, and a
+        half-cent is exactly the magnitude a float would start losing."""
+        quote, trade, bar = await self.collect_real()
+
+        assert isinstance(bar, Bar)
+        assert bar.low == Decimal("775.425")
+        assert bar.close == Decimal("775.425")
+        assert bar.vwap == Decimal("775.528336")
+        assert isinstance(trade, Trade)
+        assert trade.price == Decimal("775.545")
+        # The half-cent is real: it is not representable as a 2dp price.
+        assert bar.high - bar.low == Decimal("0.195")
+        assert isinstance(quote, Quote)
+        assert quote.ask - quote.bid == Decimal("0.29")
+
+    async def test_vendor_fields_are_ignored_and_sizes_are_decimal(self) -> None:
+        """`bx`, `ax`, `z`, `i` and `x` are not read. Sizes arrive as JSON
+        integers and must still become `Decimal` — a quantity is rule §1.1's
+        other half, not just a price."""
+        quote, trade, bar = await self.collect_real()
+
+        assert isinstance(quote, Quote)
+        assert quote.bid_size == Decimal("40")
+        assert quote.ask_size == Decimal("240")
+        assert isinstance(quote.bid_size, Decimal)
+        assert isinstance(trade, Trade)
+        assert trade.size == Decimal("100")
+        # A trade condition can be a single space — real, and not a reason to
+        # drop the print.
+        assert trade.conditions == (" ",)
+        assert isinstance(bar, Bar)
+        assert bar.volume == Decimal("3407")
+        assert bar.trade_count == 43
+        # A streamed bar has no corporate-action history behind it yet.
+        assert bar.adj_close is None
+
+    async def test_real_subscription_confirmation_yields_no_events(self) -> None:
+        """The server confirms channels we never asked for — `corrections` and
+        `cancelErrors` come back on any subscription. That frame is
+        acknowledgement, not data, and must not reach the ingestor."""
+        feed, _, _ = build(
+            FakeConnection(
+                [[CONNECTED], [AUTHENTICATED], [REAL_SUBSCRIPTION_MSG], [REAL_QUOTE_MSG]]
             )
         )
         await feed.subscribe(["SPY"])

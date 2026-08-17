@@ -91,15 +91,42 @@ A line they can be ticked against is proposed below.
   persists bars, and on `FeedReconnected` re-fetches `[last message, last
   completed bar)` before handling anything from the new connection. A gap it
   cannot close engages the kill switch instead of trading across the hole.
-  A socket has now been held open to Alpaca: `AlpacaRealtimeFeed` authenticates
-  and subscribes against the live server (`stream_connected`,
-  `stream_subscribed bars=1 quotes=1`), which also confirms the credentials
-  carry the stream entitlement — a separate grant from the REST API. That is
-  the handshake only. It was run with the exchange shut, so no bar or quote has
-  ever been parsed from the live stream, and the reconnect ladder and the
-  `FeedReconnected` gap backfill — the parts that decide whether a dropped
-  connection trades across a hole — remain pinned by tests. Unticked on that
-  basis, not on the historical *Verifiable:* line, which does not reach here.
+
+  A socket has now been held open to Alpaca *during the session*, and live data
+  parsed from it: 5,284 SPY quotes and a complete one-minute bar over ~80s on
+  2026-08-17, plus a second bar in a follow-up capture. Every price and size
+  arrived a `Decimal`, each bar's OHLC sat inside its own range, and each was
+  stamped at its open. The handshake — and with it the stream entitlement, a
+  separate grant from the REST API — is confirmed (`stream_connected`,
+  `stream_subscribed bars=1 quotes=1`). The note that stood here said no bar or
+  quote had ever been parsed from the live stream; that was true when written
+  and is now not, so it is corrected in place rather than left reading as
+  current.
+
+  That run also closed a blind spot no scripted fake could have found. Every
+  wire fixture in `test_alpaca_realtime_feed.py` was written from Alpaca's
+  documentation, and the wire disagrees with the documentation in three ways:
+  quotes and trades are stamped to the **nanosecond** — nine fractional digits,
+  where the fixtures stopped at six — real prices carry sub-cent precision
+  (`775.425`, and a VWAP to six decimals), and every message arrives padded
+  with vendor fields the parser ignores (`bx`, `ax`, `z`, `i`, `x`). The adapter
+  handles all three correctly, so no bug was found; but nothing held it to
+  them. A `strptime` parser accepting an optional six-digit fraction rejects
+  every real quote and trade on the feed and still passes all 648 other unit
+  tests. `TestRealWireFormat` now carries the captured frames verbatim, and was
+  verified by making exactly that change: the other 648 stayed green and only
+  those 4 failed.
+
+  Still unticked — but the *reason* has moved, which is worth recording so the
+  next person does not re-check what is now known. Egress is not the blocker:
+  the policy permits the `wss://` upgrade to `stream.data.alpaca.markets`
+  (`101 Switching Protocols`, then real frames), and a shut exchange is not the
+  blocker either. What is missing is a *process*. `atp_worker.main` is still a
+  `NotImplementedError` stub, so nothing wires this ingestor to a real Redis and
+  a real hypertable, and nothing forces the disconnect the line asks for. The
+  reconnect ladder and the `FeedReconnected` gap backfill — the half of this
+  item that decides whether a dropped connection trades across a hole — are
+  therefore still pinned by tests alone.
 - [ ] Redis quote cache, pub/sub publisher, staleness monitor — @claude (wip).
   All three are built. `RedisQuoteCache` (one key per symbol, `MGET` for a
   watchlist, every number stored as a string, TTL as garbage collection rather
@@ -123,8 +150,20 @@ during market hours; every session bar lands in the hypertable, the reconnect
 backfills the gap, and the latest quote is readable from Redis.
 **Not yet shown** — proposed here because the two items above have no line of
 their own, and were being held against a historical-data line that cannot
-demonstrate them. Needs an open market; adjust the wording if it is not the
-demonstration you want.
+demonstrate them. Adjust the wording if it is not the demonstration you want.
+
+It is no longer blocked on egress or on the clock, which is the one thing this
+line's status has learned since it was written. Checked on 2026-08-17 with the
+market open: the egress policy permits the WebSocket upgrade to
+`stream.data.alpaca.markets`, the credentials carry the stream entitlement, and
+live quotes and bars parse through `AlpacaRealtimeFeed` end to end. So access is
+settled and only wiring is left. The line has four clauses — a held socket
+through a *forced* disconnect, session bars in the hypertable, the reconnect
+backfilling the gap, the latest quote readable from Redis — and holding a socket
+is the only one demonstrated. The other three need a process that binds the
+ingestor to a real Redis and a real hypertable, which is `atp_worker.main`, a
+`NotImplementedError` stub tracked under Phase 4's `StrategyRunner` item. That
+dependency, rather than market hours, is what this line is waiting on.
 
 ## Phase 2 — Backtesting (requirement #2)
 - [x] Indicators (`ema`, `rsi`, `atr`, …) — @claude (#24, #27).
