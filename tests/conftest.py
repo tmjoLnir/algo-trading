@@ -57,10 +57,14 @@ def sample_bars():
 def fake_broker():
     """In-memory `BrokerPort` with controllable fills and failures.
 
-    Must be able to simulate: a partial fill, a reject, a timeout on submit
-    (to test that we do NOT resubmit blind), and a disconnect.
+    Simulates: a partial fill, a reject, a timeout on submit (both kinds — one
+    where the venue never saw the order and one where it did, which is what
+    makes a blind resubmit dangerous), and a disconnect that takes reads down
+    too. See `tests/fakes.FakeBroker`.
     """
-    raise NotImplementedError
+    from tests.fakes import FakeBroker
+
+    return FakeBroker()
 
 
 @pytest.fixture

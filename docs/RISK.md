@@ -69,6 +69,34 @@ ATR(14).
   that should have ratcheted the stop is invisible in closes.
 - **Place protective orders immediately on entry fill.** The gap between owning
   a position and having a stop is unprotected exposure.
+- **The stop goes to the venue; the take-profit does not.** `OrderRouter
+  .submit_protective_orders` sends a broker-side stop and arms
+  `position.take_profit_price` for the engine to watch. The asymmetry is
+  deliberate: `BrokerPort` has no bracket, so a stop and a target for the same
+  shares are two independent live orders, and when one fills the other is still
+  working — filling it would not close anything, it would open a fresh position
+  on the opposite side. A target that only exists in our process is an
+  acceptable loss when the process dies; a stop is not, which is why SAFETY.md
+  has a layer for one and not the other.
+- **An entry that fills in pieces gets a stop per piece.** Protection is
+  additive rather than cancel-and-replace: replacing opens an unprotected window
+  between the cancel landing and the replacement being acknowledged, and the
+  cancel can lose the race outright.
+- **A protective stop can be refused.** Four of the nine rules judge the order
+  rather than whether it reduces a position, so the kill switch, trading hours,
+  the rate limit and stale data can each block one; two more block it whenever
+  another holding is unmarked. Only the daily loss limit, buying power and the
+  open-position cap can never refuse one. The router reports a refusal as an
+  unprotected quantity and logs `CRITICAL` rather than exempting the order —
+  see docs/RUNBOOK.md, "Position open with no stop".
+- **A stop the market has already passed is not placed.** Submitted, it is a
+  market order in disguise; armed, it triggers on the next bar. The reachable
+  case is a reversal that has only partly filled — the position is still on the
+  old side while the level belongs to the side being opened.
+- **A flip through zero invalidates the old side's stops.** `apply_fill` clears
+  protective levels only at exactly flat, and a flip never passes through flat,
+  so a sell stop under what is now a short survives and *adds* to the short when
+  it triggers. The router cancels them before placing the new side's.
 - **Protective levels are cleared when a position goes flat.** `apply_fill`
   does this, and it matters: a stop left armed across a flat would reference a
   basis that no longer exists, and would arm itself against whatever position

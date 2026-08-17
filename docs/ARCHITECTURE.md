@@ -61,12 +61,19 @@ lease — not two actives.
 ```
 domain/      entities. imports nothing from siblings.
    ↑
-indicators/  strategy/  risk/  backtest/  analytics/     pure logic
+indicators/  strategy/  risk/  backtest/  analytics/  execution/     pure logic
    ↑
 data/ports  brokers/ports  persistence/     protocol definitions
    ↑
 adapters: alpaca.py, simulated.py, providers/, repositories/
 ```
+
+Siblings on the pure-logic tier may import one another — `backtest/` uses
+`strategy/`, `execution/` uses `risk/` and `strategy/` — and should, where the
+alternative is a second copy of a rule. `execution/router.py` sizes through
+`risk.rules.position_size` and prices through `risk.rules.reference_price` for
+exactly that reason: sizing against one price and validating against another is
+invisible, because both numbers look right on their own.
 
 Dependencies point downward only. A violation — core importing from `apps/`, or
 `domain/` importing from `strategy/` — is a review rejection, because it is what

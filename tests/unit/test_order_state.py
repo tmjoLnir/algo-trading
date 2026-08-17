@@ -12,7 +12,12 @@ from hypothesis import strategies as st
 from atp_core.domain.enums import OrderStatus, Side
 from atp_core.domain.order import Fill, Order
 from atp_core.errors import InvalidStateTransitionError
-from atp_core.execution.state import assert_transition, can_transition, is_stale_event
+from atp_core.execution.state import (
+    assert_transition,
+    can_transition,
+    is_stale_event,
+    transition,
+)
 
 TS = datetime(2024, 6, 3, 14, 30, tzinfo=UTC)
 
@@ -44,6 +49,70 @@ def test_stale_event_after_terminal_is_detected() -> None:
     """A replayed 'submitted' after a reconnect must not resurrect a filled
     order — discard, do not raise."""
     assert is_stale_event(OrderStatus.FILLED, OrderStatus.SUBMITTED)
+
+
+class TestTransition:
+    """`transition` is the only way a status should be assigned.
+
+    The table is a guarantee only where something consults it, and a plain
+    `order.status = ...` consults nothing.
+    """
+
+    def test_a_legal_move_lands_and_reports_that_it_did(self) -> None:
+        order = _order(qty="100")
+        order.status = OrderStatus.PENDING_RISK
+
+        assert transition(order, OrderStatus.PENDING_SUBMIT)
+        assert order.status is OrderStatus.PENDING_SUBMIT
+
+    def test_an_illegal_move_raises_rather_than_silently_landing(self) -> None:
+        order = _order(qty="100")
+        order.status = OrderStatus.PENDING_RISK
+
+        with pytest.raises(InvalidStateTransitionError):
+            transition(order, OrderStatus.SUBMITTED)
+        assert order.status is OrderStatus.PENDING_RISK
+
+    def test_a_replayed_event_on_a_terminal_order_is_discarded(self) -> None:
+        """The bug this whole module exists for: a late "submitted" arriving
+        after the fill would make a position appear to vanish. Discarded, not
+        raised — a reconnect replaying history is ordinary."""
+        order = _order(qty="100")
+        order.apply_fill(_fill(order, "100", "10"))
+
+        assert not transition(order, OrderStatus.SUBMITTED)
+        assert order.status is OrderStatus.FILLED
+
+    def test_repeating_the_current_status_is_a_no_op(self) -> None:
+        """Brokers re-send. `PARTIALLY_FILLED → PARTIALLY_FILLED` is meaningful
+        only when a *fill* comes with it, which is `apply_fill`'s job."""
+        order = _order(qty="100")
+        assert not transition(order, OrderStatus.SUBMITTED)
+        assert order.status is OrderStatus.SUBMITTED
+
+    def test_it_stamps_the_fields_that_belong_to_the_move(self) -> None:
+        order = _order(qty="100")
+        order.status = OrderStatus.PENDING_SUBMIT
+
+        transition(order, OrderStatus.SUBMITTED, at=TS)
+        assert order.submitted_at == TS
+
+        transition(order, OrderStatus.REJECTED, reason="halted symbol")
+        assert order.reject_reason == "halted symbol"
+
+    def test_it_never_stamps_filled_at(self) -> None:
+        """A status carries no execution time. `filled_at` comes from the
+        fill's own timestamp, inside `apply_fill`."""
+        order = _order(qty="100")
+        transition(order, OrderStatus.CANCELLED, at=TS)
+
+        assert order.filled_at is None
+
+    def test_an_acknowledgement_cannot_be_skipped(self) -> None:
+        """`PENDING_SUBMIT` has no edge to `FILLED`, and it should not: an order
+        acquiring a fill without ever having been acknowledged is an order the
+        venue may never have had."""
+        assert not can_transition(OrderStatus.PENDING_SUBMIT, OrderStatus.FILLED)
 
 
 class TestOrderFills:
