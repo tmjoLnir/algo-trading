@@ -33,57 +33,55 @@ is invisible and poisons every number the platform produces.
 
 ## Phase 1 — Data (requirement #4)
 
-**Live-feed status.** The feed has now been reached: with egress opened to
-`data.alpaca.markets` and credentials supplied, a 5-year SPY daily backfill ran
-against the real Alpaca API — 1,254 bars, and a gap scan against the NYSE
-calendar returning 1,254 expected / 1,254 matched / 0 missing / 0 unmatched
-(571 of the range's 1,825 calendar days correctly excluded as weekends and
-holidays). This retires the "no bar has ever been fetched from Alpaca" caveat
-that stood on the four items below, and settles three things that were pinned by
-tests but unseen on live data:
+**The *Verifiable:* line has been shown.** With egress open to
+`data.alpaca.markets` and credentials supplied,
+`scripts/backfill_bars.py --symbols SPY --start 2021-08-17 --verify` ran against
+the real Alpaca feed into a real TimescaleDB hypertable and exited 0:
+
+```
+1,254 bars written for 1 symbol(s) across 1 window(s) in 1 request(s).
+Verified against the NYSE calendar: every session in 2021-08-17 → 2026-08-17
+has a bar for all 1 symbol(s).
+```
+
+`find_gaps` — SQL read included this time, not just the pure scan — reported
+`expected=1254 missing=0 windows=0`. In the database: 1,254 rows across 262
+hypertable chunks, `adj_close` populated on every one, every price and quantity
+column `numeric`. Re-running left the row count at 1,254, so the idempotence the
+backfiller claims is now observed rather than asserted. The full integration
+suite (52 tests) passes against that hypertable and a real Redis.
+
+Three things previously pinned only by tests are also now seen on live data:
 
 - Daily bars **are** stamped 00:00 New York — 05:00Z in winter, 04:00Z in
   summer — so the attribution rule in `atp_core.data.gaps` holds across DST.
 - Pagination **does** cross real `next_page_token` boundaries: 22,727 one-minute
-  bars over 3 pages, ascending and duplicate-free across both seams.
+  bars over 3 pages, ascending and duplicate-free across both seams. The daily
+  backfill fits in one page, so it never exercises this on its own.
 - The calendar handles a one-off closure the vendor also skips (2025-01-09, the
-  national day of mourning), so the scan is not passing vacuously.
+  national day of mourning), so the clean scan is not passing vacuously.
 
-Everything stays unticked, because the run stored nothing. TimescaleDB cannot be
-provisioned in this environment — Docker Hub, ghcr, quay, ECR, packagecloud and
-the Ubuntu archives are all 403 at the egress gateway, and the initial migration
-correctly refuses to create `bars` as a plain table without the extension. The
-backfill therefore ran against an in-memory `BarRepository` standing in for
-`PostgresBarRepository`, so the *fetch* and *gap* legs of the *Verifiable:* line
-are shown and the *store* leg is not. Opening egress to a container registry (or
-any TimescaleDB instance) is the one remaining blocker.
+The last two items stay unticked. This *Verifiable:* line is entirely a
+historical-data statement — it never opens a socket and never reads a quote — so
+it cannot demonstrate them, which is a gap in the roadmap rather than in them.
+A line they can be ticked against is proposed below.
 
-- [ ] Alpaca historical provider with pagination — @claude (wip #8).
-  `AlpacaHistoricalProvider` is implemented, unit-tested against recorded
-  responses, and now exercised against the live feed including multi-page
-  pagination (above). Unticked: Phase 1 ticks against its one *Verifiable:*
-  line, and that line needs a backfill that persists.
-- [ ] `BarRepository` + backfill script — @claude (wip #10).
-  Both halves are built: `PostgresBarRepository` (#9, integration-tested
-  against the real hypertable) and `scripts/backfill_bars.py` over
-  `atp_core.data.backfill`. The `backfill_bars` orchestration — windowing,
-  batching, rate limiting, empty-window detection — has now run end to end
-  against the live feed. Still unticked, and this is the item the remaining
-  blocker sits on: `PostgresBarRepository` has never seen live data, because no
-  hypertable can be created here. `find_gaps` stays deliberately unimplemented
-  on this item; it belongs to the calendar-aware item below.
-- [ ] Gap detection, calendar-aware — @claude (wip #15, #16).
-  `TradingCalendar` is implemented over `pandas_market_calendars` (sessions,
-  holidays, early closes, `next_open`, `minutes_to_close`), `find_gaps` is
-  implemented on top of it, and `--verify` now runs instead of refusing (#15).
-  The nightly sweep that consumes it — `backfill_missing_bars`, over every
-  stored series for the last 7 days, re-checking and naming what it could not
-  fill — landed in #16. The pure logic (`expected_windows`, `scan_gaps`) has now
-  been run over five years of live SPY dailies and reported clean, and the
-  00:00-New-York assumption it rests on has been confirmed on live data rather
-  than only in tests. Unticked because the SQL half of `find_gaps` — the stored
-  timestamp read — has not run against live data. `1h`/`4h` gap detection is
-  deliberately refused rather than guessed (docs/DATA.md 'Gaps').
+- [x] Alpaca historical provider with pagination — @claude (#23).
+  `AlpacaHistoricalProvider`, unit-tested against recorded responses and now
+  exercised against the live feed including multi-page pagination.
+- [x] `BarRepository` + backfill script — @claude (#23).
+  `PostgresBarRepository` (#9) and `scripts/backfill_bars.py` over
+  `atp_core.data.backfill`, run end to end against the live feed into the
+  hypertable: windowing, batching, rate limiting, empty-window detection, and
+  an upsert that re-runs clean.
+- [x] Gap detection, calendar-aware — @claude (#15, #16, #23).
+  `TradingCalendar` over `pandas_market_calendars` (sessions, holidays, early
+  closes, `next_open`, `minutes_to_close`), `find_gaps` on top of it, and
+  `--verify` (#15). The nightly sweep that consumes it — `backfill_missing_bars`
+  over every stored series for the last 7 days, re-checking and naming what it
+  could not fill — landed in #16. Verified end to end against five years of
+  stored SPY dailies. `1h`/`4h` gap detection stays deliberately refused rather
+  than guessed (docs/DATA.md 'Gaps').
 - [ ] Real-time WS ingestor, reconnect + gap backfill — @claude (wip).
   Both halves are built and unit-tested against scripted fakes.
   `AlpacaRealtimeFeed` owns the socket — auth handshake, subscription replay,
@@ -93,10 +91,15 @@ any TimescaleDB instance) is the one remaining blocker.
   persists bars, and on `FeedReconnected` re-fetches `[last message, last
   completed bar)` before handling anything from the new connection. A gap it
   cannot close engages the kill switch instead of trading across the hole.
-  Unticked, and unlike the three items above the live run did not touch it: the
-  historical REST feed has now been exercised, but nothing here has yet held a
-  socket open to Alpaca, so the reconnect ladder and the bar-message shape are
-  still pinned by tests rather than by live data.
+  A socket has now been held open to Alpaca: `AlpacaRealtimeFeed` authenticates
+  and subscribes against the live server (`stream_connected`,
+  `stream_subscribed bars=1 quotes=1`), which also confirms the credentials
+  carry the stream entitlement — a separate grant from the REST API. That is
+  the handshake only. It was run with the exchange shut, so no bar or quote has
+  ever been parsed from the live stream, and the reconnect ladder and the
+  `FeedReconnected` gap backfill — the parts that decide whether a dropped
+  connection trades across a hole — remain pinned by tests. Unticked on that
+  basis, not on the historical *Verifiable:* line, which does not reach here.
 - [ ] Redis quote cache, pub/sub publisher, staleness monitor — @claude (wip).
   All three are built. `RedisQuoteCache` (one key per symbol, `MGET` for a
   watchlist, every number stored as a string, TTL as garbage collection rather
@@ -107,10 +110,21 @@ any TimescaleDB instance) is the one remaining blocker.
   agreeing with us about them would prove nothing. `StalenessMonitor` is
   calendar-aware and measures silence from the latest of last-message,
   connect-time and session-open; it halts once per outage and never clears.
-  Unticked for the same reason as everything above it: Phase 1's *Verifiable:*
-  line still has not been shown.
+  Those tests were re-run green as part of the 52-test suite above. Unticked
+  because the historical *Verifiable:* line does not exercise any of it —
+  nothing in a bar backfill writes a quote to the cache or publishes an event —
+  so there is no demonstration to tick against yet, only passing tests.
 
 *Verifiable:* backfill 5 years of SPY dailies; no gaps outside holidays.
+**Shown** — @claude (#23); see the run above.
+
+*Verifiable (streaming):* hold the live stream through a forced disconnect
+during market hours; every session bar lands in the hypertable, the reconnect
+backfills the gap, and the latest quote is readable from Redis.
+**Not yet shown** — proposed here because the two items above have no line of
+their own, and were being held against a historical-data line that cannot
+demonstrate them. Needs an open market; adjust the wording if it is not the
+demonstration you want.
 
 ## Phase 2 — Backtesting (requirement #2)
 - [ ] Indicators (`ema`, `rsi`, `atr`, …)
