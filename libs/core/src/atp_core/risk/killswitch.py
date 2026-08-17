@@ -12,12 +12,18 @@ stopping should be reflexive, restarting should not be.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
+
+from atp_core.logging import get_logger
 
 if TYPE_CHECKING:
-    from datetime import datetime
+    from redis import Redis
+
+log = get_logger(__name__)
 
 
 class HaltScope(StrEnum):
@@ -74,15 +80,88 @@ class KillSwitch(Protocol):
         ...
 
 
-class RedisKillSwitch:
-    """Redis-backed implementation. See docs/SAFETY.md."""
+#: redis-py types its sync client's returns as `Awaitable[Any] | Any`, because
+#: one class serves both the sync and async APIs. Every call below is against
+#: the synchronous client, so the awaitable half is unreachable — narrowed here
+#: rather than with an ignore on each call site, which would suppress real
+#: errors alongside this one.
+def _sync(value: object) -> Any:
+    return cast("Any", value)
 
-    def __init__(self, redis_url: str, key_prefix: str = "atp:halt") -> None:
-        self.redis_url = redis_url
+
+def _encode(record: HaltRecord) -> str:
+    return json.dumps(
+        {
+            "scope": record.scope.value,
+            "reason": record.reason.value,
+            "engaged_at": record.engaged_at.isoformat(),
+            "engaged_by": record.engaged_by,
+            "detail": record.detail,
+            "target": record.target,
+        }
+    )
+
+
+def _decode(raw: str | bytes) -> HaltRecord:
+    payload: dict[str, Any] = json.loads(raw)
+    return HaltRecord(
+        scope=HaltScope(payload["scope"]),
+        reason=HaltReason(payload["reason"]),
+        engaged_at=datetime.fromisoformat(payload["engaged_at"]),
+        engaged_by=payload["engaged_by"],
+        detail=payload.get("detail", ""),
+        target=payload.get("target"),
+    )
+
+
+class RedisKillSwitch:
+    """Redis-backed implementation. See docs/SAFETY.md.
+
+    Takes a client rather than a URL, like `RedisQuoteCache`: the client owns a
+    connection pool, and core does not open sockets on its own behalf
+    (CLAUDE.md §1.3). The stub's `redis_url` signature would have had this
+    module dialling out, which is the rule that keeps core testable.
+
+    Synchronous, unlike the quote cache, because `KillSwitchRule.check` is —
+    the risk chain is a synchronous decision on the path of every order, and
+    making it async to reach one key would colour the whole chain.
+    """
+
+    def __init__(self, client: Redis, key_prefix: str = "atp:halt") -> None:
+        self._client = client
         self.key_prefix = key_prefix
 
+    def _key(self, scope: HaltScope, target: str | None) -> str:
+        if scope is HaltScope.GLOBAL:
+            return f"{self.key_prefix}:global"
+        if not target:
+            raise ValueError(f"a {scope.value}-scoped halt needs a target")
+        return f"{self.key_prefix}:{scope.value}:{target}"
+
     def is_engaged(self, strategy_id: str | None = None, symbol: str | None = None) -> bool:
-        raise NotImplementedError
+        """True if this order is covered by any active halt.
+
+        **Fails closed.** If Redis cannot be reached, this returns True and
+        trading stops. docs/SAFETY.md names that explicitly as how layer 6
+        fails, and the reasoning is one-sided: a false halt costs missed
+        opportunity, while a false clear trades an account through whatever
+        made Redis unreachable in the first place.
+        """
+        keys = [self._key(HaltScope.GLOBAL, None)]
+        if strategy_id:
+            keys.append(self._key(HaltScope.STRATEGY, strategy_id))
+        if symbol:
+            keys.append(self._key(HaltScope.SYMBOL, symbol))
+
+        try:
+            return any(value is not None for value in _sync(self._client.mget(keys)))
+        except Exception as exc:
+            log.critical(
+                "risk.killswitch.unreachable",
+                error=str(exc),
+                effect="failing closed — refusing the order",
+            )
+            return True
 
     def engage(
         self,
@@ -92,13 +171,77 @@ class RedisKillSwitch:
         detail: str = "",
         target: str | None = None,
     ) -> HaltRecord:
-        raise NotImplementedError
+        """Halt immediately. Idempotent — re-engaging an active halt is fine.
+
+        An existing halt is returned unchanged rather than overwritten, so the
+        record keeps who stopped trading and when it first stopped. A second
+        engagement is not new information, and letting it reset the timestamp
+        would erase the only audit trail of the original.
+
+        Deliberately no error handling: engaging must never fail quietly. If
+        Redis is unreachable the exception propagates, and `is_engaged` is
+        already failing closed on the same outage.
+        """
+        key = self._key(scope, target)
+        existing = _sync(self._client.get(key))
+        if existing is not None:
+            return _decode(existing)
+
+        record = HaltRecord(
+            scope=scope,
+            reason=reason,
+            engaged_at=datetime.now(UTC),
+            engaged_by=engaged_by,
+            detail=detail,
+            target=target,
+        )
+        self._client.set(key, _encode(record))
+        log.critical(
+            "risk.killswitch.engaged",
+            scope=scope.value,
+            reason=reason.value,
+            engaged_by=engaged_by,
+            target=target,
+            detail=detail,
+        )
+        return record
 
     def clear(self, scope: HaltScope, cleared_by: str, target: str | None = None) -> None:
-        raise NotImplementedError
+        """Resume. Requires a named human; always audit-logged.
+
+        The asymmetry with `engage` is the point: stopping should be reflexive,
+        restarting should not. An empty `cleared_by` is refused because "who
+        decided it was safe to trade again" is the one question anyone asks
+        afterwards, and an automated caller passing "" would answer it "nobody".
+        """
+        if not cleared_by.strip():
+            raise ValueError(
+                "clearing a halt requires a named human — an anonymous clear is not an audit trail"
+            )
+
+        key = self._key(scope, target)
+        record = _sync(self._client.get(key))
+        removed = bool(self._client.delete(key))
+        log.critical(
+            "risk.killswitch.cleared",
+            scope=scope.value,
+            target=target,
+            cleared_by=cleared_by,
+            was_engaged=removed,
+            original=_decode(record).engaged_by if record is not None else None,
+        )
 
     def active_halts(self) -> list[HaltRecord]:
-        raise NotImplementedError
+        """Everything currently halted — rendered as a banner on the dashboard.
+
+        Lets a Redis failure raise rather than returning an empty list. This is
+        a display read, and "nothing is halted" is exactly the wrong thing to
+        show a human when the truth is unknown.
+        """
+        keys = list(_sync(self._client.scan_iter(match=f"{self.key_prefix}:*")))
+        if not keys:
+            return []
+        return [_decode(v) for v in _sync(self._client.mget(keys)) if v is not None]
 
 
 def flatten_all_positions() -> None:

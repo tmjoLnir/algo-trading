@@ -256,7 +256,7 @@ strategy evaluated without them is flattered by 1.3 points over five years on
 11 round trips — and far more at any real turnover.
 
 ## Phase 3 — Risk (requirement #3)
-- [ ] `RiskEngine` + full rule chain — @claude (wip #28, #29).
+- [x] `RiskEngine` + full rule chain — @claude (#28, #29, #32).
   All nine rules and `default_rules()` are implemented, with 35 tests covering
   both directions for each — a rule that fails to block is an obvious bug, but
   a rule that blocks something it should have allowed is the one that traps a
@@ -277,11 +277,11 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   four things without anyone deciding to. `RiskEngine(limits)` with no rules now
   raises rather than defaulting.
 
-  Unticked for two reasons. **Nothing routes live orders through it** — the
-  backtest CLI still passes an explicit empty chain, and `OrderRouter` is Phase
-  4, so "every order passes `RiskEngine.validate()`" still has nowhere to be
-  true. And Phase 3 states no *Verifiable:* line to tick against; one is
-  proposed below.
+  Ticked against the *Verifiable:* line below, now shown. The caveat that stood
+  here still stands and is worth keeping in view: **nothing routes live orders
+  through this chain.** The backtest CLI passes an explicit empty chain and
+  `OrderRouter` is Phase 4, so "every order passes `RiskEngine.validate()`"
+  remains true of the chain and not yet of the platform.
 - [ ] Position sizing, all methods — @claude (wip #30).
   All five implemented: `fixed_qty`, `fixed_notional`, `equity_pct`, `risk_pct`
   and `volatility_target`. `risk_pct` and `volatility_target` each refuse the
@@ -333,7 +333,34 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   `position.stop_loss_price` but only ever sets it from a `Signal`, and no
   caller of `StopManager` exists — the same gap the audit flagged for the rule
   chain, closing in Phase 4.
-- [ ] Redis kill switch
+- [x] Redis kill switch — @claude (#32).
+  `RedisKillSwitch` over the three halt scopes, tested against a real Redis as
+  well as in memory. Ticked on docs/SAFETY.md's own go-live checklist rather
+  than on anything proposed here: *"Kill switch tested end to end — engage it
+  and confirm orders are actually refused"* — engaged, the chain refuses and
+  names `kill_switch`; cleared, the same order passes.
+
+  **It fails closed.** docs/SAFETY.md is explicit that layer 6 fails "Redis
+  unreachable — fail closed", so an unreachable Redis reports engaged and
+  trading stops. Shown against a genuinely dead port, not a fake that raises.
+  The reasoning is one-sided: a false halt costs missed opportunity, a false
+  clear trades the account through whatever broke Redis.
+
+  Engaging is idempotent and keeps the *original* record — a halt that
+  re-stamps itself erases the only evidence of when trading actually stopped.
+  Clearing refuses an empty `cleared_by`, because "who decided it was safe to
+  trade again" is the question anyone asks afterwards.
+
+  Takes a client rather than the stub's `redis_url`, matching `RedisQuoteCache`
+  — core does not open sockets on its own behalf (CLAUDE.md §1.3). Synchronous,
+  unlike the quote cache, because the risk chain is.
+
+  Still open, and not this item: none of the five documented auto-engage
+  triggers calls `engage()`. Each belongs to the subsystem that detects it —
+  reconciliation, the stream consumer, the broker adapter — and `RISK.md`'s
+  `flatten_all_positions` remains a stub, deliberately separate because halting
+  stops new risk while flattening realises P&L into a market you may not be
+  able to see.
 
 **Before any live order path exists.** Not after.
 
@@ -341,11 +368,33 @@ strategy evaluated without them is flattered by 1.3 points over five years on
 by the *right* rule each time — the reason a human reads names the most
 fundamental breach, not merely the first one checked — and no configuration of
 the chain can refuse an exit.
-**Not yet shown.** Proposed because this phase states no line at all, which is
-how the three Phase 2 items ended up held against a line none of them could
-satisfy. It wants the kill switch and a live order path, so it cannot be shown
-until Phase 4 — but it is the demonstration that matters here, and the second
-clause is the one worth failing the build over.
+**Shown** — @claude (#32). Proposed in #29 because this phase stated no line at
+all, which is how three Phase 2 items ended up held against a line none of them
+could satisfy. *Proposed and ticked by the same hand, so it is worth a
+reviewer's eye rather than mine.*
+
+`test_each_limit_is_refused_by_its_own_rule` breaches each limit in isolation
+and asserts the rejection names the rule that owns it — a rejection blamed on
+the wrong rule sends whoever reads it to the wrong config. The kill-switch half
+runs against a real Redis in `tests/integration/test_kill_switch.py`.
+
+The second clause is the one worth failing a build over, and
+`test_no_configuration_of_the_chain_can_refuse_an_exit` states it directly:
+against a book breaching every limit at once — down 40% on the day, no cash, an
+oversized position — the order that closes it still passes, while an entry
+against that same book is refused.
+
+That work turned up something worth recording. At the default 100% gross cap, a
+long-only book's equity is its cash plus its positions, so the headroom under
+the gross cap *is* the cash — `BuyingPowerRule` and `MaxExposureRule` bind
+identically and gross always answers first. Buying power only becomes the
+operative limit under margin or with shorts. Pinned by a test, because it looks
+like a gap and is not.
+
+I earlier wrote that this line needed a live order path. On reflection that
+conflated two claims: the line describes the chain refusing correctly, which is
+shown, whereas wiring it to real orders is Phase 4 and is tracked on the item
+above.
 
 ## Phase 4 — Execution & paper trading (requirements #1, #5)
 - [ ] `BrokerPort` + Alpaca adapter (paper first)
