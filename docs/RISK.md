@@ -115,7 +115,13 @@ Halts everything. Engaging needs no confirmation — hesitation is the expensive
 part. Clearing requires a named human and is audit-logged.
 
 Auto-engages on: daily loss limit breach, reconciliation mismatch, data feed
-loss, broker unreachable, repeated unhandled exceptions.
+loss, broker unreachable, a rate-limit storm, repeated unhandled exceptions.
+
+**Fails closed.** The switch lives in Redis so that the API can trip it while
+the worker is mid-loop, and so that it survives a restart — a switch that
+cleared on restart would let a crash loop silently resume trading. If Redis
+cannot be reached the switch reports *engaged*: a false halt costs missed
+opportunity, a false clear trades the account through whatever broke Redis.
 
 **Halting is not flattening.** Halting stops new risk. Flattening realises
 existing P&L and is not always right — a data outage means stop trading, not

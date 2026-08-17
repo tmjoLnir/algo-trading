@@ -4,13 +4,16 @@ Findings from auditing `docs/RISK.md` against the code that is supposed to enfor
 recorded before Phase 3 starts rather than discovered during it.
 
 `RISK.md` is written descriptively — "enforced by `RiskEngine` on every order", "ATR-based
-stops are the default" — but it is a *specification*. Almost none of it is implemented yet,
-and in a handful of places the skeleton actively disagrees with it. Those disagreements are
-the point of this file: each one is a decision someone will otherwise make by accident at
-implementation time.
+stops are the default" — but it is a *specification*. When this was written almost none of
+it was implemented, and in a handful of places the skeleton actively disagreed with it.
+Those disagreements were the point of the file: each one is a decision someone would
+otherwise have made by accident at implementation time.
 
-**This file is temporary.** Delete it when Phase 3 lands and every item below is either
-fixed or promoted into `RISK.md` proper.
+**Now largely spent.** Every row of the table below is implemented, and the contradictions
+are annotated in place with how each was resolved. What is left is items 4, 5 and 8 and most
+of *Smaller drift* — plus the one thing this file was most right about, which no amount of
+implementation fixes: **nothing is wired.** Delete the file once those are closed or promoted
+into `RISK.md` proper.
 
 ---
 
@@ -22,7 +25,7 @@ fixed or promoted into `RISK.md` proper.
 | Position sizing | **Implemented and tested.** All five methods, `risk/rules.py:position_size` |
 | Stop losses | **Implemented and tested.** All six types, `risk/stops.py`, 41 tests |
 | Portfolio limits | **Implemented and tested.** All nine rules, `risk/rules.py`, 35 tests |
-| The kill switch | Protocol implemented against; `RedisKillSwitch` still a stub |
+| The kill switch | **Implemented and tested.** `risk/killswitch.py`, unit + real-Redis integration |
 
 `RiskEngine.validate` and `validate_or_raise` landed in #28; `default_rules()` landed
 alongside the rules. Every `OrderRouter` method (`execution/router.py:57-91`) still raises
@@ -41,19 +44,20 @@ from whoever owns the rule-builder UI.
 
 Two things worth separating out, because they are different problems:
 
-**Nothing is wired.** Searching `libs`, `apps`, `scripts` and `tests` for `RiskEngine(`,
-`OrderRouter(`, `StopManager(`, `RedisKillSwitch(`, `.validate(`, `.engage(` and
-`position_size(` returns no call sites at all. Filling in the bodies is necessary but not
-sufficient — there is currently no path that would reach them, so "every order passes
-`RiskEngine.validate()`" has nowhere to be true. Whoever implements the engine owns
-constructing it in the worker as part of the same change.
+**Nothing is wired.** *Still true, and now the only thing standing between Phase 3 and
+being real.* The bodies are filled in, but outside tests the sole production call site is the
+backtest CLI, which passes an explicit empty chain. `OrderRouter` still raises. So "every
+order passes `RiskEngine.validate()`" is true of the chain and not of the platform — filling
+in the bodies was necessary and, exactly as this paragraph warned, not sufficient.
 
-**Nothing is asserted.** `tests/unit/test_risk_engine.py` is ten tests, ten
-`pytest.skip("TODO")`. The test names are good and encode the right cases — keep them, they
-are a to-do list.
+~~**Nothing is asserted.**~~ Was ten tests and ten `pytest.skip("TODO")`. The names were
+good and encoded the right cases, so they were kept and filled in; that file is now 60 tests
+with no skips, and `test_stops.py` and `test_kill_switch.py` sit alongside it.
 
-The roadmap is accurate about all of this: Phase 3 is entirely unticked, and the one Phase 0
-item that *is* ticked (`Position.apply_fill`) genuinely holds. No roadmap correction needed.
+The **nothing is wired** paragraph above is the one that still stands, and it has outlived
+every other finding here. `RiskEngine`, `StopManager`, `position_size` and `RedisKillSwitch`
+are all implemented and all reachable only from tests. The roadmap says so on each item
+rather than letting a tick imply otherwise.
 
 ### The accounting code holds up
 
@@ -227,12 +231,14 @@ until Phase 4.
   `RISK.md`'s own gaps went in alongside it: that protective levels are cleared when a
   position goes flat (which the *accounting* section of this file said should be documented),
   and that a level below zero is refused rather than armed.
-- **`HaltReason.RATE_LIMIT_STORM`** (`risk/killswitch.py:35`) is a sixth auto-engage reason
-  beyond the five `RISK.md` lists. The other five all map cleanly. Add it to the doc.
-- **Zero of the documented auto-engage triggers are wired.** No caller of `engage()` exists.
-  Each of the five is a separate piece of work in whichever subsystem detects it —
+- ~~**`HaltReason.RATE_LIMIT_STORM`** is a sixth auto-engage reason beyond the five
+  `RISK.md` lists~~ — **RESOLVED.** Added to the doc's auto-engage list.
+- **Zero of the documented auto-engage triggers are wired.** Still true, and still the
+  honest reading: `RedisKillSwitch.engage()` exists and works, but nothing calls it outside
+  tests. Each of the five is a separate piece of work in whichever subsystem detects it —
   reconciliation, the stream consumer, the broker adapter — not something the kill switch
-  module can do alone.
+  module can do alone. `flatten_all_positions()` also remains a stub, deliberately: it needs
+  a broker, and halting is not flattening.
 - ~~**`StaleDataRule.max_age_seconds = 30`** is hardcoded on the dataclass~~ — **RESOLVED.**
   Moved to `RiskLimits.max_quote_age_seconds`, so it is configurable like every other limit.
 - ~~**`RiskDecision.adjusted_qty`** is specified but unreachable~~ — **RESOLVED.**

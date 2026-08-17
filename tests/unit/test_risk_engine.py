@@ -305,12 +305,17 @@ class TestChain:
             last_tick_at=lambda _s: OPEN_HOURS,
         )
 
-    def _chain(self, engaged: bool = False, *, anchored: bool = True) -> RiskEngine:
+    def _anchored_rules(
+        self, engaged: bool = False, anchor: Decimal = Decimal(100_000)
+    ) -> list[object]:
         rules = self._rules(engaged)
-        if anchored:
-            for rule in rules:
-                if isinstance(rule, DailyLossLimitRule):
-                    rule.anchor(Decimal(100_000))
+        for rule in rules:
+            if isinstance(rule, DailyLossLimitRule):
+                rule.anchor(anchor)
+        return rules
+
+    def _chain(self, engaged: bool = False, *, anchored: bool = True) -> RiskEngine:
+        rules = self._anchored_rules(engaged) if anchored else self._rules(engaged)
         return RiskEngine(limits(), rules=rules)  # type: ignore[arg-type]
 
     def test_the_chain_refuses_entries_until_the_day_is_anchored(self) -> None:
@@ -389,6 +394,112 @@ class TestChain:
     def test_a_shrink_to_nothing_is_not_a_shrink(self) -> None:
         with pytest.raises(ValueError, match="leave something to trade"):
             RiskDecision.shrink("r", "why", Decimal(0))
+
+    @pytest.mark.parametrize(
+        ("rule_name", "build"),
+        [
+            # 20,000 into one symbol against a 10% cap on 100k.
+            (
+                "max_position_size",
+                lambda: (order(qty=200, limit=100), portfolio(cash=100_000), limits(), None),
+            ),
+            # Ten symbols already at 10,000 each: no single position breaches
+            # the 10% cap, but an eleventh takes gross past 100% of equity.
+            (
+                "max_gross_exposure",
+                lambda: (
+                    order(qty=100, limit=100),
+                    portfolio(cash=0, **{f"S{i}": (100.0, 100.0) for i in range(10)}),
+                    limits(),
+                    None,
+                ),
+            ),
+            (
+                "max_open_positions",
+                lambda: (
+                    order(symbol="NEW", qty=1, limit=100),
+                    portfolio(cash=100_000, **{f"S{i}": (1.0, 100.0) for i in range(20)}),
+                    limits(),
+                    None,
+                ),
+            ),
+            (
+                "daily_loss_limit",
+                lambda: (order(qty=10), portfolio(cash=90_000), limits(), Decimal(100_000)),
+            ),
+            # Needs a gross cap above 100% to be reachable at all — see the
+            # test below this one.
+            (
+                "buying_power",
+                lambda: (
+                    order(qty=10, limit=100),
+                    portfolio(cash=50, QQQ=(500, 100)),
+                    limits(max_gross_exposure_pct=Decimal(2)),
+                    None,
+                ),
+            ),
+        ],
+    )
+    def test_each_limit_is_refused_by_its_own_rule(self, rule_name: str, build: object) -> None:
+        """The first half of the phase's proposed *Verifiable:* line. Breaching
+        one limit must be attributed to the rule that owns it — a rejection
+        blamed on the wrong rule sends whoever reads it to the wrong config.
+        """
+        placed, book, rule_limits, anchor = build()  # type: ignore[operator]
+        # Anchor the day to the book itself unless the case is about the loss
+        # limit, so that every other case breaches exactly one thing.
+        rules = self._anchored_rules(anchor=anchor if anchor is not None else book.equity)
+        engine = RiskEngine(rule_limits, rules=rules)  # type: ignore[arg-type]
+        decision = engine.validate(placed, book)
+        assert not decision.approved
+        assert decision.rule == rule_name, f"blamed {decision.rule!r}, expected {rule_name!r}"
+
+    def test_buying_power_is_unreachable_on_a_long_only_book_at_100_percent_gross(self) -> None:
+        """Worth pinning, because it looks like a gap and is not.
+
+        For a long-only book, equity is cash plus the value of the positions, so
+        the headroom under a 100% gross cap is *exactly* the cash. Gross runs
+        before buying power and the two bind identically, so buying power only
+        becomes the operative limit under margin or with shorts — where equity
+        and gross come apart.
+
+        If someone later reorders the chain and this starts failing, the
+        question to ask is whether buying power should run first, not whether
+        this test is wrong.
+        """
+        book = portfolio(cash=50, QQQ=(500, 100))
+        placed = order(qty=10, limit=100)
+
+        flat_day = book.equity
+        at_100 = RiskEngine(limits(), rules=self._anchored_rules(anchor=flat_day)).validate(
+            placed, book
+        )
+        assert at_100.rule == "max_gross_exposure"
+
+        on_margin = RiskEngine(
+            limits(max_gross_exposure_pct=Decimal(2)),
+            rules=self._anchored_rules(anchor=flat_day),
+        ).validate(placed, book)
+        assert on_margin.rule == "buying_power"
+
+    def test_no_configuration_of_the_chain_can_refuse_an_exit(self) -> None:
+        """The second half, and the clause worth failing a build over. Against
+        a book that breaches every limit at once — down 40% on the day, no cash,
+        an oversized position — the order that closes it must still pass."""
+        book = portfolio(cash=0, SPY=(500, 100))
+        rules = self._rules()
+        for rule in rules:
+            if isinstance(rule, DailyLossLimitRule):
+                rule.anchor(Decimal(1_000_000))  # a catastrophic day
+
+        engine = RiskEngine(limits(), rules=rules)  # type: ignore[arg-type]
+        exit_order = order(side=Side.SELL, qty=500)
+        assert reduces_position(exit_order, book)
+        assert engine.validate(exit_order, book).approved
+
+        # And the same book refuses an entry, so the pass above is the exit
+        # carve-out rather than a chain that approves everything.
+        assert not engine.validate(order(side=Side.BUY, qty=500), book).approved
 
 
 EQUITY = Decimal(100_000)
