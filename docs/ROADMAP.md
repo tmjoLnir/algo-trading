@@ -21,10 +21,14 @@ fix it here in the PR that discovered it.
 
 ## Phase 0 — Foundations (skeleton is here)
 - [x] Repo structure, tooling, docs, CI (#1, #2)
-- [x] `make install` and `make up` work end to end — @claude (#7).
+- [x] `make install` and `make up` work end to end — @claude (#7, #35).
   Demonstrated by the `stack` CI job, which runs both on a clean checkout.
-  `make up` starts db, redis, api and web; the worker is behind a compose
-  profile until its entry point stops raising `NotImplementedError` (Phase 4).
+  `make up` starts db, redis, api, web **and the worker**: the compose profile
+  that held it back is gone, because the condition stated here for removing it —
+  that its entry point stop raising `NotImplementedError` — is met (#35). On a
+  clean checkout the worker comes up in backtest mode with no watchlist, reports
+  that it is ingesting nothing, and runs its schedule; the `stack` job's
+  "none is restarting" step now covers it without needing a new check.
 - [x] Alembic initial migration; TimescaleDB hypertable created — @claude (#6)
 - [x] `Position.apply_fill` + `Order.apply_fill` implemented and property-tested — @claude (#4)
 
@@ -117,16 +121,19 @@ A line they can be ticked against is proposed below.
   verified by making exactly that change: the other 648 stayed green and only
   those 4 failed.
 
-  Still unticked — but the *reason* has moved, which is worth recording so the
-  next person does not re-check what is now known. Egress is not the blocker:
+  Still unticked, and the *reason* has moved twice — recorded each time so the
+  next person does not re-check what is already known. Egress is not the blocker:
   the policy permits the `wss://` upgrade to `stream.data.alpaca.markets`
   (`101 Switching Protocols`, then real frames), and a shut exchange is not the
-  blocker either. What is missing is a *process*. `atp_worker.main` is still a
-  `NotImplementedError` stub, so nothing wires this ingestor to a real Redis and
-  a real hypertable, and nothing forces the disconnect the line asks for. The
-  reconnect ladder and the `FeedReconnected` gap backfill — the half of this
-  item that decides whether a dropped connection trades across a hole — are
-  therefore still pinned by tests alone.
+  blocker either. Nor, as of #35, is the missing process: `atp_worker.main` now
+  wires this ingestor to a real Redis and a real hypertable, supervises it, and
+  halts if it dies.
+
+  What is left is simply to run it through a disconnect and watch. The reconnect
+  ladder and the `FeedReconnected` gap backfill — the half of this item that
+  decides whether a dropped connection trades across a hole — are still pinned by
+  tests alone, because nothing has yet dropped the socket on purpose during a
+  session with the stack up.
 - [ ] Redis quote cache, pub/sub publisher, staleness monitor — @claude (wip).
   All three are built. `RedisQuoteCache` (one key per symbol, `MGET` for a
   watchlist, every number stored as a string, TTL as garbage collection rather
@@ -141,6 +148,11 @@ A line they can be ticked against is proposed below.
   because the historical *Verifiable:* line does not exercise any of it —
   nothing in a bar backfill writes a quote to the cache or publishes an event —
   so there is no demonstration to tick against yet, only passing tests.
+
+  All three now have a production caller: `atp_worker.main` builds the cache, the
+  publisher and the watchdog and hands them to the ingestor (#35). That closes
+  the "nothing constructs these" gap but not the item — a caller is not a
+  demonstration, and the streaming line below is still what they need.
 
 *Verifiable:* backfill 5 years of SPY dailies; no gaps outside holidays.
 **Shown** — @claude (#23); see the run above.
@@ -160,10 +172,13 @@ live quotes and bars parse through `AlpacaRealtimeFeed` end to end. So access is
 settled and only wiring is left. The line has four clauses — a held socket
 through a *forced* disconnect, session bars in the hypertable, the reconnect
 backfilling the gap, the latest quote readable from Redis — and holding a socket
-is the only one demonstrated. The other three need a process that binds the
-ingestor to a real Redis and a real hypertable, which is `atp_worker.main`, a
-`NotImplementedError` stub tracked under Phase 4's `StrategyRunner` item. That
-dependency, rather than market hours, is what this line is waiting on.
+is the only one demonstrated.
+
+That wiring landed in #35: `atp_worker.main` binds the ingestor to a real Redis
+and a real hypertable, so nothing structural stands in the way any more. What
+this line now needs is an *act*, not a component — `make up` with a watchlist
+during a session, kill the socket, and check all four clauses. Nobody has done
+that yet, so it stays **not shown**.
 
 ## Phase 2 — Backtesting (requirement #2)
 - [x] Indicators (`ema`, `rsi`, `atr`, …) — @claude (#24, #27).
@@ -506,8 +521,24 @@ above.
   `StrategyRunner` holds the `BarRepository` and owns closing that.
 - [ ] `SimulatedBroker`
 - [ ] Reconciliation
-- [ ] `StrategyRunner` live loop — also drop the `worker` compose profile (#7),
-      so the worker rejoins the default stack once it can actually start
+- [ ] `StrategyRunner` live loop — @claude (wip).
+  Untouched: `warmup`, `run`, `evaluate`, `on_fill_event` and `shutdown` all
+  still raise. It needs a `BrokerPort` adapter and reconciliation, neither
+  started, so there is nothing to run a loop against yet.
+
+  The second half of this item — drop the `worker` compose profile so the worker
+  rejoins the default stack "once it can actually start" — **is done** (#35), and
+  is worth separating from the runner because it turned out not to depend on it.
+  `atp_worker.main` is implemented: it wires the ingestor, the staleness watchdog
+  and the scheduler to a real Redis and a real hypertable, supervises them, and
+  halts on `UNHANDLED_EXCEPTION` if one of them ends instead of running until
+  cancelled. SIGTERM is an ordinary shutdown and deliberately does not halt —
+  otherwise every deploy would leave a halt for a human to clear.
+
+  So the worker starts, ingests and runs scheduled jobs. **It does not trade**,
+  and the startup log says so on every boot rather than leaving "the worker is
+  up" and "the worker is trading" as the same observation. Unticked on that
+  basis: this item is the live loop, and the live loop does not exist.
 - [ ] Trade-updates WS with reconnect
 
 *Verifiable:* a strategy trades the paper account for a week and reconciles clean.

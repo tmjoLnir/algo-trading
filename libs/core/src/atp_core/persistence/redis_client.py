@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from redis import Redis as SyncRedis
 from redis.asyncio import Redis
 
 #: How often an idle connection is pinged. The worker holds Redis connections
@@ -56,3 +57,31 @@ def create_redis(redis_url: str, **kwargs: Any) -> Redis:
 async def close_redis(client: Redis) -> None:
     """Release the pool. Safe to call twice."""
     await client.aclose()
+
+
+def create_sync_redis(redis_url: str, **kwargs: Any) -> SyncRedis:
+    """Build a *synchronous* client, for the kill switch and nothing else.
+
+    `RedisKillSwitch` is synchronous because `KillSwitchRule.check` is — the
+    risk chain is a synchronous decision on the path of every order, and making
+    it async to reach one key would colour the whole chain. So a process that
+    both ingests (async) and can halt (sync) genuinely needs two clients
+    against the same server; this is not an oversight to be tidied away into
+    one.
+
+    Same timeouts as the async client, and for a sharper reason. The kill switch
+    fails *closed*: an unreachable Redis reports engaged and trading stops. An
+    unbounded socket timeout would turn "Redis is slow" into a hung risk check
+    rather than a halt, which is the one failure mode fail-closed exists to rule
+    out.
+    """
+    client: SyncRedis = SyncRedis.from_url(
+        redis_url,
+        decode_responses=True,
+        health_check_interval=HEALTH_CHECK_SECONDS,
+        socket_keepalive=True,
+        socket_timeout=SOCKET_TIMEOUT_SECONDS,
+        socket_connect_timeout=SOCKET_TIMEOUT_SECONDS,
+        **kwargs,
+    )
+    return client

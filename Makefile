@@ -24,7 +24,8 @@ up: .env  ## Start the full stack
 	docker compose up -d --build
 	@echo "api  → http://localhost:8000/docs"
 	@echo "web  → http://localhost:5173"
-	@echo "worker is not in the default stack — see docker-compose.yml"
+	@echo "worker → market-data ingestion + scheduled jobs"
+	@echo "         it places no orders yet; set WORKER_SYMBOLS to give it a watchlist"
 
 down:  ## Stop the stack
 	docker compose down
