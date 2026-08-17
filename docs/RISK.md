@@ -46,6 +46,7 @@ trades — which happens to good strategies — is an account-threatening event.
 | Type | Level | Good for |
 |---|---|---|
 | `fixed_pct` | entry × (1 − x) | simple, predictable |
+| `fixed_amount` | entry − $x | a level you have a specific reason for |
 | `atr` | entry − n × ATR | **default** — adapts to volatility |
 | `trailing_pct` | high-water × (1 − x) | trend following |
 | `chandelier` | highest-high − n × ATR | trends, volatility-adjusted |
@@ -68,6 +69,14 @@ ATR(14).
   that should have ratcheted the stop is invisible in closes.
 - **Place protective orders immediately on entry fill.** The gap between owning
   a position and having a stop is unprotected exposure.
+- **Protective levels are cleared when a position goes flat.** `apply_fill`
+  does this, and it matters: a stop left armed across a flat would reference a
+  basis that no longer exists, and would arm itself against whatever position
+  opens next in that symbol — a live order at a price that means nothing to it.
+- **A stop below zero is not a stop.** A percentage over 1, or an ATR multiple
+  wide enough to swamp the entry, produces a level price can never reach. The
+  position looks guarded and is not, so `StopManager` refuses it at
+  construction rather than arming it.
 
 ### What stops cannot do
 

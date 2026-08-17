@@ -305,7 +305,34 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   the one proposed in #29 is about the rule chain. Rather than propose a second
   line and tick against it in the same PR, this is left for whoever reviews it:
   the demonstration above is the obvious candidate.
-- [ ] `StopManager` — fixed, ATR, trailing, chandelier, time
+- [ ] `StopManager` — fixed, ATR, trailing, chandelier, time — @claude (wip #31).
+  All six `StopType`s, including `fixed_amount`, which was in the enum but
+  missing from docs/RISK.md's table — the row is added rather than the member
+  dropped, because it is a real stop type. 41 tests, every level checked long
+  *and* short: a sign error there is silent and either stops the position out
+  on the bar it opens or never at all.
+
+  The monotonicity invariant is a hypothesis property, as docs/TESTING.md asks:
+  over any price path of up to 40 bars, in any order, a long's trailing stop
+  never decreases. `update_trailing` returns None rather than a level when
+  nothing ratchets, so a caller cannot assign a widened stop by accident, and
+  it tracks the bar's *extreme* rather than its close — a spike that closed
+  back down still locked in its gain.
+
+  `should_trigger` compares against the low for a long and the high for a
+  short. A bar that dipped through the stop and recovered did hit it, and using
+  the close would inflate every backtest that uses stops.
+
+  Two refusals worth naming. A `time` stop is refused a price level rather than
+  given a made-up one — it is not a level, so it lives in `time_exit_due`. And
+  a take-profit that is not a fixed distance from entry raises instead of
+  returning None, because a take-profit that quietly does not exist is a
+  position with no upside exit.
+
+  Unticked: nothing arms these yet. The backtest engine honours
+  `position.stop_loss_price` but only ever sets it from a `Signal`, and no
+  caller of `StopManager` exists — the same gap the audit flagged for the rule
+  chain, closing in Phase 4.
 - [ ] Redis kill switch
 
 **Before any live order path exists.** Not after.

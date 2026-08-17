@@ -20,7 +20,7 @@ fixed or promoted into `RISK.md` proper.
 |---|---|
 | Position accounting | **Implemented and tested.** `domain/position.py:76`, 18 tests, no skips |
 | Position sizing | **Implemented and tested.** All five methods, `risk/rules.py:position_size` |
-| Stop losses | Stub — `risk/stops.py:52,63,78,83` |
+| Stop losses | **Implemented and tested.** All six types, `risk/stops.py`, 41 tests |
 | Portfolio limits | **Implemented and tested.** All nine rules, `risk/rules.py`, 35 tests |
 | The kill switch | Protocol implemented against; `RedisKillSwitch` still a stub |
 
@@ -222,8 +222,11 @@ until Phase 4.
 
 ## Smaller drift
 
-- **`StopType.FIXED_AMOUNT`** (`domain/enums.py:103`) is not in `RISK.md`'s stop table. Drift
-  in the other direction — undocumented enforcement. Add the row or drop the member.
+- ~~**`StopType.FIXED_AMOUNT`** is not in `RISK.md`'s stop table~~ — **RESOLVED.** The row is
+  added and the type is implemented; it was a real stop type, not a stray member. Two of
+  `RISK.md`'s own gaps went in alongside it: that protective levels are cleared when a
+  position goes flat (which the *accounting* section of this file said should be documented),
+  and that a level below zero is refused rather than armed.
 - **`HaltReason.RATE_LIMIT_STORM`** (`risk/killswitch.py:35`) is a sixth auto-engage reason
   beyond the five `RISK.md` lists. The other five all map cleanly. Add it to the doc.
 - **Zero of the documented auto-engage triggers are wired.** No caller of `engage()` exists.
