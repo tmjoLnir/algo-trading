@@ -43,6 +43,7 @@ from atp_core.domain import (
     TimeInForce,
 )
 from atp_core.errors import BacktestError, DataGapError, LookaheadError
+from atp_core.execution.matching import intended_price
 from atp_core.indicators import ta
 from atp_core.logging import get_logger
 
@@ -597,27 +598,15 @@ class BacktestEngine:
         return filled
 
     def _intended_price(self, order: Order, bar: Bar) -> Decimal | None:
-        """The price this order would touch on this bar, or None if it would not."""
-        if order.order_type is OrderType.MARKET:
-            return bar.open
+        """The price this order would touch on this bar, or None if it would not.
 
-        if order.order_type is OrderType.LIMIT:
-            limit = order.limit_price
-            assert limit is not None
-            if order.side is Side.BUY:
-                # A bar that opens below our limit fills at the better open —
-                # we would not pay the limit for something offered cheaper.
-                return min(bar.open, limit) if bar.low <= limit else None
-            return max(bar.open, limit) if bar.high >= limit else None
-
-        if order.order_type is OrderType.STOP:
-            stop = order.stop_price
-            assert stop is not None
-            if order.side is Side.BUY:
-                return max(bar.open, stop) if bar.high >= stop else None
-            return min(bar.open, stop) if bar.low <= stop else None
-
-        raise BacktestError(f"{order.order_type} is not modelled by the backtest engine")
+        Delegates to `execution.matching`, which `SimulatedBroker` also calls.
+        The rule used to live here, and having a second copy of it in the
+        simulator would mean a paper run could fill on a bar this engine would
+        not — which would make the backtest that preceded it incomparable, and
+        comparing them is the entire reason to paper trade first.
+        """
+        return intended_price(order, bar)
 
     def _execute(
         self,

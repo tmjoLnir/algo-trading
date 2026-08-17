@@ -467,7 +467,37 @@ shown, whereas wiring it to real orders is Phase 4 and is tracked on the item
 above.
 
 ## Phase 4 — Execution & paper trading (requirements #1, #5)
-- [ ] `BrokerPort` + Alpaca adapter (paper first)
+- [ ] `BrokerPort` + Alpaca adapter (paper first) — @claude (wip #36).
+  `AlpacaBroker` is implemented over REST: account, submit, cancel, order and
+  position reads, the venue clock, and both flatten paths. Paper and live are
+  the same adapter on different hosts, which is the whole of requirement #5 at
+  this layer — there is no `if paper:` anywhere in it.
+
+  Three translations carry the risk, and each is pinned by tests rather than
+  trusted:
+
+  - **Status.** Alpaca has more order states than we do, and the map is total:
+    an unrecognised one raises rather than defaulting. The plausible default is
+    `SUBMITTED`, and an order reported as working when the venue has killed it
+    is a position nobody is watching.
+  - **Money.** Every number crosses the wire as a string in both directions.
+    Responses parse with `parse_float=Decimal`, and requests stringify, because
+    `json.dumps` cannot serialise a `Decimal` and both fallbacks lose exactness
+    on exactly the fields where it matters (rule §1.1).
+  - **A submit that dies in transport.** The adapter does *not* resubmit. It
+    looks the `client_order_id` up, and adopts the order if the venue has it —
+    the case rule §1.4 exists for, and the difference between a network blip
+    and a duplicate position.
+
+  One gap is stated rather than left to be discovered: REST reports
+  `filled_qty` and `filled_avg_price` as running totals, so a fill read this
+  way is **one** synthetic `Fill` for the whole quantity. That is right for
+  P&L and wrong for anything inspecting the sequence, and it is the reason the
+  trade-updates item below exists.
+
+  Unticked. Every test is against recorded responses through `respx`; nothing
+  in this item has yet been pointed at Alpaca's paper endpoint, and the phase's
+  *Verifiable:* line is a week of paper trading.
 - [ ] `OrderRouter`, order state machine — @claude (wip #33).
   Both halves are implemented, and Phase 3's standing caveat — "nothing routes
   live orders through this chain" — is closed at the router: `RiskEngine
@@ -513,18 +543,60 @@ above.
   refused exactly as the backtest engine refuses them.
 
   **Unticked, and not close.** Phase 4's *Verifiable:* line is a week of paper
-  trading reconciling clean; four of the six items are unstarted and nothing
-  calls this router in production yet. One dependency is worth naming now
+  trading reconciling clean; two of the six items are unstarted — that was four
+  until #36 implemented both brokers — and nothing calls this router in
+  production yet. One dependency is worth naming now
   because it blocks that line: `risk_pct` sizing with an ATR stop is the
   documented default pair, and no `Signal` carries an ATR-derived level, so
   every entry from a default-configured strategy is refused at sizing.
   `StrategyRunner` holds the `BarRepository` and owns closing that.
-- [ ] `SimulatedBroker`
+- [ ] `SimulatedBroker` — @claude (wip #36).
+  Implemented, both halves: `on_bar` for bar-driven fills and `on_quote` for
+  tick-level ones, plus the whole `BrokerPort` surface over a local book.
+
+  The decision worth reviewing is ADR 0006. The touch rule — when a resting
+  order fills and at what price — was a private method on `BacktestEngine`,
+  and is now `execution.matching.intended_price`, called by both. Two copies
+  would not have diverged loudly: they would have diverged by a `<` becoming a
+  `<=` on a limit touched exactly at a bar's low, and the symptom would be a
+  paper run whose fills quietly disagree with the backtest that approved the
+  strategy. `TestAgreementWithTheBacktestEngine` drives a real engine run and
+  the broker over the same bars and compares the fills that come out, so the
+  agreement is pinned by behaviour rather than by an import — verified by
+  making the simulator fill at the close instead, which fails it.
+
+  The extraction is behaviour-preserving: the engine's hand-computed 20-bar
+  fixture, written precisely to catch a fill-timing change, passes unchanged.
+
+  Three things it refuses to pretend about, recorded because the tempting
+  version is the flattering one:
+
+  - **Latency is not modelled at bar granularity.** 50ms against a 60,000ms
+    bar is below the resolution of the data, and faking it there moves fills
+    by a whole bar. It applies in `on_quote`, where it stops a strategy
+    trading on the very quote it reacted to.
+  - **Buying power is not re-checked.** `BuyingPowerRule` already ran — every
+    order reaching a broker has passed the chain (rule §1.5). A second opinion
+    here would refuse in paper what the platform approves in live, which is
+    the one disagreement that makes paper trading actively misleading.
+  - **A close is an order.** `close_position` rests and fills on the next bar
+    like anything else, rather than flattening instantly at a price of its own
+    choosing.
+
+  Unticked, and the reason is the same as the item above: the phase's
+  *Verifiable:* line is a paper week, and this has only ever met synthetic
+  bars.
 - [ ] Reconciliation
 - [ ] `StrategyRunner` live loop — @claude (wip).
   Untouched: `warmup`, `run`, `evaluate`, `on_fill_event` and `shutdown` all
-  still raise. It needs a `BrokerPort` adapter and reconciliation, neither
-  started, so there is nothing to run a loop against yet.
+  still raise.
+
+  It needed a `BrokerPort` adapter and reconciliation, and as of #36 the first
+  of those exists — `SimulatedBroker` and `AlpacaBroker` are both implemented
+  and `deps.get_broker` binds one per run mode. Reconciliation is still a stub,
+  so there is still nothing to start a loop safely against: a runner that comes
+  up without reconciling is a runner sizing orders against a book it has not
+  checked.
 
   The second half of this item — drop the `worker` compose profile so the worker
   rejoins the default stack "once it can actually start" — **is done** (#35), and
@@ -539,9 +611,35 @@ above.
   and the startup log says so on every boot rather than leaving "the worker is
   up" and "the worker is trading" as the same observation. Unticked on that
   basis: this item is the live loop, and the live loop does not exist.
-- [ ] Trade-updates WS with reconnect
+- [ ] Trade-updates WS with reconnect.
+  `AlpacaBroker.stream_trade_updates` is deliberately still a stub after #36,
+  which implemented every REST method around it. It is left for this item
+  rather than folded into the adapter because it is where two known gaps close,
+  and both need the stream rather than the socket:
+
+  - REST reports fills as running totals, so `_from_alpaca_order` synthesises
+    one `Fill` for the whole filled quantity. The individual prints — the fill
+    *sequence* CLAUDE.md §5 is about — exist only on this stream.
+  - `execution/state.py` names the one hole in the order state machine: a fill
+    applied to an order in a status the table would not have allowed to fill.
+    It says the guard belongs "with whatever consumes the trade-updates
+    stream", which is this item.
 
 *Verifiable:* a strategy trades the paper account for a week and reconciles clean.
+
+*Verifiable (broker layer, proposed):* the same strategy over the same bars
+produces identical fills through `BacktestEngine` and through `SimulatedBroker`,
+and `AlpacaBroker` round-trips one order against the **paper** endpoint —
+submitted, read back by `client_order_id`, cancelled — with every price and
+quantity a `Decimal`.
+**Partly shown** — @claude (#36). Proposed because the two broker items above
+have no line they can be ticked against short of a full paper week, which is
+the same trap three Phase 2 items fell into. The first clause is shown, by
+`TestAgreementWithTheBacktestEngine`. The second is not: nothing in #36 has
+been pointed at a real endpoint, and until it has, "the adapter works" rests
+entirely on fixtures written from Alpaca's documentation — which #34 already
+demonstrated can disagree with the wire in three ways at once. Adjust the
+wording if it is not the demonstration you want.
 
 ## Phase 5 — Dashboard & analytics (requirements #6, #7)
 - [ ] `/dashboard/live` aggregate endpoint
