@@ -138,13 +138,43 @@ demonstration you want.
   disagree on — SMA-seeded EMA, Wilder's alpha for RSI and ATR, population
   `stddev` for Bollinger — are stated at the top of `ta.py`, and each is
   cross-checked to 1e-9 against pandas' independent `ewm`/`rolling`.
-  Unticked: Phase 2 ticks against an engine that does not exist yet.
-- [ ] Backtest engine event loop, next-bar fills
+  Still unticked, for a narrower reason than before: the engine now exists and
+  the *Verifiable:* line below has been shown, but that fixture is driven by a
+  scripted strategy that computes nothing from prices — deliberately, so that
+  fill timing is the only variable in it — so it cannot demonstrate an
+  indicator. `SmaCrossover runs end to end` is the item that will.
+- [x] Backtest engine event loop, next-bar fills — @claude (#25).
+  `BacktestEngine.run` walks a merged timeline over all symbols in the
+  documented order (mark → stops → fills → decide → size → risk → queue for the
+  next bar), and `BacktestContext` is the lookahead guarantee: a per-symbol
+  cursor that every accessor slices behind, monotonic, so there is no code path
+  that returns a later bar. Orders rest for one bar and fill against the next —
+  market at its open, limit only if the range reached the price, stop at the
+  open when the bar gapped through the trigger. Fills are capped at
+  `max_volume_participation` of the bar's volume, and a DAY order that cannot
+  fill expires rather than resting into an unrelated later bar. When a bar's
+  range spans both stop and target the stop is taken, since the bar cannot say
+  which came first.
 - [ ] Cost and slippage models
 - [ ] Metrics
 - [ ] `SmaCrossover` runs end to end
 
 *Verifiable:* a hand-computed 20-bar fixture matches the engine exactly.
+**Shown** — @claude (#25). `TestAgainstKnownFixture` in
+`tests/unit/test_backtest_engine.py`: 20 bars, entry signalled on bar 5 and
+filled at bar 6's open (110), exit signalled on bar 12 and filled at bar 13's
+open (130), for a realised 2,000 on 100 shares and a total return of 0.02 —
+every number worked out by hand in the docstring. The path is deliberately not
+a straight ramp: on a linear one, filling at the signal bar's close gives the
+same P&L as filling at the next open, so the headline number would pass under
+exactly the bug the fixture exists to catch. Here the wrong reading returns
+5,000 instead of 2,000.
+
+Separately smoke-tested over the 1,254 real SPY dailies in the hypertable with
+`SmaCrossover`: 23 signals, 23 fills, every fill price equal to the next bar's
+open and inside that bar's range, one equity point per bar. That is engine
+mechanics only — it ran on `ZeroCostModel` and a fixed share count, so its
+return is not a strategy result and must not be read as one.
 
 ## Phase 3 — Risk (requirement #3)
 - [ ] `RiskEngine` + full rule chain

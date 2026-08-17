@@ -18,16 +18,65 @@ backtested strategy be trusted in paper and live.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
+
+import numpy as np
+
+from atp_core.clock import SimulatedClock
+from atp_core.domain import (
+    Fill,
+    Order,
+    OrderStatus,
+    OrderType,
+    Portfolio,
+    Position,
+    Side,
+    SignalAction,
+    TimeInForce,
+)
+from atp_core.errors import BacktestError, DataGapError, LookaheadError
+from atp_core.indicators import ta
+from atp_core.logging import get_logger
 
 if TYPE_CHECKING:
     from datetime import datetime
 
     from atp_core.backtest.costs import CostModel
-    from atp_core.domain import Bar, Order, Portfolio, Signal, Timeframe
+    from atp_core.domain import Bar, Signal, Timeframe
     from atp_core.risk.engine import RiskEngine
     from atp_core.strategy.base import Strategy
+
+log = get_logger(__name__)
+
+
+class PositionSizer(Protocol):
+    """Turns intent into a quantity.
+
+    A seam, not a home: real sizing is risk-based and lands with the risk engine
+    (docs/RISK.md 'Position sizing', roadmap Phase 3). The engine takes one
+    rather than computing a quantity itself, so that when `risk.rules
+    .position_size` exists there is nothing here to delete.
+    """
+
+    def __call__(self, signal: Signal, portfolio: Portfolio, price: Decimal) -> Decimal: ...
+
+
+@dataclass(frozen=True, slots=True)
+class FixedQtySizer:
+    """A constant share count.
+
+    For exercising engine mechanics only — never for evaluating a strategy, for
+    the same reason `ZeroCostModel` is not an execution model. Sizing every
+    trade identically ignores volatility, which is precisely the mistake
+    docs/RISK.md exists to prevent.
+    """
+
+    qty: Decimal
+
+    def __call__(self, signal: Signal, portfolio: Portfolio, price: Decimal) -> Decimal:
+        return self.qty
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,11 +111,173 @@ class BacktestResult:
 
     @property
     def total_return(self) -> Decimal:
-        raise NotImplementedError
+        """Fractional return on starting equity. 0.25 is +25%."""
+        start = self.portfolio.starting_equity
+        if start == 0:
+            return Decimal(0)
+        return (self.portfolio.equity - start) / start
 
     def to_report(self) -> dict[str, object]:
         """Serialisable summary for the API and the dashboard."""
-        raise NotImplementedError
+        filled = [o for o in self.orders if o.filled_qty > 0]
+        return {
+            "strategy": self.strategy_name,
+            "symbols": list(self.config.symbols),
+            "timeframe": self.config.timeframe.value,
+            "start": self.config.start.isoformat(),
+            "end": self.config.end.isoformat(),
+            "starting_equity": str(self.portfolio.starting_equity),
+            "ending_equity": str(self.portfolio.equity),
+            "total_return": str(self.total_return),
+            "orders": len(self.orders),
+            "filled_orders": len(filled),
+            "signals": len(self.signals),
+            "fees": str(sum((o.total_fees for o in self.orders), Decimal(0))),
+            # Empty until `backtest.metrics` is implemented (roadmap Phase 2).
+            # Present rather than omitted so a consumer's shape does not change
+            # when it fills in.
+            "metrics": dict(self.metrics),
+            "warnings": list(self.warnings),
+        }
+
+
+class BacktestContext:
+    """The strategy's window onto the world, bounded by a cursor.
+
+    The lookahead guarantee is this class, not a convention: `_cursor` holds the
+    index of the bar currently being decided on, and every accessor slices at
+    `cursor + 1`. There is no code path that returns a later bar, so a strategy
+    cannot read one by mistake — which is the only kind of lookahead that
+    actually happens.
+    """
+
+    def __init__(
+        self,
+        bars: dict[str, list[Bar]],
+        portfolio: Portfolio,
+        clock: SimulatedClock,
+        symbols: tuple[str, ...],
+    ) -> None:
+        self._bars = bars
+        self._portfolio = portfolio
+        self._clock = clock
+        self._symbols = symbols
+        #: symbol → index of the latest bar this strategy may see. -1 means the
+        #: symbol has not printed yet in this run.
+        self._cursor: dict[str, int] = dict.fromkeys(bars, -1)
+        self._indicator_cache: dict[
+            tuple[str, str, int, tuple[tuple[str, object], ...]], float
+        ] = {}
+
+    # ── engine-facing ───────────────────────────────────────────────────────
+
+    def advance(self, symbol: str, index: int) -> None:
+        """Move one symbol's cursor. Engine-only — a strategy never sees this."""
+        if index < self._cursor[symbol]:
+            raise LookaheadError(f"cursor for {symbol} cannot go backwards")
+        self._cursor[symbol] = index
+        self._indicator_cache.clear()
+
+    def _visible(self, symbol: str) -> list[Bar]:
+        index = self._cursor.get(symbol, -1)
+        if index < 0:
+            return []
+        return self._bars[symbol][: index + 1]
+
+    # ── StrategyContext ─────────────────────────────────────────────────────
+
+    @property
+    def now(self) -> datetime:
+        return self._clock.now()
+
+    @property
+    def symbols(self) -> tuple[str, ...]:
+        return self._symbols
+
+    def history(self, symbol: str, timeframe: Timeframe, lookback: int) -> list[Bar]:
+        """The last `lookback` completed bars, oldest first.
+
+        Raises rather than returning a short series: a 20-period SMA over 6 bars
+        is not a 20-period SMA, and a strategy that silently got one would trade
+        on a number that does not mean what its name says.
+        """
+        visible = self._visible(symbol)
+        if len(visible) < lookback:
+            raise DataGapError(
+                f"{symbol} has {len(visible)} bars at {self.now.isoformat()}, needs {lookback}"
+            )
+        return visible[-lookback:]
+
+    def closes(self, symbol: str, timeframe: Timeframe, lookback: int) -> np.ndarray:
+        """Closing prices as a float array, for indicator maths.
+
+        Unlike `history`, this returns what exists rather than raising — the
+        reference strategies check the length themselves so that they can sit
+        quietly through warmup instead of erroring on every early bar.
+        """
+        visible = self._visible(symbol)[-lookback:] if lookback > 0 else []
+        return np.array([float(b.close) for b in visible], dtype=float)
+
+    def last_price(self, symbol: str) -> Decimal | None:
+        visible = self._visible(symbol)
+        return visible[-1].close if visible else None
+
+    def position(self, symbol: str) -> Position:
+        return self._portfolio.position(symbol)
+
+    @property
+    def equity(self) -> Decimal:
+        return self._portfolio.equity
+
+    def indicator(self, name: str, symbol: str, **kwargs: object) -> float | None:
+        """Cached indicator value, or None when there is not enough history.
+
+        Cached per cursor position and shared across strategies in a run —
+        computing SMA(50) on one symbol once per bar rather than once per
+        strategy per bar is what keeps a few-hundred-symbol universe tractable.
+        """
+        raw_period = kwargs.get("period", 14)
+        if not isinstance(raw_period, int):
+            # Rejected rather than coerced: a rule spec carrying `period: "20"`
+            # is a malformed spec, and quietly accepting it here would hide it
+            # until someone wondered why two strategies disagreed.
+            raise BacktestError(f"indicator {name!r} needs an integer period, got {raw_period!r}")
+        period = raw_period
+        key = (name, symbol, self._cursor.get(symbol, -1), tuple(sorted(kwargs.items())))
+        if key in self._indicator_cache:
+            return self._indicator_cache[key]
+
+        visible = self._visible(symbol)
+        value = _compute_indicator(name, visible, period)
+        if value is not None:
+            self._indicator_cache[key] = value
+        return value
+
+
+def _compute_indicator(name: str, bars: list[Bar], period: int) -> float | None:
+    """Dispatch a name from a rule spec onto `indicators.ta`.
+
+    Returns None when the series is too short, which is the ordinary state
+    during warmup — the alternative is every rule raising for the first fifty
+    bars of every run.
+    """
+    closes = np.array([float(b.close) for b in bars], dtype=float)
+    try:
+        if name == "sma":
+            return ta.sma(closes, period)
+        if name == "ema":
+            return ta.ema(closes, period)
+        if name == "rsi":
+            return ta.rsi(closes, period)
+        if name == "stddev":
+            return ta.stddev(closes, period)
+        if name == "atr":
+            highs = np.array([float(b.high) for b in bars], dtype=float)
+            lows = np.array([float(b.low) for b in bars], dtype=float)
+            return ta.atr(highs, lows, closes, period)
+    except ValueError:
+        return None  # not enough history yet
+    raise BacktestError(f"unknown indicator {name!r}")
 
 
 class BacktestEngine:
@@ -85,6 +296,11 @@ class BacktestEngine:
     Stops (3) resolve before new signals (5) because in reality a stop can fire
     before the strategy would have acted; running them the other way lets a
     strategy exit at a price it could not have got.
+
+    Stops also resolve before fills (4), which has a consequence worth stating:
+    a position opened by this bar's fill cannot be stopped out on the same bar.
+    That follows the documented order rather than reinterpreting it, and at bar
+    resolution there is no evidence about which came first anyway.
     """
 
     def __init__(
@@ -93,11 +309,21 @@ class BacktestEngine:
         config: BacktestConfig,
         cost_model: CostModel,
         risk_engine: RiskEngine,
+        position_sizer: PositionSizer | None = None,
     ) -> None:
         self.strategy = strategy
         self.config = config
         self.cost_model = cost_model
         self.risk_engine = risk_engine
+        self.position_sizer = position_sizer
+
+        self._portfolio = Portfolio(cash=config.starting_cash, starting_equity=config.starting_cash)
+        self._pending: list[Order] = []
+        self._result: BacktestResult | None = None
+        #: order id → (stop, target), armed onto the position once it fills.
+        self._protection: dict[str, tuple[Decimal | None, Decimal | None]] = {}
+
+    # ── public ──────────────────────────────────────────────────────────────
 
     def run(self, bars: dict[str, list[Bar]]) -> BacktestResult:
         """Execute the backtest.
@@ -106,7 +332,172 @@ class BacktestEngine:
         gaps, duplicate timestamps and unsorted input each produce plausible but
         wrong results, so fail loudly (`DataGapError`) rather than proceeding.
         """
-        raise NotImplementedError("see docs/BACKTESTING.md")
+        self._validate(bars)
+
+        warmup = (
+            self.config.warmup_bars
+            if self.config.warmup_bars is not None
+            else self.strategy.warmup_bars
+        )
+        symbols = tuple(self.config.symbols)
+        step = timedelta(seconds=self.config.timeframe.seconds)
+
+        first_ts = min(series[0].ts for series in bars.values() if series)
+        clock = SimulatedClock(first_ts)
+        context = BacktestContext(bars, self._portfolio, clock, symbols)
+
+        result = BacktestResult(
+            config=self.config, strategy_name=self.strategy.name, portfolio=self._portfolio
+        )
+        self._result = result
+        self._pending = []
+        self._protection = {}
+
+        self.strategy.on_start()
+
+        # One merged timeline. Symbols do not have to share a bar grid — a
+        # halted name simply has no bar at some timestamps — so the loop walks
+        # timestamps and asks which symbols printed, rather than assuming every
+        # series is the same length.
+        index_of: dict[str, dict[datetime, int]] = {
+            symbol: {bar.ts: i for i, bar in enumerate(series)} for symbol, series in bars.items()
+        }
+        timeline = sorted({bar.ts for series in bars.values() for bar in series})
+
+        seen: dict[str, int] = dict.fromkeys(bars, 0)
+
+        for ts in timeline:
+            # 1. The clock stands at the bar's CLOSE: `Bar.ts` is its open, and
+            #    a decision taken on a completed bar is taken once it has ended.
+            clock.set(ts + step)
+
+            printed = [s for s in symbols if ts in index_of.get(s, {})]
+            for symbol in printed:
+                bar = bars[symbol][index_of[symbol][ts]]
+                context.advance(symbol, index_of[symbol][ts])
+                seen[symbol] += 1
+
+                # 2. Mark. `Portfolio.mark` appends an equity point per call,
+                #    which would emit one per symbol per timestamp; the curve is
+                #    appended once below instead, after every symbol is marked.
+                self._portfolio.position(symbol).last_price = bar.close
+
+                self._check_stops(bar, result)  # 3
+                self._fill_pending_for(bar, result)  # 4
+
+            # Re-mark to the close before snapshotting equity. Step 2 marks so
+            # that stops and fills see a valued book, but a position opened by
+            # step 4 is left marked at its fill price by `Position.apply_fill`,
+            # and an end-of-bar equity point carrying the fill price instead of
+            # the close is wrong on every bar that traded.
+            for symbol in printed:
+                self._portfolio.position(symbol).last_price = bars[symbol][
+                    index_of[symbol][ts]
+                ].close
+
+            equity = self._portfolio.equity
+            self._portfolio.equity_curve.append((clock.now(), equity))
+            result.equity_curve.append((clock.now(), equity))
+
+            for symbol in printed:
+                bar = bars[symbol][index_of[symbol][ts]]
+                signals = self.strategy.on_bar(context, bar) or []  # 5
+                if seen[symbol] <= warmup:
+                    # Discarded, not suppressed upstream: the strategy still
+                    # sees the bars so its indicators warm up, but nothing it
+                    # says during warmup is allowed to trade.
+                    continue
+                result.signals.extend(signals)
+                for signal in signals:
+                    self._handle_signal(signal, bar, result)  # 6, 7
+
+        self.strategy.on_stop()
+
+        log.info(
+            "backtest.done",
+            strategy=self.strategy.name,
+            bars=len(timeline),
+            orders=len(result.orders),
+            signals=len(result.signals),
+            total_return=str(result.total_return),
+        )
+        return result
+
+    # ── validation ──────────────────────────────────────────────────────────
+
+    def _validate(self, bars: dict[str, list[Bar]]) -> None:
+        missing = [s for s in self.config.symbols if s not in bars or not bars[s]]
+        if missing:
+            raise DataGapError(f"no bars supplied for {', '.join(missing)}")
+
+        for symbol, series in bars.items():
+            timestamps = [b.ts for b in series]
+            if timestamps != sorted(timestamps):
+                raise DataGapError(f"{symbol} bars are not in chronological order")
+            if len(set(timestamps)) != len(timestamps):
+                raise DataGapError(f"{symbol} has duplicate bar timestamps")
+            wrong = [b for b in series if b.timeframe is not self.config.timeframe]
+            if wrong:
+                raise DataGapError(
+                    f"{symbol} has {len(wrong)} bar(s) that are not {self.config.timeframe.value}"
+                )
+
+    # ── 3. stops ────────────────────────────────────────────────────────────
+
+    def _check_stops(self, bar: Bar, result: BacktestResult) -> None:
+        """Resolve protective levels against this bar's high and low.
+
+        When the bar's range spans both the stop and the target, the stop is
+        assumed to have filled first. The bar cannot say which came first, and
+        the pessimistic reading is the only honest one at this resolution
+        (docs/BACKTESTING.md).
+        """
+        position = self._portfolio.position(bar.symbol)
+        if position.is_flat:
+            return
+
+        stop, target = position.stop_loss_price, position.take_profit_price
+        long = position.is_long
+        hit_stop = stop is not None and (bar.low <= stop if long else bar.high >= stop)
+        hit_target = target is not None and (bar.high >= target if long else bar.low <= target)
+
+        if not hit_stop and not hit_target:
+            return
+
+        if hit_stop:
+            # A stop becomes a market order once triggered, so the fill is
+            # routinely worse than the trigger — especially on the gaps where
+            # stops matter most.
+            intended = stop
+            reason = "stop_loss"
+        else:
+            intended = target
+            reason = "take_profit"
+        assert intended is not None
+
+        side = Side.SELL if long else Side.BUY
+        order = Order(
+            symbol=bar.symbol,
+            side=side,
+            qty=abs(position.qty),
+            order_type=OrderType.STOP if hit_stop else OrderType.LIMIT,
+            stop_price=stop if hit_stop else None,
+            limit_price=None if hit_stop else target,
+            strategy_id=self.strategy.name,
+            created_at=bar.ts,
+            status=OrderStatus.SUBMITTED,
+        )
+        # A gap through the level fills at the open, not at the level: the
+        # market never traded at the stop price on this bar.
+        if hit_stop:
+            price = min(bar.open, intended) if long else max(bar.open, intended)
+        else:
+            price = max(bar.open, intended) if long else min(bar.open, intended)
+
+        self._execute(order, bar, price, result, note=reason)
+        result.orders.append(order)
+
+    # ── 4. fills ────────────────────────────────────────────────────────────
 
     def _fill_pending(self, bar: Bar) -> list[Order]:
         """Fill resting orders against this bar.
@@ -116,4 +507,181 @@ class BacktestEngine:
         slippage past it, because a stop becomes a market order in a moving
         market and the fill is routinely worse than the trigger.
         """
-        raise NotImplementedError
+        result = self._result
+        if result is None:  # pragma: no cover - run() always sets it
+            raise BacktestError("_fill_pending called outside run()")
+        return self._fill_pending_for(bar, result)
+
+    def _fill_pending_for(self, bar: Bar, result: BacktestResult) -> list[Order]:
+        filled: list[Order] = []
+        still_resting: list[Order] = []
+
+        for order in self._pending:
+            if order.symbol != bar.symbol:
+                still_resting.append(order)
+                continue
+
+            price = self._intended_price(order, bar)
+            if price is None:
+                # Never touched. A DAY order dies at the session's end rather
+                # than resting forever and filling on some unrelated later bar.
+                if order.time_in_force is TimeInForce.DAY:
+                    order.status = OrderStatus.EXPIRED
+                else:
+                    still_resting.append(order)
+                continue
+
+            self._execute(order, bar, price, result)
+            if order.remaining_qty > 0:
+                if order.time_in_force is TimeInForce.DAY:
+                    order.status = OrderStatus.EXPIRED
+                else:
+                    still_resting.append(order)
+            filled.append(order)
+
+        self._pending = still_resting
+        return filled
+
+    def _intended_price(self, order: Order, bar: Bar) -> Decimal | None:
+        """The price this order would touch on this bar, or None if it would not."""
+        if order.order_type is OrderType.MARKET:
+            return bar.open
+
+        if order.order_type is OrderType.LIMIT:
+            limit = order.limit_price
+            assert limit is not None
+            if order.side is Side.BUY:
+                # A bar that opens below our limit fills at the better open —
+                # we would not pay the limit for something offered cheaper.
+                return min(bar.open, limit) if bar.low <= limit else None
+            return max(bar.open, limit) if bar.high >= limit else None
+
+        if order.order_type is OrderType.STOP:
+            stop = order.stop_price
+            assert stop is not None
+            if order.side is Side.BUY:
+                return max(bar.open, stop) if bar.high >= stop else None
+            return min(bar.open, stop) if bar.low <= stop else None
+
+        raise BacktestError(f"{order.order_type} is not modelled by the backtest engine")
+
+    def _execute(
+        self,
+        order: Order,
+        bar: Bar,
+        intended_price: Decimal,
+        result: BacktestResult,
+        note: str = "",
+    ) -> None:
+        """Apply slippage and the volume cap, then book the fill."""
+        slippage = self.cost_model.slippage(order, bar, intended_price)
+        price = intended_price + slippage
+        if price <= 0:
+            raise BacktestError(f"slippage produced a non-positive fill price {price}")
+
+        qty = order.remaining_qty
+        cap = self.config.max_volume_participation * bar.volume
+        if qty > cap:
+            # The excess is refused rather than pretended: a backtest that buys
+            # ten times a bar's turnover is describing a market that was not
+            # there. What fits, fills; the rest is left to the next bar.
+            result.warnings.append(
+                f"{bar.ts.isoformat()} {order.symbol}: wanted {qty}, volume cap allowed {cap}"
+            )
+            qty = cap
+        if qty <= 0:
+            return
+
+        fee = self.cost_model.commission(order, price, qty)
+        fill = Fill(order_id=order.id, ts=bar.ts, qty=qty, price=price, fee=fee)
+        order.apply_fill(fill)
+
+        position = self._portfolio.position(order.symbol)
+        position.apply_fill(fill, qty * order.side.sign)
+        self._portfolio.cash -= qty * price * order.side.sign + fee
+
+        # Arm the protective levels now, not when the order was queued: a stop
+        # sitting on a flat position would be measured against the next bar's
+        # range with nothing to protect, and `Position.apply_fill` clears them
+        # again the moment the position goes flat.
+        levels = self._protection.pop(order.id, None)
+        if levels is not None and not position.is_flat:
+            position.stop_loss_price, position.take_profit_price = levels
+
+        log.debug(
+            "backtest.fill",
+            symbol=order.symbol,
+            side=order.side.value,
+            qty=str(qty),
+            price=str(price),
+            note=note,
+        )
+
+    # ── 5-7. signals ────────────────────────────────────────────────────────
+
+    def _handle_signal(self, signal: Signal, bar: Bar, result: BacktestResult) -> None:
+        """Size, risk-check, and queue for the next bar."""
+        if signal.action is SignalAction.HOLD:
+            return
+
+        position = self._portfolio.position(signal.symbol)
+
+        if signal.action in (SignalAction.EXIT, SignalAction.SCALE_OUT):
+            if position.is_flat:
+                return
+            if signal.action is SignalAction.SCALE_OUT:
+                raise BacktestError(
+                    "SCALE_OUT is not modelled yet — the fraction to close is "
+                    "undefined, and guessing it would silently change results"
+                )
+            side = Side.SELL if position.is_long else Side.BUY
+            qty = abs(position.qty)
+        elif signal.action in (SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT):
+            if self.position_sizer is None:
+                raise BacktestError(
+                    "an entry signal needs a position_sizer; real sizing is "
+                    "risk-based and lands with the risk engine (docs/RISK.md)"
+                )
+            side = Side.BUY if signal.action is SignalAction.ENTER_LONG else Side.SELL
+            qty = self.position_sizer(signal, self._portfolio, bar.close)
+        else:
+            raise BacktestError(f"{signal.action} is not modelled by the backtest engine")
+
+        if qty <= 0:
+            return
+
+        order = Order(
+            symbol=signal.symbol,
+            side=side,
+            qty=qty,
+            order_type=OrderType.LIMIT if signal.limit_price else OrderType.MARKET,
+            limit_price=signal.limit_price,
+            strategy_id=signal.strategy_id,
+            signal_id=signal.id,
+            created_at=bar.ts,
+        )
+
+        decision = self.risk_engine.validate(order, self._portfolio)
+        if not decision.approved:
+            order.status = OrderStatus.REJECTED_RISK
+            order.reject_reason = decision.reason
+            result.warnings.append(
+                f"{bar.ts.isoformat()} {order.symbol}: risk denied "
+                f"({decision.rule}) {decision.reason}"
+            )
+            result.orders.append(order)
+            return
+
+        if decision.adjusted_qty is not None:
+            if decision.adjusted_qty <= 0:
+                return
+            order.qty = decision.adjusted_qty
+
+        order.status = OrderStatus.SUBMITTED
+        order.submitted_at = bar.ts
+        self._pending.append(order)
+        result.orders.append(order)
+
+        # The protective levels ride with the order and arm once it fills.
+        if signal.stop_loss_price is not None or signal.take_profit_price is not None:
+            self._protection[order.id] = (signal.stop_loss_price, signal.take_profit_price)
