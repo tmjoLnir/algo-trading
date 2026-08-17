@@ -8,14 +8,70 @@ its rejections.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
+from atp_core.domain import Side
+from atp_core.risk.engine import RiskDecision
+
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from datetime import datetime
+
+    from atp_core.clock import Clock, TradingCalendar
     from atp_core.config import RiskLimits
     from atp_core.domain import Order, Portfolio
-    from atp_core.risk.engine import RiskDecision
+    from atp_core.risk.killswitch import KillSwitch
+
+
+def reduces_position(order: Order, portfolio: Portfolio) -> bool:
+    """Whether this order shrinks the holding it touches.
+
+    Not a property of the order: a sell is an exit when you are long and an
+    entry when you are flat or short. `DailyLossLimitRule` turns on this
+    distinction — it must block entries and never exits — so it is written once
+    here rather than re-derived, subtly differently, in each rule that needs it.
+
+    An order larger than the position it opposes still counts as reducing. It
+    closes the position on its way through zero, and refusing it would trap the
+    very position the limit is trying to let go of.
+    """
+    position = portfolio.positions.get(order.symbol)
+    if position is None or position.is_flat:
+        return False
+    return position.is_long if order.side is Side.SELL else position.is_short
+
+
+def _price_for(order: Order, portfolio: Portfolio) -> Decimal | None:
+    """The best estimate of what this order will transact at, or None.
+
+    A limit price is what we would pay at worst; otherwise the last mark is the
+    only number available. None means the rules that need a price cannot
+    evaluate, and default-closed means they refuse.
+    """
+    if order.limit_price is not None:
+        return order.limit_price
+    position = portfolio.positions.get(order.symbol)
+    if position is not None and position.last_price is not None:
+        return position.last_price
+    return None
+
+
+def _unpriced_book(rule: str, portfolio: Portfolio) -> RiskDecision | None:
+    """Refuse while any open position lacks a mark.
+
+    `Portfolio.equity` and `gross_exposure` both treat an unmarked position as
+    worth zero, so every percentage limit computed from them comes out too
+    small and approves what it should refuse. An unpriced book is exactly when
+    you least want to be trading.
+    """
+    unmarked = portfolio.unmarked_symbols
+    if unmarked:
+        return RiskDecision.deny(rule, f"cannot value the book: no mark for {', '.join(unmarked)}")
+    return None
 
 
 @dataclass(slots=True)
@@ -25,10 +81,13 @@ class KillSwitchRule:
     First in the chain: when a human hits stop, nothing else should get a vote.
     """
 
+    switch: KillSwitch
     name: str = "kill_switch"
 
     def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
-        raise NotImplementedError
+        if self.switch.is_engaged(order.strategy_id, order.symbol):
+            return RiskDecision.deny(self.name, "trading is halted")
+        return RiskDecision.allow()
 
 
 @dataclass(slots=True)
@@ -43,7 +102,29 @@ class MaxPositionSizeRule:
     name: str = "max_position_size"
 
     def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
-        raise NotImplementedError
+        if (denial := _unpriced_book(self.name, portfolio)) is not None:
+            return denial
+        price = _price_for(order, portfolio)
+        if price is None:
+            return RiskDecision.deny(self.name, f"no price available for {order.symbol}")
+
+        equity = portfolio.equity
+        if equity <= 0:
+            return RiskDecision.deny(self.name, f"equity is {equity}")
+
+        held = portfolio.position(order.symbol).qty
+        # The position this order *leaves behind*, not the order on its own —
+        # three orders of 4% each are a 12% position.
+        resulting = abs(held + order.qty * order.side.sign) * price
+        ceiling = limits.max_position_pct * equity
+        if resulting > ceiling:
+            return RiskDecision.deny(
+                self.name,
+                f"{order.symbol} would be {resulting:.2f} "
+                f"({resulting / equity:.1%} of equity), over the "
+                f"{limits.max_position_pct:.0%} cap of {ceiling:.2f}",
+            )
+        return RiskDecision.allow()
 
 
 @dataclass(slots=True)
@@ -57,7 +138,30 @@ class MaxExposureRule:
     name: str = "max_gross_exposure"
 
     def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
-        raise NotImplementedError
+        if (denial := _unpriced_book(self.name, portfolio)) is not None:
+            return denial
+        price = _price_for(order, portfolio)
+        if price is None:
+            return RiskDecision.deny(self.name, f"no price available for {order.symbol}")
+
+        equity = portfolio.equity
+        if equity <= 0:
+            return RiskDecision.deny(self.name, f"equity is {equity}")
+
+        held = portfolio.position(order.symbol).qty
+        # Gross: every leg adds, so a short growing more short consumes the
+        # ceiling exactly as a long growing more long does.
+        without = portfolio.gross_exposure - abs(held) * price
+        resulting = without + abs(held + order.qty * order.side.sign) * price
+        ceiling = limits.max_gross_exposure_pct * equity
+        if resulting > ceiling:
+            return RiskDecision.deny(
+                self.name,
+                f"gross exposure would be {resulting:.2f} "
+                f"({resulting / equity:.1%} of equity), over the "
+                f"{limits.max_gross_exposure_pct:.0%} cap of {ceiling:.2f}",
+            )
+        return RiskDecision.allow()
 
 
 @dataclass(slots=True)
@@ -65,14 +169,49 @@ class DailyLossLimitRule:
     """Halts new entries once the day's drawdown exceeds `max_daily_loss_pct`.
 
     Exits must still be permitted — refusing to let a losing position close
-    would turn a bad day into an unbounded one. Check `order.reduces_position`
-    before denying.
+    would turn a bad day into an unbounded one. Whether an order is an exit is
+    `reduces_position(order, portfolio)` in this module, not a property of the
+    order: a sell is an exit when you are long and an entry when you are flat.
     """
 
     name: str = "daily_loss_limit"
+    #: Equity at the session's open. Anchored by whoever owns the session
+    #: boundary, and persisted there so a mid-session restart does not re-anchor
+    #: to a drawn-down number and silently grant the day a second allowance.
+    day_start_equity: Decimal | None = None
+
+    def anchor(self, equity: Decimal) -> None:
+        """Set the day's starting point. Call once, at the session open."""
+        self.day_start_equity = equity
 
     def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
-        raise NotImplementedError
+        # First, and before any other consideration: an exit is always allowed.
+        # Refusing to let a losing position close turns a bad day into an
+        # unbounded one, so this outranks even the checks below that would
+        # otherwise refuse for want of information.
+        if reduces_position(order, portfolio):
+            return RiskDecision.allow()
+
+        if self.day_start_equity is None:
+            return RiskDecision.deny(
+                self.name,
+                "the day's starting equity has not been anchored, so the loss "
+                "limit cannot be evaluated",
+            )
+        if self.day_start_equity <= 0:
+            return RiskDecision.deny(self.name, f"day-start equity is {self.day_start_equity}")
+        if (denial := _unpriced_book(self.name, portfolio)) is not None:
+            return denial
+
+        change = (portfolio.equity - self.day_start_equity) / self.day_start_equity
+        if change <= -limits.max_daily_loss_pct:
+            return RiskDecision.deny(
+                self.name,
+                f"down {change:.2%} on the day, at or past the "
+                f"{limits.max_daily_loss_pct:.0%} limit — entries are blocked, "
+                f"exits are not",
+            )
+        return RiskDecision.allow()
 
 
 @dataclass(slots=True)
@@ -84,18 +223,57 @@ class RateLimitRule:
     account in fees alone — this has happened to real firms.
     """
 
+    clock: Clock
     name: str = "rate_limit"
+    #: Submission times inside the trailing minute, oldest first.
+    _recent: deque[datetime] = field(default_factory=deque, repr=False)
 
     def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
-        raise NotImplementedError
+        now = self.clock.now()
+        cutoff = now - timedelta(seconds=60)
+        while self._recent and self._recent[0] <= cutoff:
+            self._recent.popleft()
+
+        if len(self._recent) >= limits.max_orders_per_minute:
+            return RiskDecision.deny(
+                self.name,
+                f"{len(self._recent)} orders in the last minute, at the limit of "
+                f"{limits.max_orders_per_minute}",
+            )
+
+        # Counted on the attempt rather than on the eventual approval. A later
+        # rule may still refuse this order, and that refusal does not make the
+        # attempt free — a strategy looping on a rejection is the same runaway
+        # this rule exists to stop.
+        self._recent.append(now)
+        return RiskDecision.allow()
 
 
 @dataclass(slots=True)
 class MaxOpenPositionsRule:
+    """Caps how many symbols are held at once.
+
+    Not a loss limit — a sprawl limit. Twenty positions is roughly what one
+    person can actually watch; sixty is a book nobody is reading.
+    """
+
     name: str = "max_open_positions"
 
     def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
-        raise NotImplementedError
+        # Only an order that opens a symbol we do not already hold can add to
+        # the count. Adding to an existing position, or closing one, never can.
+        position = portfolio.positions.get(order.symbol)
+        if position is not None and not position.is_flat:
+            return RiskDecision.allow()
+
+        open_count = len(portfolio.open_positions)
+        if open_count >= limits.max_open_positions:
+            return RiskDecision.deny(
+                self.name,
+                f"already holding {open_count} positions, at the limit of "
+                f"{limits.max_open_positions}",
+            )
+        return RiskDecision.allow()
 
 
 @dataclass(slots=True)
@@ -109,7 +287,22 @@ class BuyingPowerRule:
     name: str = "buying_power"
 
     def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
-        raise NotImplementedError
+        # An order that reduces a holding returns cash rather than consuming it,
+        # and refusing one for want of buying power would be perverse.
+        if reduces_position(order, portfolio):
+            return RiskDecision.allow()
+
+        price = _price_for(order, portfolio)
+        if price is None:
+            return RiskDecision.deny(self.name, f"no price available for {order.symbol}")
+
+        cost = order.qty * price
+        if cost > portfolio.cash:
+            return RiskDecision.deny(
+                self.name,
+                f"{order.symbol} would cost {cost:.2f} against {portfolio.cash:.2f} cash",
+            )
+        return RiskDecision.allow()
 
 
 @dataclass(slots=True)
@@ -120,10 +313,23 @@ class TradingHoursRule:
     percentage points from where the strategy decided.
     """
 
+    calendar: TradingCalendar
+    clock: Clock
     name: str = "trading_hours"
+    #: Set only for a strategy that genuinely trades the pre- and post-market
+    #: and has priced the wider spreads there in.
+    allow_extended_hours: bool = False
 
     def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
-        raise NotImplementedError
+        if self.allow_extended_hours:
+            return RiskDecision.allow()
+        now = self.clock.now()
+        if not self.calendar.is_open(now):
+            return RiskDecision.deny(
+                self.name,
+                f"{self.calendar.exchange} is closed at {now.isoformat()}",
+            )
+        return RiskDecision.allow()
 
 
 @dataclass(slots=True)
@@ -134,11 +340,28 @@ class StaleDataRule:
     trading blind — this rule is why `StaleDataError` exists.
     """
 
+    clock: Clock
+    #: symbol → when data for it was last seen, or None if never.
+    last_tick_at: Callable[[str], datetime | None]
     name: str = "stale_data"
-    max_age_seconds: int = 30
 
     def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
-        raise NotImplementedError
+        seen = self.last_tick_at(order.symbol)
+        if seen is None:
+            # Never having seen a price is the most stale a feed can be, and it
+            # is the case a max-age comparison would silently skip.
+            return RiskDecision.deny(self.name, f"no market data has arrived for {order.symbol}")
+
+        age = (self.clock.now() - seen).total_seconds()
+        # The limit lives in RiskLimits rather than on this rule, so an operator
+        # can tune it without editing code.
+        if age > limits.max_quote_age_seconds:
+            return RiskDecision.deny(
+                self.name,
+                f"{order.symbol} data is {age:.0f}s old, over the "
+                f"{limits.max_quote_age_seconds}s limit",
+            )
+        return RiskDecision.allow()
 
 
 def position_size(

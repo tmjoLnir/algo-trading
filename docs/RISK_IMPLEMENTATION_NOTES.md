@@ -19,13 +19,19 @@ fixed or promoted into `RISK.md` proper.
 | `RISK.md` section | Enforcement |
 |---|---|
 | Position accounting | **Implemented and tested.** `domain/position.py:76`, 18 tests, no skips |
-| Position sizing | Stub — `risk/rules.py:165` |
+| Position sizing | Stub — `risk/rules.py:position_size` |
 | Stop losses | Stub — `risk/stops.py:52,63,78,83` |
-| Portfolio limits | Stub — all nine rules, `risk/rules.py:31-141` |
-| The kill switch | Stub — `risk/killswitch.py:85-101` |
+| Portfolio limits | **Implemented and tested.** All nine rules, `risk/rules.py`, 35 tests |
+| The kill switch | Protocol implemented against; `RedisKillSwitch` still a stub |
 
-`RiskEngine.validate` (`risk/engine.py:64`), `default_rules()` (`:76`) and every
-`OrderRouter` method (`execution/router.py:57-91`) also raise `NotImplementedError`.
+`RiskEngine.validate` and `validate_or_raise` landed in #28; `default_rules()` landed
+alongside the rules. Every `OrderRouter` method (`execution/router.py:57-91`) still raises
+`NotImplementedError`.
+
+**Resolved since this file was written:** items 1, 2, 3 and 7 below, plus the
+`StaleDataRule` and `RiskDecision.shrink` entries under *Smaller drift*. Each is annotated
+in place rather than deleted, so the reasoning survives. What remains open is items 4, 5, 6
+and 8, and most of *Smaller drift*.
 
 Two things worth separating out, because they are different problems:
 
@@ -81,6 +87,12 @@ unmarked position and make the rules treat that as a denial, or give `Portfolio`
 "are all positions marked?" check that the engine consults first. Do not leave a zero that
 reads as "no exposure".
 
+**RESOLVED** — the second option. `Portfolio.unmarked_symbols` lists open positions carrying
+no mark, and `MaxPositionSizeRule`, `MaxExposureRule` and `DailyLossLimitRule` deny while it
+is non-empty, naming the symbols in the reason. `market_value` is unchanged, so nothing that
+reads it had its semantics moved underneath it. `test_rule_that_cannot_evaluate_denies`
+asserts the inversion specifically: an unmarked holding must not buy an approval.
+
 ### 2. `Order.reduces_position` does not exist
 
 `DailyLossLimitRule` (`risk/rules.py:64-75`) tells its implementer:
@@ -98,6 +110,12 @@ flat or short. The signature needs the portfolio — e.g. a module-level
 `reduces_position(order, portfolio) -> bool`, or a `Portfolio` method. Decide this before
 writing the rule, or the rule will be written against an ambiguity.
 
+**RESOLVED** — module-level `reduces_position(order, portfolio)` in `risk/rules.py`, used by
+`DailyLossLimitRule` and `BuyingPowerRule`. An order that flips through zero counts as
+reducing: it closes the position on the way past, and refusing it would trap the very
+holding the limit is trying to release. The `Order` docstring reference has been corrected
+to point at the function.
+
 ### 3. The daily loss limit has nothing to measure against
 
 `Portfolio` (`position.py:152-198`) exposes `starting_equity` — account inception, not
@@ -109,6 +127,16 @@ Needs a deliberate answer to: what anchors "the day"? Equity at the first bar of
 persisted so it survives a worker restart mid-session (a restart that re-anchors to a
 mid-drawdown equity silently doubles the day's allowed loss). Related: `equity_curve` grows
 without bound in a long-running process.
+
+**PARTIALLY RESOLVED.** `DailyLossLimitRule.day_start_equity` holds the anchor and
+`.anchor(equity)` sets it; an unanchored rule *denies entries* rather than guessing, so the
+chain refuses to trade until someone has answered the question. **Who calls `anchor()`, and
+where the value is persisted across a restart, is still open** — it belongs with
+`StrategyRunner` in Phase 4, which is also what owns the session boundary. Note the
+consequence: assembling `default_rules()` and never anchoring gives a chain that blocks every
+entry and allows every exit. That is the safe failure, not a working configuration.
+
+`equity_curve` growing without bound is untouched and still open.
 
 ### 4. `client_order_id` is random, not deterministic
 
@@ -160,6 +188,10 @@ template sees no sprawl limit and cannot tune it without reading the source.
 `config.py` and `RISK.md` agree exactly on all five values otherwise (0.10 / 1.00 / 0.03 /
 30 / 20), which is the one place doc and code are already in sync. Keep it that way.
 
+**RESOLVED** — `RISK_MAX_OPEN_POSITIONS=20` and `RISK_MAX_QUOTE_AGE_SECONDS=30` are both in
+the template now, and `RISK_DEFAULT_STOP_LOSS_PCT` carries a comment saying it is a fallback
+rather than a recommendation (item 5's smaller half).
+
 ### 8. `flatten_at_close` is a field nobody reads
 
 `RiskSpec.flatten_at_close` (`strategy/rules.py:132`) exists and is never referenced
@@ -183,14 +215,14 @@ until Phase 4.
   Each of the five is a separate piece of work in whichever subsystem detects it —
   reconciliation, the stream consumer, the broker adapter — not something the kill switch
   module can do alone.
-- **`StaleDataRule.max_age_seconds = 30`** is hardcoded on the dataclass (`risk/rules.py:138`)
-  rather than living in `RiskLimits`. It is the only limit an operator cannot configure.
-- **`RiskDecision.adjusted_qty`** is specified but unreachable. `validate`'s docstring says
-  "If a rule returns `adjusted_qty`, apply it and continue with the reduced order"
-  (`risk/engine.py:64-67`), but `allow()` never sets it and `deny()` is terminal
-  (`:33-39`), so no constructor produces a shrink. Either add one (`RiskDecision.shrink(qty)`)
-  or drop the field — a half-specified shrink path is how a rule ends up silently approving
-  full size.
+- ~~**`StaleDataRule.max_age_seconds = 30`** is hardcoded on the dataclass~~ — **RESOLVED.**
+  Moved to `RiskLimits.max_quote_age_seconds`, so it is configurable like every other limit.
+- ~~**`RiskDecision.adjusted_qty`** is specified but unreachable~~ — **RESOLVED.**
+  `RiskDecision.shrink(rule, reason, qty)` exists and rejects a shrink to zero, `validate`
+  applies it and mutates the order so later rules measure against the reduced quantity, and
+  a test asserts a second rule sees the smaller number. No default rule shrinks — refusing is
+  clearer than silently trading a fraction of what a strategy asked for — but the path is now
+  whole rather than half-specified.
 - **`RuleSet.max_concurrent_positions`** (default 5, `strategy/rules.py:148`) is a
   per-strategy limit that `RISK.md` does not mention alongside the account-wide
   `max_open_positions` of 20. The relationship — strategy limits may be tighter, never looser

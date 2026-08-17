@@ -30,6 +30,12 @@ class RiskLimits(BaseSettings):
     max_daily_loss_pct: Decimal = Decimal("0.03")
     max_orders_per_minute: int = 30
     max_open_positions: int = 20
+    #: A quote older than this is not a quiet market, it is a dead feed.
+    #: Lives here rather than on the rule so an operator can tune it.
+    max_quote_age_seconds: int = 30
+    #: A fallback, not a recommendation: docs/RISK.md is explicit that a fixed
+    #: percentage stop is too tight on a volatile name and too loose on a dull
+    #: one, and that ATR-based stops are the default.
     default_stop_loss_pct: Decimal = Decimal("0.02")
     default_take_profit_pct: Decimal = Decimal("0.06")
 

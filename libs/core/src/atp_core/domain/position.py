@@ -188,6 +188,23 @@ class Portfolio:
     def open_positions(self) -> list[Position]:
         return [p for p in self.positions.values() if not p.is_flat]
 
+    @property
+    def unmarked_symbols(self) -> list[str]:
+        """Open positions carrying no mark, so their value is unknown.
+
+        `market_value` returns 0 for an unmarked position, which means
+        `gross_exposure` and `equity` both silently *under*-report — and a risk
+        rule reading them would compute a smaller number and therefore approve
+        where it should refuse. That is the exact inversion the engine's
+        default-closed posture exists to prevent, so rules that price the book
+        consult this first and deny while it is non-empty.
+
+        Sorted, because it ends up in a rejection reason a human reads.
+        """
+        return sorted(
+            p.symbol for p in self.positions.values() if not p.is_flat and p.last_price is None
+        )
+
     def position(self, symbol: str) -> Position:
         """Get or create — an absent position is a flat position, not an error."""
         return self.positions.setdefault(symbol, Position(symbol=symbol))
