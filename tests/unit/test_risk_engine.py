@@ -13,10 +13,12 @@ expected answer is refusal, and that is asserted rather than assumed.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 
 from atp_core.clock import SimulatedClock, TradingCalendar
 from atp_core.config import RiskLimits
@@ -33,8 +35,10 @@ from atp_core.risk.rules import (
     RateLimitRule,
     StaleDataRule,
     TradingHoursRule,
+    position_size,
     reduces_position,
 )
+from atp_core.strategy.rules import PositionSizeSpec
 
 OPEN_HOURS = datetime(2024, 1, 2, 15, 0, tzinfo=UTC)  # 10:00 New York, a Tuesday
 CLOSED = datetime(2024, 1, 2, 2, 0, tzinfo=UTC)  # 21:00 New York the evening before
@@ -387,12 +391,130 @@ class TestChain:
             RiskDecision.shrink("r", "why", Decimal(0))
 
 
+EQUITY = Decimal(100_000)
+
+
 class TestPositionSizing:
     def test_risk_pct_equalises_risk_not_notional(self) -> None:
         """$100k equity, 1% risk: $50 entry/$48 stop → 500 shares;
         $50 entry/$35 stop → 66 shares. Both lose $1,000 if stopped."""
-        pytest.skip("position_size is the next Phase 3 item — risk/rules.py:position_size")
+        tight = position_size("risk_pct", EQUITY, Decimal(50), Decimal(48), Decimal("0.01"))
+        wide = position_size("risk_pct", EQUITY, Decimal(50), Decimal(35), Decimal("0.01"))
+
+        assert tight == Decimal(500)
+        assert wide == Decimal(66)
+
+        # The whole point, stated as the invariant rather than the quantities:
+        # both lose about the same if stopped, despite one being 7.5x the other
+        # in notional. Rounding down costs the wide one at most one share of it.
+        assert tight * Decimal(2) == Decimal(1_000)
+        assert Decimal(985) <= wide * Decimal(15) <= Decimal(1_000)
+
+        # Under fixed notional the volatile name would get the same $25,000 and
+        # lose $7,500 on the same stop — precisely backwards.
+        by_notional = position_size("fixed_notional", EQUITY, Decimal(50), risk_pct=Decimal(25_000))
+        assert by_notional * Decimal(15) == Decimal(7_500)
 
     def test_risk_pct_without_stop_raises(self) -> None:
         """Undefined — must raise rather than silently defaulting."""
-        pytest.skip("position_size is the next Phase 3 item — risk/rules.py:position_size")
+        with pytest.raises(ValueError, match="needs a stop"):
+            position_size("risk_pct", EQUITY, Decimal(50))
+
+    def test_a_stop_at_the_entry_price_raises(self) -> None:
+        """Zero risk per share makes the position unbounded, and a division by
+        zero here would surface as an inscrutable traceback rather than the
+        configuration error it is."""
+        with pytest.raises(ValueError, match="risk per share is zero"):
+            position_size("risk_pct", EQUITY, Decimal(50), Decimal(50))
+
+    def test_fixed_qty_is_the_value_itself(self) -> None:
+        assert position_size("fixed_qty", EQUITY, Decimal(50), risk_pct=Decimal(250)) == 250
+
+    def test_fixed_notional_divides_by_price(self) -> None:
+        assert position_size(
+            "fixed_notional", EQUITY, Decimal(50), risk_pct=Decimal(10_000)
+        ) == Decimal(200)
+
+    def test_equity_pct_is_volatility_blind(self) -> None:
+        """5% of $100k at $50 is 100 shares whatever the instrument does — the
+        documented weakness of the method, pinned so it is not mistaken for a
+        bug later."""
+        assert position_size(
+            "equity_pct", EQUITY, Decimal(50), risk_pct=Decimal("0.05")
+        ) == Decimal(100)
+
+    def test_volatility_target_shrinks_the_more_volatile_name(self) -> None:
+        """Same target, twice the volatility, half the position."""
+        calm = position_size(
+            "volatility_target",
+            EQUITY,
+            Decimal(50),
+            risk_pct=Decimal("0.10"),
+            volatility=Decimal("0.20"),
+        )
+        wild = position_size(
+            "volatility_target",
+            EQUITY,
+            Decimal(50),
+            risk_pct=Decimal("0.10"),
+            volatility=Decimal("0.40"),
+        )
+        assert calm == Decimal(1_000)
+        assert wild == Decimal(500)
+
+    def test_volatility_target_without_volatility_raises(self) -> None:
+        """Same shape as risk_pct without a stop: the input the method is
+        defined by is missing, so it refuses rather than inventing one."""
+        with pytest.raises(ValueError, match="needs the instrument's volatility"):
+            position_size("volatility_target", EQUITY, Decimal(50), risk_pct=Decimal("0.10"))
+
+    def test_sizes_round_down_never_up(self) -> None:
+        """A sizing function must not hand back more risk than it was asked
+        for. 66.67 becomes 66, which is also what docs/RISK.md's own worked
+        example does."""
+        assert position_size(
+            "fixed_notional", EQUITY, Decimal(3), risk_pct=Decimal(100)
+        ) == Decimal(33)
+
+    def test_unknown_method_names_the_supported_ones(self) -> None:
+        with pytest.raises(ValueError, match="unknown position sizing method"):
+            position_size("kelly", EQUITY, Decimal(50))
+
+    @pytest.mark.parametrize(
+        ("equity", "price", "value", "match"),
+        [
+            (Decimal(0), Decimal(50), Decimal("0.01"), "equity"),
+            (Decimal(100), Decimal(0), Decimal("0.01"), "price"),
+            (Decimal(100), Decimal(50), Decimal(0), "must be positive"),
+        ],
+    )
+    def test_degenerate_inputs_raise(
+        self, equity: Decimal, price: Decimal, value: Decimal, match: str
+    ) -> None:
+        with pytest.raises(ValueError, match=match):
+            position_size("equity_pct", equity, price, risk_pct=value)
+
+
+class TestPositionSizeSpecBounds:
+    """Config-time validation. A misplaced decimal point is the mistake worth
+    catching here rather than at trade 3."""
+
+    def test_a_sane_risk_pct_is_accepted(self) -> None:
+        assert PositionSizeSpec(type="risk_pct", value=Decimal("0.01")).value == Decimal("0.01")
+
+    def test_a_fraction_above_one_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match=re.escape("0.01 is 1%, not 1")):
+            PositionSizeSpec(type="risk_pct", value=Decimal(2))
+
+    def test_risk_per_trade_past_the_backstop_is_refused(self) -> None:
+        """0.95 was the audit's example of what nothing rejected."""
+        with pytest.raises(ValidationError, match="losing streak"):
+            PositionSizeSpec(type="risk_pct", value=Decimal("0.95"))
+
+    def test_a_share_count_is_not_bounded_like_a_fraction(self) -> None:
+        """500 shares is ordinary; 500 as a risk fraction would not be."""
+        assert PositionSizeSpec(type="fixed_qty", value=Decimal(500)).value == Decimal(500)
+
+    def test_a_non_positive_value_is_refused(self) -> None:
+        with pytest.raises(ValidationError):
+            PositionSizeSpec(type="fixed_qty", value=Decimal(0))

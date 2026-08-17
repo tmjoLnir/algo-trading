@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import TYPE_CHECKING
 
 from atp_core.domain import Side
@@ -364,12 +364,17 @@ class StaleDataRule:
         return RiskDecision.allow()
 
 
+#: Methods whose value is a fraction of equity rather than a count or an amount.
+FRACTIONAL_METHODS = frozenset({"equity_pct", "risk_pct", "volatility_target"})
+
+
 def position_size(
     method: str,
     equity: Decimal,
     price: Decimal,
     stop_price: Decimal | None = None,
     risk_pct: Decimal = Decimal("0.01"),
+    volatility: Decimal | None = None,
 ) -> Decimal:
     """Turn intent into a quantity.
 
@@ -384,5 +389,59 @@ def position_size(
 
     Raises if `method` is risk-based and `stop_price` is None — sizing by risk
     without a stop is undefined, and defaulting it would hide the mistake.
+
+    `risk_pct` carries `PositionSizeSpec.value`, whose meaning follows `method`:
+    a share count for `fixed_qty`, an amount for `fixed_notional`, a fraction of
+    equity for the rest. The parameter keeps its name because the fraction is
+    what it is for the default method and the one worth naming.
+
+    `volatility` is the instrument's own volatility, in the same units as the
+    target — needed only by `volatility_target`, and required there for the same
+    reason a stop is required by `risk_pct`.
+
+    **Rounded down to whole shares.** docs/RISK.md's own worked example rounds
+    that way (a $15 stop on $1,000 of risk gives 66 shares, not 66.67), and
+    down rather than to-nearest because a sizing function should never hand back
+    more risk than it was asked for.
     """
-    raise NotImplementedError("see docs/RISK.md 'Position sizing'")
+    if equity <= 0:
+        raise ValueError(f"cannot size against equity of {equity}")
+    if price <= 0:
+        raise ValueError(f"cannot size at a price of {price}")
+    if risk_pct <= 0:
+        raise ValueError(f"position size value must be positive, got {risk_pct}")
+
+    if method == "fixed_qty":
+        raw = risk_pct
+    elif method == "fixed_notional":
+        raw = risk_pct / price
+    elif method == "equity_pct":
+        raw = equity * risk_pct / price
+    elif method == "risk_pct":
+        if stop_price is None:
+            raise ValueError(
+                "risk_pct sizing needs a stop: the quantity is defined by the "
+                "distance to it, and defaulting that distance would silently "
+                "size every trade as though its stop were somewhere it is not"
+            )
+        per_share_risk = abs(price - stop_price)
+        if per_share_risk == 0:
+            raise ValueError(
+                f"stop price {stop_price} equals the entry price, so the risk "
+                f"per share is zero and the position size is unbounded"
+            )
+        raw = equity * risk_pct / per_share_risk
+    elif method == "volatility_target":
+        if volatility is None or volatility <= 0:
+            raise ValueError(
+                f"volatility_target sizing needs the instrument's volatility; got {volatility}"
+            )
+        # Scale exposure so a more volatile instrument gets proportionally less
+        # of the book — the same equalising instinct as risk_pct, applied to
+        # ongoing variance rather than to a single stop distance.
+        raw = equity * (risk_pct / volatility) / price
+    else:
+        supported = "fixed_qty, fixed_notional, equity_pct, risk_pct, volatility_target"
+        raise ValueError(f"unknown position sizing method {method!r}; supported: {supported}")
+
+    return raw.to_integral_value(rounding=ROUND_DOWN)

@@ -19,7 +19,7 @@ fixed or promoted into `RISK.md` proper.
 | `RISK.md` section | Enforcement |
 |---|---|
 | Position accounting | **Implemented and tested.** `domain/position.py:76`, 18 tests, no skips |
-| Position sizing | Stub — `risk/rules.py:position_size` |
+| Position sizing | **Implemented and tested.** All five methods, `risk/rules.py:position_size` |
 | Stop losses | Stub — `risk/stops.py:52,63,78,83` |
 | Portfolio limits | **Implemented and tested.** All nine rules, `risk/rules.py`, 35 tests |
 | The kill switch | Protocol implemented against; `RedisKillSwitch` still a stub |
@@ -28,10 +28,16 @@ fixed or promoted into `RISK.md` proper.
 alongside the rules. Every `OrderRouter` method (`execution/router.py:57-91`) still raises
 `NotImplementedError`.
 
-**Resolved since this file was written:** items 1, 2, 3 and 7 below, plus the
+**Resolved since this file was written:** items 1, 2, 3, 6 and 7 below, plus the
 `StaleDataRule` and `RiskDecision.shrink` entries under *Smaller drift*. Each is annotated
-in place rather than deleted, so the reasoning survives. What remains open is items 4, 5, 6
-and 8, and most of *Smaller drift*.
+in place rather than deleted, so the reasoning survives. What remains open is items 4, 5 and
+8, and most of *Smaller drift*.
+
+Item 5 is deliberately left open. Giving `StopSpec.type` and `PositionSizeSpec.type` default
+values would mean a rule set that omits them silently gets one — and "silently gets a stop
+policy" is not obviously better than "is told to state one". That is a judgement about how
+much the config layer should assume, not a defect to be cleared, and it wants an opinion
+from whoever owns the rule-builder UI.
 
 Two things worth separating out, because they are different problems:
 
@@ -178,6 +184,15 @@ Notable because the same file bounds everything else it can: `offset` is `ge=0`,
 `cooldown_bars` is `ge=0`, `max_concurrent_positions` is `ge=1`. A `Field(gt=0, le=...)` here
 is a one-line change and belongs with sizing. Consider a hard cap that rejects and a soft
 threshold that warns, since 2% is a rule of thumb rather than a law.
+
+**RESOLVED** — bounded, but type-aware rather than by a single `Field`, because `value` means
+a different thing per method: 500 is an ordinary share count and an absurd risk fraction.
+`value` is now `gt=0` always; the three fractional methods reject anything above 1 (with a
+message pointing out that 0.01 is 1%, not 1); and `risk_pct` additionally rejects above
+`MAX_RISK_PCT = 0.10`. That backstop is deliberately an order of magnitude past the
+documented 0.5–2% rather than at it — the mistake worth catching at config time is a
+misplaced decimal point, not a deliberate 3%. No soft warning: a warning that goes nowhere
+a human reads is not a control.
 
 ### 7. `.env.example` omits `RISK_MAX_OPEN_POSITIONS`
 

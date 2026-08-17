@@ -282,9 +282,29 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   4, so "every order passes `RiskEngine.validate()`" still has nowhere to be
   true. And Phase 3 states no *Verifiable:* line to tick against; one is
   proposed below.
-- [ ] Position sizing, all methods — next. `risk/rules.py:position_size` is the
-  last stub in that module, and `test_risk_engine.py::TestPositionSizing` is
-  two skipped tests already encoding the case docs/RISK.md works through.
+- [ ] Position sizing, all methods — @claude (wip #30).
+  All five implemented: `fixed_qty`, `fixed_notional`, `equity_pct`, `risk_pct`
+  and `volatility_target`. `risk_pct` and `volatility_target` each refuse the
+  input they are defined by — a stop, an instrument volatility — rather than
+  defaulting it, because a default there sizes every trade as though its stop
+  were somewhere it is not. Sizes round *down*: a sizing function must never
+  hand back more risk than it was asked for, and docs/RISK.md's own worked
+  example rounds that way too.
+
+  `PositionSizeSpec.value` is now bounded, type-aware — 500 is an ordinary share
+  count and an absurd risk fraction — with a `risk_pct` backstop set an order of
+  magnitude past the documented 0.5–2%, because the mistake worth catching at
+  config time is a misplaced decimal point rather than a deliberate 3%.
+
+  docs/RISK.md's worked example reproduces exactly: $50 entry with a $48 stop
+  gives 500 shares ($25,000), with a $35 stop gives 66 shares ($3,300), and both
+  lose about $1,000 if stopped. Across 40 stop distances the loss-if-stopped
+  never exceeds the target and is never more than one share short of it.
+
+  Unticked because Phase 3 still has no *Verifiable:* line that covers sizing —
+  the one proposed in #29 is about the rule chain. Rather than propose a second
+  line and tick against it in the same PR, this is left for whoever reviews it:
+  the demonstration above is the obvious candidate.
 - [ ] `StopManager` — fixed, ATR, trailing, chandelier, time
 - [ ] Redis kill switch
 
