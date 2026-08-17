@@ -127,7 +127,18 @@ demonstrate them. Needs an open market; adjust the wording if it is not the
 demonstration you want.
 
 ## Phase 2 — Backtesting (requirement #2)
-- [ ] Indicators (`ema`, `rsi`, `atr`, …)
+- [ ] Indicators (`ema`, `rsi`, `atr`, …) — @claude (wip #24).
+  `ema`, `rsi`, `atr`, `bollinger`, `macd` and `stddev` are implemented, along
+  with the `*_series` variants the module docstring promised the engine, plus
+  `true_range` and `sma_series`. The series form is the primitive and the
+  scalar is its last element: Wilder's smoothing is recursive, and two
+  implementations of it are two chances to get it subtly wrong. Warmup is
+  `nan` rather than a partial average, which is what stops a run opening on an
+  SMA(200) computed from six bars. Conventions that reasonable implementations
+  disagree on — SMA-seeded EMA, Wilder's alpha for RSI and ATR, population
+  `stddev` for Bollinger — are stated at the top of `ta.py`, and each is
+  cross-checked to 1e-9 against pandas' independent `ewm`/`rolling`.
+  Unticked: Phase 2 ticks against an engine that does not exist yet.
 - [ ] Backtest engine event loop, next-bar fills
 - [ ] Cost and slippage models
 - [ ] Metrics
