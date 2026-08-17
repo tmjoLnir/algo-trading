@@ -87,11 +87,23 @@ evaluate with `ZeroCostModel` — it exists for testing engine mechanics only.
 # CLI
 uv run python scripts/run_backtest.py \
   --strategy sma_crossover --symbols SPY,QQQ \
-  --start 2020-01-01 --end 2024-12-31 --timeframe 1d
+  --start 2020-01-01 --end 2024-12-31 --timeframe 1d \
+  --qty 100 --out results.json
 
-# API (queued to the worker)
+# API (queued to the worker) — not wired yet
 POST /api/v1/backtests
 ```
+
+Bars come from the database, not the vendor: a backtest has to be reproducible,
+and re-fetching means today's answer can differ from yesterday's because the
+vendor restated something. Run `scripts/backfill_bars.py` first — the CLI names
+the exact command if the range is empty.
+
+`--qty` is a placeholder. It sizes every entry at the same share count, so the
+reported return is a property of that number as much as of the strategy; real
+sizing is risk-based (docs/RISK.md 'Position sizing'). Until the rule chain
+exists, no pre-trade check refuses anything either — orders are routed through
+`RiskEngine`, but it is holding an empty chain. The CLI says both on every run.
 
 ## Reading the result
 
