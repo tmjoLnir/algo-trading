@@ -184,14 +184,25 @@ demonstration you want.
   are supplied by the caller from what it watched happen; the engine tracks
   round trips as positions return to flat, so it needs none of the FIFO
   reconstruction the analytics layer will.
-- [ ] `SmaCrossover` runs end to end — @claude (wip #27).
-  The library path does: data → indicators → engine → costs → metrics runs over
-  five years of real SPY dailies and reconciles (see below). What does not is
-  the operator's: `scripts/run_backtest.py` is still a stub that raises, and
-  docs/BACKTESTING.md 'Running one' documents it as the way to run a backtest.
-  `POST /api/v1/backtests` and the worker task behind it are stubs too. Unticked
-  until someone can actually run one — wiring that CLI is the last thing Phase 2
-  needs.
+- [x] `SmaCrossover` runs end to end — @claude (#27, #28).
+  `scripts/run_backtest.py` runs it from the command line: bars out of the
+  hypertable, strategy resolved from the registry by name, engine, realistic
+  costs, metrics, a formatted report and optional JSON. Bars come from the
+  database rather than the vendor, because a backtest has to be reproducible
+  and re-fetching means today's answer can differ from yesterday's over a
+  restatement.
+
+  Two caveats the CLI prints on every run rather than burying here, because a
+  number a human has already read is a number they have already believed.
+  Sizing is a fixed share count (`--qty`), so the return is a property of that
+  share count — real sizing is risk-based and equalises risk per trade. And no
+  pre-trade rule refuses anything: orders are routed through `RiskEngine`, but
+  the chain is empty. Both are Phase 3, which the build order puts after this.
+
+  `POST /api/v1/backtests` and its worker task are still stubs. They are not
+  Phase 2 items and the dashboard that would consume them is Phase 5; the CLI
+  is what docs/BACKTESTING.md 'Running one' documents as the way to run one,
+  and it works.
 
 *Verifiable:* a hand-computed 20-bar fixture matches the engine exactly.
 **Shown** — @claude (#25). `TestAgainstKnownFixture` in
@@ -245,7 +256,15 @@ strategy evaluated without them is flattered by 1.3 points over five years on
 11 round trips — and far more at any real turnover.
 
 ## Phase 3 — Risk (requirement #3)
-- [ ] `RiskEngine` + full rule chain
+- [ ] `RiskEngine` + full rule chain — partially touched by #28.
+  `RiskEngine.validate` and `validate_or_raise` are implemented, because the
+  backtest CLI cannot route an order through a gate that raises. That is the
+  chain *runner* only: it runs the rules it is given, first denial wins, and a
+  rule that shrinks rather than refuses mutates the order so later rules
+  measure against what would actually be sent. Every rule in `risk/rules.py`
+  and `default_rules()` itself are still stubs, so the only way to get an
+  engine is to hand it an explicit rule list — nothing acquires an unguarded
+  one by omission. Unticked: a chain with no rules in it is not a risk layer.
 - [ ] Position sizing, all methods
 - [ ] `StopManager` — fixed, ATR, trailing, chandelier, time
 - [ ] Redis kill switch
