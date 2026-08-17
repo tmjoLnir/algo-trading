@@ -30,7 +30,7 @@ untrusted input that arrives over HTTP.
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -119,9 +119,38 @@ class PositionSizeSpec(BaseModel):
     across instruments of wildly different volatility. See docs/RISK.md.
     """
 
+    #: A hard backstop, not a recommendation. docs/RISK.md gives 0.5–2% risk per
+    #: trade and explains that above 2% a normal losing streak of 8–10 trades is
+    #: an account-threatening event. This rejects an order of magnitude past
+    #: that, on the grounds that anything beyond it is a typo rather than a
+    #: choice — a misplaced decimal point turning 0.01 into 0.1 is the exact
+    #: mistake worth catching at config time rather than at trade 3.
+    MAX_RISK_PCT: ClassVar[Decimal] = Decimal("0.10")
+
     type: Literal["fixed_qty", "fixed_notional", "equity_pct", "risk_pct", "volatility_target"]
-    value: Decimal
-    max_position_pct: Decimal | None = None
+    value: Decimal = Field(gt=0)
+    max_position_pct: Decimal | None = Field(default=None, gt=0, le=1)
+
+    @model_validator(mode="after")
+    def _value_suits_the_method(self) -> PositionSizeSpec:
+        """`value` means a different thing per method, so it bounds differently.
+
+        A share count of 500 is ordinary; a `risk_pct` of 500 would size the
+        whole account into one trade fifty times over. Every other bound in this
+        file is stated (`offset` is `ge=0`, `cooldown_bars` is `ge=0`), and this
+        one was the gap.
+        """
+        if self.type in {"equity_pct", "risk_pct", "volatility_target"} and self.value > 1:
+            raise ValueError(
+                f"{self.type} takes a fraction of equity, got {self.value} — 0.01 is 1%, not 1"
+            )
+        if self.type == "risk_pct" and self.value > self.MAX_RISK_PCT:
+            raise ValueError(
+                f"risk_pct of {self.value} is past the {self.MAX_RISK_PCT} backstop. "
+                f"docs/RISK.md gives 0.5-2% per trade: above 2%, a normal losing "
+                f"streak of 8-10 trades threatens the account"
+            )
+        return self
 
 
 class RiskSpec(BaseModel):
