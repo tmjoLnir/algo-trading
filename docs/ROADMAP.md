@@ -127,7 +127,7 @@ demonstrate them. Needs an open market; adjust the wording if it is not the
 demonstration you want.
 
 ## Phase 2 — Backtesting (requirement #2)
-- [ ] Indicators (`ema`, `rsi`, `atr`, …) — @claude (wip #24).
+- [x] Indicators (`ema`, `rsi`, `atr`, …) — @claude (#24, #27).
   `ema`, `rsi`, `atr`, `bollinger`, `macd` and `stddev` are implemented, along
   with the `*_series` variants the module docstring promised the engine, plus
   `true_range` and `sma_series`. The series form is the primitive and the
@@ -137,12 +137,11 @@ demonstration you want.
   SMA(200) computed from six bars. Conventions that reasonable implementations
   disagree on — SMA-seeded EMA, Wilder's alpha for RSI and ATR, population
   `stddev` for Bollinger — are stated at the top of `ta.py`, and each is
-  cross-checked to 1e-9 against pandas' independent `ewm`/`rolling`.
-  Still unticked, for a narrower reason than before: the engine now exists and
-  the *Verifiable:* line below has been shown, but that fixture is driven by a
-  scripted strategy that computes nothing from prices — deliberately, so that
-  fill timing is the only variable in it — so it cannot demonstrate an
-  indicator. `SmaCrossover runs end to end` is the item that will.
+  cross-checked to 1e-9 against pandas' independent `ewm`/`rolling`. Ticked on
+  the end-to-end line below, where `SmaCrossover`'s `ta.sma` calls drive 23
+  fills over five years of real SPY dailies — the phase's first *Verifiable:*
+  line runs a scripted strategy that computes nothing from prices, so it never
+  could.
 - [x] Backtest engine event loop, next-bar fills — @claude (#25).
   `BacktestEngine.run` walks a merged timeline over all symbols in the
   documented order (mark → stops → fills → decide → size → risk → queue for the
@@ -155,7 +154,7 @@ demonstration you want.
   fill expires rather than resting into an unrelated later bar. When a bar's
   range spans both stop and target the stop is taken, since the bar cannot say
   which came first.
-- [ ] Cost and slippage models — @claude (wip #26).
+- [x] Cost and slippage models — @claude (#26, #27).
   `PerShareCostModel.commission` and `SpreadSlippageModel.slippage` are
   implemented; `ZeroCostModel`, `CompositeCostModel` and
   `alpaca_equities_default` already wired them together. Commission is
@@ -167,11 +166,32 @@ demonstration you want.
   quietly make a split order cost more than a whole one. Slippage crosses half
   the spread and adds an impact term in `√(qty / volume)`, sized on what we try
   to execute rather than on what fills, and is adverse on both sides by
-  construction. Unticked for the same reason as indicators: the phase's
-  *Verifiable:* line is a hand-computed fixture run on `ZeroCostModel`, so it
-  cannot demonstrate a cost model.
-- [ ] Metrics
-- [ ] `SmaCrossover` runs end to end
+  construction. Ticked on the end-to-end line below, which charges them: the
+  same SPY run scores +11.74% costless and +10.41% with
+  `alpaca_equities_default()`, of which only $15.04 is fees — the rest is
+  spread and impact inside the fill prices.
+- [x] Metrics — @claude (#27).
+  Every function in `backtest/metrics.py`, plus the engine wiring that makes
+  them real: `BacktestResult.metrics` was a dead field until now. Sample
+  standard deviation, annual `risk_free_rate`/`target` divided down by
+  `periods_per_year`, and downside deviation over every period rather than only
+  the losing ones — all stated at the top of the module, because reasonable
+  implementations differ and a number that disagrees with the reader's own
+  arithmetic reads as a bug. Ratios return `inf` where the denominator is
+  legitimately zero rather than a sentinel, which per docs/BACKTESTING.md
+  nearly always means too few trades rather than a perfect strategy. The three
+  metrics an equity curve cannot answer — holding period, exposure, turnover —
+  are supplied by the caller from what it watched happen; the engine tracks
+  round trips as positions return to flat, so it needs none of the FIFO
+  reconstruction the analytics layer will.
+- [ ] `SmaCrossover` runs end to end — @claude (wip #27).
+  The library path does: data → indicators → engine → costs → metrics runs over
+  five years of real SPY dailies and reconciles (see below). What does not is
+  the operator's: `scripts/run_backtest.py` is still a stub that raises, and
+  docs/BACKTESTING.md 'Running one' documents it as the way to run a backtest.
+  `POST /api/v1/backtests` and the worker task behind it are stubs too. Unticked
+  until someone can actually run one — wiring that CLI is the last thing Phase 2
+  needs.
 
 *Verifiable:* a hand-computed 20-bar fixture matches the engine exactly.
 **Shown** — @claude (#25). `TestAgainstKnownFixture` in
@@ -193,18 +213,36 @@ return is not a strategy result and must not be read as one.
 *Verifiable (end to end):* `SmaCrossover` over real stored bars with
 `alpaca_equities_default()` costs and a full metrics report, where the fills,
 the fees and the reported metrics all reconcile against the equity curve.
-**Not yet shown** — proposed here because the line above is a hand-computed
-fixture on a scripted strategy and `ZeroCostModel`, which is exactly what makes
-it a good test of fill timing and a useless one for indicators, costs or
-metrics. Those three items were being held against it with nothing they could
-ever satisfy. Needs `backtest.metrics`; adjust the wording if it is not the
-demonstration you want.
+**Shown** — @claude (#27). Proposed in #26 because the line above is a
+hand-computed fixture on a scripted strategy and `ZeroCostModel`, which is
+exactly what makes it a good test of fill timing and a useless one for
+indicators, costs or metrics; those three were being held against a line none
+of them could ever satisfy. `SmaCrossover(20, 50)` over the 1,254 stored SPY
+dailies, with `alpaca_equities_default()`:
 
-Costs are already known to bite: the same SPY run scores +11.74% on
-`ZeroCostModel` and +10.41% on `alpaca_equities_default()`, of which only
-$15.04 is fees — Alpaca charges no commission, so the rest is spread and impact
-inside the fill prices. A strategy evaluated without that is being flattered by
-1.3 points over five years on 23 trades, and far more at any real turnover.
+```
+equity 100,000 → 110,411.07   total_return 0.1041   fees $15.04
+sharpe 0.358   sortino 0.489   calmar 0.140   volatility 0.061
+max_drawdown -14.39% over 477 days
+11 round trips   win_rate 0.455   profit_factor 1.232   expectancy $358.16
+exposure 65.2%   turnover 11.3×   avg hold 2,365h
+```
+
+Each number was recomputed from the run's own artefacts rather than trusted:
+`total_return` against the curve's endpoints, `max_drawdown` and `sharpe`
+re-derived from the equity array, one equity point per bar, fees non-zero,
+win-rate consistent with the trade count. The per-trade-P&L identity is
+reported as *not applicable* rather than passed, because the book is still long
+SPY on the last bar — an open position means trade P&L cannot account for the
+whole equity change, and asserting it anyway would be the check lying.
+
+A Sharpe of 0.36 is the point. docs/BACKTESTING.md says anything above 3 on a
+simple strategy is a bug until proven otherwise, and a 20/50 SMA crossover on
+one index ETF scoring modestly is what a working engine looks like.
+
+Costs bite as expected: the same run scores +11.74% on `ZeroCostModel`, so a
+strategy evaluated without them is flattered by 1.3 points over five years on
+11 round trips — and far more at any real turnover.
 
 ## Phase 3 — Risk (requirement #3)
 - [ ] `RiskEngine` + full rule chain

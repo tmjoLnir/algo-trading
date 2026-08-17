@@ -24,6 +24,11 @@ from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 
+from atp_core.backtest.metrics import (
+    TRADING_DAYS_PER_YEAR,
+    PerformanceMetrics,
+    compute_all,
+)
 from atp_core.clock import SimulatedClock
 from atp_core.domain import (
     Fill,
@@ -34,6 +39,7 @@ from atp_core.domain import (
     Position,
     Side,
     SignalAction,
+    Timeframe,
     TimeInForce,
 )
 from atp_core.errors import BacktestError, DataGapError, LookaheadError
@@ -44,11 +50,23 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from atp_core.backtest.costs import CostModel
-    from atp_core.domain import Bar, Signal, Timeframe
+    from atp_core.domain import Bar, Signal
     from atp_core.risk.engine import RiskEngine
     from atp_core.strategy.base import Strategy
 
 log = get_logger(__name__)
+
+#: A regular US equity session, in seconds. Used only to annualise: a minute
+#: backtest has ~390 bars a day, and annualising it at 252 would understate its
+#: volatility by a factor of twenty.
+_SESSION_SECONDS = 390 * 60
+
+
+def _periods_per_year(timeframe: Timeframe) -> int:
+    """Bars per year, for annualising a return series of this timeframe."""
+    if timeframe is Timeframe.D1:
+        return TRADING_DAYS_PER_YEAR
+    return TRADING_DAYS_PER_YEAR * (_SESSION_SECONDS // timeframe.seconds)
 
 
 class PositionSizer(Protocol):
@@ -133,9 +151,6 @@ class BacktestResult:
             "filled_orders": len(filled),
             "signals": len(self.signals),
             "fees": str(sum((o.total_fees for o in self.orders), Decimal(0))),
-            # Empty until `backtest.metrics` is implemented (roadmap Phase 2).
-            # Present rather than omitted so a consumer's shape does not change
-            # when it fills in.
             "metrics": dict(self.metrics),
             "warnings": list(self.warnings),
         }
@@ -322,6 +337,18 @@ class BacktestEngine:
         self._result: BacktestResult | None = None
         #: order id → (stop, target), armed onto the position once it fills.
         self._protection: dict[str, tuple[Decimal | None, Decimal | None]] = {}
+        #: Net P&L of each completed round trip, and how long each was held.
+        #: Accumulated as positions return to flat rather than by matching fills
+        #: after the fact — the engine watches every fill go by, so it does not
+        #: need the FIFO reconstruction the analytics layer does.
+        self._trade_pnls: list[Decimal] = []
+        self._holding_hours: list[float] = []
+        #: symbol → (realised − fees) at the moment the position last opened.
+        #: `Position.realized_pnl` is cumulative for the symbol, so a round
+        #: trip's own P&L is the difference across its life.
+        self._trade_base: dict[str, Decimal] = {}
+        self._traded_notional = Decimal(0)
+        self._bars_in_market = 0
 
     # ── public ──────────────────────────────────────────────────────────────
 
@@ -352,6 +379,11 @@ class BacktestEngine:
         self._result = result
         self._pending = []
         self._protection = {}
+        self._trade_pnls = []
+        self._holding_hours = []
+        self._trade_base = {}
+        self._traded_notional = Decimal(0)
+        self._bars_in_market = 0
 
         self.strategy.on_start()
 
@@ -398,6 +430,8 @@ class BacktestEngine:
             equity = self._portfolio.equity
             self._portfolio.equity_curve.append((clock.now(), equity))
             result.equity_curve.append((clock.now(), equity))
+            if self._portfolio.open_positions:
+                self._bars_in_market += 1
 
             for symbol in printed:
                 bar = bars[symbol][index_of[symbol][ts]]
@@ -412,6 +446,7 @@ class BacktestEngine:
                     self._handle_signal(signal, bar, result)  # 6, 7
 
         self.strategy.on_stop()
+        result.metrics = self._metrics(result, len(timeline)).to_dict()
 
         log.info(
             "backtest.done",
@@ -422,6 +457,25 @@ class BacktestEngine:
             total_return=str(result.total_return),
         )
         return result
+
+    def _metrics(self, result: BacktestResult, bars: int) -> PerformanceMetrics:
+        """Fold the run's own bookkeeping into the shared metric set.
+
+        The three things an equity curve cannot answer are supplied from what
+        the engine watched happen: how long each round trip was held, how many
+        bars the book was in the market for, and how much notional crossed.
+        """
+        starting = self._portfolio.starting_equity
+        return compute_all(
+            list(result.equity_curve),
+            self._trade_pnls,
+            periods_per_year=_periods_per_year(self.config.timeframe),
+            avg_holding_period_hours=(
+                sum(self._holding_hours) / len(self._holding_hours) if self._holding_hours else 0.0
+            ),
+            exposure_pct=self._bars_in_market / bars if bars else 0.0,
+            turnover=float(self._traded_notional / starting) if starting else 0.0,
+        )
 
     # ── validation ──────────────────────────────────────────────────────────
 
@@ -597,8 +651,26 @@ class BacktestEngine:
         order.apply_fill(fill)
 
         position = self._portfolio.position(order.symbol)
+        was_flat = position.is_flat
+        opened_at = position.opened_at
+        pnl_before = position.realized_pnl - position.fees_paid
+
         position.apply_fill(fill, qty * order.side.sign)
         self._portfolio.cash -= qty * price * order.side.sign + fee
+        self._traded_notional += qty * price
+
+        if was_flat:
+            self._trade_base[order.symbol] = pnl_before
+        if position.is_flat:
+            # A completed round trip. Its P&L is the change in the symbol's
+            # cumulative realised total across the position's life, net of the
+            # fees paid getting in and out — which is what a human means by
+            # "what did that trade make". Reading `realized_pnl` directly would
+            # report the symbol's whole history on every exit.
+            base = self._trade_base.pop(order.symbol, pnl_before)
+            self._trade_pnls.append((position.realized_pnl - position.fees_paid) - base)
+            if opened_at is not None:
+                self._holding_hours.append((fill.ts - opened_at).total_seconds() / 3600)
 
         # Arm the protective levels now, not when the order was queued: a stop
         # sitting on a flat position would be measured against the next bar's

@@ -23,6 +23,7 @@ from atp_core.backtest.engine import (
     BacktestConfig,
     BacktestContext,
     BacktestEngine,
+    BacktestResult,
     FixedQtySizer,
 )
 from atp_core.clock import SimulatedClock
@@ -473,4 +474,49 @@ class TestAgainstKnownFixture:
         assert report["ending_equity"] == "102000"
         assert report["total_return"] == "0.02"
         assert report["filled_orders"] == 2
-        assert report["metrics"] == {}  # until backtest.metrics lands
+        assert isinstance(report["metrics"], dict)
+        assert report["metrics"]["num_trades"] == 1
+
+
+class TestMetricsReconcile:
+    """The metrics the engine reports have to agree with the fixture it just
+    ran. A metric set computed from its own separate bookkeeping is exactly
+    where a plausible-but-wrong number comes from."""
+
+    def result(self) -> BacktestResult:
+        bars = [
+            bar(i, open_=o, high=h, low=lo, close=c) for i, (o, h, lo, c) in enumerate(FIXTURE_BARS)
+        ]
+        strategy = ScriptedStrategy({5: SignalAction.ENTER_LONG, 12: SignalAction.EXIT})
+        return engine(strategy).run({"TEST": bars})
+
+    def test_one_round_trip_worth_its_hand_computed_pnl(self) -> None:
+        m = self.result().metrics
+        assert m["num_trades"] == 1
+        assert m["expectancy"] == pytest.approx(2000.0)  # the fixture's realised P&L
+        assert m["win_rate"] == pytest.approx(1.0)
+        assert m["largest_win"] == pytest.approx(2000.0)
+        assert m["profit_factor"] == float("inf")  # no losing trade to divide by
+
+    def test_total_return_matches_the_result(self) -> None:
+        result = self.result()
+        assert result.metrics["total_return"] == pytest.approx(float(result.total_return))
+
+    def test_turnover_is_both_legs_over_starting_equity(self) -> None:
+        """100 × 110 in, 100 × 130 out = 24,000 traded on 100,000."""
+        assert self.result().metrics["turnover"] == pytest.approx(0.24)
+
+    def test_exposure_counts_only_the_bars_actually_held(self) -> None:
+        """Filled on bar 6, exited on bar 13's open — so the book is in the
+        market at the close of bars 6 through 12, seven of twenty."""
+        assert self.result().metrics["exposure_pct"] == pytest.approx(7 / 20)
+
+    def test_holding_period_runs_from_entry_fill_to_exit_fill(self) -> None:
+        """Bar 6 to bar 13 is seven daily bars — 168 hours."""
+        assert self.result().metrics["avg_holding_period_hours"] == pytest.approx(168.0)
+
+    def test_drawdown_is_measured_on_the_marked_curve(self) -> None:
+        """Equity peaks at 104,000 on bar 12 (100 shares marked at 150) and
+        lands at 102,000 once the exit fills at 130. Without the mark-to-close
+        the curve would step only on fills and this drawdown would vanish."""
+        assert self.result().metrics["max_drawdown"] == pytest.approx((102_000 - 104_000) / 104_000)
