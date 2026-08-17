@@ -21,6 +21,40 @@ from pydantic import SecretStr
 from atp_core.config import Settings
 from atp_core.domain.enums import RunMode
 
+#: The environment variables `Settings` reads that any test here could be
+#: fooled by. Cleared per test — see `_settings_read_only_their_inputs`.
+_AMBIENT = (
+    "ATP_RUN_MODE",
+    "ATP_ALLOW_LIVE_TRADING",
+    "ALPACA_API_KEY",
+    "ALPACA_API_SECRET",
+)
+
+
+@pytest.fixture(autouse=True)
+def _settings_read_only_their_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Take the ambient environment out of every test in this file.
+
+    `Settings` reads the environment, which is correct — and it makes a test
+    asking "what does `Settings` do when nothing is set" unanswerable unless
+    the environment is controlled, because the honest answer becomes "whatever
+    the machine exported". `conftest.pytest_configure` sets
+    `ATP_RUN_MODE=backtest` for the session and CI sets it in the job env too,
+    while a developer box may well have `paper` exported.
+
+    That is not hypothetical: two tests here asserted the default was `paper`,
+    passed on a machine with `ATP_RUN_MODE=paper` exported, and failed in CI
+    where it is `backtest`. Both were reading the environment and reporting it
+    as the code's default.
+
+    Clearing rather than pinning is the point — the field defaults are what is
+    under test. This does **not** weaken conftest's live-trading guard: that
+    runs once at session start, before any fixture here, and refuses the whole
+    session if `ATP_RUN_MODE=live` was exported.
+    """
+    for name in _AMBIENT:
+        monkeypatch.delenv(name, raising=False)
+
 
 def test_live_mode_requires_second_flag() -> None:
     """`ATP_RUN_MODE=live` alone must raise (rule §1.8). One flag is one typo
@@ -72,25 +106,41 @@ def test_default_run_mode_is_paper() -> None:
     assert settings.is_live is False
 
 
-def test_a_non_backtest_mode_demands_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_environment_still_selects_the_mode() -> None:
+    """The flip side of the fixture above, stated so nobody "fixes" the
+    clearing by pinning a mode instead.
+
+    Reading `ATP_RUN_MODE` from the environment is the whole deployment
+    mechanism — it is how compose, CI and the runbook choose a mode. The
+    fixture removes it as a hidden *input* to the other tests; it must not be
+    read as the platform ignoring it.
+    """
+    settings = Settings(
+        ATP_RUN_MODE="paper", alpaca_api_key=SecretStr("k"), alpaca_api_secret=SecretStr("s")
+    )
+    assert settings.run_mode is RunMode.PAPER
+
+    settings = Settings(ATP_RUN_MODE="backtest")
+    assert settings.run_mode is RunMode.BACKTEST
+
+
+def test_a_non_backtest_mode_demands_credentials() -> None:
     """Paper still talks to a real venue, so it still needs a key.
 
-    The credentials are cleared from the environment first. `Settings` reads
-    it, and a machine that has real Alpaca keys exported — a developer's, or
-    this repo's own CI, which runs the live-feed checks — would otherwise
-    satisfy the guard from the ambient environment and pass this test without
-    ever exercising it.
+    The autouse fixture has already cleared the ambient credentials, which is
+    load-bearing here: a machine with real Alpaca keys exported — this repo's
+    own CI, which runs the live-feed checks — would otherwise satisfy the
+    guard from the environment and pass this test without exercising it.
     """
-    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
-    monkeypatch.delenv("ALPACA_API_SECRET", raising=False)
-
     with pytest.raises(ValueError, match="ALPACA_API_KEY"):
         Settings(ATP_RUN_MODE="paper")
 
 
 def test_paper_and_live_use_different_urls() -> None:
     """Requirement #5 is one host swap, not a branch in the engine."""
-    paper = Settings(alpaca_api_key=SecretStr("k"), alpaca_api_secret=SecretStr("s"))
+    paper = Settings(
+        ATP_RUN_MODE="paper", alpaca_api_key=SecretStr("k"), alpaca_api_secret=SecretStr("s")
+    )
     live = Settings(
         ATP_RUN_MODE="live",
         ATP_ALLOW_LIVE_TRADING=True,
