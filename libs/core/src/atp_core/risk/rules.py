@@ -45,19 +45,33 @@ def reduces_position(order: Order, portfolio: Portfolio) -> bool:
     return position.is_long if order.side is Side.SELL else position.is_short
 
 
-def _price_for(order: Order, portfolio: Portfolio) -> Decimal | None:
-    """The best estimate of what this order will transact at, or None.
+def reference_price(
+    symbol: str, portfolio: Portfolio, limit_price: Decimal | None = None
+) -> Decimal | None:
+    """The best estimate of what an order in `symbol` will transact at, or None.
 
     A limit price is what we would pay at worst; otherwise the last mark is the
-    only number available. None means the rules that need a price cannot
-    evaluate, and default-closed means they refuse.
+    only number available. None means the caller cannot evaluate, and
+    default-closed means it refuses.
+
+    Public and symbol-shaped rather than order-shaped so that position sizing,
+    which runs *before* an `Order` exists, prices a trade the same way the rules
+    that later judge it do. Sizing against one price and validating against
+    another is how an order comes out just over a limit it was sized to sit
+    under, and the disagreement would be invisible — both numbers look right on
+    their own.
     """
-    if order.limit_price is not None:
-        return order.limit_price
-    position = portfolio.positions.get(order.symbol)
+    if limit_price is not None:
+        return limit_price
+    position = portfolio.positions.get(symbol)
     if position is not None and position.last_price is not None:
         return position.last_price
     return None
+
+
+def _price_for(order: Order, portfolio: Portfolio) -> Decimal | None:
+    """`reference_price` for an order that already exists."""
+    return reference_price(order.symbol, portfolio, order.limit_price)
 
 
 def _unpriced_book(rule: str, portfolio: Portfolio) -> RiskDecision | None:

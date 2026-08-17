@@ -278,10 +278,12 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   raises rather than defaulting.
 
   Ticked against the *Verifiable:* line below, now shown. The caveat that stood
-  here still stands and is worth keeping in view: **nothing routes live orders
-  through this chain.** The backtest CLI passes an explicit empty chain and
-  `OrderRouter` is Phase 4, so "every order passes `RiskEngine.validate()`"
-  remains true of the chain and not yet of the platform.
+  here — **nothing routes live orders through this chain** — is closed by
+  `OrderRouter` (#33): every path through it validates, and there is no way to
+  reach a broker adapter around it. The backtest CLI still passes an explicit
+  empty chain, and nothing calls the router in production until
+  `StrategyRunner` exists, so the claim has moved one link down rather than
+  being discharged.
 - [ ] Position sizing, all methods — @claude (wip #30).
   All five implemented: `fixed_qty`, `fixed_notional`, `equity_pct`, `risk_pct`
   and `volatility_target`. `risk_pct` and `volatility_target` each refuse the
@@ -305,6 +307,11 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   the one proposed in #29 is about the rule chain. Rather than propose a second
   line and tick against it in the same PR, this is left for whoever reviews it:
   the demonstration above is the obvious candidate.
+
+  It now has a production caller: `OrderRouter.submit_signal` sizes through it
+  (#33), and `test_order_router.py` reproduces the docs/RISK.md worked example
+  end to end rather than against `position_size` alone. Still unticked — a
+  caller is not a demonstration, and the missing line is the reason.
 - [ ] `StopManager` — fixed, ATR, trailing, chandelier, time — @claude (wip #31).
   All six `StopType`s, including `fixed_amount`, which was in the enum but
   missing from docs/RISK.md's table — the row is added rather than the member
@@ -329,10 +336,17 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   returning None, because a take-profit that quietly does not exist is a
   position with no upside exit.
 
-  Unticked: nothing arms these yet. The backtest engine honours
-  `position.stop_loss_price` but only ever sets it from a `Signal`, and no
-  caller of `StopManager` exists — the same gap the audit flagged for the rule
-  chain, closing in Phase 4.
+  `OrderRouter.submit_protective_orders` is the first caller (#33): it derives
+  the level from a `StopConfig` against the entry's *actual* average fill price,
+  arms it on the position, and sends a broker-side stop. So "nothing arms these"
+  no longer holds.
+
+  Unticked all the same, and for a sharper reason than before: broker-side stops
+  are docs/SAFETY.md's layer 5, and a layer is only demonstrated by watching it
+  hold. Nothing has yet placed one of these against a real venue, and four of
+  the nine rules can refuse a protective stop — which the router reports rather
+  than hides, but which no *Verifiable:* line yet exercises. Phase 4's paper
+  week is the demonstration.
 - [x] Redis kill switch — @claude (#32).
   `RedisKillSwitch` over the three halt scopes, tested against a real Redis as
   well as in memory. Ticked on docs/SAFETY.md's own go-live checklist rather
@@ -355,12 +369,14 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   — core does not open sockets on its own behalf (CLAUDE.md §1.3). Synchronous,
   unlike the quote cache, because the risk chain is.
 
-  Still open, and not this item: none of the five documented auto-engage
-  triggers calls `engage()`. Each belongs to the subsystem that detects it —
-  reconciliation, the stream consumer, the broker adapter — and `RISK.md`'s
-  `flatten_all_positions` remains a stub, deliberately separate because halting
-  stops new risk while flattening realises P&L into a market you may not be
-  able to see.
+  Still open, and not this item: most of the documented auto-engage triggers
+  still never call `engage()`. Each belongs to the subsystem that detects it —
+  `DATA_FEED_LOST` is wired from the stream consumer and `BROKER_UNREACHABLE`
+  from the order router (#33), leaving the daily loss limit, reconciliation
+  mismatch, rate-limit storm and repeated unhandled exceptions to the runner and
+  the reconciler. `RISK.md`'s `flatten_all_positions` remains a stub,
+  deliberately separate because halting stops new risk while flattening realises
+  P&L into a market you may not be able to see.
 
 **Before any live order path exists.** Not after.
 
@@ -398,7 +414,57 @@ above.
 
 ## Phase 4 — Execution & paper trading (requirements #1, #5)
 - [ ] `BrokerPort` + Alpaca adapter (paper first)
-- [ ] `OrderRouter`, order state machine
+- [ ] `OrderRouter`, order state machine — @claude (wip #33).
+  Both halves are implemented, and Phase 3's standing caveat — "nothing routes
+  live orders through this chain" — is closed at the router: `RiskEngine
+  .validate()` gates every path through it (entries, exits, protective stops,
+  flattens) and there is no way to reach a broker adapter around it.
+  `StopManager` and `RedisKillSwitch` gained their first callers outside tests
+  in the same change.
+
+  The state machine gained the piece it was missing: `state.transition()`, which
+  moves an order *through* the table. `TRANSITIONS` was already correct and is
+  unchanged — but nothing consulted it, every status in the repo being set by
+  plain assignment, which is precisely how a replayed "submitted" overwrites a
+  "filled".
+
+  `client_order_id` is now derived rather than random
+  (`execution/idempotency.py`), closing `docs/RISK_IMPLEMENTATION_NOTES.md`
+  item 4. Two collisions that note did not anticipate are pinned by tests, and
+  both were live in the first draft of this work: a reversal on one bar (exit
+  the long, open the short) produces two SELLs agreeing on strategy, symbol,
+  side and timestamp, so `purpose` is part of the key; and an entry filling
+  100 + 100 produces two stops the venue would treat as one unless the child key
+  names the *range* it covers, which would leave the second tranche naked while
+  the router reported it protected.
+
+  A third class of bug, found by review and fixed here, is worth recording
+  because it will recur in every later Phase 4 item: **a fill that flips a
+  position through zero resets nothing.** `Position.apply_fill` clears
+  protective levels only at exactly flat, and a flip never passes through flat —
+  so the old side's stops stay working, where a sell stop under what is now a
+  short *adds* to the short when it fires. Protection is therefore tracked and
+  counted by side, stale-side stops are cancelled before new ones are placed,
+  and a level the market has already passed is refused rather than armed. Each
+  of those failed silently before: the result object reported the position
+  fully protected.
+
+  Three deliberate refusals. A submit that fails in transport gets one lookup
+  and then stops — it does not resubmit, because the venue may already hold the
+  order, and it halts on `BROKER_UNREACHABLE` (the second auto-engage trigger to
+  be wired, after `DATA_FEED_LOST`). Only the stop goes to the venue; a
+  take-profit is armed on the position, because `BrokerPort` has no bracket and
+  the fill handler that would cancel the losing leg is a separate item — placing
+  both would ship the trap before the guard. And `SCALE_IN`/`SCALE_OUT` are
+  refused exactly as the backtest engine refuses them.
+
+  **Unticked, and not close.** Phase 4's *Verifiable:* line is a week of paper
+  trading reconciling clean; four of the six items are unstarted and nothing
+  calls this router in production yet. One dependency is worth naming now
+  because it blocks that line: `risk_pct` sizing with an ATR stop is the
+  documented default pair, and no `Signal` carries an ATR-derived level, so
+  every entry from a default-configured strategy is refused at sizing.
+  `StrategyRunner` holds the `BarRepository` and owns closing that.
 - [ ] `SimulatedBroker`
 - [ ] Reconciliation
 - [ ] `StrategyRunner` live loop — also drop the `worker` compose profile (#7),

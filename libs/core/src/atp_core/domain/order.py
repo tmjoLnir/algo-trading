@@ -41,6 +41,15 @@ class Order:
     retry (rule §1.4). It is the idempotency key: if a submit times out, we
     query by this id rather than resubmitting blind and risking a double
     position. `broker_order_id` is assigned by the venue on acknowledgement.
+
+    The default factory below is random, which makes it unique but **not**
+    reproducible: rebuild this order from a persisted request or after a restart
+    and it mints a different key. It is a fallback for an order nobody is going
+    to retry (a fixture, a backtest fill that never leaves the process). Every
+    order that reaches a venue gets its key from
+    `atp_core.execution.idempotency.client_order_id`, derived from the decision
+    rather than from the object — that derivation, not this default, is what
+    rule §1.4 promises.
     """
 
     symbol: str
@@ -127,10 +136,26 @@ class OrderRequest:
     Kept separate from `Order` so that a strategy cannot construct something the
     risk engine has not seen — there is exactly one path from request to order
     (rule §1.5).
+
+    `decided_at` is the instant the decision behind this request was made: a
+    signal's `ts`, the bar that triggered it, the moment a human clicked submit.
+    It is required, and it is on the *request* rather than being stamped at
+    submission time, because it is what makes `client_order_id` reproducible
+    (rule §1.4). A request persisted to a table and replayed after a restart has
+    to derive the same key it did the first time, and it can only do that if the
+    instant travelled with it.
+
+    `purpose` says what this request is for, and travels with it for the same
+    reason. It is what separates two orders that agree on everything else: a
+    strategy exiting a long and the same strategy opening a short on one bar are
+    both a SELL, for one symbol, at one instant. The vocabulary lives in
+    `atp_core.execution.idempotency`; the default here is the bare string
+    because `domain/` imports nothing from its siblings.
     """
 
     symbol: str
     side: Side
+    decided_at: datetime
     order_type: OrderType = OrderType.MARKET
     qty: Decimal | None = None  # None → let the position sizer decide
     notional: Decimal | None = None
@@ -140,3 +165,24 @@ class OrderRequest:
     time_in_force: TimeInForce = TimeInForce.DAY
     strategy_id: str | None = None
     signal_id: str | None = None
+    purpose: str = "entry"
+
+    def __post_init__(self) -> None:
+        # The domain boundary rejects naive datetimes (rule §1.2) rather than
+        # letting one reach the id derivation, where it would only surface as
+        # two keys for what was meant to be one order.
+        if self.decided_at.tzinfo is None:
+            raise ValueError(f"decided_at must be tz-aware UTC, got {self.decided_at!r}")
+        if not self.purpose:
+            raise ValueError("an order request needs a purpose — it is part of its identity")
+        if self.qty is not None and self.notional is not None:
+            raise ValueError(
+                f"an order request states a quantity or a notional, not both — "
+                f"got qty={self.qty} and notional={self.notional}"
+            )
+        if self.qty is not None and self.qty <= 0:
+            raise ValueError(
+                f"request qty must be positive (side carries direction), got {self.qty}"
+            )
+        if self.notional is not None and self.notional <= 0:
+            raise ValueError(f"request notional must be positive, got {self.notional}")

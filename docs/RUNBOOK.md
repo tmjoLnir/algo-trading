@@ -89,6 +89,44 @@ Likely a retry without `client_order_id` reuse, or two workers running.
 4. If it is prolonged and you want out, use the broker's own UI. Do not wait for
    the platform.
 
+## Indeterminate submit (`order.submit_indeterminate`)
+
+*Symptom:* a `CRITICAL` log with that event name, and trading halted with reason
+`broker_unreachable`.
+
+The transport failed *after* an order was sent, so the venue either never saw
+it, has it resting, or has already filled it. The router deliberately did not
+resubmit — that is how one intended position becomes two — and left the order at
+`pending_submit`, which is the honest status for "approved, not yet
+acknowledged".
+
+1. Take the `client_order_id` from the log line. It is deterministic, so it is
+   the same key the venue would have recorded.
+2. Look it up in the broker's own UI or API. This is the whole question: does
+   the venue have that order, and did it fill?
+3. **Do not resubmit by hand.** If the order needs to go again, replay the same
+   request through the platform — the key is derived from the decision, so the
+   venue deduplicates. A hand-built order gets a new key and no such protection.
+4. Reconcile before clearing the halt. Trading on against a book you have not
+   confirmed is the thing the halt bought you time to avoid.
+
+## Position open with no stop (`order.position_unprotected`)
+
+*Symptom:* a `CRITICAL` log with that event name.
+
+An entry filled and its protective stop was refused, or there was no stop to
+place. The position is live and the venue holds nothing against it. An
+engine-side level may be armed, which protects you only while the worker is up —
+that is not the guarantee a broker-side stop gives.
+
+1. Read `rule` in the log line. A transient refusal (`stale_data`,
+   `trading_hours`, `rate_limit`) clears on its own and the runner's next
+   attempt places the stop; `kill_switch` will not clear until someone clears it.
+2. If it will not clear promptly, place the stop through the broker's own UI.
+3. `no stop level was requested and no stop_config was supplied` is a strategy
+   configuration bug, not an incident: the strategy is trading without a stop.
+   docs/SAFETY.md makes that a go-live blocker.
+
 ## Emergency flatten
 
 `POST /api/v1/risk/flatten-all` with `confirm: "FLATTEN ALL POSITIONS"`.

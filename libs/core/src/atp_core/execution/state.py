@@ -4,12 +4,38 @@ Orders arrive from two directions — our own submissions and broker events — 
 events arrive out of order after a reconnect. An explicit transition table means
 a late "submitted" event cannot overwrite a "filled" status, which is the class
 of bug that makes a position appear to vanish.
+
+`transition()` is how a status is set. The table is a guarantee only where
+something consults it, and a plain `order.status = ...` consults nothing.
+
+**One status change deliberately does not come through here.**
+`Order.apply_fill` sets `PARTIALLY_FILLED` / `FILLED` itself, because `domain/`
+imports nothing from its siblings (CLAUDE.md §2) and a fill is an accounting
+event that has to stay in the entity that accumulates it. That leaves one gap
+worth naming rather than papering over: a fill applied to an order in a status
+the table would not have allowed to fill — a `PENDING_RISK` order, say — is
+accepted. In practice a fill arrives against an order the venue acknowledged,
+so the order is `SUBMITTED` or `PARTIALLY_FILLED` and the move is legal anyway;
+the guard belongs with whatever consumes the trade-updates stream, which is
+where an event of unknown provenance first meets an order (a separate Phase 4
+item). Closing it here would mean either `domain` importing `execution` or this
+module reimplementing fill accounting, and both are worse than the gap.
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from atp_core.domain.enums import OrderStatus
 from atp_core.errors import InvalidStateTransitionError
+from atp_core.logging import get_logger
+
+if TYPE_CHECKING:
+    from datetime import datetime
+
+    from atp_core.domain import Order
+
+log = get_logger(__name__)
 
 #: Legal transitions. Anything absent is rejected.
 TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
@@ -63,3 +89,54 @@ def is_stale_event(current: OrderStatus, incoming: OrderStatus) -> bool:
     history, and not an error worth waking anyone for.
     """
     return current.is_terminal and incoming is not current
+
+
+def transition(
+    order: Order,
+    target: OrderStatus,
+    *,
+    at: datetime | None = None,
+    reason: str | None = None,
+) -> bool:
+    """Move an order to `target`, through the table rather than around it.
+
+    Returns True if the order moved and False if the event was discarded as
+    stale. Raises `InvalidStateTransitionError` on a move that is neither.
+
+    The table above is only a guarantee if something consults it, and until now
+    nothing did: every status in the codebase was assigned with `order.status =
+    ...`, which is exactly how a replayed "submitted" ends up overwriting a
+    "filled". This is the one place that assignment should happen for a status
+    that came from outside the order — our own submission path included, since
+    a bug in it looks identical to a bad broker event.
+
+    A repeat of the status the order already holds is a no-op rather than an
+    error. Brokers re-send, and `PARTIALLY_FILLED → PARTIALLY_FILLED` is only
+    meaningful when a *fill* comes with it — which is `Order.apply_fill`'s job,
+    not this one.
+
+    `at` and `reason` fill the fields that belong to the move itself, so a
+    caller cannot record the transition and forget the timestamp that explains
+    it. `filled_at` is deliberately absent: it is set by `apply_fill` from the
+    fill's own timestamp, because a status carries no execution time.
+    """
+    current = order.status
+    if current is target:
+        return False
+    if is_stale_event(current, target):
+        log.info(
+            "order.stale_event_discarded",
+            order_id=order.id,
+            client_order_id=order.client_order_id,
+            current=current.value,
+            incoming=target.value,
+        )
+        return False
+
+    assert_transition(current, target)
+    order.status = target
+    if target is OrderStatus.SUBMITTED and at is not None:
+        order.submitted_at = at
+    if reason is not None and target in (OrderStatus.REJECTED, OrderStatus.REJECTED_RISK):
+        order.reject_reason = reason
+    return True

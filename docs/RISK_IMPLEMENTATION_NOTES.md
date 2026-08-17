@@ -10,9 +10,10 @@ Those disagreements were the point of the file: each one is a decision someone w
 otherwise have made by accident at implementation time.
 
 **Now largely spent.** Every row of the table below is implemented, and the contradictions
-are annotated in place with how each was resolved. What is left is items 4, 5 and 8 and most
-of *Smaller drift* — plus the one thing this file was most right about, which no amount of
-implementation fixes: **nothing is wired.** Delete the file once those are closed or promoted
+are annotated in place with how each was resolved. What is left is items 5 and 8 and part of
+*Smaller drift*. The one thing this file was most right about — **nothing is wired** — is
+half-answered: the risk chain now has a production caller in `OrderRouter`, and the runner
+that would drive it does not exist yet. Delete the file once the rest are closed or promoted
 into `RISK.md` proper.
 
 ---
@@ -28,13 +29,13 @@ into `RISK.md` proper.
 | The kill switch | **Implemented and tested.** `risk/killswitch.py`, unit + real-Redis integration |
 
 `RiskEngine.validate` and `validate_or_raise` landed in #28; `default_rules()` landed
-alongside the rules. Every `OrderRouter` method (`execution/router.py:57-91`) still raises
-`NotImplementedError`.
+alongside the rules. `OrderRouter` is implemented, so the chain finally has a caller outside
+tests.
 
-**Resolved since this file was written:** items 1, 2, 3, 6 and 7 below, plus the
-`StaleDataRule` and `RiskDecision.shrink` entries under *Smaller drift*. Each is annotated
-in place rather than deleted, so the reasoning survives. What remains open is items 4, 5 and
-8, and most of *Smaller drift*.
+**Resolved since this file was written:** items 1, 2, 3, 4, 6 and 7 below, plus the
+`StaleDataRule`, `RiskDecision.shrink` and auto-engage entries under *Smaller drift*. Each is
+annotated in place rather than deleted, so the reasoning survives. What remains open is items
+5 and 8, and part of *Smaller drift*.
 
 Item 5 is deliberately left open. Giving `StopSpec.type` and `PositionSizeSpec.type` default
 values would mean a rule set that omits them silently gets one — and "silently gets a stop
@@ -44,20 +45,21 @@ from whoever owns the rule-builder UI.
 
 Two things worth separating out, because they are different problems:
 
-**Nothing is wired.** *Still true, and now the only thing standing between Phase 3 and
-being real.* The bodies are filled in, but outside tests the sole production call site is the
-backtest CLI, which passes an explicit empty chain. `OrderRouter` still raises. So "every
-order passes `RiskEngine.validate()`" is true of the chain and not of the platform — filling
-in the bodies was necessary and, exactly as this paragraph warned, not sufficient.
+~~**Nothing is wired.**~~ **Half-answered.** `OrderRouter` is implemented, and it is the
+production call site the chain never had: `RiskEngine.validate()` gates every path through
+it — entries, exits, protective stops, flattens — with no way to reach a broker adapter
+around it. `StopManager` and `RedisKillSwitch` now have callers there too. So "every order
+passes `RiskEngine.validate()`" is true of the chain *and* of every order the platform can
+currently construct.
+
+What it is not yet is *exercised*: nothing calls `OrderRouter` in production either, because
+`StrategyRunner` and the trade-updates stream are unstarted Phase 4 items. The claim has
+moved one link down the chain rather than being discharged, and the roadmap says so on each
+item rather than letting a tick imply otherwise.
 
 ~~**Nothing is asserted.**~~ Was ten tests and ten `pytest.skip("TODO")`. The names were
 good and encoded the right cases, so they were kept and filled in; that file is now 60 tests
 with no skips, and `test_stops.py` and `test_kill_switch.py` sit alongside it.
-
-The **nothing is wired** paragraph above is the one that still stands, and it has outlived
-every other finding here. `RiskEngine`, `StopManager`, `position_size` and `RedisKillSwitch`
-are all implemented and all reachable only from tests. The roadmap says so on each item
-rather than letting a tick imply otherwise.
 
 ### The accounting code holds up
 
@@ -165,6 +167,29 @@ Derive it from something reproducible instead: strategy id, symbol, side, and th
 timestamp that triggered it. Then the same intent produces the same key no matter how many
 times it is reconstructed.
 
+**RESOLVED** — `execution/idempotency.py`, wired into the one submission path. The key is
+`sha256(strategy · symbol · side · purpose · decided_at)`, and `OrderRequest` carries
+`decided_at` and `purpose` so a request persisted to a table and replayed after a restart
+derives the key it derived the first time. The random default on `Order` stays, relabelled
+in its docstring as the fallback for an order that never reaches a venue.
+
+Two things the derivation had to get right that this note did not anticipate, both of them
+collisions rather than duplications — the failure that reads as fine in a log, because the
+venue returns the *existing* order and one leg silently never trades:
+
+- **`purpose` is load-bearing.** Strategy id, symbol, side and bar timestamp are not
+  enough. A strategy reversing on one bar — exit the long, open the short — emits two
+  SELLs agreeing on all four. Without a discriminator they are one key and the strategy
+  ends up flat believing it is short.
+- **Quantity is out of the entry key and in the child key.** A rule that shrinks an order
+  mutates `order.qty` (`engine.py:112`), so a qty-bearing key would let the shrunk order
+  through as a second order — turning the one control that can *reduce* an order into the
+  one that can duplicate it. A protective child is the reverse: it exists to cover a
+  specific tranche, so it is keyed on the range `(covered_from, covered_to]` of the entry's
+  fill it protects. Keyed on the increment instead, a 200-share entry filling 100 + 100 —
+  the ordinary case — gives both stops the same key, and the second tranche is naked while
+  the router books it as protected.
+
 ### 5. "ATR is the default" and "`risk_pct` is the default" are prose only
 
 Neither `StopSpec.type` (`strategy/rules.py:107`) nor `PositionSizeSpec.type` (`:122`) has a
@@ -233,12 +258,15 @@ until Phase 4.
   and that a level below zero is refused rather than armed.
 - ~~**`HaltReason.RATE_LIMIT_STORM`** is a sixth auto-engage reason beyond the five
   `RISK.md` lists~~ — **RESOLVED.** Added to the doc's auto-engage list.
-- **Zero of the documented auto-engage triggers are wired.** Still true, and still the
-  honest reading: `RedisKillSwitch.engage()` exists and works, but nothing calls it outside
-  tests. Each of the five is a separate piece of work in whichever subsystem detects it —
-  reconciliation, the stream consumer, the broker adapter — not something the kill switch
-  module can do alone. `flatten_all_positions()` also remains a stub, deliberately: it needs
-  a broker, and halting is not flattening.
+- ~~**Zero of the documented auto-engage triggers are wired.**~~ — **STALE, corrected.** Two
+  are: `DATA_FEED_LOST` from the stream consumer (`data/stream.py:354`, `:515`) and
+  `BROKER_UNREACHABLE` from the order router, which engages when a submit fails in transport
+  and cannot be resolved against the venue — the case `RUNBOOK.md`'s "Broker unreachable →
+  *Auto-halts. Confirm.*" describes. The general point stands for the remaining four
+  (`DAILY_LOSS_LIMIT`, `RECONCILIATION_MISMATCH`, `RATE_LIMIT_STORM`, `UNHANDLED_EXCEPTION`):
+  each belongs to whichever subsystem detects it, and two of those subsystems —
+  reconciliation and the runner — are still stubs. `flatten_all_positions()` also remains a
+  stub, deliberately: it needs a broker, and halting is not flattening.
 - ~~**`StaleDataRule.max_age_seconds = 30`** is hardcoded on the dataclass~~ — **RESOLVED.**
   Moved to `RiskLimits.max_quote_age_seconds`, so it is configurable like every other limit.
 - ~~**`RiskDecision.adjusted_qty`** is specified but unreachable~~ — **RESOLVED.**
