@@ -60,18 +60,20 @@ services:
     # Market-data ingestion + the live strategy loop. Deliberately a separate
     # process from the API: a strategy must not be able to stall HTTP requests,
     # and the two scale on different axes.
+    #
+    # In the default stack as of the worker entry point landing. It was behind a
+    # `worker` profile while `atp_worker.main` raised NotImplementedError, which
+    # `restart: unless-stopped` would have turned into an endless crash-loop —
+    # and a red container everyone learns to ignore. It now starts: with the
+    # defaults in .env.example (backtest mode, no credentials, no watchlist) it
+    # reports that it has no watchlist and runs the schedule, which is an idle
+    # process rather than a failing one.
+    #
+    # It does not trade. `StrategyRunner` is still a stub, so this ingests market
+    # data and runs scheduled jobs; give it a watchlist with WORKER_SYMBOLS.
     build:
       context: .
       dockerfile: infra/docker/worker.Dockerfile
-    # Not started by default: `atp_worker.main` is still a stub that raises
-    # NotImplementedError, and `restart: unless-stopped` would turn that into an
-    # endless crash-loop on every developer's machine — noise that teaches people
-    # to ignore a red container. Opt in once there is something to run:
-    #
-    #     docker compose --profile worker up -d
-    #
-    # Delete this profile when the StrategyRunner live loop lands (Phase 4).
-    profiles: [worker]
     env_file:
       - path: .env
         required: false

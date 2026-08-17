@@ -71,6 +71,25 @@ class Settings(BaseSettings):
     engine_tick_interval_seconds: int = 60
     dashboard_refresh_seconds: int = 300  # requirement #7
 
+    # ── worker ──────────────────────────────────────────────────────────────
+    #: The ingestor's watchlist, comma-separated (`WORKER_SYMBOLS=SPY,QQQ`).
+    #: No default universe: subscribing a process to symbols nobody asked for
+    #: spends the one market-data connection and writes bars for a watchlist
+    #: that was never chosen. Empty means the worker reports that it has nothing
+    #: to ingest rather than opening a socket to subscribe to nothing.
+    #:
+    #: Unaliased, like every setting here that is not one of the four `ATP_`
+    #: process switches: the env var is the field name upper-cased. An alias
+    #: would also make `Settings(worker_symbols=...)` silently do nothing under
+    #: this model's `extra="ignore"`.
+    worker_symbols: str = ""
+    #: How long the feed may be silent *during a session* before the watchdog
+    #: halts trading. Distinct from `risk.max_quote_age_seconds`, which is how
+    #: old a quote may be when an order is priced against it: this one is about
+    #: a connection that has stopped delivering, and is necessarily the looser
+    #: of the two — a symbol can legitimately go a minute without printing.
+    worker_max_silence_seconds: int = 60
+
     # ── api ─────────────────────────────────────────────────────────────────
     api_host: str = "0.0.0.0"
     api_port: int = 8000
@@ -112,6 +131,19 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.api_cors_origins.split(",") if o.strip()]
+
+    @property
+    def worker_symbol_list(self) -> list[str]:
+        """The watchlist, normalised.
+
+        Upper-cased because `symbol` is always an uppercase ticker here and the
+        ingestor rejects anything else — `ATP_WORKER_SYMBOLS=spy` is a shell
+        convenience, not a different instrument. De-duplicated in first-seen
+        order: a symbol listed twice would otherwise be subscribed twice and
+        counted twice against the vendor's symbol limit.
+        """
+        seen = [s.strip().upper() for s in self.worker_symbols.split(",") if s.strip()]
+        return list(dict.fromkeys(seen))
 
     def redacted(self) -> dict[str, Any]:
         """Safe to log: secrets replaced with '***'."""

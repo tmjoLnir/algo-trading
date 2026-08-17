@@ -10,18 +10,59 @@ They run as asyncio tasks under one supervisor. If any dies unexpectedly, the
 supervisor engages the kill switch before exiting — a worker that half-runs is
 more dangerous than one that is plainly down, because monitoring still sees a
 live process while positions go unmanaged.
+
+**Two of the three run today.** `StrategyRunner` is still a stub, and it depends
+on two more that are unstarted — a `BrokerPort` adapter and reconciliation — so
+there is nothing to supervise yet. This worker therefore ingests market data,
+watchdogs it, and runs the schedule; it places no orders. That is stated in the
+startup log rather than left for a reader to infer from a quiet process, because
+"the worker is up" and "the worker is trading" must never be the same
+observation.
 """
 
 from __future__ import annotations
 
 import asyncio
 import signal
+from contextlib import AsyncExitStack
+from typing import TYPE_CHECKING, Any
 
 from atp_core.config import get_settings
+from atp_core.data.providers.alpaca import AlpacaHistoricalProvider, AlpacaRealtimeFeed
+from atp_core.data.stream import StalenessMonitor, StreamIngestor
+from atp_core.errors import ATPError
 from atp_core.logging import configure as configure_logging
 from atp_core.logging import get_logger
+from atp_core.persistence.bars import PostgresBarRepository
+from atp_core.persistence.db import create_engine, create_session_factory
+from atp_core.persistence.events import RedisEventPublisher
+from atp_core.persistence.quotes import RedisQuoteCache
+from atp_core.persistence.redis_client import close_redis, create_redis, create_sync_redis
+from atp_core.risk.killswitch import HaltReason, HaltScope, RedisKillSwitch
+from atp_worker.scheduler import run_scheduler
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Coroutine, Mapping
+
+    from atp_core.config import Settings
+    from atp_core.risk.killswitch import KillSwitch
+
+    #: A thing the supervisor runs. A factory rather than a coroutine because a
+    #: coroutine is single-use, and the supervisor is the only thing entitled to
+    #: decide when — or whether — each one starts.
+    Responsibility = Callable[[], Coroutine[Any, Any, None]]
 
 log = get_logger(__name__)
+
+#: Who a halt engaged from here is attributed to. Distinct from the ingestor's
+#: and the watchdog's actors: "a supervised task died" is a different incident
+#: from "the feed gave up", and the halt record should not make an operator
+#: guess which one they are looking at.
+HALT_ACTOR = "worker_supervisor"
+
+
+class WorkerError(ATPError):
+    """A supervised responsibility ended when it should have run forever."""
 
 
 async def main() -> None:
@@ -42,11 +83,164 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
 
-    raise NotImplementedError(
-        "Wire up: StreamIngestor, one StrategyRunner per active strategy, and "
-        "the Scheduler. Await stop_event; on shutdown cancel tasks, flush state, "
-        "and leave broker-side stops in place."
+    await run(settings, stop_event)
+
+
+async def run(settings: Settings, stop_event: asyncio.Event) -> None:
+    """Wire the adapters, supervise the responsibilities, tear everything down.
+
+    Split from `main` so that the wiring is reachable without installing signal
+    handlers, which only an entry point may do — `add_signal_handler` is
+    process-global and belongs to whoever owns the process.
+
+    Everything opened here is registered for teardown as it is created rather
+    than in a trailing `finally`. The ordering that matters is the WebSocket's:
+    Alpaca allows one connection per key, so a socket left open by a crashing
+    worker is refused to the worker that replaces it. `StreamIngestor.run`
+    closes its own stream on the way out; the stack below is what covers the
+    paths that never reached it.
+    """
+    symbols = settings.worker_symbol_list
+
+    async with AsyncExitStack() as stack:
+        redis = create_redis(settings.redis_url)
+        stack.push_async_callback(close_redis, redis)
+
+        # A second client, synchronous, for the kill switch alone — see
+        # `create_sync_redis`. Both point at the same server.
+        sync_redis = create_sync_redis(settings.redis_url)
+        stack.callback(sync_redis.close)
+
+        engine = create_engine(settings.database_url)
+        stack.push_async_callback(engine.dispose)
+
+        provider = AlpacaHistoricalProvider(settings)
+        stack.push_async_callback(provider.aclose)
+
+        kill_switch = RedisKillSwitch(sync_redis)
+        bar_repo = PostgresBarRepository(create_session_factory(engine))
+        quote_cache = RedisQuoteCache(redis)
+        publisher = RedisEventPublisher(redis)
+
+        responsibilities: dict[str, Responsibility] = {"scheduler": run_scheduler}
+
+        if symbols:
+            ingestor = StreamIngestor(
+                AlpacaRealtimeFeed(settings),
+                quote_cache,
+                bar_repo,
+                provider,
+                publisher=publisher,
+                kill_switch=kill_switch,
+            )
+            monitor = StalenessMonitor(settings.worker_max_silence_seconds, kill_switch=kill_switch)
+            responsibilities["ingestor"] = lambda: ingestor.run(symbols)
+            responsibilities["staleness_monitor"] = lambda: monitor.watch(ingestor)
+        else:
+            # Not fatal and not a halt: nothing is trading, and a stale quote
+            # cache already refuses orders through `StaleDataRule`. But it is a
+            # misconfiguration, and a worker that silently ingests nothing is
+            # the thing an operator would most like to have been told.
+            log.error(
+                "worker.no_watchlist",
+                msg="WORKER_SYMBOLS is empty — ingesting no market data",
+                hint="set WORKER_SYMBOLS=SPY,QQQ to give the ingestor a watchlist",
+            )
+
+        log.info(
+            "worker.ready",
+            run_mode=settings.run_mode,
+            symbols=symbols,
+            responsibilities=sorted(responsibilities),
+            trading=False,
+            msg="no StrategyRunner exists yet — this worker does not place orders",
+        )
+
+        await supervise(responsibilities, stop_event=stop_event, kill_switch=kill_switch)
+
+
+async def supervise(
+    responsibilities: Mapping[str, Responsibility],
+    *,
+    stop_event: asyncio.Event,
+    kill_switch: KillSwitch | None = None,
+) -> None:
+    """Run every responsibility until one ends or a signal arrives.
+
+    Two outcomes, and the difference between them is the whole point of this
+    function:
+
+    - **A signal.** An ordinary shutdown. Tasks are cancelled and nothing is
+      halted — leaving a halt behind that a human has to clear would make every
+      routine restart a manual operation, which is the reasoning
+      `StreamIngestor.run` already applies to its own cancellation.
+    - **A responsibility ended.** Never routine, whether it raised or returned:
+      each of these is written to run until cancelled. Trading is halted before
+      this process exits, because the dangerous state is not a dead worker — it
+      is a worker whose ingestor died while the rest of the system carries on
+      pricing against the last quote it happened to write.
+
+    Halting here is often the *second* halt of an incident: a feed the adapter
+    gave up on has already engaged `DATA_FEED_LOST` on its way out. That is
+    intended. `engage` is idempotent and keeps the original record, so the
+    earlier, more specific reason survives and this one adds nothing but
+    certainty that something halted.
+    """
+    tasks: dict[asyncio.Task[None], str] = {
+        asyncio.create_task(start(), name=name): name for name, start in responsibilities.items()
+    }
+    stopper: asyncio.Task[bool] = asyncio.create_task(stop_event.wait(), name="stop_event")
+
+    waiting: set[asyncio.Task[Any]] = {*tasks, stopper}
+    done, pending = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    ended = [task for task in done if task is not stopper]
+    if not ended:
+        log.info(
+            "worker.stopped",
+            cancelled=sorted(tasks.values()),
+            msg="signal received — shut down cleanly, nothing halted",
+        )
+        return
+
+    first = ended[0]
+    name = tasks[first]
+    error = None if first.cancelled() else first.exception()
+    detail = (
+        f"worker responsibility {name!r} raised {type(error).__name__}: {error}"
+        if error is not None
+        else f"worker responsibility {name!r} finished, but it should run until cancelled"
     )
+
+    log.critical("worker.responsibility_ended", responsibility=name, detail=detail)
+    _halt(kill_switch, detail)
+
+    if error is not None:
+        raise error
+    raise WorkerError(detail)
+
+
+def _halt(kill_switch: KillSwitch | None, detail: str) -> None:
+    """Stop trading platform-wide, or say loudly that we could not."""
+    if kill_switch is None:
+        log.critical(
+            "worker.halt_unavailable",
+            detail=detail,
+            msg="no kill switch bound — TRADING IS NOT HALTED",
+        )
+        return
+    kill_switch.engage(
+        HaltScope.GLOBAL,
+        HaltReason.UNHANDLED_EXCEPTION,
+        engaged_by=HALT_ACTOR,
+        detail=detail,
+    )
+    log.critical("worker.halted", detail=detail)
 
 
 if __name__ == "__main__":
