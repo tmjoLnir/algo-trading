@@ -155,7 +155,21 @@ demonstration you want.
   fill expires rather than resting into an unrelated later bar. When a bar's
   range spans both stop and target the stop is taken, since the bar cannot say
   which came first.
-- [ ] Cost and slippage models
+- [ ] Cost and slippage models — @claude (wip #26).
+  `PerShareCostModel.commission` and `SpreadSlippageModel.slippage` are
+  implemented; `ZeroCostModel`, `CompositeCostModel` and
+  `alpaca_equities_default` already wired them together. Commission is
+  per-share over a minimum, with SEC Section 31 and FINRA TAF on sells only —
+  Alpaca charges no commission but the regulators still do. The minimum and the
+  TAF cap belong to the *order* rather than to each fill, so both are charged as
+  the difference between the order's running total after a fill and before it;
+  otherwise the engine's volume cap, which makes partial fills ordinary, would
+  quietly make a split order cost more than a whole one. Slippage crosses half
+  the spread and adds an impact term in `√(qty / volume)`, sized on what we try
+  to execute rather than on what fills, and is adverse on both sides by
+  construction. Unticked for the same reason as indicators: the phase's
+  *Verifiable:* line is a hand-computed fixture run on `ZeroCostModel`, so it
+  cannot demonstrate a cost model.
 - [ ] Metrics
 - [ ] `SmaCrossover` runs end to end
 
@@ -175,6 +189,22 @@ Separately smoke-tested over the 1,254 real SPY dailies in the hypertable with
 open and inside that bar's range, one equity point per bar. That is engine
 mechanics only — it ran on `ZeroCostModel` and a fixed share count, so its
 return is not a strategy result and must not be read as one.
+
+*Verifiable (end to end):* `SmaCrossover` over real stored bars with
+`alpaca_equities_default()` costs and a full metrics report, where the fills,
+the fees and the reported metrics all reconcile against the equity curve.
+**Not yet shown** — proposed here because the line above is a hand-computed
+fixture on a scripted strategy and `ZeroCostModel`, which is exactly what makes
+it a good test of fill timing and a useless one for indicators, costs or
+metrics. Those three items were being held against it with nothing they could
+ever satisfy. Needs `backtest.metrics`; adjust the wording if it is not the
+demonstration you want.
+
+Costs are already known to bite: the same SPY run scores +11.74% on
+`ZeroCostModel` and +10.41% on `alpaca_equities_default()`, of which only
+$15.04 is fees — Alpaca charges no commission, so the rest is spread and impact
+inside the fill prices. A strategy evaluated without that is being flattered by
+1.3 points over five years on 23 trades, and far more at any real turnover.
 
 ## Phase 3 — Risk (requirement #3)
 - [ ] `RiskEngine` + full rule chain
