@@ -256,20 +256,49 @@ strategy evaluated without them is flattered by 1.3 points over five years on
 11 round trips — and far more at any real turnover.
 
 ## Phase 3 — Risk (requirement #3)
-- [ ] `RiskEngine` + full rule chain — partially touched by #28.
-  `RiskEngine.validate` and `validate_or_raise` are implemented, because the
-  backtest CLI cannot route an order through a gate that raises. That is the
-  chain *runner* only: it runs the rules it is given, first denial wins, and a
-  rule that shrinks rather than refuses mutates the order so later rules
-  measure against what would actually be sent. Every rule in `risk/rules.py`
-  and `default_rules()` itself are still stubs, so the only way to get an
-  engine is to hand it an explicit rule list — nothing acquires an unguarded
-  one by omission. Unticked: a chain with no rules in it is not a risk layer.
-- [ ] Position sizing, all methods
+- [ ] `RiskEngine` + full rule chain — @claude (wip #28, #29).
+  All nine rules and `default_rules()` are implemented, with 35 tests covering
+  both directions for each — a rule that fails to block is an obvious bug, but
+  a rule that blocks something it should have allowed is the one that traps a
+  losing position. The chain runner landed in #28.
+
+  Four decisions `docs/RISK_IMPLEMENTATION_NOTES.md` said to settle *before*
+  writing any rule were settled first, and that file is annotated in place:
+  `Portfolio.unmarked_symbols` (an unmarked holding valued at zero made every
+  percentage limit come out too small and approve what it should refuse),
+  module-level `reduces_position(order, portfolio)` (a sell is an exit only if
+  you are long), `DailyLossLimitRule.anchor()` for the day's starting equity,
+  and `RiskDecision.shrink()` to complete a path that was specified but had no
+  constructor.
+
+  Four of the nine cannot evaluate without a halt state, a clock, a calendar or
+  a feed timestamp, so `default_rules()` takes them as arguments. There is no
+  no-argument version: a chain that quietly dropped them would stop enforcing
+  four things without anyone deciding to. `RiskEngine(limits)` with no rules now
+  raises rather than defaulting.
+
+  Unticked for two reasons. **Nothing routes live orders through it** — the
+  backtest CLI still passes an explicit empty chain, and `OrderRouter` is Phase
+  4, so "every order passes `RiskEngine.validate()`" still has nowhere to be
+  true. And Phase 3 states no *Verifiable:* line to tick against; one is
+  proposed below.
+- [ ] Position sizing, all methods — next. `risk/rules.py:position_size` is the
+  last stub in that module, and `test_risk_engine.py::TestPositionSizing` is
+  two skipped tests already encoding the case docs/RISK.md works through.
 - [ ] `StopManager` — fixed, ATR, trailing, chandelier, time
 - [ ] Redis kill switch
 
 **Before any live order path exists.** Not after.
+
+*Verifiable (proposed):* a strategy that tries to breach every limit is refused
+by the *right* rule each time — the reason a human reads names the most
+fundamental breach, not merely the first one checked — and no configuration of
+the chain can refuse an exit.
+**Not yet shown.** Proposed because this phase states no line at all, which is
+how the three Phase 2 items ended up held against a line none of them could
+satisfy. It wants the kill switch and a live order path, so it cannot be shown
+until Phase 4 — but it is the demonstration that matters here, and the second
+clause is the one worth failing the build over.
 
 ## Phase 4 — Execution & paper trading (requirements #1, #5)
 - [ ] `BrokerPort` + Alpaca adapter (paper first)
