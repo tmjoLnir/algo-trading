@@ -210,12 +210,14 @@ Ranked by how much of this has actually met a venue, which is none of it:
 State them when recording the result, because a tick that overstates what was
 shown is worse than no tick.
 
-**Reconciliation across a restart is clean by construction.** There is no order
-or position persistence, so every boot calls `adopt_broker_state` and takes the
-broker's book wholesale. A restart therefore *cannot* produce a mismatch. If
-your week includes a restart — it will — the clean reconciliation on the other
-side of it proves the adoption ran, not that our accounting survived. Closing
-this needs the order and position repositories.
+**Reconciliation across a restart proves something now, but only after the
+first one.** The repositories landed, so a worker with a stored book restarts
+from *ours* and lets the broker disagree — which is a real check, because the
+two views were formed independently. The caveat that remains is narrower: on a
+**first** boot, or against a fresh database, there is no stored book, so the
+worker adopts the broker's wholesale and that reconciliation is still clean by
+construction. Watch which one you got — `worker.restored_book` means the check
+was real, `worker.adopted_broker_state` means it was not.
 
 **A week of no signals is not a week of correct trading.** If `sma_crossover`
 never crosses, the run demonstrates ingestion, warmup, reconciliation and the

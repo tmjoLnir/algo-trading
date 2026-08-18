@@ -23,7 +23,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from atp_core.brokers.ports import AccountSnapshot
-from atp_core.domain import Fill, Order, OrderStatus, OrderType, Position
+from atp_core.domain import Fill, Order, OrderStatus, OrderType, Portfolio, Position
 from atp_core.errors import BrokerConnectionError, OrderRejectedError
 
 if TYPE_CHECKING:
@@ -227,3 +227,49 @@ class FakeKillSwitch:
 
     def active_halts(self) -> list[object]:
         return []
+
+
+class FakeOrderRepository:
+    """In-memory `OrderRepository`, keyed the way the real one is.
+
+    Stores a *copy* of each order. The runner mutates the orders it holds, and
+    a fake that kept the same object would make "was it saved?" unanswerable —
+    every assertion would see the live object rather than what was written.
+    """
+
+    def __init__(self) -> None:
+        self.saved: dict[str, Order] = {}
+        self.save_calls: list[str] = []
+        #: Seeded by a test to stand for what a previous process stored.
+        self.restorable: list[Order] = []
+
+    async def save(self, order: Order, *, run_mode: object) -> None:
+        self.save_calls.append(order.client_order_id)
+        self.saved[order.client_order_id] = replace(order, fills=list(order.fills))
+
+    async def open_orders(self, run_mode: object) -> list[Order]:
+        return list(self.restorable)
+
+
+class FakePortfolioRepository:
+    """In-memory `PortfolioRepository`.
+
+    `latest` returns None until a test seeds `stored`, which is the first-boot
+    case the worker adopts the broker's book for.
+    """
+
+    def __init__(self) -> None:
+        self.snapshots: list[tuple[datetime, Portfolio]] = []
+        self.stored: Portfolio | None = None
+
+    async def snapshot(self, portfolio: Portfolio, *, at: datetime, run_mode: object) -> None:
+        # Copied for the same reason as above: the runner keeps mutating this
+        # portfolio, so a stored reference would appear to change after the
+        # snapshot was taken.
+        copy = Portfolio(cash=portfolio.cash, starting_equity=portfolio.starting_equity)
+        for symbol, position in portfolio.positions.items():
+            copy.positions[symbol] = replace(position)
+        self.snapshots.append((at, copy))
+
+    async def latest(self, run_mode: object) -> Portfolio | None:
+        return self.stored
