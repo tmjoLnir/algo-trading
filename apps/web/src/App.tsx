@@ -5,6 +5,7 @@ import Backtests from './pages/Backtests'
 import Positions from './pages/Positions'
 import Orders from './pages/Orders'
 import Analytics from './pages/Analytics'
+import Audit from './pages/Audit'
 import Login from './pages/Login'
 import RunModeBanner from './components/RunModeBanner'
 import HaltBanner from './components/HaltBanner'
@@ -17,6 +18,7 @@ const NAV = [
   { to: '/positions', label: 'Positions' },
   { to: '/orders', label: 'Orders' },
   { to: '/analytics', label: 'Analytics' },
+  { to: '/audit', label: 'Audit' },
 ]
 
 function Centred({ children }: { children: React.ReactNode }) {
@@ -110,6 +112,7 @@ export default function App() {
           <Route path="/positions" element={<Positions />} />
           <Route path="/orders" element={<Orders />} />
           <Route path="/analytics" element={<Analytics />} />
+          <Route path="/audit" element={<Audit />} />
         </Routes>
       </main>
     </div>

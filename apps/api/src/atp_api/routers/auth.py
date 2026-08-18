@@ -11,8 +11,16 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
-from atp_api.auth import COOKIE_NAME, Scope, authenticate, create_session_token
-from atp_api.deps import CurrentSession, get_clock
+from atp_api.auth import (
+    COOKIE_NAME,
+    Scope,
+    authenticate,
+    create_session_token,
+    read_session_token,
+)
+from atp_api.deps import CurrentSession, get_audit_sink, get_clock, get_rate_limiter
+from atp_api.ratelimit import RateLimiter, client_address
+from atp_core.audit.ports import Action, AuditEntry, AuditSink
 from atp_core.clock import Clock
 from atp_core.config import Settings, get_settings
 from atp_core.logging import get_logger
@@ -20,6 +28,12 @@ from atp_core.logging import get_logger
 log = get_logger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+#: `actor` on an audit row means "who we know this was". Before a login
+#: succeeds nobody is known, so unauthenticated events are attributed to this
+#: rather than to the username the caller typed — which is a claim, not an
+#: identity, and belongs in `detail` where it reads as one.
+ANONYMOUS = "anonymous"
 
 
 class LoginRequest(BaseModel):
@@ -69,6 +83,8 @@ async def login(
     response: Response,
     settings: Annotated[Settings, Depends(get_settings)],
     clock: Annotated[Clock, Depends(get_clock)],
+    limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
+    audit: Annotated[AuditSink, Depends(get_audit_sink)],
 ) -> WhoAmI:
     """Exchange a username and password for a session cookie.
 
@@ -82,16 +98,51 @@ async def login(
     are the same answer here, because telling them apart confirms which usernames
     exist.
     """
+    now = clock.now()
+    address = client_address(request)
+    verdict = await limiter.check(
+        f"ratelimit:login:{address}",
+        settings.api_login_attempts,
+        settings.api_login_window_seconds,
+    )
+    if not verdict.allowed:
+        log.warning("auth.login_rate_limited", address=address)
+        await audit.record(
+            AuditEntry(
+                at=now,
+                actor=ANONYMOUS,
+                action=Action.RATE_LIMITED,
+                target=address,
+                detail={"username": payload.username, "retry_after": verdict.retry_after},
+            )
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="too many sign-in attempts",
+            # Told rather than left to guess, so an honest client waits instead
+            # of retrying into a counter that its own retries keep alive.
+            headers={"Retry-After": str(verdict.retry_after)},
+        )
+
     subject = authenticate(payload.username, payload.password, settings)
     if subject is None:
-        log.warning("auth.login_failed", username=payload.username)
+        log.warning("auth.login_failed", username=payload.username, address=address)
+        await audit.record(
+            AuditEntry(
+                at=now,
+                actor=ANONYMOUS,
+                action=Action.LOGIN_FAILED,
+                target=address,
+                detail={"username": payload.username},
+            )
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid username or password",
         )
 
     scope = Scope.READ if payload.read_only else Scope.FULL
-    token = create_session_token(subject, settings, clock.now(), scope)
+    token = create_session_token(subject, settings, now, scope)
     response.set_cookie(
         COOKIE_NAME,
         token,
@@ -102,11 +153,26 @@ async def login(
         path="/",
     )
     log.info("auth.login", user=subject, scope=scope.value)
+    await audit.record(
+        AuditEntry(
+            at=now,
+            actor=subject,
+            action=Action.LOGIN,
+            target=address,
+            detail={"scope": scope.value},
+        )
+    )
     return WhoAmI(user=subject, scope=scope.value)
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
-async def logout(request: Request, response: Response) -> None:
+async def logout(
+    request: Request,
+    response: Response,
+    settings: Annotated[Settings, Depends(get_settings)],
+    clock: Annotated[Clock, Depends(get_clock)],
+    audit: Annotated[AuditSink, Depends(get_audit_sink)],
+) -> None:
     """Clear the session cookie.
 
     Unauthenticated on purpose: logging out with an already-expired session must
@@ -117,6 +183,19 @@ async def logout(request: Request, response: Response) -> None:
     honest cost of stateless sessions and the reason `api_session_hours` is
     hours rather than weeks.
     """
+    now = clock.now()
+    # Read rather than required: this endpoint stays unauthenticated so that
+    # signing out of an expired session works. That means the actor is only
+    # known when the cookie still verifies — and when it does not, nothing
+    # happened worth recording. Clearing a cookie that was already invalid is
+    # not an event; writing a row saying "anonymous logged out" would be noise
+    # in a record whose value is that everything in it means something.
+    session = read_session_token(request.cookies.get(COOKIE_NAME, ""), settings, now)
+    if session is not None:
+        await audit.record(
+            AuditEntry(at=now, actor=session.user, action=Action.LOGOUT, target=None)
+        )
+
     response.delete_cookie(
         COOKIE_NAME,
         httponly=True,

@@ -22,6 +22,8 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from atp_api.auth import COOKIE_NAME, Session, read_session_token
+from atp_api.ratelimit import AlwaysAllows, RateLimiter, RedisRateLimiter
+from atp_core.audit.ports import Action, AuditEntry, AuditSink
 from atp_core.backtest.costs import alpaca_equities_default
 from atp_core.brokers import AlpacaBroker, BrokerPort, SimulatedBroker
 from atp_core.clock import Clock, SystemClock, TradingCalendar
@@ -29,6 +31,8 @@ from atp_core.config import Settings, get_settings
 from atp_core.dashboard.ports import SnapshotStore
 from atp_core.domain.enums import RunMode
 from atp_core.execution.ports import PortfolioRepository
+from atp_core.logging import get_logger
+from atp_core.persistence.audit import PostgresAuditLog
 from atp_core.persistence.dashboard import RedisSnapshotStore
 from atp_core.persistence.positions import PostgresPortfolioRepository
 from atp_core.risk.killswitch import KillSwitch
@@ -39,6 +43,9 @@ from atp_core.risk.killswitch import KillSwitch
 #: on the first request — the same trap `tests/unit/test_api_contract.py` guards
 #: the route handlers against, one layer down. The `apps/api/**` TC exemption in
 #: pyproject.toml is what stops the linter moving them back.
+
+
+log = get_logger(__name__)
 
 
 async def get_clock() -> Clock:
@@ -119,6 +126,60 @@ async def get_kill_switch(request: Request) -> KillSwitch:
     """
     switch: KillSwitch = _from_state(request, "kill_switch", "the kill switch")
     return switch
+
+
+class _DroppedAuditLog:
+    """The sink used when there is no database to write to.
+
+    Not a 503, which is what every other missing resource here answers, and the
+    difference is the audit log's own rule: a failed audit write must never fail
+    the action (atp_core.audit.ports). A dependency that refused the request
+    would make the record's absence more disruptive than the record's presence
+    is useful — and the actions being audited include halting trading.
+
+    Reading is the opposite case and is *not* routed through here: the endpoint
+    that lists entries depends on the database directly and answers 503 when it
+    is gone, because an empty page and "the record is unreachable" are different
+    sentences and only one of them is safe to believe.
+    """
+
+    async def record(self, entry: AuditEntry) -> None:
+        log.critical(
+            "audit.no_sink",
+            action=entry.action,
+            actor=entry.actor,
+            effect="the action proceeded; this event is missing from the audit trail",
+        )
+
+    async def recent(
+        self,
+        limit: int = 100,
+        before_id: int | None = None,
+        action: str | None = None,
+    ) -> list[tuple[int, AuditEntry]]:
+        return []
+
+
+async def get_audit_sink(request: Request) -> AuditSink:
+    """Where to append audit entries. Never refuses the request."""
+    factory = getattr(request.app.state, "session_factory", None)
+    if factory is None:
+        return _DroppedAuditLog()
+    return PostgresAuditLog(factory)
+
+
+async def get_rate_limiter(request: Request) -> RateLimiter:
+    """The limiter for the unauthenticated surface. Never refuses the request.
+
+    Tolerant of a missing Redis for the same reason `get_audit_sink` is tolerant
+    of a missing database: refusing here would turn an infrastructure gap into a
+    locked door on the one endpoint that has to keep working for anyone to
+    diagnose it.
+    """
+    redis = getattr(request.app.state, "redis", None)
+    if redis is None:
+        return AlwaysAllows()
+    return RedisRateLimiter(redis)
 
 
 async def get_snapshot_store(
@@ -244,7 +305,12 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 READ_ONLY_MAY_CALL = frozenset({"/api/v1/risk/halt"})
 
 
-async def require_write_scope(request: Request, session: CurrentSession) -> None:
+async def require_write_scope(
+    request: Request,
+    session: CurrentSession,
+    audit: Annotated[AuditSink, Depends(get_audit_sink)],
+    clock: Annotated[Clock, Depends(get_clock)],
+) -> None:
     """Refuse a mutating request from a read-only session.
 
     Decided from the request's method and path in one place rather than route by
@@ -262,6 +328,21 @@ async def require_write_scope(request: Request, session: CurrentSession) -> None
         return
     if session.may_act:
         return
+
+    # Recorded, not just refused. A read-only session attempting a write is
+    # either the operator forgetting which session they are in — harmless and
+    # worth being able to confirm — or a cookie somewhere it should not be,
+    # which is the case the record exists for. Both look identical at the moment
+    # of refusal, and only the audit trail tells them apart afterwards.
+    await audit.record(
+        AuditEntry(
+            at=clock.now(),
+            actor=session.user,
+            action=Action.FORBIDDEN,
+            target=request.url.path,
+            detail={"method": request.method, "scope": session.scope.value},
+        )
+    )
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="this session is read-only",
