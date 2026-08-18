@@ -198,9 +198,70 @@ jobs:
             exit 1
           fi
 
+      # ── the built dashboard ────────────────────────────────────────────
+      # `make up` runs the dev server, deliberately and permanently — it is the
+      # right thing for the loop developers spend the day in. Which leaves the
+      # production image built by nobody until the person deploying builds it,
+      # and that is the worst possible moment to find out it does not. These
+      # steps are the only place it is ever built.
+      - name: Build and start the built dashboard
+        run: docker compose --profile prod up -d --build web-prod
+
+      - name: Wait for nginx to serve the bundle
+        run: |
+          for i in $(seq 1 90); do
+            if curl -fsS -o /dev/null http://localhost:8080/; then
+              echo "web-prod responding after ~${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "web-prod never responded"; exit 1
+
+      - name: The bundle carries no hardcoded API host
+        # The regression this exists for, and it is a silent one: Vite inlines
+        # VITE_API_BASE_URL at BUILD time, so setting it as runtime container
+        # environment (which compose used to do) does nothing whatsoever to a
+        # built bundle and the default gets compiled in instead. A bundle with a
+        # hostname in it works only on the machine it was built for, and fails
+        # by talking to nothing rather than by failing to build.
+        run: |
+          asset=$(curl -fsS http://localhost:8080/ | grep -oE '/assets/[^"]+\.js' | head -1)
+          if [ -z "$asset" ]; then
+            echo "::error::no hashed JS asset referenced by index.html"; exit 1
+          fi
+          echo "checking $asset"
+          # Downloaded first rather than piped straight into grep: in a pipeline
+          # the exit status is grep's, so a curl that failed for any reason
+          # would read as "found nothing" and pass. `-e` aborts here instead.
+          curl -fsS "http://localhost:8080$asset" -o bundle.js
+          if grep -qE '(https?|wss?)://(localhost|127\.0\.0\.1):[0-9]+' bundle.js; then
+            echo "::error::a host is compiled into the bundle -- it must address the API on its own origin"
+            grep -oE '(https?|wss?)://(localhost|127\.0\.0\.1):[0-9]+' bundle.js | sort -u
+            exit 1
+          fi
+          echo "no hardcoded host in the bundle"
+          rm -f bundle.js
+
+      - name: The API answers on the dashboard's own origin
+        # Same-origin is the entire design. If this 404s or 502s, the deployed
+        # dashboard renders perfectly and then talks to nothing.
+        run: |
+          curl -fsS http://localhost:8080/healthz | grep -q '"ok"' \
+            || { echo "::error::/healthz does not reach the API through nginx"; exit 1; }
+          echo "healthz via the proxy: ok"
+
+      - name: A client-side route survives a hard refresh
+        # /positions has no file behind it; without the SPA fallback a reload on
+        # any route but / is a 404, which is the classic way a working SPA looks
+        # broken to everyone who did not arrive via the home page.
+        run: |
+          code=$(curl -fsS -o /dev/null -w '%{http_code}' http://localhost:8080/positions)
+          [ "$code" = "200" ] || { echo "::error::SPA fallback broken (/positions -> $code)"; exit 1; }
+          echo "SPA fallback: /positions -> 200"
+
       - name: Container logs
         if: failure()
-        run: docker compose logs --tail=120
+        run: docker compose --profile prod logs --tail=120
 
       - name: make down
         if: always()

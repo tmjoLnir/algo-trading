@@ -1,0 +1,43 @@
+# The build context is the repository root for every image here (api, worker
+# and web), so what is excluded below is excluded from all three.
+#
+# This file is not only about size. `COPY apps/web/ ./` in the web build would
+# otherwise land the host's `node_modules` on top of the one `npm ci` just
+# installed inside the image — native binaries built for the developer's
+# platform, silently replacing the ones built for the image's.
+
+.git/
+.github/
+
+# Virtualenvs and node_modules are reinstalled inside the image, never copied.
+.venv/
+venv/
+**/node_modules/
+
+# Build output. `apps/web/dist` in particular must be built by the image, not
+# inherited from whatever the developer last ran locally.
+**/dist/
+build/
+*.egg-info/
+
+# Caches
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Secrets. `.env` is gitignored and must never reach a build context either —
+# an image layer is as public as a commit (CLAUDE.md §1.6).
+.env
+.env.*
+!.env.example
+
+# Local noise
+.idea/
+.vscode/
+*.swp
+.DS_Store

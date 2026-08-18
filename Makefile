@@ -1,6 +1,7 @@
 .DEFAULT_GOAL := help
-.PHONY: help install up down logs migrate revision seed backfill test test-unit \
-        test-integration lint typecheck fmt check gen-types dev-api dev-worker dev-web clean
+.PHONY: help install up up-prod down logs migrate revision seed backfill test test-unit \
+        test-integration lint typecheck fmt check gen-types build-web dev-api dev-worker \
+        dev-web clean
 
 WEB := apps/web
 
@@ -27,8 +28,24 @@ up: .env  ## Start the full stack
 	@echo "worker → market-data ingestion + scheduled jobs"
 	@echo "         it places no orders yet; set WORKER_SYMBOLS to give it a watchlist"
 
+up-prod: .env  ## Start the stack with the BUILT dashboard behind nginx
+	@# `web` is the dev server and stays that way; this starts `web-prod`
+	@# instead, which is the bundle `npm run build` produces served by nginx
+	@# with /api and /ws proxied onto the same origin. Services are named
+	@# explicitly so the dev server does not come up alongside it on 5173.
+	docker compose --profile prod up -d --build db redis api worker web-prod
+	@echo
+	@echo "dashboard → http://localhost:8080   (built bundle; API on the same origin)"
+	@echo "api       → http://localhost:8000/docs"
+	@echo
+	@echo "!! NO AUTHENTICATION — this is ROADMAP Phase 6 and it is not built."
+	@echo "!! Bind port 8080 to a private network: anyone who can reach it reads"
+	@echo "!! the entire book, and the risk endpoints ask nobody who is calling."
+
 down:  ## Stop the stack
-	docker compose down
+	@# --profile prod so this also takes down web-prod, which is otherwise
+	@# outside the set of services `down` considers.
+	docker compose --profile prod down
 
 logs:  ## Tail all service logs
 	docker compose logs -f --tail=100
@@ -114,6 +131,13 @@ dev-worker:
 
 dev-web:
 	npm --prefix $(WEB) run dev
+
+build-web:  ## Build the dashboard to apps/web/dist (static files, no server)
+	@# For serving the bundle from something other than this repo's nginx
+	@# image. The output addresses the API on its own origin, so whatever
+	@# serves dist/ must also route /api and /ws to the API — see
+	@# infra/docker/web.nginx.conf for the configuration that does.
+	npm --prefix $(WEB) run build
 
 clean:
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +

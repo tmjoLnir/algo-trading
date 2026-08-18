@@ -20,6 +20,7 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import { apiGet } from '@/api/client'
+import { wsUrl } from '@/api/origin'
 import type { EquityCurveView, LiveDashboard } from '@/api/types'
 
 const DEFAULT_REFRESH_MS = 5 * 60 * 1000
@@ -125,7 +126,7 @@ export function useDashboardStream(symbols: string[]) {
     // effect's dependencies are genuinely exhaustive and cannot go stale.
     const subscribed = symbolKey ? symbolKey.split(',') : []
 
-    const url = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8000/ws'
+    const url = wsUrl()
     let ws: WebSocket | null = null
     let reconnectTimer: ReturnType<typeof setTimeout>
     let attempt = 0
