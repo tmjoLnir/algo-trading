@@ -89,18 +89,60 @@ services:
     restart: unless-stopped
 
   web:
+    # The Vite dev server, with HMR and the source bind-mounted. This is what
+    # `make up` runs and it stays that way: a production image has to be
+    # rebuilt for every edit, which is the wrong trade for the loop you spend
+    # the day in. The built bundle is `web-prod` below.
     build:
-      context: ./apps/web
-      dockerfile: ../../infra/docker/web.Dockerfile
+      # Context is the repo root, as it already is for api and worker — the
+      # nginx config the prod stage needs lives under infra/docker/, which a
+      # context rooted at apps/web cannot reach.
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+      target: dev
     environment:
-      VITE_API_BASE_URL: http://localhost:8000
-      VITE_WS_URL: ws://localhost:8000/ws
+      # Deliberately NOT VITE_API_BASE_URL. The dashboard now addresses the API
+      # on its own origin, and the dev server proxies /api and /ws across
+      # (vite.config.ts) exactly as nginx does in production — so the two
+      # environments resolve the API the same way instead of only both working.
+      # Inside this container `localhost` is this container, hence the service
+      # name.
+      ATP_DEV_PROXY_TARGET: http://api:8000
     ports: ["5173:5173"]
     depends_on: [api]
     volumes:
       - ./apps/web:/app
       - /app/node_modules
     command: npm run dev -- --host 0.0.0.0
+
+  web-prod:
+    # The dashboard as deployed: `npm run build` output served by nginx, with
+    # /api and /ws proxied to the API so the browser only ever sees one origin.
+    #
+    # Behind a profile so that `make up` — and CI's `stack` job, which is a
+    # roadmap deliverable — are completely unaffected by it. `make up-prod`
+    # starts this one instead of `web`.
+    #
+    # THERE IS STILL NO AUTHENTICATION (ROADMAP Phase 6, docs/SAFETY.md). Bind
+    # port 8080 to a private network. Anyone who reaches it reads the entire
+    # book, and the risk endpoints — halt, and a flatten-all specified to
+    # liquidate at market — ask nobody who is calling. They are stubs today,
+    # which is build order rather than a safeguard.
+    profiles: ["prod"]
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+      target: prod
+    environment:
+      API_UPSTREAM: http://api:8000
+    ports: ["8080:80"]
+    depends_on:
+      # Waiting for healthy rather than started: nginx resolves its upstream
+      # per request here (see the resolver in web.nginx.conf), so it would boot
+      # happily against a missing API and serve a dashboard that 502s on its
+      # first poll. This makes the first page load a working one.
+      api: {condition: service_healthy}
+    restart: unless-stopped
 
 volumes:
   db_data:

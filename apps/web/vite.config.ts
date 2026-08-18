@@ -3,10 +3,31 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'node:path'
 
+// Where the dev server forwards /api, /ws and the health probes. Defaults to a
+// local `make dev-api`; docker-compose sets it to the api service, because
+// inside the web container `localhost` is the web container.
+const devProxyTarget = process.env.ATP_DEV_PROXY_TARGET ?? 'http://localhost:8000'
+
 export default defineConfig({
   plugins: [react()],
   resolve: { alias: { '@': path.resolve(__dirname, './src') } },
-  server: { port: 5173, host: true },
+  server: {
+    port: 5173,
+    host: true,
+    // The dev server proxies the API onto its own origin, which is how
+    // production serves it too (infra/docker/web.nginx.conf). The point is not
+    // convenience — it is that both environments resolve the API the same way.
+    // With the dev server talking cross-origin to :8000 and production talking
+    // same-origin, every CORS and mixed-content problem is invisible until
+    // deploy, and `import.meta.env.VITE_API_BASE_URL` has to be right in two
+    // places that are never exercised together.
+    proxy: {
+      '/api': { target: devProxyTarget, changeOrigin: true },
+      '/healthz': { target: devProxyTarget, changeOrigin: true },
+      '/readyz': { target: devProxyTarget, changeOrigin: true },
+      '/ws': { target: devProxyTarget, ws: true, changeOrigin: true },
+    },
+  },
   test: {
     // jsdom rather than the default node environment: the dashboard's rules —
     // a P&L that shows a sign as well as a colour, a stale price that is greyed

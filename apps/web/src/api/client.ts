@@ -1,9 +1,12 @@
 /**
  * Thin fetch wrapper. All server state goes through React Query — never call
  * these from a useEffect (CLAUDE.md §4).
+ *
+ * The host is not this module's business: `apiBase()` owns it, and defaults to
+ * the page's own origin so the built bundle carries no hostname.
  */
 
-const BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
+import { apiBase } from './origin'
 
 export class ApiError extends Error {
   constructor(
@@ -15,7 +18,7 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
+  const res = await fetch(`${apiBase()}${path}`, {
     ...init,
     headers: { 'Content-Type': 'application/json', ...init?.headers },
   })

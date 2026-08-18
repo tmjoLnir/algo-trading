@@ -962,6 +962,34 @@ the only property that makes the screen worth reading.
 - [ ] Metrics/tracing
 - [ ] Backups and a tested restore
 - [ ] Deployment target chosen; secrets manager
+- [ ] Dashboard served as a built bundle rather than a dev server — @claude (wip).
+  `infra/docker/web.Dockerfile` gained a `prod` stage: the `npm run build`
+  output served by nginx, with `/api`, `/ws` and the health probes proxied so
+  the browser only ever sees one origin (`make up-prod`, port 8080). The
+  dashboard addresses the API with relative paths now and derives the socket
+  scheme from the page's, so the bundle carries no hostname and one image is
+  correct on localhost, on a LAN address and behind TLS.
+
+  This closed a trap rather than only adding a target. Vite inlines
+  `VITE_API_BASE_URL` into the bundle at **build** time, and docker-compose was
+  setting it as **runtime** container environment — which is invisible, because
+  it works for the dev server it was actually pointed at and does nothing
+  whatsoever to a built bundle. A production build made under that arrangement
+  had `http://localhost:8000` compiled into it, which was confirmed by building
+  one before the change.
+
+  Unticked, and Phase 6 has no *Verifiable:* line to tick anything against —
+  the same gap that left #16's calendar endpoint untickable through the whole
+  of Phase 1. What has been shown: the nginx config validated, then *run*,
+  serving the real built bundle — SPA fallback on a client-side route, the
+  cache headers, gzip, the `/api/v1` prefix and query string arriving
+  unstripped, and the WebSocket upgrade headers forwarded. What has not: the
+  image has never been built and nothing has been served from the container, no
+  Docker daemon being available where this was written.
+
+  It does not make the platform deployable. The item above it is unstarted and
+  the authentication item at the top of this phase is still blocking: this
+  serves the dashboard to a private network and nowhere else.
 
 ## Later
 Declarative rule builder UI · walk-forward optimisation · sector/factor exposure

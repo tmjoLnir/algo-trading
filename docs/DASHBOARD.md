@@ -146,6 +146,73 @@ No running server is needed. `src/api/types.ts` is nothing but aliases over the
 generated `schema.d.ts`; if one stops compiling, the server contract changed and
 the components reading it need to change too. That is the alarm working.
 
+## Serving it
+
+Two ways, and they resolve the API identically on purpose.
+
+| | Command | Port | What runs |
+|---|---|---|---|
+| Development | `make up`, or `make dev-web` | 5173 | Vite dev server, HMR, source bind-mounted |
+| Deployed | `make up-prod` | 8080 | `npm run build` output served by nginx |
+
+**Everything is same-origin.** The dashboard addresses the API with relative
+paths — `/api/v1/dashboard/live`, `/ws` — and whatever served the page routes
+those through to FastAPI: the dev-server proxy in `vite.config.ts`, and
+`infra/docker/web.nginx.conf` in production. The browser only ever sees one
+origin, so CORS is not part of the deployment and `API_CORS_ORIGINS` goes unread.
+
+That is not for convenience. It is so the two environments resolve the API the
+*same way* rather than merely both working. A dev server talking cross-origin to
+:8000 while production talks same-origin hides every CORS and mixed-content
+problem until the deploy, and puts the correct value of one variable in two
+places that are never exercised together.
+
+**`VITE_API_BASE_URL` and `VITE_WS_URL` are build-time, not runtime.** Vite
+inlines `import.meta.env.VITE_*` into the bundle when it is built, so setting
+either on the container *serving* a built bundle does nothing at all — the value
+compiled in is the one the browser uses. `docker-compose.yml` used to set them on
+the `web` service, which worked only because that service runs the dev server.
+They reach a build through the build args in `infra/docker/web.Dockerfile`.
+
+Both default to empty, which means "same origin as the page", and that is what
+makes one image correct on localhost, on a LAN address and behind a hostname. Set
+them only to point at an API on a genuinely different origin — which means taking
+on `API_CORS_ORIGINS` and giving up a bundle that travels.
+
+The socket's scheme is derived from the page's rather than hardcoded
+(`src/api/origin.ts`): a browser refuses a `ws://` socket from an `https://` page
+as mixed content, so a hardcoded scheme is a dashboard that loses every live
+update the day it goes behind TLS — while the 5-minute poll keeps working and
+hides that it has.
+
+### What nginx does
+
+- Serves `dist/` with an SPA fallback, so a hard refresh on `/positions` returns
+  `index.html` rather than a 404.
+- Caches fingerprinted `/assets/*` for a year, and `index.html` not at all. A
+  cached `index.html` names asset hashes that stop existing at the next deploy,
+  which is a blank dashboard that a reload does not fix.
+- Proxies `/api/`, `/healthz`, `/readyz` and `/ws`, passing the path through
+  unstripped, and forwards the WebSocket upgrade with a read timeout long enough
+  that a quiet market does not look like a broken feed. The health probes keep
+  their unversioned names, so `/healthz` through the proxy answers "is the whole
+  chain up".
+- Resolves the API's address per request via Docker's DNS. nginx otherwise
+  resolves an upstream once at startup and caches it forever, and goes on
+  proxying to a dead address after the api container restarts on a new one.
+
+### Before it leaves a private network
+
+**It must not, yet.** There is no authentication of any kind (below). What is
+exposed *today* is disclosure: the entire book — positions, equity, P&L, the
+signals and the reasoning behind them — to anyone who can reach the port. The
+mutating endpoints are still `NotImplementedError` stubs, so the kill switch on
+this screen currently 500s rather than doing anything; that is an accident of
+build order and not a protection, and it stops being true the moment Phase 3's
+risk endpoints land. On a LAN or a VPN this is a contained risk. On a public
+address it is the whole platform. Authentication is ROADMAP Phase 6 and
+blocking — see docs/SAFETY.md.
+
 ## Not built yet
 
 Stated here rather than left to be discovered:
@@ -162,4 +229,10 @@ Stated here rather than left to be discovered:
   The snapshot names the strategy running the whole book instead.
 - **There is no authentication.** docs/SAFETY.md's access-control item is Phase
   6 and blocking for any deployment. The socket is read-only, but everything it
-  carries is disclosure.
+  carries is disclosure — the whole book, to anyone who can reach the port. Nor
+  is the API behind it designed read-only: the kill switch on this screen POSTs
+  to `/api/v1/risk/halt`, `/api/v1/risk/flatten-all` is specified to liquidate
+  everything at market, and `actor` is a query parameter the caller fills in for
+  themselves. Both are `NotImplementedError` stubs today — build order, not a
+  safeguard. Until this item lands, "serving it" (above) means serving it to a
+  private network.
