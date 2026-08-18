@@ -201,17 +201,58 @@ hides that it has.
   resolves an upstream once at startup and caches it forever, and goes on
   proxying to a dead address after the api container restarts on a new one.
 
-### Before it leaves a private network
+### Reaching it from another machine
 
-**It must not, yet.** There is no authentication of any kind (below). What is
-exposed *today* is disclosure: the entire book — positions, equity, P&L, the
-signals and the reasoning behind them — to anyone who can reach the port. The
-mutating endpoints are still `NotImplementedError` stubs, so the kill switch on
-this screen currently 500s rather than doing anything; that is an accident of
-build order and not a protection, and it stops being true the moment Phase 3's
-risk endpoints land. On a LAN or a VPN this is a contained risk. On a public
-address it is the whole platform. Authentication is ROADMAP Phase 6 and
-blocking — see docs/SAFETY.md.
+Every port in `docker-compose.yml` is bound to `127.0.0.1`. One of them is meant
+to be moved off it — the dashboard's — and it is the only one that is
+configurable:
+
+```bash
+ATP_WEB_BIND_ADDR=192.168.1.50   # in .env, then: make up-prod
+```
+
+The others are pinned. The API does not need publishing for the dashboard to
+work, because nginx reaches it across the compose network; Postgres and Redis
+are published only so `make migrate`, `seed` and `backfill` can run from the
+host. Putting the dashboard on a LAN therefore does not put an unauthenticated
+API, a `atp`/`atp` Postgres, or a passwordless Redis holding the kill-switch
+state there with it. That separation is what makes exposing one port defensible.
+
+Three ways to reach it, in descending order of how much they protect you:
+
+| | How | Cost |
+|---|---|---|
+| **SSH tunnel** | leave the default, `ssh -L 8080:127.0.0.1:8080 you@host` | nothing on the network at all; every viewer needs an SSH account, and it is awkward from a phone |
+| **VPN interface** | `ATP_WEB_BIND_ADDR` = a Tailscale (`tailscale ip -4`) or WireGuard address | reachable from anywhere you are on the VPN, encrypted in transit; needs the VPN |
+| **LAN interface** | `ATP_WEB_BIND_ADDR` = the address from `ip -4 -brief addr` | simplest; "the LAN" usually includes guest wifi and IoT unless segmented, DHCP can move the address, and it is plain HTTP so the book crosses the wire in clear text |
+
+The VPN route is the one to prefer if you want to look at positions away from
+the machine. With Tailscale, `tailscale serve` additionally fronts it with a
+real HTTPS certificate — which is what the `wss://` derivation above is waiting
+for — and can gate on Tailscale identity, the closest thing to authentication
+available before Phase 6.
+
+**Do not use a firewall instead of a bind address.** Docker publishes ports with
+rules that are traversed before the chain ufw and firewalld write into, so
+`ufw deny 8080` reports itself applied and blocks nothing at all. Restricting a
+published Docker port means writing into the `DOCKER-USER` chain. The bind
+address is the control that actually holds; a firewall is defence in depth
+behind it, never instead of it.
+
+`make check-bindings` refuses a wildcard bind, and CI runs it before the stack
+starts — a compose file that puts any of this on `0.0.0.0` fails the build.
+
+### It should not leave a private network at all
+
+There is no authentication of any kind (below). What is exposed *today* is
+disclosure: the entire book — positions, equity, P&L, the signals and the
+reasoning behind them — to anyone who can reach the port. The mutating endpoints
+are still `NotImplementedError` stubs, so the kill switch on this screen
+currently 500s rather than doing anything; that is an accident of build order
+and not a protection, and it stops being true the moment Phase 3's risk
+endpoints land. On a LAN or a VPN this is a contained risk. On a public address
+it is the whole platform. Authentication is ROADMAP Phase 6 and blocking — see
+docs/SAFETY.md.
 
 ## Not built yet
 

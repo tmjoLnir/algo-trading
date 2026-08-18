@@ -90,6 +90,26 @@ Until auth is implemented: bind to localhost only, never expose port 8000
 publicly, and do not deploy to a cloud host with a public IP. This is a blocking
 item before any deployment, and it is item one in `docs/ROADMAP.md` Phase 6.
 
+**This is enforced now, not merely stated.** Every port in `docker-compose.yml`
+binds `127.0.0.1` — the API, Postgres (whose credentials are `atp`/`atp`), the
+Redis holding the kill-switch state, and the dev server alike — and
+`make check-bindings` fails on any service published to `0.0.0.0`. CI runs it
+before the stack starts, so a compose file that opens one of these to the
+network fails the build instead of being found by a port scan. It was stated
+here and contradicted by the compose file for some time, which is the argument
+for the check.
+
+The single deliberate exception is the dashboard's own port, through
+`ATP_WEB_BIND_ADDR`: one LAN or VPN address, defaulting to loopback, wildcards
+refused. It is safe to move only because nginx reaches the API across the
+compose network, so exposing the dashboard does not expose the API with it.
+docs/DASHBOARD.md has the trade-offs.
+
+A firewall is not a substitute. Docker publishes ports with rules traversed
+before the chain ufw and firewalld write into, so `ufw deny 8080` reports itself
+applied and blocks nothing; restricting a published port means the `DOCKER-USER`
+chain. Bind addresses are the control that holds.
+
 ## Secrets
 
 - Keys live in `.env` (gitignored) or a secrets manager. Never in code, never in

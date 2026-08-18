@@ -9,7 +9,13 @@ services:
       POSTGRES_USER: atp
       POSTGRES_PASSWORD: atp
       POSTGRES_DB: atp
-    ports: ["5432:5432"]
+    # Loopback, never 0.0.0.0. Published at all only because `make migrate`,
+    # `seed` and `backfill` run from the host against localhost:5432 — nothing
+    # inside the stack needs it, the api and worker reach `db` over the compose
+    # network. The credentials here are atp/atp, so binding this to every
+    # interface hands the trading database to whoever is on the network
+    # (docs/SAFETY.md, "Access control").
+    ports: ["127.0.0.1:5432:5432"]
     volumes:
       - db_data:/var/lib/postgresql/data
       - ./infra/db/init:/docker-entrypoint-initdb.d:ro
@@ -24,7 +30,11 @@ services:
     # and the job queue for scheduled backtests/reports.
     image: redis:7-alpine
     command: redis-server --appendonly yes
-    ports: ["6379:6379"]
+    # Loopback, for the same reason as db above, and one of its own: this holds
+    # the kill-switch state, with no password in front of it. Anything that can
+    # reach this port can clear a halt — the one control docs/RUNBOOK.md tells
+    # an operator to reach for first.
+    ports: ["127.0.0.1:6379:6379"]
     volumes: [redis_data:/data]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -47,7 +57,15 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://atp:atp@db:5432/atp
       REDIS_URL: redis://redis:6379/0
-    ports: ["8000:8000"]
+    # Loopback, and deliberately nothing else for as long as the API has no
+    # authentication — docs/SAFETY.md says so in as many words. Published only
+    # for the developer's own /docs and curl.
+    #
+    # The dashboard does NOT need this port. nginx proxies /api and /ws to
+    # `api` across the compose network (infra/docker/web.nginx.conf), so
+    # putting the dashboard on a LAN does not put the API there with it. That
+    # is the property that makes exposing one port a defensible thing to do.
+    ports: ["127.0.0.1:8000:8000"]
     depends_on:
       db: {condition: service_healthy}
       redis: {condition: service_healthy}
@@ -108,7 +126,11 @@ services:
       # Inside this container `localhost` is this container, hence the service
       # name.
       ATP_DEV_PROXY_TARGET: http://api:8000
-    ports: ["5173:5173"]
+    # Loopback. The dev server serves the same unauthenticated dashboard as the
+    # built one, so it gets the same default. To reach a dashboard from another
+    # machine, use `make up-prod` and ATP_WEB_BIND_ADDR below — one deliberate
+    # way out of localhost is easier to reason about than two.
+    ports: ["127.0.0.1:5173:5173"]
     depends_on: [api]
     volumes:
       - ./apps/web:/app
@@ -135,7 +157,26 @@ services:
       target: prod
     environment:
       API_UPSTREAM: http://api:8000
-    ports: ["8080:80"]
+    # THE one port meant to be reachable from another machine, and the only
+    # binding in this file that is configurable:
+    #
+    #   unset          -> 127.0.0.1, this host only (the default)
+    #   192.168.1.50   -> that LAN interface
+    #   100.x.y.z      -> a Tailscale interface
+    #   10.8.0.1       -> a WireGuard interface
+    #
+    # Fail-closed on purpose. An operator who forgets to set it gets a dashboard
+    # nobody else can reach, which is the harmless half of the mistake; the
+    # other half is a trading book on every interface of the machine. Do not set
+    # it to 0.0.0.0 — pick the one address you mean.
+    #
+    # `:-` and not `-`, and the difference is the whole guarantee. `make up`
+    # copies .env.example to .env, so ATP_WEB_BIND_ADDR arrives *set and empty*
+    # rather than absent. `:-` substitutes the default for an empty value; `-`
+    # substitutes only for a missing one, and would resolve this to ":8080:80"
+    # — host_ip dropped, which is 0.0.0.0. One character between fail-closed and
+    # fail-open, in the direction nobody would notice.
+    ports: ["${ATP_WEB_BIND_ADDR:-127.0.0.1}:8080:80"]
     depends_on:
       # Waiting for healthy rather than started: nginx resolves its upstream
       # per request here (see the resolver in web.nginx.conf), so it would boot

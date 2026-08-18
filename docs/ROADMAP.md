@@ -983,13 +983,30 @@ the only property that makes the screen worth reading.
   of Phase 1. What has been shown: the nginx config validated, then *run*,
   serving the real built bundle — SPA fallback on a client-side route, the
   cache headers, gzip, the `/api/v1` prefix and query string arriving
-  unstripped, and the WebSocket upgrade headers forwarded. What has not: the
-  image has never been built and nothing has been served from the container, no
-  Docker daemon being available where this was written.
+  unstripped, and the WebSocket upgrade headers forwarded.
 
-  It does not make the platform deployable. The item above it is unstarted and
-  the authentication item at the top of this phase is still blocking: this
-  serves the dashboard to a private network and nowhere else.
+  The caveat that stood here — that the image had never been built and nothing
+  had ever been served from the container — is no longer true, and is corrected
+  in place rather than left reading as current. The `stack` job built the image
+  and served from it on the #46 merge commit (CI run 32099581786): the bundle
+  carried no compiled-in host, `/healthz` answered through nginx on the
+  dashboard's own origin, and a client-side route survived a hard refresh. Every
+  push re-checks it, which is the point of putting it there rather than in a
+  deployment runbook.
+
+  Exposure is a decision now rather than a default — @claude (wip). Every port
+  in `docker-compose.yml` binds `127.0.0.1`: the API, the `atp`/`atp` Postgres
+  and the passwordless Redis holding the kill-switch state were all published on
+  `0.0.0.0`, which contradicted docs/SAFETY.md's own "bind to localhost only"
+  rule for as long as both have existed. The dashboard's port is the single
+  deliberate exception, through `ATP_WEB_BIND_ADDR`, and `make check-bindings`
+  refuses a wildcard — in CI, before the stack starts. Moving that one port is
+  safe only because nginx reaches the API across the compose network, so putting
+  the dashboard on a LAN does not put an unauthenticated API on it too.
+
+  It still does not make the platform deployable. The item above this is
+  unstarted and the authentication item at the top of the phase is still
+  blocking: this serves the dashboard to a private network and nowhere else.
 
 ## Later
 Declarative rule builder UI · walk-forward optimisation · sector/factor exposure
