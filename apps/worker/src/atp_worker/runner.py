@@ -14,23 +14,64 @@ Per evaluation, in this exact order:
     6. Persist state and publish updates.
 
 Stops before signals, same as the backtest. Never reorder one without the other.
+
+Two things this file is deliberately not:
+
+**It is not a second submission path.** Every order it causes goes through
+`OrderRouter`, which is the only thing that reaches a broker (rule §1.5). The
+runner decides *what* to ask for and never *how* to send it.
+
+**It is not a second indicator implementation.** The context below serves the
+strategy from an in-memory window of the same `Bar` objects the backtest reads,
+through the same `indicators.dispatch`. A strategy computing a different SMA(20)
+live than the one its backtest approved is the single divergence this platform's
+premise cannot survive.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, replace
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
+import numpy as np
+
+from atp_core.domain import Order, Portfolio, Side, SignalAction
+from atp_core.domain.enums import StopType
+from atp_core.errors import ATPError, DataGapError, ExecutionError
+from atp_core.execution.trade_updates import apply_trade_update
+from atp_core.indicators import dispatch
+from atp_core.logging import get_logger
+from atp_core.risk.killswitch import HaltReason, HaltScope
+
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
     from datetime import datetime
 
+    from atp_core.brokers.ports import TradeUpdate
     from atp_core.clock import Clock, TradingCalendar
     from atp_core.data.ports import BarRepository, QuoteCache
-    from atp_core.domain import Portfolio
+    from atp_core.domain import Bar, Fill, Position, Quote, Signal, Timeframe
+    from atp_core.execution.reconciliation import Reconciler
     from atp_core.execution.router import OrderRouter
     from atp_core.risk.killswitch import KillSwitch
-    from atp_core.risk.stops import StopManager
+    from atp_core.risk.stops import StopConfig, StopManager
     from atp_core.strategy.base import Strategy
+    from atp_core.strategy.rules import PositionSizeSpec
+
+log = get_logger(__name__)
+
+#: Consecutive failed evaluations before the runner halts trading. A runner
+#: erroring every tick is not trading, but it looks alive to a health check —
+#: which is the state this counter exists to end. Three rather than one,
+#: because a single transient read failure should not stop a strategy.
+MAX_CONSECUTIVE_ERRORS = 3
+
+#: How long to sleep when the market is shut and the calendar cannot say when
+#: it next opens. A bounded nap rather than a spin, and short enough that a
+#: calendar that starts answering is picked up promptly.
+CLOSED_MARKET_FALLBACK_SECONDS = 300.0
 
 
 @dataclass(slots=True)
@@ -42,10 +83,149 @@ class RunnerStats:
     orders_rejected_by_risk: int = 0
     last_evaluation_at: datetime | None = None
     errors: int = 0
+    consecutive_errors: int = 0
+    fills_applied: int = 0
+    stops_triggered: int = 0
+
+
+@dataclass(slots=True)
+class _AppliedFill:
+    """A fill the runner has already booked, waiting for `strategy.on_fill`.
+
+    Held rather than dispatched at the moment it lands, because the strategy
+    hook belongs inside the loop's documented ordering while *booking* the fill
+    and protecting the position does not — that has to happen the instant the
+    event arrives.
+    """
+
+    order: Order
+    fill: Fill
+
+
+class LiveContext:
+    """The strategy's window onto the world, live.
+
+    The counterpart of `BacktestContext`, and deliberately the same shape. It
+    serves a rolling in-memory window of completed bars rather than slicing a
+    fixed array, but the guarantee it provides is identical: a strategy sees
+    completed bars and nothing else. There is no cursor here because there is
+    no future to accidentally address — the window holds what has closed.
+
+    Sync, because `StrategyContext` is sync and a strategy must not be able to
+    await inside a decision. Everything it serves is loaded before the hook is
+    called, which is what `warmup` and the loop's bar refresh are for.
+    """
+
+    def __init__(
+        self,
+        bars: dict[str, list[Bar]],
+        quotes: dict[str, Quote],
+        portfolio: Portfolio,
+        clock: Clock,
+        symbols: tuple[str, ...],
+    ) -> None:
+        self._bars = bars
+        self._quotes = quotes
+        self._portfolio = portfolio
+        self._clock = clock
+        self._symbols = symbols
+        self._indicator_cache: dict[
+            tuple[str, str, int, tuple[tuple[str, object], ...]], float
+        ] = {}
+
+    def invalidate(self) -> None:
+        """Drop cached indicator values. Called when the window moves."""
+        self._indicator_cache.clear()
+
+    # ── StrategyContext ─────────────────────────────────────────────────────
+
+    @property
+    def now(self) -> datetime:
+        return self._clock.now()
+
+    @property
+    def symbols(self) -> tuple[str, ...]:
+        return self._symbols
+
+    def history(self, symbol: str, timeframe: Timeframe, lookback: int) -> list[Bar]:
+        """The last `lookback` completed bars, oldest first.
+
+        Raises rather than returning a short series, exactly as the backtest
+        does: a 20-period SMA over 6 bars is not a 20-period SMA. Live, this
+        fires when warmup could not load enough history — which is a reason to
+        stop rather than to trade on a number that does not mean what its name
+        says.
+        """
+        available = self._bars.get(symbol, [])
+        if len(available) < lookback:
+            raise DataGapError(
+                f"{symbol} has {len(available)} bars at {self.now.isoformat()}, needs {lookback}"
+            )
+        return available[-lookback:]
+
+    def closes(self, symbol: str, timeframe: Timeframe, lookback: int) -> np.ndarray:
+        """Closing prices as a float array, for indicator maths.
+
+        Returns what exists rather than raising, matching `BacktestContext` —
+        the reference strategies check the length themselves so they can sit
+        quietly through warmup.
+        """
+        available = self._bars.get(symbol, [])
+        window = available[-lookback:] if lookback > 0 else []
+        return np.array([float(b.close) for b in window], dtype=float)
+
+    def last_price(self, symbol: str) -> Decimal | None:
+        """The last completed bar's close.
+
+        Deliberately the bar rather than the live quote, even though a quote is
+        fresher. This is what a strategy *decides* on, and a decision taken on a
+        mid-quote inside an unfinished bar is a decision the backtest can never
+        reproduce. Marking a position for P&L is the opposite case and does use
+        the quote — see `StrategyRunner._mark`.
+        """
+        available = self._bars.get(symbol, [])
+        return available[-1].close if available else None
+
+    def position(self, symbol: str) -> Position:
+        return self._portfolio.position(symbol)
+
+    @property
+    def equity(self) -> Decimal:
+        return self._portfolio.equity
+
+    def indicator(self, name: str, symbol: str, **kwargs: object) -> float | None:
+        """Cached indicator value, or None when there is not enough history."""
+        raw_period = kwargs.get("period", 14)
+        if not isinstance(raw_period, int):
+            raise ExecutionError(f"indicator {name!r} needs an integer period, got {raw_period!r}")
+        key = (name, symbol, len(self._bars.get(symbol, [])), tuple(sorted(kwargs.items())))
+        if key in self._indicator_cache:
+            return self._indicator_cache[key]
+
+        value = dispatch.compute(name, self._bars.get(symbol, []), raw_period)
+        if value is not None:
+            self._indicator_cache[key] = value
+        return value
 
 
 class StrategyRunner:
-    """Runs one strategy against live (or paper) market data."""
+    """Runs one strategy against live (or paper) market data.
+
+    Four dependencies the skeleton did not name are required here, each because
+    something documented is impossible without it:
+
+    - `reconciler` — `warmup` must reconcile before the first evaluation, and a
+      runner that built its own could not be tested against a fake broker.
+    - `sizing` — `OrderRouter.submit_signal` takes a `PositionSizeSpec`; there
+      is no default that is safe for every strategy.
+    - `stop_config` — protective orders need one, and it is also what lets a
+      signal without an explicit stop still be sized by `risk_pct`.
+    - `timeframe` — which series this strategy trades. The repository holds
+      several, and guessing would silently run a daily strategy on minutes.
+
+    None of them have defaults, for the reason `default_rules()` has none: a
+    dependency that quietly defaulted would be one nobody chose.
+    """
 
     def __init__(
         self,
@@ -58,6 +238,13 @@ class StrategyRunner:
         quote_cache: QuoteCache,
         clock: Clock,
         calendar: TradingCalendar,
+        *,
+        reconciler: Reconciler,
+        sizing: PositionSizeSpec,
+        stop_config: StopConfig,
+        timeframe: Timeframe,
+        tick_interval_seconds: float = 60.0,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self.strategy = strategy
         self.symbols = symbols
@@ -68,7 +255,43 @@ class StrategyRunner:
         self.quote_cache = quote_cache
         self.clock = clock
         self.calendar = calendar
+        self.reconciler = reconciler
+        self.sizing = sizing
+        self.stop_config = stop_config
+        self.timeframe = timeframe
+        self.tick_interval_seconds = tick_interval_seconds
+        self._sleep: Callable[[float], Awaitable[None]] = (
+            sleep if sleep is not None else asyncio.sleep
+        )
         self.stats = RunnerStats()
+
+        self._bars: dict[str, list[Bar]] = {symbol: [] for symbol in symbols}
+        self._quotes: dict[str, Quote] = {}
+        #: Bound for real by `warmup`, which is the only thing that knows the
+        #: portfolio. Empty rather than `None` so every accessor can be typed
+        #: without an optional, and replaced rather than mutated.
+        self._portfolio = Portfolio(cash=Decimal(0), starting_equity=Decimal(0))
+        self._context = LiveContext(
+            self._bars, self._quotes, self._portfolio, clock, tuple(symbols)
+        )
+        #: What we believe is working at the venue, keyed by `client_order_id`.
+        #: This is what `Reconciler.reconcile` needs and had no source for: the
+        #: runner is the thing that knows what it submitted.
+        self._open_orders: dict[str, Order] = {}
+        #: Fills booked since the last pass, awaiting `strategy.on_fill`.
+        self._pending_fills: list[_AppliedFill] = []
+        #: Serialises a pushed fill against an in-flight evaluation, so a fill
+        #: cannot land halfway through the ordered pass it is supposed to be a
+        #: step of.
+        self._lock = asyncio.Lock()
+        self._running = False
+
+    # ── lifecycle ───────────────────────────────────────────────────────────
+
+    @property
+    def open_orders(self) -> list[Order]:
+        """What we believe is working at the venue. Handed to the reconciler."""
+        return list(self._open_orders.values())
 
     async def warmup(self, portfolio: Portfolio) -> None:
         """Load history and rebuild state before the first evaluation.
@@ -81,8 +304,48 @@ class StrategyRunner:
         2. Reconcile against the broker (`execution.reconciliation`). We may
            have restarted holding positions we no longer know about — a runner
            that starts assuming it is flat will happily double a position.
+
+        A dirty reconciliation **refuses to start**. The reconciler has already
+        engaged the kill switch, so the risk chain would refuse every order
+        anyway; raising here means the operator sees why at startup rather than
+        finding a process that is running and silently declining to trade.
         """
-        raise NotImplementedError
+        self._portfolio = portfolio
+        self._context = LiveContext(
+            self._bars, self._quotes, portfolio, self.clock, tuple(self.symbols)
+        )
+        needed = max(self.strategy.warmup_bars, 1)
+
+        for symbol in self.symbols:
+            bars = await self.bar_repo.get_last_n_bars(symbol, self.timeframe, needed)
+            self._bars[symbol] = list(bars)
+            if len(bars) < needed:
+                # Loud, and not fatal on its own: `LiveContext.history` refuses
+                # for whoever actually needs the missing bars, while a strategy
+                # that checks its own lengths can still run.
+                log.warning(
+                    "runner.warmup_short_history",
+                    symbol=symbol,
+                    have=len(bars),
+                    needed=needed,
+                )
+        self._context.invalidate()
+
+        report = await self.reconciler.reconcile(portfolio, known_orders=self.open_orders)
+        if not report.is_clean:
+            raise ExecutionError(
+                f"refusing to start: the book does not match the broker's — {report.summary()}. "
+                "See docs/RUNBOOK.md 'Reconciliation mismatch'."
+            )
+
+        self.strategy.on_start()
+        self.stats.started_at = self.clock.now()
+        log.info(
+            "runner.warmed_up",
+            strategy=self.strategy.name,
+            symbols=len(self.symbols),
+            bars=sum(len(b) for b in self._bars.values()),
+        )
 
     async def run(self, portfolio: Portfolio) -> None:
         """The main loop. Runs until cancelled.
@@ -91,26 +354,41 @@ class StrategyRunner:
         spinning — and re-run `warmup()` at each open, because overnight
         corporate actions and after-hours fills change the picture.
         """
-        raise NotImplementedError
+        self._running = True
+        await self.warmup(portfolio)
 
-    async def evaluate(self, portfolio: Portfolio) -> None:
-        """One pass of the ordering documented at the top of this module.
+        while self._running:
+            now = self.clock.now()
+            if not self.calendar.is_open(now):
+                await self._sleep_until_open(now)
+                if not self._running:
+                    return
+                # A new session is a new picture: positions may have been
+                # adjusted for a split overnight, and fills can land after the
+                # close. Re-reconciling here is what stops the first order of
+                # the day being sized against yesterday's book.
+                await self.warmup(portfolio)
+                continue
 
-        Wrap in a try/except: an unhandled exception here must not kill the
-        loop silently. Log it, increment `stats.errors`, and engage the kill
-        switch after N consecutive failures — a runner erroring every tick is
-        not trading, but it looks alive to a health check.
-        """
-        raise NotImplementedError
+            await self.evaluate(portfolio)
+            await self._sleep(self.tick_interval_seconds)
 
-    async def on_fill_event(self, event: dict[str, object], portfolio: Portfolio) -> None:
-        """Handle a broker fill.
+    async def _sleep_until_open(self, now: datetime) -> None:
+        """Wait out a closed market without spinning."""
+        try:
+            opens_at = self.calendar.next_open(now)
+        except ValueError:
+            # The calendar cannot see that far — a bounded nap rather than a
+            # spin, and it will be asked again.
+            log.warning("runner.no_next_open", now=now.isoformat())
+            await self._sleep(CLOSED_MARKET_FALLBACK_SECONDS)
+            return
 
-        On an entry fill, place protective orders IMMEDIATELY (`router
-        .submit_protective_orders`). Every millisecond between owning a position
-        and having a stop on it is unprotected exposure.
-        """
-        raise NotImplementedError
+        seconds = (opens_at - now).total_seconds()
+        log.info(
+            "runner.market_closed", sleeping_seconds=int(seconds), opens_at=opens_at.isoformat()
+        )
+        await self._sleep(max(seconds, 0.0))
 
     async def shutdown(self, close_positions: bool = False) -> None:
         """Stop cleanly.
@@ -120,4 +398,405 @@ class StrategyRunner:
         event and a guaranteed spread cost — the stops are there precisely so
         the position can survive us not running.
         """
-        raise NotImplementedError
+        self._running = False
+        self.strategy.on_stop()
+        if not close_positions:
+            log.info("runner.stopped", positions_left_open=True)
+            return
+
+        # Through the router, like everything else — `flatten` still passes the
+        # risk chain, and a refusal is reported rather than worked around
+        # (ADR 0005).
+        for position in list(self._portfolio.open_positions):
+            result = await self.router.flatten(position.symbol, self._portfolio)
+            if not result.submitted:
+                log.error(
+                    "runner.shutdown_flatten_refused",
+                    symbol=position.symbol,
+                    reason=result.decision.reason,
+                )
+        log.warning("runner.stopped", positions_left_open=False)
+
+    # ── one pass ────────────────────────────────────────────────────────────
+
+    async def evaluate(self, portfolio: Portfolio) -> None:
+        """One pass of the ordering documented at the top of this module.
+
+        Wrap in a try/except: an unhandled exception here must not kill the
+        loop silently. Log it, increment `stats.errors`, and engage the kill
+        switch after N consecutive failures — a runner erroring every tick is
+        not trading, but it looks alive to a health check.
+
+        `asyncio.CancelledError` is deliberately not caught. It is a shutdown,
+        not a failure, and swallowing it would make the loop unkillable.
+        """
+        async with self._lock:
+            try:
+                await self._evaluate_once(portfolio)
+            except asyncio.CancelledError:
+                raise
+            except (ATPError, Exception) as exc:
+                self.stats.errors += 1
+                self.stats.consecutive_errors += 1
+                log.error(
+                    "runner.evaluation_failed",
+                    strategy=self.strategy.name,
+                    error=str(exc),
+                    consecutive=self.stats.consecutive_errors,
+                )
+                if self.stats.consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    self.kill_switch.engage(
+                        HaltScope.STRATEGY,
+                        HaltReason.UNHANDLED_EXCEPTION,
+                        engaged_by="strategy_runner",
+                        detail=(
+                            f"{self.strategy.name} failed {self.stats.consecutive_errors} "
+                            f"evaluations in a row: {exc}"
+                        ),
+                        target=self.strategy.name,
+                    )
+                return
+
+        self.stats.consecutive_errors = 0
+
+    async def _evaluate_once(self, portfolio: Portfolio) -> None:
+        closed = await self._refresh_bars()  # feeds steps 1, 2 and 4
+
+        await self._mark(portfolio)  # 1
+        await self._check_stops(portfolio, closed)  # 2
+        signals = self._drain_fills(portfolio)  # 3
+        signals.extend(self._poll_strategy(closed))  # 4
+        await self._submit(signals, portfolio)  # 5
+        # 6. Persist state and publish updates — deliberately not done here.
+        # There is no order or position repository (`PositionSnapshotRow` is a
+        # table with no reader) and no publisher on this class. Writing a
+        # half-persistence that only some restarts could read would be worse
+        # than the honest gap: `warmup` reconciles against the broker, which is
+        # the authority a restart actually needs.
+
+        self.stats.evaluations += 1
+        self.stats.last_evaluation_at = self.clock.now()
+
+    async def _refresh_bars(self) -> list[Bar]:
+        """Append any newly completed bars; return the ones that just closed.
+
+        A bar is "new" when its timestamp is past the last one we hold. Compared
+        on the timestamp rather than on a count, because a repository that
+        re-serves the same bar — an idempotent upsert re-running, a restatement
+        landing — must not read as a fresh close and re-trigger a strategy.
+        """
+        just_closed: list[Bar] = []
+        for symbol in self.symbols:
+            latest = await self.bar_repo.get_last_n_bars(symbol, self.timeframe, 1)
+            if not latest:
+                continue
+            bar = latest[-1]
+            held = self._bars.get(symbol) or []
+            if held and bar.ts <= held[-1].ts:
+                continue
+            held.append(bar)
+            self._bars[symbol] = held
+            just_closed.append(bar)
+
+        if just_closed:
+            self._context.invalidate()
+        return just_closed
+
+    async def _mark(self, portfolio: Portfolio) -> None:
+        """Step 1. Value open positions off the freshest price we have.
+
+        The quote, not the last bar close — the opposite of what the strategy
+        decides on. A mark is about what the book is worth *now*, and every
+        percentage risk limit is denominated in it, so a stale mark makes a
+        breached limit look compliant. `Portfolio.unmarked_symbols` already
+        refuses to price a book it cannot value; this is what keeps that list
+        empty.
+        """
+        open_symbols = [p.symbol for p in portfolio.open_positions]
+        if not open_symbols:
+            return
+
+        quotes = await self.quote_cache.get_quotes(open_symbols)
+        for symbol in open_symbols:
+            quote = quotes.get(symbol)
+            if quote is not None:
+                self._quotes[symbol] = quote
+                portfolio.position(symbol).last_price = quote.mid
+                continue
+            # No quote: fall back to the last completed bar rather than leaving
+            # the position unmarked, and say so — an unmarked holding is what
+            # makes every percentage limit compute too small.
+            fallback = self._context.last_price(symbol)
+            if fallback is not None:
+                portfolio.position(symbol).last_price = fallback
+            log.warning("runner.no_quote_for_mark", symbol=symbol)
+
+    async def _check_stops(self, portfolio: Portfolio, closed: list[Bar]) -> None:
+        """Step 2. Engine-side protective levels, and trailing ratchets.
+
+        Broker-side stops are not checked here — they are resting at the venue
+        and fire without us, which is the entire reason docs/SAFETY.md makes
+        them layer 5. What this owns is the part the venue cannot do: ratcheting
+        a trailing stop as the high-water mark moves, and time exits, which are
+        not a price level at all.
+
+        A triggered level exits through `OrderRouter.flatten`, so the exit
+        passes the risk chain like everything else. Six of the nine default
+        rules can refuse an exit; a refusal is logged loudly rather than
+        retried around, because a stop that silently did not fire is the worst
+        thing this file could hide.
+        """
+        by_symbol = {bar.symbol: bar for bar in closed}
+        for position in list(portfolio.open_positions):
+            bar = by_symbol.get(position.symbol)
+            if bar is None:
+                continue
+
+            if self.stop_config.stop_type in (StopType.TRAILING_PCT, StopType.CHANDELIER):
+                atr = self._atr(position.symbol)
+                moved = self.stop_manager.update_trailing(position, bar, self.stop_config, atr)
+                if moved is not None:
+                    log.info(
+                        "runner.trailing_stop_ratcheted",
+                        symbol=position.symbol,
+                        level=str(moved),
+                    )
+
+            reason = self._exit_reason(position, bar)
+            if reason is None:
+                continue
+
+            self.stats.stops_triggered += 1
+            log.warning("runner.stop_triggered", symbol=position.symbol, reason=reason)
+            result = await self.router.flatten(position.symbol, portfolio)
+            if not result.submitted:
+                log.error(
+                    "runner.stop_exit_refused",
+                    symbol=position.symbol,
+                    reason=result.decision.reason,
+                )
+            elif result.order is not None:
+                self._track(result.order)
+
+    def _exit_reason(self, position: Position, bar: Bar) -> str | None:
+        """Why this position should be closed now, or None to hold it.
+
+        A time stop is checked separately from a price one because it is not a
+        level: `StopManager` refuses to give it a price, and a caller that
+        asked for one would be inventing it.
+        """
+        if self.stop_config.stop_type is StopType.TIME:
+            held = self._bars_held(position)
+            if held is not None and self.stop_manager.time_exit_due(held, self.stop_config):
+                return "time_exit"
+            return None
+
+        if self.stop_config.broker_side:
+            # Resting at the venue. Checking it here as well would double-exit
+            # on the bar the venue also fills.
+            return None
+
+        return "stop_loss" if self.stop_manager.should_trigger(position, bar) else None
+
+    def _bars_held(self, position: Position) -> int | None:
+        """How many completed bars since the position opened."""
+        if position.opened_at is None:
+            return None
+        return sum(1 for bar in self._bars.get(position.symbol, []) if bar.ts >= position.opened_at)
+
+    def _drain_fills(self, portfolio: Portfolio) -> list[Signal]:
+        """Step 3. Hand booked fills to the strategy.
+
+        The fill itself was applied the moment it arrived — see
+        `on_fill_event`, where protecting the position cannot wait for the next
+        pass. What waits for the pass is the *strategy's* reaction to it, which
+        belongs inside the documented ordering like any other signal source.
+        """
+        if not self._pending_fills:
+            return []
+
+        pending, self._pending_fills = self._pending_fills, []
+        signals: list[Signal] = []
+        for applied in pending:
+            signals.extend(self.strategy.on_fill(self._context, applied.order, applied.fill) or [])
+        return signals
+
+    def _poll_strategy(self, closed: list[Bar]) -> list[Signal]:
+        """Step 4. `on_bar` for each symbol whose bar just closed."""
+        signals: list[Signal] = []
+        for bar in closed:
+            signals.extend(self.strategy.on_bar(self._context, bar) or [])
+        return signals
+
+    async def _submit(self, signals: list[Signal], portfolio: Portfolio) -> None:
+        """Step 5. Size, risk-check and send.
+
+        A `HOLD` never reaches the router: it is the strategy saying nothing
+        happened, and routing it would spend a rate-limit slot and an audit
+        entry to be refused.
+        """
+        for signal in signals:
+            if signal.action is SignalAction.HOLD:
+                continue
+            self.stats.signals_generated += 1
+
+            result = await self.router.submit_signal(
+                self._with_stop(signal), portfolio, self.sizing
+            )
+            if not result.submitted:
+                self.stats.orders_rejected_by_risk += 1
+                log.info(
+                    "runner.signal_refused",
+                    symbol=signal.symbol,
+                    action=signal.action.value,
+                    rule=result.decision.rule,
+                    reason=result.decision.reason,
+                )
+                continue
+
+            self.stats.orders_submitted += 1
+            if result.order is not None:
+                self._track(result.order)
+
+    def _with_stop(self, signal: Signal) -> Signal:
+        """Give an entry signal a stop level if it did not carry one.
+
+        This closes the dependency #33 recorded against this item: `risk_pct`
+        sizing with an ATR stop is the documented default pair, no `Signal`
+        carries an ATR-derived level, and so every entry from a
+        default-configured strategy was refused at sizing for want of a stop to
+        measure risk against. The runner is the thing holding the bar history
+        the ATR needs.
+
+        A signal that already names a stop is left exactly as it is. The
+        strategy's own level always wins — deriving one over the top would
+        override a deliberate choice with a configured default.
+        """
+        if signal.stop_loss_price is not None:
+            return signal
+        if signal.action not in (SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT):
+            return signal
+        if self.stop_config.stop_type is StopType.TIME:
+            return signal  # not a level; `time_exit_due` owns it
+
+        price = self._context.last_price(signal.symbol)
+        if price is None:
+            return signal  # nothing to measure from; the router will refuse it
+
+        side = Side.BUY if signal.action is SignalAction.ENTER_LONG else Side.SELL
+        try:
+            level = self.stop_manager.initial_stop(
+                price, side, self.stop_config, self._atr(signal.symbol)
+            )
+        except (ValueError, ATPError) as exc:
+            # Refused rather than guessed — an ATR stop with no ATR is exactly
+            # the input `StopManager` declines to default.
+            log.warning("runner.could_not_derive_stop", symbol=signal.symbol, error=str(exc))
+            return signal
+
+        return replace(signal, stop_loss_price=level)
+
+    def _atr(self, symbol: str) -> Decimal | None:
+        """ATR over the configured period, as a `Decimal` for the stop maths.
+
+        Float in, `Decimal` out via `str` — never `Decimal(float)`, which
+        inherits the binary rounding error rule §1.1 exists to avoid. ATR is a
+        statistic so computing it in float is fine; the moment it becomes a
+        price distance it stops being one.
+        """
+        value = dispatch.compute("atr", self._bars.get(symbol, []), self.stop_config.period)
+        return None if value is None else Decimal(str(value))
+
+    # ── fills ───────────────────────────────────────────────────────────────
+
+    async def on_fill_event(self, update: TradeUpdate, portfolio: Portfolio) -> None:
+        """Handle a broker fill.
+
+        On an entry fill, place protective orders IMMEDIATELY (`router
+        .submit_protective_orders`). Every millisecond between owning a position
+        and having a stop on it is unprotected exposure.
+
+        Takes a `TradeUpdate` rather than the skeleton's `dict[str, object]`:
+        #37 gave the platform a typed one carrying the venue's own execution id,
+        and the untyped version cannot express the duplicate-fill discard that
+        stops a redelivered event doubling a position.
+
+        Booking the fill goes through `execution.trade_updates`, which owns the
+        guard against a fill landing on an order our book has already killed.
+        The runner does not re-implement any of that; what it adds is the
+        protective order and the position accounting.
+        """
+        async with self._lock:
+            order = self._open_orders.get(update.client_order_id)
+            if order is None:
+                # Not ours to book. Reconciliation reports it as an orphan; the
+                # runner must not invent an order to hang it on, because the
+                # quantity would then be applied to a position twice when the
+                # real order turns up.
+                log.warning(
+                    "runner.fill_for_unknown_order",
+                    client_order_id=update.client_order_id,
+                    symbol=update.symbol,
+                )
+                return
+
+            before = order.filled_qty
+            if not apply_trade_update(order, update):
+                return
+
+            fill = order.fills[-1] if order.fills else None
+            if fill is not None and order.filled_qty > before:
+                self._apply_to_portfolio(order, fill, portfolio)
+                self.stats.fills_applied += 1
+                self._pending_fills.append(_AppliedFill(order=order, fill=fill))
+                await self._protect(order, portfolio)
+
+            if order.is_complete:
+                self._open_orders.pop(order.client_order_id, None)
+
+    def _apply_to_portfolio(self, order: Order, fill: Fill, portfolio: Portfolio) -> None:
+        """Fold a fill into cash and the position.
+
+        The same arithmetic the backtest engine performs on a fill, and it has
+        to stay that way: a live P&L computed differently from the backtested
+        one makes the comparison between them meaningless.
+        """
+        position = portfolio.position(order.symbol)
+        position.apply_fill(fill, fill.qty * order.side.sign)
+        portfolio.cash -= fill.qty * fill.price * order.side.sign + fill.fee
+
+    async def _protect(self, order: Order, portfolio: Portfolio) -> None:
+        """Arm protection on a position that just opened or grew.
+
+        Only for entries. A fill that *reduces* a position needs no new stop —
+        and asking for one would place a stop on the way out of a trade.
+        """
+        position = portfolio.position(order.symbol)
+        if position.is_flat:
+            return
+        if (position.qty > 0) != (order.side is Side.BUY):
+            return  # a reducing fill
+
+        result = await self.router.submit_protective_orders(
+            order, portfolio, stop_config=self.stop_config, atr_value=self._atr(order.symbol)
+        )
+        for protective in result.placed:
+            self._track(protective)
+        if not result.is_fully_protected:
+            # Loud: this is docs/SAFETY.md layer 5 not holding, and the position
+            # is real whether or not the stop is. `unprotected_qty` is measured
+            # after the risk chain, so a stop the chain shrank reports the
+            # shares it actually covers rather than the ones it asked for.
+            log.error(
+                "runner.position_unprotected",
+                symbol=order.symbol,
+                unprotected_qty=str(result.unprotected_qty),
+                refusals=[r.decision.reason for r in result.refused],
+            )
+
+    def _track(self, order: Order) -> None:
+        """Remember an order we believe is working at the venue."""
+        if order.is_complete:
+            self._open_orders.pop(order.client_order_id, None)
+            return
+        self._open_orders[order.client_order_id] = order
