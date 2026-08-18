@@ -44,7 +44,7 @@ from atp_core.domain import (
 )
 from atp_core.errors import BacktestError, DataGapError, LookaheadError
 from atp_core.execution.matching import intended_price
-from atp_core.indicators import ta
+from atp_core.indicators import dispatch
 from atp_core.logging import get_logger
 
 if TYPE_CHECKING:
@@ -273,27 +273,12 @@ class BacktestContext:
 def _compute_indicator(name: str, bars: list[Bar], period: int) -> float | None:
     """Dispatch a name from a rule spec onto `indicators.ta`.
 
-    Returns None when the series is too short, which is the ordinary state
-    during warmup — the alternative is every rule raising for the first fifty
-    bars of every run.
+    Delegates to `indicators.dispatch`, which the live runner also calls. A
+    second copy here would mean a strategy could compute a different SMA(20)
+    live than the one its backtest approved — the one divergence this
+    platform's premise cannot survive (ADR 0006).
     """
-    closes = np.array([float(b.close) for b in bars], dtype=float)
-    try:
-        if name == "sma":
-            return ta.sma(closes, period)
-        if name == "ema":
-            return ta.ema(closes, period)
-        if name == "rsi":
-            return ta.rsi(closes, period)
-        if name == "stddev":
-            return ta.stddev(closes, period)
-        if name == "atr":
-            highs = np.array([float(b.high) for b in bars], dtype=float)
-            lows = np.array([float(b.low) for b in bars], dtype=float)
-            return ta.atr(highs, lows, closes, period)
-    except ValueError:
-        return None  # not enough history yet
-    raise BacktestError(f"unknown indicator {name!r}")
+    return dispatch.compute(name, bars, period)
 
 
 class BacktestEngine:

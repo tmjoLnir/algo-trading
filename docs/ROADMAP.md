@@ -638,37 +638,75 @@ above.
   empty portfolio would report every real position as `missing_position` and
   halt on the first run, so the job is left honestly unbuilt; the scheduler
   already treats a stub as unbuilt rather than failed.
-- [ ] `StrategyRunner` live loop — @claude (wip).
-  Untouched: `warmup`, `run`, `evaluate`, `on_fill_event` and `shutdown` all
-  still raise.
 
-  It needed a `BrokerPort` adapter and reconciliation, and as of #36 the first
-  of those exists — `SimulatedBroker` and `AlpacaBroker` are both implemented
-  and `deps.get_broker` binds one per run mode. #37 adds the trade-updates
-  stream and `apply_trade_update`, so `on_fill_event` now has something to
-  delegate to rather than reimplement, and #38 adds the `Reconciler` that
-  `warmup` and the `TradeUpdatesReconnected` catch-up both need.
+  #39 builds the `StrategyRunner` that owns a live `Portfolio` and the set of
+  orders we believe are working, so the missing half now exists as an object —
+  but nothing constructs one in the worker yet, so the scheduled job still has
+  nothing to reach for.
+- [ ] `StrategyRunner` live loop — @claude (wip #39).
+  Implemented: `warmup`, `run`, `evaluate`, `on_fill_event` and `shutdown`, plus
+  `LiveContext` — the live counterpart of `BacktestContext`, serving a strategy
+  from a rolling in-memory window of completed bars.
 
-  So the dependencies are built and the direction of the blocker has now
-  reversed: reconciliation is no longer waiting on the runner, the runner is
-  what reconciliation is waiting for. `Reconciler.reconcile` needs a live
-  `Portfolio` and the set of orders we believe are working, and this loop is
-  the thing that would own both. Until it exists, layer 7's scheduled job has
-  nothing to compare and stays stubbed.
+  The loop runs the documented six-step ordering, and **stops before signals**
+  is the part that matters: it is the mirror of the backtest engine, and a
+  divergence makes every backtest a claim about a system that does not exist.
+  Pinned by a test that reads the order the router was called in, and verified
+  by swapping the two steps — which fails it.
 
-  The second half of this item — drop the `worker` compose profile so the worker
-  rejoins the default stack "once it can actually start" — **is done** (#35), and
-  is worth separating from the runner because it turned out not to depend on it.
-  `atp_worker.main` is implemented: it wires the ingestor, the staleness watchdog
-  and the scheduler to a real Redis and a real hypertable, supervises them, and
-  halts on `UNHANDLED_EXCEPTION` if one of them ends instead of running until
-  cancelled. SIGTERM is an ordinary shutdown and deliberately does not halt —
-  otherwise every deploy would leave a halt for a human to clear.
+  `indicators/dispatch.py` is new and holds the name→`ta` lookup that the
+  engine and the runner both need. ADR 0006's reasoning a third time: a
+  strategy computing a different SMA(20) live than the one its backtest
+  approved is the one divergence this platform's premise cannot survive. The
+  engine delegates to it and its tests pass unchanged.
 
-  So the worker starts, ingests and runs scheduled jobs. **It does not trade**,
-  and the startup log says so on every boot rather than leaving "the worker is
-  up" and "the worker is trading" as the same observation. Unticked on that
-  basis: this item is the live loop, and the live loop does not exist.
+  Decisions worth reading:
+
+  - **A mismatched book refuses to start.** `warmup` reconciles and raises on a
+    dirty report rather than continuing. The kill switch is already engaged by
+    then, so the chain would refuse every order anyway — raising means the
+    operator sees why at startup instead of finding a process that is up and
+    silently not trading.
+  - **The strategy decides on bars; the book is marked on quotes.** `LiveContext
+    .last_price` is the last *completed* bar's close, because a decision taken
+    on a mid-quote inside an unfinished bar is one the backtest can never
+    reproduce. Marking is the opposite case and uses the quote, because every
+    percentage risk limit is denominated in the mark and a stale one makes a
+    breached limit look compliant.
+  - **A fill is booked and protected the instant it arrives**, not on the next
+    pass — the window between owning a position and having a stop on it is
+    unprotected exposure. What waits for the pass is the *strategy's* reaction
+    (`on_fill`), which belongs inside the ordering like any other signal source.
+  - **A fill for an order the runner does not know is refused**, not invented.
+    Hanging it on a fabricated order would apply the quantity twice when the
+    real one turns up; reconciliation reports it as an orphan instead.
+  - **Bars are compared on timestamp, not count.** A repository re-serving the
+    same bar — an idempotent upsert re-running, a restatement landing — must
+    not read as a fresh close and re-trigger a strategy.
+
+  This closes the dependency #33 recorded against the router: `risk_pct` sizing
+  with an ATR stop is the documented default pair, no `Signal` carries an
+  ATR-derived level, and so every entry from a default-configured strategy was
+  refused at sizing. `_with_stop` derives one from the runner's own bar history
+  — and leaves a signal that already names a stop exactly as it is, because the
+  strategy's choice outranks a configured default.
+
+  It also gives #38's `Reconciler` the `known_orders` set it had no source for:
+  the runner tracks what it submitted, which is what makes orphan detection
+  mean anything.
+
+  **Two things are deliberately not done, and both are visible.** Step 6 of the
+  ordering — persist and publish — is a no-op with a comment saying why: there
+  is no order or position repository (`PositionSnapshotRow` is still a table
+  with no reader) and no publisher on this class, and a half-persistence only
+  some restarts could read would be worse than the honest gap, since `warmup`
+  reconciles against the broker anyway. And `atp_worker.main` still does not
+  construct a runner, so the worker continues to say it is not trading on every
+  boot. Wiring it changes what the worker *does* in production and deserves its
+  own change and its own review.
+
+  Unticked. Phase 4's *Verifiable:* line is a paper week, and this loop has
+  never been pointed at a venue — every test drives it off fakes.
 - [ ] Trade-updates WS with reconnect — @claude (wip #37).
   `AlpacaBroker.stream_trade_updates` is implemented, and so is the consumer
   that makes it mean anything. Both gaps this item existed to close are closed:
