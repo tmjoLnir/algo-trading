@@ -22,6 +22,10 @@ dist/
 build/
 
 # --- node ---
+# The intermediate file `make gen-types` dumps the API schema to before it
+# generates `src/api/schema.d.ts`. The generated types ARE committed — CI
+# type-checks against them — but this is a build input, reproducible in one command.
+apps/web/openapi.json
 node_modules/
 apps/web/dist/
 apps/web/.vite/

@@ -61,6 +61,11 @@ lint:
 	uv run ruff check .
 	uv run ruff format --check .
 	npm --prefix $(WEB) run lint
+	@# The web half had no formatting gate while the Python half did, so
+	@# `make fmt` produced a 27-file diff the first time anyone ran it. There is
+	@# a `.prettierrc.json` now that agrees with the code as written; this keeps
+	@# it that way.
+	npm --prefix $(WEB) run format:check
 
 typecheck:
 	uv run mypy libs apps
@@ -92,7 +97,12 @@ check-tracked:  ## Fail if any source file is excluded by .gitignore
 
 check: check-tracked lint typecheck test  ## Everything CI runs — green before you push
 
-gen-types:  ## Regenerate TS API types from the live OpenAPI schema
+gen-types:  ## Regenerate TS API types from the OpenAPI schema
+	@# Dumped from the app rather than fetched from a running server. Requiring
+	@# `make up` and a live API to regenerate types is how hand-written
+	@# duplicates of a server contract end up being maintained instead
+	@# (CLAUDE.md §4).
+	uv run python scripts/dump_openapi.py $(WEB)/openapi.json
 	npm --prefix $(WEB) run gen:types
 
 # ── local dev ───────────────────────────────────────────────────────────────
