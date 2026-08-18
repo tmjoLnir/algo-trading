@@ -28,6 +28,7 @@ from atp_core.domain import (
     OrderType,
     Portfolio,
     Quote,
+    RunMode,
     Side,
     Signal,
     SignalAction,
@@ -42,7 +43,7 @@ from atp_core.risk.stops import StopConfig, StopManager
 from atp_core.strategy.base import Strategy
 from atp_core.strategy.rules import PositionSizeSpec
 from atp_worker.runner import MAX_CONSECUTIVE_ERRORS, StrategyRunner
-from tests.fakes import FakeKillSwitch
+from tests.fakes import FakeKillSwitch, FakeOrderRepository, FakePortfolioRepository
 
 if TYPE_CHECKING:
     from atp_core.strategy.context import StrategyContext
@@ -260,6 +261,8 @@ def build(
     bars: list[Bar] | None = None,
     clean: bool = True,
     stop_config: StopConfig | None = None,
+    order_repo: FakeOrderRepository | None = None,
+    portfolio_repo: FakePortfolioRepository | None = None,
 ) -> tuple[StrategyRunner, FakeRouter, FakeKillSwitch, FakeReconciler, Portfolio, list[float]]:
     router = FakeRouter()
     switch = FakeKillSwitch()
@@ -283,6 +286,9 @@ def build(
         sizing=PositionSizeSpec(type="fixed_qty", value=Decimal("10")),
         stop_config=stop_config or StopConfig(stop_type=StopType.FIXED_PCT, value=Decimal("0.02")),
         timeframe=Timeframe.D1,
+        run_mode=RunMode.PAPER,
+        order_repo=order_repo or FakeOrderRepository(),  # type: ignore[arg-type]
+        portfolio_repo=portfolio_repo or FakePortfolioRepository(),  # type: ignore[arg-type]
         sleep=sleep,
     )
     portfolio = Portfolio(cash=Decimal("100000"), starting_equity=Decimal("100000"))

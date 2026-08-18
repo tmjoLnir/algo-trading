@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from atp_core.domain import Order, Portfolio, Side, SignalAction
+from atp_core.domain import Order, Portfolio, RunMode, Side, SignalAction
 from atp_core.domain.enums import StopType
 from atp_core.errors import ATPError, DataGapError, ExecutionError
 from atp_core.execution.trade_updates import apply_trade_update
@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from atp_core.clock import Clock, TradingCalendar
     from atp_core.data.ports import BarRepository, QuoteCache
     from atp_core.domain import Bar, Fill, Position, Quote, Signal, Timeframe
+    from atp_core.execution.ports import OrderRepository, PortfolioRepository
     from atp_core.execution.reconciliation import Reconciler
     from atp_core.execution.router import OrderRouter
     from atp_core.risk.killswitch import KillSwitch
@@ -243,6 +244,9 @@ class StrategyRunner:
         sizing: PositionSizeSpec,
         stop_config: StopConfig,
         timeframe: Timeframe,
+        run_mode: RunMode,
+        order_repo: OrderRepository,
+        portfolio_repo: PortfolioRepository,
         tick_interval_seconds: float = 60.0,
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
@@ -259,6 +263,14 @@ class StrategyRunner:
         self.sizing = sizing
         self.stop_config = stop_config
         self.timeframe = timeframe
+        self.run_mode = run_mode
+        #: Required rather than optional. A runner without them keeps its book
+        #: in memory only, so every restart adopts the broker's wholesale and
+        #: reconciliation across a restart becomes clean by construction — the
+        #: exact hole `execution/ports.py` exists to close. Making them
+        #: defaultable would make that hole reachable by omission.
+        self.order_repo = order_repo
+        self.portfolio_repo = portfolio_repo
         self.tick_interval_seconds = tick_interval_seconds
         self._sleep: Callable[[float], Awaitable[None]] = (
             sleep if sleep is not None else asyncio.sleep
@@ -330,6 +342,19 @@ class StrategyRunner:
                     needed=needed,
                 )
         self._context.invalidate()
+
+        # What we believed was working before the restart. Restored *before*
+        # reconciling, because it is the set reconciliation compares against —
+        # without it every order resting at the venue reads as an orphan.
+        restored = await self.order_repo.open_orders(self.run_mode)
+        for order in restored:
+            self._open_orders[order.client_order_id] = order
+        if restored:
+            log.info(
+                "runner.restored_open_orders",
+                count=len(restored),
+                client_order_ids=[o.client_order_id for o in restored],
+            )
 
         report = await self.reconciler.reconcile(portfolio, known_orders=self.open_orders)
         if not report.is_clean:
@@ -467,15 +492,27 @@ class StrategyRunner:
         signals = self._drain_fills(portfolio)  # 3
         signals.extend(self._poll_strategy(closed))  # 4
         await self._submit(signals, portfolio)  # 5
-        # 6. Persist state and publish updates — deliberately not done here.
-        # There is no order or position repository (`PositionSnapshotRow` is a
-        # table with no reader) and no publisher on this class. Writing a
-        # half-persistence that only some restarts could read would be worse
-        # than the honest gap: `warmup` reconciles against the broker, which is
-        # the authority a restart actually needs.
+        await self._persist(portfolio)  # 6
 
         self.stats.evaluations += 1
         self.stats.last_evaluation_at = self.clock.now()
+
+    async def _persist(self, portfolio: Portfolio) -> None:
+        """Step 6. Write the book and every order we believe is working.
+
+        Orders first, then the snapshot. If the process dies between them, a
+        restart reads a slightly stale book alongside a current order set —
+        which reconciliation notices and halts on. The other order would
+        restore a book claiming fills whose orders were never recorded, and
+        that disagreement is the one nothing downstream could detect.
+
+        *Publishing* is still not done here. The dashboard that would consume
+        it is Phase 5 and there is no publisher on this class; the durable half
+        was the half that mattered, because it is what a restart reads.
+        """
+        for order in self._open_orders.values():
+            await self.order_repo.save(order, run_mode=self.run_mode)
+        await self.portfolio_repo.snapshot(portfolio, at=self.clock.now(), run_mode=self.run_mode)
 
     async def _refresh_bars(self) -> list[Bar]:
         """Append any newly completed bars; return the ones that just closed.
@@ -752,6 +789,10 @@ class StrategyRunner:
                 await self._protect(order, portfolio)
 
             if order.is_complete:
+                # Saved before it leaves the working set: `_persist` only walks
+                # open orders, so a fill that completed an order would
+                # otherwise never reach storage.
+                await self.order_repo.save(order, run_mode=self.run_mode)
                 self._open_orders.pop(order.client_order_id, None)
 
     def _apply_to_portfolio(self, order: Order, fill: Fill, portfolio: Portfolio) -> None:

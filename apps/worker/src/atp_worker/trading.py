@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from atp_core.clock import Clock, TradingCalendar
     from atp_core.config import Settings
     from atp_core.data.ports import BarRepository, QuoteCache
+    from atp_core.execution.ports import OrderRepository, PortfolioRepository
     from atp_core.risk.killswitch import KillSwitch
 
 log = get_logger(__name__)
@@ -130,6 +131,8 @@ def build_runner(
     clock: Clock,
     calendar: TradingCalendar,
     last_tick_at: Callable[[str], datetime | None],
+    order_repo: OrderRepository,
+    portfolio_repo: PortfolioRepository,
 ) -> tuple[StrategyRunner, Reconciler]:
     """Assemble the live loop from settings.
 
@@ -163,6 +166,9 @@ def build_runner(
         ),
         stop_config=_stop_config(settings),
         timeframe=Timeframe.D1,
+        run_mode=settings.run_mode,
+        order_repo=order_repo,
+        portfolio_repo=portfolio_repo,
         tick_interval_seconds=float(settings.engine_tick_interval_seconds),
     )
     return runner, reconciler
@@ -207,38 +213,57 @@ def _stop_config(settings: Settings) -> StopConfig:
     )
 
 
-async def adopt_broker_state(reconciler: Reconciler, clock: Clock) -> Portfolio:
-    """The portfolio this worker starts from: the broker's, wholesale.
+async def restore_or_adopt(
+    reconciler: Reconciler,
+    portfolio_repo: PortfolioRepository,
+    run_mode: RunMode,
+) -> Portfolio:
+    """The book this worker starts from: ours if we have one, else the broker's.
 
-    docs/RUNBOOK.md says a restart's `warmup()` "will reconcile and adopt open
-    positions", and docs/SAFETY.md's checklist requires a worker restarted with
-    open positions to adopt them rather than double them. This is where that
-    happens, and it is deliberately *here* rather than inside `warmup`.
+    These are two different situations and telling them apart is the whole
+    point of the persistence layer:
 
-    The distinction is between two situations that look identical to a
-    reconciler and are not:
+    - **We have a stored book.** Use it. `StrategyRunner.warmup` then reconciles
+      it against the broker and halts on a mismatch — which is a real check,
+      because the two views were formed independently. This is the case that
+      makes "restarted cleanly" mean something.
+    - **There is no stored book at all.** A first-ever boot, or a fresh
+      database. Nothing exists to disagree with the broker, so adopt it
+      wholesale and say so loudly. `docs/RUNBOOK.md` documents this as the
+      restart behaviour and `docs/SAFETY.md`'s checklist requires it — a worker
+      that started flat while holding positions would double them.
 
-    - **Boot.** We hold no book at all. There is nothing for the broker's to
-      disagree with, so adopting is the only sensible move — and without it a
-      worker restarted while holding positions would refuse to start forever.
-    - **Drift.** We had a book and it stopped matching. That is a mismatch, it
-      halts, and a human decides. `StrategyRunner.warmup` keeps that behaviour
-      for every reconciliation after this one.
+    Before this existed, *every* boot took the adopt path, which made
+    reconciliation across a restart clean by construction and therefore
+    worthless as evidence — `docs/FIRST_PAPER_RUN.md` says so in the section on
+    what a paper week cannot prove. That section is now narrower: it holds only
+    for a first boot.
 
-    There is no persistence yet, so every boot takes this path. That is worth
-    knowing rather than glossing: it means a bug that lost our state would be
-    indistinguishable from a clean restart, which is one of the reasons the
-    order and position repositories matter.
+    A read failure raises rather than falling back to adoption. Adopting
+    because the database was briefly unreachable would silently discard our own
+    book, which is the one outcome worse than refusing to start.
     """
+    stored = await portfolio_repo.latest(run_mode)
+    if stored is not None:
+        log.info(
+            "worker.restored_book",
+            positions=sorted(p.symbol for p in stored.open_positions),
+            cash=str(stored.cash),
+            msg="starting from our own stored book — the broker is about to be asked to agree",
+        )
+        return stored
+
     portfolio = Portfolio(cash=Decimal(0), starting_equity=Decimal(0))
     await reconciler.adopt_broker_state(portfolio)
     portfolio.starting_equity = portfolio.equity
-
     log.warning(
         "worker.adopted_broker_state",
         positions=sorted(p.symbol for p in portfolio.open_positions),
         cash=str(portfolio.cash),
-        msg="starting from the broker's book — this worker holds no state of its own",
+        msg=(
+            "no stored book — adopting the broker's. Expected on a first boot; "
+            "on any later one it means the snapshot history was lost."
+        ),
     )
     return portfolio
 

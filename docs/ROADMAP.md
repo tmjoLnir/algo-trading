@@ -632,9 +632,12 @@ above.
   usual one. `scheduler.reconcile_with_broker` is already on the 5-minute
   schedule layer 7 asks for and stays a `NotImplementedError` stub: it can
   build a broker and a kill switch from settings, but it has nothing to
-  *compare them against*. The live portfolio belongs to `StrategyRunner`, which
-  does not exist, and there is no position-snapshot repository to load one from
-  — `PositionSnapshotRow` is a table with no reader. Reconciling against an
+  *compare them against*. That is now a wiring gap rather than a missing
+  component: #44 gives `PositionSnapshotRow` a reader, so a scheduled job could
+  load the last snapshot — but a snapshot is not the live book, and reconciling
+  the venue against a minute-old copy would report every fill in between as a
+  mismatch. It needs the runner's own portfolio, which means the runner
+  handing it over rather than the scheduler fetching it. Reconciling against an
   empty portfolio would report every real position as `missing_position` and
   halt on the first run, so the job is left honestly unbuilt; the scheduler
   already treats a stub as unbuilt rather than failed.
@@ -695,11 +698,11 @@ above.
   the runner tracks what it submitted, which is what makes orphan detection
   mean anything.
 
-  **Step 6 of the ordering — persist and publish — is a no-op with a comment
-  saying why**: there is no order or position repository (`PositionSnapshotRow`
-  is still a table with no reader) and no publisher on this class, and a
-  half-persistence only some restarts could read would be worse than the honest
-  gap, since `warmup` reconciles against the broker anyway.
+  **Step 6 of the ordering is half done as of #44.** The durable half is real:
+  every pass saves the working orders and snapshots the book, and `warmup`
+  restores what was working before reconciling. *Publishing* is still not done
+  — the dashboard that would consume it is Phase 5 and there is no publisher on
+  this class.
 
   The other gap recorded here — that `atp_worker.main` did not construct a
   runner — is closed by #40, which wires it behind an opt-in.
@@ -793,6 +796,48 @@ above.
   run against the paper account — no credentials and no session from this
   environment — so what is shown is that the wiring assembles and the locks
   hold, not that a strategy traded.
+- [ ] Order and position persistence — @claude (wip #44).
+  `OrderRepository` and `PortfolioRepository` in `execution/ports.py`, with
+  PostgreSQL adapters over the `orders`, `fills`, `position_snapshots` and
+  `equity_snapshots` tables that had been sitting there with no reader.
+
+  **What this is actually for.** Before it, the runner's book lived only in
+  memory, so every boot adopted the broker's wholesale — which made
+  reconciliation across a restart clean *by construction* and therefore
+  worthless as evidence. `trading.restore_or_adopt` now tells the two
+  situations apart: a stored book is used and the broker is allowed to disagree
+  (a real check, since the views were formed independently), and only a
+  first-ever boot adopts. docs/FIRST_PAPER_RUN.md's caveat about what a paper
+  week cannot prove is narrowed to that first boot rather than deleted.
+
+  A read failure raises rather than falling back to adoption. Adopting because
+  the database blinked would silently discard our own book, which is worse than
+  refusing to start.
+
+  Two decisions worth review:
+
+  - **The repositories are required on `StrategyRunner`, not optional.** A
+    defaultable one would make the in-memory-only hole reachable by omission,
+    which is the hole this closes.
+  - **An order is upserted on its primary key, not on `client_order_id`.** The
+    unique constraint on that key is the database half of rule §1.4 and stays
+    exactly where it is; but the same key legitimately arrives many times as an
+    order fills in pieces, so it is the wrong conflict target for a repeated
+    save. Fills get a deterministic id derived from the order and their index,
+    so re-saving an order inserts nothing new — a double-counted fill is a
+    double-counted position.
+
+  Migration `a1c4e77b91d2` adds `take_profit_price`, `high_water_mark`,
+  `opened_at` and `fees_paid` to `position_snapshots`. The table stored
+  `stop_loss_price` and nothing else a position protects itself with, and the
+  first of those is the dangerous one: a trailing stop reloaded without its
+  high-water mark re-anchors on the current bar, so `update_trailing`'s
+  monotonicity guarantee holds around a mark that has moved *down*.
+
+  Unticked. The SQL is exercised by 15 integration tests against a real
+  Postgres in CI, but nothing here has survived an actual restart of a running
+  worker — which is the demonstration, and it is one the paper week produces
+  for free the first time the process is bounced.
 
 *Verifiable:* a strategy trades the paper account for a week and reconciles clean.
 

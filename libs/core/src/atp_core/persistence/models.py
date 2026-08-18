@@ -183,6 +183,19 @@ class PositionSnapshotRow(Base):
     unrealized_pnl: Mapped[Decimal] = mapped_column(MONEY)
     realized_pnl: Mapped[Decimal] = mapped_column(MONEY)
     stop_loss_price: Mapped[Decimal | None] = mapped_column(MONEY, nullable=True)
+    #: The other two protective fields a `Position` carries. Added because a
+    #: snapshot that restores a position without them is worse than one that
+    #: restores nothing: a trailing stop reloaded with no high-water mark
+    #: re-anchors on the current bar, and `update_trailing`'s monotonicity
+    #: invariant then holds around a mark that has moved *down*. A take-profit
+    #: silently dropped is a position with no upside exit.
+    take_profit_price: Mapped[Decimal | None] = mapped_column(MONEY, nullable=True)
+    high_water_mark: Mapped[Decimal | None] = mapped_column(MONEY, nullable=True)
+    #: Nullable because a position adopted from the broker has no opening time
+    #: we know of, and a time stop measuring from "now" would exit late rather
+    #: than never — worth telling apart from a genuine zero.
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    fees_paid: Mapped[Decimal] = mapped_column(MONEY, default=Decimal(0))
     run_mode: Mapped[str] = mapped_column(String(10))
 
 

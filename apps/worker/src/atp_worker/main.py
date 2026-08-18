@@ -38,6 +38,8 @@ from atp_core.logging import get_logger
 from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.db import create_engine, create_session_factory
 from atp_core.persistence.events import RedisEventPublisher
+from atp_core.persistence.orders import PostgresOrderRepository
+from atp_core.persistence.positions import PostgresPortfolioRepository
 from atp_core.persistence.quotes import RedisQuoteCache
 from atp_core.persistence.redis_client import close_redis, create_redis, create_sync_redis
 from atp_core.risk.killswitch import HaltReason, HaltScope, RedisKillSwitch
@@ -121,7 +123,9 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
         stack.push_async_callback(provider.aclose)
 
         kill_switch = RedisKillSwitch(sync_redis)
-        bar_repo = PostgresBarRepository(create_session_factory(engine))
+        session_factory = create_session_factory(engine)
+        bar_repo = PostgresBarRepository(session_factory)
+        portfolio_repo = PostgresPortfolioRepository(session_factory)
         quote_cache = RedisQuoteCache(redis)
         publisher = RedisEventPublisher(redis)
 
@@ -168,8 +172,12 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
                 clock=clock,
                 calendar=TradingCalendar(),
                 last_tick_at=ingestor.last_tick_at,
+                order_repo=PostgresOrderRepository(session_factory),
+                portfolio_repo=portfolio_repo,
             )
-            portfolio = await trading.adopt_broker_state(reconciler, clock)
+            portfolio = await trading.restore_or_adopt(
+                reconciler, portfolio_repo, settings.run_mode
+            )
 
             responsibilities["strategy_runner"] = lambda: runner.run(portfolio)
             responsibilities["trade_updates"] = lambda: trading.consume_trade_updates(
