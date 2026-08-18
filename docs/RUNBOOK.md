@@ -10,11 +10,21 @@ money.
 
 > **The dashboard button does not exist yet.** It is Phase 5, and
 > `POST /api/v1/risk/halt` still raises `NotImplementedError`. Until both land,
-> the halt is a command, and you should have it ready *before* you need it —
-> see `FIRST_PAPER_RUN.md` 'Read this part first: how to stop', which carries
-> the exact invocation for engaging and clearing the switch. Stopping the
-> worker (`docker compose stop worker`) is not the same thing: it leaves other
+> the halt is a command:
+>
+> ```bash
+> uv run python scripts/halt.py engage --by "<your name>" --detail "why"
+> ```
+>
+> Run it before you need it once, so the first time is not during an incident.
+> `scripts/halt.py status` says what is halted and exits 2 when anything is;
+> `clear --by <name>` resumes. Stopping the worker
+> (`docker compose stop worker`) is **not** the same thing: it leaves other
 > processes free to trade and deliberately does not halt.
+>
+> `scripts/status.py` is the read-only companion — halts, quote freshness, the
+> latest stored bars, and the venue's account, positions and working orders.
+> Safe to run during an incident.
 
 Halting is *not* flattening. Halting stops new risk. Flattening realises
 existing P&L and is a separate decision.

@@ -25,27 +25,19 @@ will use:
 positions and their broker-side stops alone. This is the halt the runbook means.
 
 ```bash
-uv run python -c "
-from atp_core.persistence.redis_client import create_sync_redis
-from atp_core.risk.killswitch import RedisKillSwitch, HaltScope, HaltReason
-ks = RedisKillSwitch(create_sync_redis('redis://localhost:6379/0'))
-print(ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, engaged_by='<your name>',
-                detail='first paper run — stopping by hand'))
-"
+uv run python scripts/halt.py engage --by "<your name>" --detail "why"
+uv run python scripts/halt.py status          # exits 2 when halted
+uv run python scripts/halt.py clear --by "<your name>"
 ```
 
-Written through `RedisKillSwitch` rather than by hand-setting `atp:halt:global`,
-so the record encodes correctly and keeps the audit fields. Clearing it needs a
-named human:
+`--by` is required on both, because "who stopped trading" and "who decided it
+was safe to resume" are the two questions asked afterwards. Engaging is
+idempotent and keeps the *original* record, so a second call reports the first
+one rather than overwriting who stopped it and when.
 
-```bash
-uv run python -c "
-from atp_core.persistence.redis_client import create_sync_redis
-from atp_core.risk.killswitch import RedisKillSwitch, HaltScope
-RedisKillSwitch(create_sync_redis('redis://localhost:6379/0')).clear(
-    HaltScope.GLOBAL, cleared_by='<your name>')
-"
-```
+Narrow it with `--scope strategy --target <id>` or `--scope symbol --target SPY`
+when only one thing is misbehaving. Plain `engage` stops everything, which is
+the right reflex.
 
 **2. Stop the worker** — `docker compose stop worker`. SIGTERM is an ordinary
 shutdown: it does *not* halt, and it deliberately leaves positions open with
@@ -106,10 +98,12 @@ Then confirm data is actually moving — the feed being *connected* and the feed
 *delivering* are different observations:
 
 ```bash
-docker compose exec redis redis-cli --scan --pattern 'atp:quote:*'
-docker compose exec db psql -U atp -d atp -c \
-  "SELECT symbol, max(ts) FROM bars WHERE timeframe='1m' GROUP BY symbol;"
+uv run python scripts/status.py --no-broker
 ```
+
+It prints halts, quote freshness against `RISK_MAX_QUOTE_AGE_SECONDS` — the
+same budget `StaleDataRule` refuses orders on — and the latest stored bar per
+symbol. `--no-broker` keeps it to local state, so it needs no credentials.
 
 **Do not proceed** until quotes are landing in Redis and bars are landing in the
 hypertable. A strategy started on a stale cache will be refused by
@@ -155,6 +149,12 @@ Expect:
 handshake is **not** the market-data one — different action, nested credentials,
 different key names — and it has never run against a real account. If it never
 appears, the stream is where to look, not the strategy.
+
+At any point, `uv run python scripts/status.py` shows the same local view plus
+the venue's: account, positions, and working orders. It is read-only and safe
+to run during an incident. It cannot show the *runner's* book — that lives in
+the worker's memory with no persistence behind it — which is exactly the gap
+the order and position repositories close.
 
 ### Then wait
 
