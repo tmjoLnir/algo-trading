@@ -19,7 +19,9 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import pytest
 
 from atp_core.brokers.ports import TradeUpdate
+from atp_core.channels import CHANNEL_ORDERS, CHANNEL_SIGNALS
 from atp_core.clock import SimulatedClock
+from atp_core.dashboard.snapshot import DEFAULT_SIGNAL_LIMIT
 from atp_core.domain import (
     Bar,
     Fill,
@@ -43,7 +45,13 @@ from atp_core.risk.stops import StopConfig, StopManager
 from atp_core.strategy.base import Strategy
 from atp_core.strategy.rules import PositionSizeSpec
 from atp_worker.runner import MAX_CONSECUTIVE_ERRORS, StrategyRunner
-from tests.fakes import FakeKillSwitch, FakeOrderRepository, FakePortfolioRepository
+from tests.fakes import (
+    FakeKillSwitch,
+    FakeOrderRepository,
+    FakePortfolioRepository,
+    FakePublisher,
+    FakeSnapshotStore,
+)
 
 if TYPE_CHECKING:
     from atp_core.strategy.context import StrategyContext
@@ -263,6 +271,9 @@ def build(
     stop_config: StopConfig | None = None,
     order_repo: FakeOrderRepository | None = None,
     portfolio_repo: FakePortfolioRepository | None = None,
+    snapshot_store: FakeSnapshotStore | None = None,
+    publisher: FakePublisher | None = None,
+    signal_limit: int = DEFAULT_SIGNAL_LIMIT,
 ) -> tuple[StrategyRunner, FakeRouter, FakeKillSwitch, FakeReconciler, Portfolio, list[float]]:
     router = FakeRouter()
     switch = FakeKillSwitch()
@@ -289,6 +300,9 @@ def build(
         run_mode=RunMode.PAPER,
         order_repo=order_repo or FakeOrderRepository(),  # type: ignore[arg-type]
         portfolio_repo=portfolio_repo or FakePortfolioRepository(),  # type: ignore[arg-type]
+        snapshot_store=snapshot_store,  # type: ignore[arg-type]
+        publisher=publisher,  # type: ignore[arg-type]
+        signal_limit=signal_limit,
         sleep=sleep,
     )
     portfolio = Portfolio(cash=Decimal("100000"), starting_equity=Decimal("100000"))
@@ -688,3 +702,249 @@ class TestShutdown:
         await runner.shutdown()
 
         assert strategy.stopped is True
+
+
+class TestPublishing:
+    """Step 6's other half — what the dashboard is told, and when.
+
+    The rule running through all of it: publishing is best-effort and comes
+    *after* the durable writes. Anything that must not be lost is in the
+    database or the book before it is announced, and nothing announced is
+    allowed to fail an evaluation — three failed evaluations halt trading, and
+    stopping a strategy because a screen went dark is a cure worse than the
+    disease.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_pass_publishes_the_book(self) -> None:
+        store = FakeSnapshotStore()
+        runner, _, _, _, portfolio, _ = build(snapshot_store=store)
+        await runner.warmup(portfolio)
+
+        await runner.evaluate(portfolio)
+
+        assert len(store.puts) == 1
+        assert store.puts[0].run_mode is RunMode.PAPER
+        assert store.puts[0].strategy == "scripted"
+
+    @pytest.mark.asyncio
+    async def test_the_snapshot_shares_the_instant_the_durable_one_was_written_at(self) -> None:
+        """One book, one instant. Two calls to the clock would let the published
+        picture and the stored one disagree by however long a write took."""
+        store = FakeSnapshotStore()
+        book = FakePortfolioRepository()
+        runner, _, _, _, portfolio, _ = build(snapshot_store=store, portfolio_repo=book)
+        await runner.warmup(portfolio)
+
+        await runner.evaluate(portfolio)
+
+        assert store.puts[0].as_of == book.snapshots[-1][0]
+
+    @pytest.mark.asyncio
+    async def test_a_store_that_is_down_does_not_fail_the_evaluation(self) -> None:
+        """And therefore cannot count toward the consecutive-error halt."""
+        store = FakeSnapshotStore()
+        store.put_error = ConnectionError("redis is down")
+        runner, _, switch, _, portfolio, _ = build(snapshot_store=store)
+        await runner.warmup(portfolio)
+
+        await runner.evaluate(portfolio)
+
+        assert runner.stats.errors == 0
+        assert runner.stats.consecutive_errors == 0
+        assert switch.engaged is False
+
+    @pytest.mark.asyncio
+    async def test_no_store_configured_is_not_an_error(self) -> None:
+        """A worker without one is running blind, not running wrong — refusing
+        to trade over it would stop a strategy to protect a screen."""
+        runner, _, _, _, portfolio, _ = build()
+        await runner.warmup(portfolio)
+
+        await runner.evaluate(portfolio)
+
+        assert runner.stats.errors == 0
+
+    @pytest.mark.asyncio
+    async def test_the_feed_pulse_comes_from_the_watchlist_not_the_book(self) -> None:
+        """`_mark` returns early when nothing is open, so a snapshot built from
+        its cache would report "no data has ever arrived" for a flat book with a
+        perfectly healthy feed."""
+        store = FakeSnapshotStore()
+        runner, _, _, _, portfolio, _ = build(snapshot_store=store)
+        await runner.warmup(portfolio)
+        runner.quote_cache.quotes[SYMBOL] = Quote(  # type: ignore[attr-defined]
+            symbol=SYMBOL, ts=START, bid=Decimal("99"), ask=Decimal("101")
+        )
+
+        await runner.evaluate(portfolio)
+
+        assert portfolio.open_positions == []
+        assert store.puts[0].last_data_at == START
+
+    @pytest.mark.asyncio
+    async def test_a_refused_signal_reaches_the_feed_with_the_rule_that_refused_it(self) -> None:
+        """A strategy blocked on every bar looks, from anywhere else, exactly
+        like a strategy with no ideas."""
+        store = FakeSnapshotStore()
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)], snapshot_store=store)
+        router.refuse_signals = True
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+
+        await runner.evaluate(portfolio)
+
+        published = store.puts[-1].recent_signals
+        assert [s.acted_on for s in published] == [False]
+        assert published[0].rejected_by == "a_rule"
+        assert published[0].rejection_reason == "nope"
+
+    @pytest.mark.asyncio
+    async def test_an_accepted_signal_is_recorded_as_acted_on(self) -> None:
+        store = FakeSnapshotStore()
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, _, _, _, portfolio, _ = build(strategy, bars=[bar(0)], snapshot_store=store)
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+
+        await runner.evaluate(portfolio)
+
+        published = store.puts[-1].recent_signals
+        assert [s.acted_on for s in published] == [True]
+        assert published[0].rejected_by is None
+
+    @pytest.mark.asyncio
+    async def test_the_feed_is_bounded(self) -> None:
+        """It is a fixed-size document in Redis. An unbounded list of a busy
+        day's signals would grow it without limit."""
+        store = FakeSnapshotStore()
+        strategy = ScriptedStrategy(dict.fromkeys(range(10), SignalAction.ENTER_LONG))
+        runner, _, _, _, portfolio, _ = build(
+            strategy, bars=[bar(0)], snapshot_store=store, signal_limit=3
+        )
+        await runner.warmup(portfolio)
+        for i in range(1, 6):
+            close_bar(runner, bar(i))
+            await runner.evaluate(portfolio)
+
+        assert len(store.puts[-1].recent_signals) == 3
+
+    @pytest.mark.asyncio
+    async def test_a_signal_is_announced_on_the_signals_channel(self) -> None:
+        publisher = FakePublisher()
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, _, _, _, portfolio, _ = build(strategy, bars=[bar(0)], publisher=publisher)
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+
+        await runner.evaluate(portfolio)
+
+        announced = publisher.on(CHANNEL_SIGNALS)
+        assert [m["type"] for m in announced] == ["signal"]
+        assert announced[0]["symbol"] == SYMBOL
+
+    @pytest.mark.asyncio
+    async def test_a_publisher_that_raises_does_not_fail_the_evaluation(self) -> None:
+        publisher = FakePublisher(error=ConnectionError("redis is down"))
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, _, switch, _, portfolio, _ = build(strategy, bars=[bar(0)], publisher=publisher)
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+
+        await runner.evaluate(portfolio)
+
+        assert runner.stats.errors == 0
+        assert switch.engaged is False
+
+    @pytest.mark.asyncio
+    async def test_a_fill_is_announced_only_after_the_position_is_protected(self) -> None:
+        """A dashboard told about a fill before the stop is armed would be
+        showing exposure nothing is yet managing, and a reader who acts on that
+        is acting earlier than the system did.
+        """
+        publisher = FakePublisher()
+        order_events: list[str] = []
+
+        class RecordingRouter(FakeRouter):
+            async def submit_protective_orders(self, *args: Any, **kwargs: Any) -> ProtectionResult:
+                order_events.append("protected")
+                return await super().submit_protective_orders(*args, **kwargs)
+
+        runner, _, _, _, portfolio, _ = build(publisher=publisher)
+        runner.router = RecordingRouter()  # type: ignore[assignment]
+        await runner.warmup(portfolio)
+
+        order = Order(
+            symbol=SYMBOL,
+            side=Side.BUY,
+            qty=Decimal("10"),
+            client_order_id="atp-entry",
+            broker_order_id="brk-entry",
+            status=OrderStatus.SUBMITTED,
+        )
+        runner._track(order)
+
+        original_publish = publisher.publish
+
+        async def recording_publish(channel: str, message: dict[str, Any]) -> None:
+            if channel == CHANNEL_ORDERS:
+                order_events.append("announced")
+            await original_publish(channel, message)
+
+        publisher.publish = recording_publish  # type: ignore[method-assign]
+
+        await runner.on_fill_event(
+            TradeUpdate(
+                event="fill",
+                client_order_id="atp-entry",
+                broker_order_id="brk-entry",
+                symbol=SYMBOL,
+                at=START,
+                fill=Fill(
+                    order_id=order.id,
+                    ts=START,
+                    qty=Decimal("10"),
+                    price=Decimal("100"),
+                    venue_fill_id="v-1",
+                ),
+            ),
+            portfolio,
+        )
+
+        assert order_events == ["protected", "announced"]
+        assert publisher.on(CHANNEL_ORDERS)[0]["price"] == "100"
+
+    @pytest.mark.asyncio
+    async def test_a_fill_message_carries_no_floats(self) -> None:
+        """`RedisEventPublisher` refuses one outright (rule §1.1). The guard
+        fires at publish time on a live worker; the point of rendering correctly
+        here is that it never has to."""
+        publisher = FakePublisher()
+        runner, _, _, _, portfolio, _ = build(publisher=publisher)
+        await runner.warmup(portfolio)
+        order = Order(
+            symbol=SYMBOL,
+            side=Side.BUY,
+            qty=Decimal("10"),
+            client_order_id="atp-entry",
+            broker_order_id="brk-entry",
+            status=OrderStatus.SUBMITTED,
+        )
+        runner._track(order)
+
+        await runner.on_fill_event(
+            TradeUpdate(
+                event="fill",
+                client_order_id="atp-entry",
+                broker_order_id="brk-entry",
+                symbol=SYMBOL,
+                at=START,
+                fill=Fill(order_id=order.id, ts=START, qty=Decimal("10"), price=Decimal("100.125")),
+            ),
+            portfolio,
+        )
+
+        message = publisher.on(CHANNEL_ORDERS)[0]
+        assert not any(isinstance(v, float) for v in message.values())
+        assert message["price"] == "100.125"

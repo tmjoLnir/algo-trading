@@ -36,6 +36,7 @@ from atp_core.errors import ATPError
 from atp_core.logging import configure as configure_logging
 from atp_core.logging import get_logger
 from atp_core.persistence.bars import PostgresBarRepository
+from atp_core.persistence.dashboard import RedisSnapshotStore
 from atp_core.persistence.db import create_engine, create_session_factory
 from atp_core.persistence.events import RedisEventPublisher
 from atp_core.persistence.orders import PostgresOrderRepository
@@ -128,6 +129,7 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
         portfolio_repo = PostgresPortfolioRepository(session_factory)
         quote_cache = RedisQuoteCache(redis)
         publisher = RedisEventPublisher(redis)
+        snapshot_store = RedisSnapshotStore(redis)
 
         responsibilities: dict[str, Responsibility] = {"scheduler": run_scheduler}
 
@@ -174,6 +176,8 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
                 last_tick_at=ingestor.last_tick_at,
                 order_repo=PostgresOrderRepository(session_factory),
                 portfolio_repo=portfolio_repo,
+                snapshot_store=snapshot_store,
+                publisher=publisher,
             )
             portfolio = await trading.restore_or_adopt(
                 reconciler, portfolio_repo, settings.run_mode

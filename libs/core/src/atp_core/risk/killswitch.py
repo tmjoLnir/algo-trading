@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from atp_core.channels import CHANNEL_HALTS
 from atp_core.logging import get_logger
 
 if TYPE_CHECKING:
@@ -204,6 +205,7 @@ class RedisKillSwitch:
             target=target,
             detail=detail,
         )
+        self._announce("engaged", record)
         return record
 
     def clear(self, scope: HaltScope, cleared_by: str, target: str | None = None) -> None:
@@ -230,6 +232,62 @@ class RedisKillSwitch:
             was_engaged=removed,
             original=_decode(record).engaged_by if record is not None else None,
         )
+        if removed:
+            self._announce(
+                "cleared",
+                _decode(record) if record is not None else None,
+                scope=scope,
+                target=target,
+                actor=cleared_by,
+            )
+
+    def _announce(
+        self,
+        transition: str,
+        record: HaltRecord | None,
+        *,
+        scope: HaltScope | None = None,
+        target: str | None = None,
+        actor: str | None = None,
+    ) -> None:
+        """Tell every open dashboard, immediately. Never let it matter if it fails.
+
+        The state is already in Redis before this runs, and the state is what
+        every risk check reads — this is an announcement, not the mechanism. So
+        it is swallowed: `engage` promises that halting never fails quietly, and
+        an exception raised here would break that promise in the one direction
+        that matters, by making an unpublishable halt look like a halt that did
+        not happen.
+
+        Without it a halt reaches the screen on the dashboard's next five-minute
+        poll. `atp_api.ws` fans these out to every client regardless of what it
+        subscribed to, because a trading halt is not something to opt into, and
+        five minutes is a long time to be looking at a screen that says trading
+        is fine.
+        """
+        message: dict[str, Any] = {
+            "type": "halt",
+            "transition": transition,
+            "scope": (record.scope if record is not None else scope or HaltScope.GLOBAL).value,
+            "target": record.target if record is not None else target,
+        }
+        if record is not None:
+            message["reason"] = record.reason.value
+            message["engaged_at"] = record.engaged_at.isoformat()
+            message["engaged_by"] = record.engaged_by
+            message["detail"] = record.detail
+        if actor is not None:
+            message["actor"] = actor
+
+        try:
+            self._client.publish(CHANNEL_HALTS, json.dumps(message))
+        except Exception as exc:
+            log.error(
+                "risk.killswitch.announce_failed",
+                transition=transition,
+                error=str(exc),
+                msg="the halt IS in effect; only the live notification was lost",
+            )
 
     def active_halts(self) -> list[HaltRecord]:
         """Everything currently halted — rendered as a banner on the dashboard.

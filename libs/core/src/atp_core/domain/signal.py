@@ -42,6 +42,22 @@ class Signal:
     indicators: dict[str, Any] = field(default_factory=dict)  # values at decision time
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """Reject a naive timestamp at the domain boundary (rule §1.2).
+
+        Every other dated value object here already does — `Bar`, `Quote`,
+        `Trade` and `OrderRequest` all refuse one — and a `Signal` is the last
+        one that did not, which made it the one way a naive instant could get
+        into the system. It travels a long way: into `OrderRequest.decided_at`,
+        where it derives the `client_order_id` that rule §1.4 depends on, and
+        into the dashboard's signal feed, where one unparseable timestamp makes
+        the whole published snapshot undecodable. Both failures surface far from
+        the strategy that emitted it; this one surfaces at the line that built
+        it.
+        """
+        if self.ts.tzinfo is None:
+            raise ValueError(f"Signal.ts must be tz-aware UTC (rule §1.2), got naive {self.ts!r}")
+
     @property
     def is_entry(self) -> bool:
         return self.action in (SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT)

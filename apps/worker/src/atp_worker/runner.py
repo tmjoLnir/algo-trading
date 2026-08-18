@@ -31,12 +31,16 @@ premise cannot survive.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from dataclasses import dataclass, replace
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from atp_core.channels import CHANNEL_ORDERS, CHANNEL_SIGNALS
+from atp_core.dashboard import SignalSummary, build_snapshot
+from atp_core.dashboard.snapshot import DEFAULT_SIGNAL_LIMIT
 from atp_core.domain import Order, Portfolio, RunMode, Side, SignalAction
 from atp_core.domain.enums import StopType
 from atp_core.errors import ATPError, DataGapError, ExecutionError
@@ -51,11 +55,12 @@ if TYPE_CHECKING:
 
     from atp_core.brokers.ports import TradeUpdate
     from atp_core.clock import Clock, TradingCalendar
-    from atp_core.data.ports import BarRepository, QuoteCache
+    from atp_core.dashboard.ports import SnapshotStore
+    from atp_core.data.ports import BarRepository, EventPublisher, QuoteCache
     from atp_core.domain import Bar, Fill, Position, Quote, Signal, Timeframe
     from atp_core.execution.ports import OrderRepository, PortfolioRepository
     from atp_core.execution.reconciliation import Reconciler
-    from atp_core.execution.router import OrderRouter
+    from atp_core.execution.router import OrderRouter, SubmitResult
     from atp_core.risk.killswitch import KillSwitch
     from atp_core.risk.stops import StopConfig, StopManager
     from atp_core.strategy.base import Strategy
@@ -247,6 +252,9 @@ class StrategyRunner:
         run_mode: RunMode,
         order_repo: OrderRepository,
         portfolio_repo: PortfolioRepository,
+        snapshot_store: SnapshotStore | None = None,
+        publisher: EventPublisher | None = None,
+        signal_limit: int = DEFAULT_SIGNAL_LIMIT,
         tick_interval_seconds: float = 60.0,
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
@@ -271,6 +279,14 @@ class StrategyRunner:
         #: defaultable would make that hole reachable by omission.
         self.order_repo = order_repo
         self.portfolio_repo = portfolio_repo
+        #: Optional, unlike the two above, and the asymmetry is deliberate.
+        #: Losing the durable book is a correctness failure — it is what a
+        #: restart reads. Losing the published one costs a dashboard its
+        #: freshness and nothing else, so a worker configured without either is
+        #: a worker running blind rather than a worker running wrong, and
+        #: refusing to start over it would stop trading to protect a screen.
+        self.snapshot_store = snapshot_store
+        self.publisher = publisher
         self.tick_interval_seconds = tick_interval_seconds
         self._sleep: Callable[[float], Awaitable[None]] = (
             sleep if sleep is not None else asyncio.sleep
@@ -292,6 +308,13 @@ class StrategyRunner:
         self._open_orders: dict[str, Order] = {}
         #: Fills booked since the last pass, awaiting `strategy.on_fill`.
         self._pending_fills: list[_AppliedFill] = []
+        #: What the strategy decided lately and what became of it, newest last.
+        #: Bounded, and in memory only: this is a feed, not the audit trail.
+        #: `persistence.models.SignalRow` is where the durable record belongs
+        #: and nothing writes it yet — see docs/ROADMAP.md Phase 5, "Trade
+        #: reconstruction". Until then a restart loses the feed, which is worth
+        #: knowing when the dashboard is empty after a deploy.
+        self._recent_signals: deque[SignalSummary] = deque(maxlen=signal_limit)
         #: Serialises a pushed fill against an in-flight evaluation, so a fill
         #: cannot land halfway through the ordered pass it is supposed to be a
         #: step of.
@@ -498,21 +521,69 @@ class StrategyRunner:
         self.stats.last_evaluation_at = self.clock.now()
 
     async def _persist(self, portfolio: Portfolio) -> None:
-        """Step 6. Write the book and every order we believe is working.
+        """Step 6. Write the book, then publish it.
 
-        Orders first, then the snapshot. If the process dies between them, a
-        restart reads a slightly stale book alongside a current order set —
-        which reconciliation notices and halts on. The other order would
+        Orders first, then the durable snapshot. If the process dies between
+        them, a restart reads a slightly stale book alongside a current order
+        set — which reconciliation notices and halts on. The other order would
         restore a book claiming fills whose orders were never recorded, and
         that disagreement is the one nothing downstream could detect.
 
-        *Publishing* is still not done here. The dashboard that would consume
-        it is Phase 5 and there is no publisher on this class; the durable half
-        was the half that mattered, because it is what a restart reads.
+        Publishing comes last, after both durable writes, and its failures are
+        swallowed. The ordering is the same argument `persistence/events.py`
+        makes about pub/sub: anything that must not be lost is written first
+        and announced second, so a dashboard can never show a fill the database
+        does not have. Swallowing is the other half — an unreachable Redis must
+        not fail an evaluation, because three failed evaluations halt trading
+        and stopping a strategy because a screen went dark is a cure worse than
+        the disease. It is logged at warning, once per pass, and the missing
+        snapshot is visible on the dashboard as an age that stops advancing.
         """
         for order in self._open_orders.values():
             await self.order_repo.save(order, run_mode=self.run_mode)
-        await self.portfolio_repo.snapshot(portfolio, at=self.clock.now(), run_mode=self.run_mode)
+        at = self.clock.now()
+        await self.portfolio_repo.snapshot(portfolio, at=at, run_mode=self.run_mode)
+        await self._publish_snapshot(portfolio, at)
+
+    async def _publish_snapshot(self, portfolio: Portfolio, at: datetime) -> None:
+        """Hand the dashboard one consistent picture of the book.
+
+        Built from `portfolio` and the runner's own working-order set rather
+        than re-read from the repositories it just wrote to: those two are the
+        live objects the evaluation just finished with, so the published
+        picture is the same one the loop acted on. Reading it back would
+        introduce a second view that can differ, which is exactly the
+        disagreement one aggregate snapshot exists to prevent.
+        """
+        if self.snapshot_store is None:
+            return
+        try:
+            # The whole watchlist, read fresh, rather than `self._quotes`. That
+            # cache is filled by `_mark`, which returns early when nothing is
+            # open and never prunes what it holds — so a flat book with a
+            # perfectly healthy feed would publish "no data has ever arrived",
+            # and a symbol exited an hour ago would keep answering for the
+            # feed's pulse long after we stopped watching it.
+            quotes = await self.quote_cache.get_quotes(list(self.symbols))
+            await self.snapshot_store.put(
+                build_snapshot(
+                    portfolio,
+                    at=at,
+                    run_mode=self.run_mode,
+                    working_orders=self._open_orders.values(),
+                    recent_signals=self._recent_signals,
+                    quotes=quotes,
+                    symbols=self.symbols,
+                    strategy=self.strategy.name,
+                )
+            )
+        except Exception as exc:
+            log.warning(
+                "runner.snapshot_publish_failed",
+                strategy=self.strategy.name,
+                error=str(exc),
+                msg="the dashboard will show an age that stops advancing",
+            )
 
     async def _refresh_bars(self) -> list[Bar]:
         """Append any newly completed bars; return the ones that just closed.
@@ -680,6 +751,8 @@ class StrategyRunner:
             result = await self.router.submit_signal(
                 self._with_stop(signal), portfolio, self.sizing
             )
+            await self._record_signal(signal, result)
+
             if not result.submitted:
                 self.stats.orders_rejected_by_risk += 1
                 log.info(
@@ -694,6 +767,41 @@ class StrategyRunner:
             self.stats.orders_submitted += 1
             if result.order is not None:
                 self._track(result.order)
+
+    async def _record_signal(self, signal: Signal, result: SubmitResult) -> None:
+        """Keep the decision and its fate, and announce it.
+
+        Recorded whatever the outcome, which is the point: a strategy whose
+        every signal is refused by a risk rule looks, from any other vantage
+        point in the system, exactly like a strategy that had no ideas. The
+        dashboard is where that difference is meant to be visible (requirement
+        #7), so a refusal is as much a feed entry as a fill is.
+
+        "Not acted on" covers two different things and `rejected_by` separates
+        them: a rule that denied the order, and `no_action` — a HOLD-shaped
+        outcome such as an exit for a position that is already flat, which the
+        router reports as *approved* precisely so it does not inflate the
+        rejection count an operator reads to judge whether risk is too tight.
+        """
+        decision = result.decision
+        summary = SignalSummary(
+            id=signal.id,
+            ts=signal.ts,
+            strategy_id=signal.strategy_id,
+            symbol=signal.symbol,
+            action=signal.action.value,
+            reason=signal.reason,
+            # Rendered as strings, not floats. An indicator value is usually a
+            # price — an SMA of closes is denominated in dollars — and rule
+            # §1.1's exemption for "indicator maths" covers computing it, not
+            # putting it on a wire that only has binary floats to carry it.
+            indicators={k: str(v) for k, v in signal.indicators.items()},
+            acted_on=result.submitted,
+            rejection_reason=None if result.submitted else decision.reason or None,
+            rejected_by=None if result.submitted else decision.rule or None,
+        )
+        self._recent_signals.append(summary)
+        await self._announce(CHANNEL_SIGNALS, _signal_message(summary))
 
     def _with_stop(self, signal: Signal) -> Signal:
         """Give an entry signal a stop level if it did not carry one.
@@ -787,6 +895,12 @@ class StrategyRunner:
                 self.stats.fills_applied += 1
                 self._pending_fills.append(_AppliedFill(order=order, fill=fill))
                 await self._protect(order, portfolio)
+                # Announced only now: after the book has it and after the stop
+                # is armed. A dashboard told about a fill before the position
+                # is protected would be showing exposure nothing is yet
+                # managing, and a reader who acts on that is acting earlier
+                # than the system did.
+                await self._announce(CHANNEL_ORDERS, _fill_message(order, fill))
 
             if order.is_complete:
                 # Saved before it leaves the working set: `_persist` only walks
@@ -841,3 +955,68 @@ class StrategyRunner:
             self._open_orders.pop(order.client_order_id, None)
             return
         self._open_orders[order.client_order_id] = order
+
+    # ── fan-out ─────────────────────────────────────────────────────────────
+
+    async def _announce(self, channel: str, message: dict[str, Any]) -> None:
+        """Tell whoever is listening. Never let it matter whether anyone was.
+
+        Best-effort by contract (`data.ports.EventPublisher`), and the
+        swallowing belongs here rather than in the adapter because this is the
+        call site that knows a dropped message is survivable: the dashboard
+        polls every five minutes and the poll is the authoritative path. What
+        must not happen is an evaluation failing over it — three of those halt
+        trading, and Redis being unable to gossip is not a reason to stop.
+        """
+        if self.publisher is None:
+            return
+        try:
+            await self.publisher.publish(channel, message)
+        except Exception as exc:
+            log.warning("runner.publish_failed", channel=channel, error=str(exc))
+
+
+def _signal_message(summary: SignalSummary) -> dict[str, Any]:
+    """The wire shape `atp_api.ws` forwards to the dashboard.
+
+    Deliberately not `encode_snapshot`'s signal document. That one is a storage
+    record inside a larger snapshot; this is a client protocol with a `type`
+    discriminator, versioned by whatever the dashboard understands. They look
+    alike today and are free to diverge — the same separation `persistence
+    .quotes` keeps from `data.stream._quote_message`, and for the same reason.
+    """
+    return {
+        "type": "signal",
+        "id": summary.id,
+        "ts": summary.ts.isoformat(),
+        "strategy": summary.strategy_id,
+        "symbol": summary.symbol,
+        "action": summary.action,
+        "reason": summary.reason,
+        "acted_on": summary.acted_on,
+        "rejected_by": summary.rejected_by,
+        "rejection_reason": summary.rejection_reason,
+    }
+
+
+def _fill_message(order: Order, fill: Fill) -> dict[str, Any]:
+    """One execution, as the dashboard hears about it.
+
+    Every number is a string. `RedisEventPublisher` refuses a float outright
+    (rule §1.1), which is the guard that catches this being written the other
+    way — but the guard fires at publish time on a live worker, and the point
+    of rendering correctly here is that it never has to.
+    """
+    return {
+        "type": "fill",
+        "order_id": order.id,
+        "client_order_id": order.client_order_id,
+        "symbol": order.symbol,
+        "side": order.side.value,
+        "qty": str(fill.qty),
+        "price": str(fill.price),
+        "filled_qty": str(order.filled_qty),
+        "remaining_qty": str(order.remaining_qty),
+        "status": order.status.value,
+        "ts": fill.ts.isoformat(),
+    }

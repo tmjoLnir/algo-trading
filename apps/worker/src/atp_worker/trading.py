@@ -49,7 +49,8 @@ if TYPE_CHECKING:
     from atp_core.brokers.alpaca import AlpacaBroker
     from atp_core.clock import Clock, TradingCalendar
     from atp_core.config import Settings
-    from atp_core.data.ports import BarRepository, QuoteCache
+    from atp_core.dashboard.ports import SnapshotStore
+    from atp_core.data.ports import BarRepository, EventPublisher, QuoteCache
     from atp_core.execution.ports import OrderRepository, PortfolioRepository
     from atp_core.risk.killswitch import KillSwitch
 
@@ -133,6 +134,8 @@ def build_runner(
     last_tick_at: Callable[[str], datetime | None],
     order_repo: OrderRepository,
     portfolio_repo: PortfolioRepository,
+    snapshot_store: SnapshotStore | None = None,
+    publisher: EventPublisher | None = None,
 ) -> tuple[StrategyRunner, Reconciler]:
     """Assemble the live loop from settings.
 
@@ -169,6 +172,8 @@ def build_runner(
         run_mode=settings.run_mode,
         order_repo=order_repo,
         portfolio_repo=portfolio_repo,
+        snapshot_store=snapshot_store,
+        publisher=publisher,
         tick_interval_seconds=float(settings.engine_tick_interval_seconds),
     )
     return runner, reconciler

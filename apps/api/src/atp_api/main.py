@@ -11,6 +11,8 @@ consumes, so there remains exactly one execution path (rule §1.5).
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -29,10 +31,15 @@ from atp_api.routers import (
     risk,
     strategies,
 )
+from atp_api.ws import manager as ws_manager
+from atp_api.ws import redis_bridge
 from atp_api.ws import router as ws_router
 from atp_core.config import get_settings
 from atp_core.logging import configure as configure_logging
 from atp_core.logging import get_logger
+from atp_core.persistence.db import create_engine, create_session_factory
+from atp_core.persistence.redis_client import close_redis, create_redis, create_sync_redis
+from atp_core.risk.killswitch import RedisKillSwitch
 
 log = get_logger(__name__)
 
@@ -56,10 +63,43 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         log.info("startup", run_mode=settings.run_mode, broker_url=settings.broker_base_url)
 
-    # TODO: init DB engine, Redis pool, kill switch; attach to app.state
-    yield
-    # TODO: dispose engine, close Redis
-    log.info("shutdown")
+    # Pools belong to the application, not to a dependency. A client built
+    # lazily on first use has nowhere to be closed, and an API that exits
+    # holding Redis connections leaves them for the server to time out.
+    #
+    # None of these connect here: `create_async_engine` and `Redis.from_url`
+    # both open lazily, so a database or a Redis that is down delays nothing at
+    # startup and surfaces on the request that needs it. That is deliberate —
+    # the probe endpoints are what an orchestrator gates on, and an API that
+    # refused to boot without Redis could not serve `/healthz` to say so.
+    engine = create_engine(settings.database_url)
+    redis = create_redis(settings.redis_url)
+    # A second client, synchronous, for the kill switch alone — the risk chain
+    # that consults it is synchronous and must not be coloured async to reach
+    # one key (`persistence.redis_client`). Both point at the same server.
+    sync_redis = create_sync_redis(settings.redis_url)
+
+    app.state.session_factory = create_session_factory(engine)
+    app.state.redis = redis
+    app.state.kill_switch = RedisKillSwitch(sync_redis)
+
+    # Live push. Started here rather than on the first socket so that the
+    # subscription exists before any client does — a bridge brought up by the
+    # first connection would drop everything published while nobody was
+    # watching, which includes the halt that happened thirty seconds ago.
+    bridge = asyncio.create_task(redis_bridge(redis, ws_manager), name="ws_bridge")
+    app.state.ws_bridge = bridge
+
+    try:
+        yield
+    finally:
+        bridge.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await bridge
+        await close_redis(redis)
+        sync_redis.close()
+        await engine.dispose()
+        log.info("shutdown")
 
 
 def create_app() -> FastAPI:
