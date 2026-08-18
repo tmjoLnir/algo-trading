@@ -1056,7 +1056,69 @@ the only property that makes the screen worth reading.
 - [ ] Alerting to a phone (feed loss, halt, reconciliation failure)
 - [ ] Metrics/tracing
 - [ ] Backups and a tested restore
-- [ ] Deployment target chosen; secrets manager
+- [ ] Deployment target chosen; secrets manager — @claude (wip).
+  **The target is chosen and recorded; nothing is deployed.** ADR 0011: one
+  always-on VM per run mode in a US-East region, the existing compose stack,
+  reached over Tailscale, deployed by an explicit operator action, with paper
+  and live on separate hosts so that docs/SAFETY.md layer 3 is structural
+  rather than conventional.
+
+  Two constraints decided it, and both are in the code rather than in anyone's
+  preference. Alpaca refuses a second stream connection per key with code 406,
+  which `AlpacaRealtimeFeed` treats as permanent — so the worker is a singleton,
+  and every mainstream orchestrator's default rollout overlaps instances, which
+  is the duplicate-position incident in docs/RUNBOOK.md. And HA is not wanted:
+  broker-side stops hold positions while the platform is down, so the posture is
+  fail-stopped and restart cleanly rather than multi-node.
+
+  What landed with it is `docker-compose.prod.yml`, which is the more useful
+  half today. `docker-compose.yml` is a development stack — that is deliberate
+  and documented — and deploying it as-is would have been three quiet faults at
+  once: `db`, `redis` and `api` carry no restart policy while `worker` does, so
+  a reboot brought back the worker alone, whose kill switch fails closed against
+  an unreachable Redis and which therefore came up halted while looking alive;
+  `api` and `worker` bind-mount `./libs` and `./apps/*` over the code baked into
+  the images, so what runs is the checkout rather than what was built and
+  tested; and `api` runs uvicorn with `--reload`, which makes a `git pull` a hot
+  deploy mid-session. The overlay corrects all three, `make deploy` applies it,
+  and docs/DEPLOYMENT.md is the procedure — the page README.md has linked to
+  since the skeleton and which did not exist.
+
+  `scripts/check_port_bindings.py` now checks **both** configurations. It read
+  only the development one, so the deployed file — where a wrong bind matters
+  most — would have been the one thing nothing looked at. It also asserts the
+  deployed *shape*: the overlay strips those mounts and `--reload` with
+  compose's `!reset`, and a compose that does not know the tag leaves them in
+  place silently, so the resolved configuration is checked rather than the file
+  trusted. Verified by removing the tag and watching the check fail.
+
+  What was actually run, since a compose file that only parses is not a compose
+  file that works. `db` and `redis` were started **through the overlay** and
+  inspected as containers rather than as YAML: both come up with
+  `RestartPolicy=unless-stopped` and a rotating log driver, which the base file
+  gives neither. The database password is enforced on the path the API and
+  worker use — over the compose network the base file's `atp` is refused
+  `password authentication failed` and the configured one succeeds. (In-container
+  loopback is `trust` in this image, so a `docker exec psql` test proves nothing
+  and was not what was used.) The `api` and `worker` images could **not** be
+  built here: both Dockerfiles pull `uv` from `ghcr.io`, and this environment's
+  egress policy answers 403 for its blob storage. CI has that access and builds
+  both in the `stack` job on every push.
+
+  **Unticked, and not close.** Nothing has been provisioned and nothing has been
+  deployed: this is a decision, a compose file and a runbook, none of which is a
+  running host. The secrets-manager half is unstarted — ADR 0011 chooses SOPS +
+  age and no tooling is written, so `.env` at `0600` is still the secret store.
+  Alerting and backups, the two items above, are what a live host would need
+  next, and docs/DEPLOYMENT.md says so rather than implying a host is ready.
+
+  One thing found on the way and recorded rather than fixed: `tailscale serve`
+  is the documented way to get HTTPS, but TLS terminates at Tailscale and nginx
+  sets `X-Forwarded-Proto` from its own `$scheme`, which is `http` — so the
+  session cookie `_is_https()` guards is **not** marked `Secure` behind exactly
+  the TLS this recommends. Fixing it means deciding which proxy's headers to
+  trust, which is a security change rather than a deployment one. SECURITY.md
+  lists it and docs/DEPLOYMENT.md explains it.
 - [x] Dashboard served as a built bundle rather than a dev server — @claude (#46).
   `infra/docker/web.Dockerfile` gained a `prod` stage: the `npm run build`
   output served by nginx, with `/api`, `/ws` and the health probes proxied so
@@ -1200,10 +1262,29 @@ genuinely unstarted — and it must not be read as evidence for any of them.
 *Proposed and ticked by the same hand, so it wants a reviewer's eye rather than
 mine.*
 
-The phase still needs a line covering production readiness as a whole, and the
-blocking item at the top of it is why there is no point writing one yet:
-nothing here is deployable until authentication lands, so a line written now
-could only describe a system nobody should run.
+*Verifiable (deployment, proposed):* the stack runs unattended on the chosen
+host across a full trading week — a deliberate reboot brings every service back
+without a hand on it, a deploy mid-week never has two workers alive at once, the
+dashboard is reachable over the tailnet and from nowhere else, and no plaintext
+secret sits on the host outside the `0600` runtime file.
+**Not yet shown** — nothing has been provisioned. Proposed here because this
+item had no line it could ever be ticked against, which is the defect #45 and
+#46 both named: a phase without a line cannot tick anything, however much of it
+is built. It is scoped to *deployment* on purpose and says nothing about
+alerting, metrics or backups, which are separately unstarted.
+
+That line and Phase 4's are the same week of uptime seen from two ends, which is
+the argument for doing this now rather than at go-live: Phase 4 has eight built
+items held against "a strategy trades the paper account for a week", Phase 5
+needs "a worker trading paper", and Phase 1's streaming line needs a forced
+disconnect during a session. None of that is demonstrable on a laptop that
+sleeps.
+
+The phase still needs a line covering production readiness as a whole. The
+reason previously given for not writing one — that nothing is deployable until
+authentication lands — no longer holds, since it has; what stands in its way now
+is alerting, backups and metrics, so a line written today would still describe a
+system docs/SAFETY.md's own go-live checklist refuses.
 
 ## Later
 Declarative rule builder UI · walk-forward optimisation · sector/factor exposure
