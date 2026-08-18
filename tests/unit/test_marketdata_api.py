@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import pytest
 
-from atp_api.deps import get_clock
+from atp_api.deps import get_clock, get_current_user
 from atp_api.main import create_app
 from atp_api.routers.marketdata import MAX_CALENDAR_DAYS
 from atp_core.clock import SimulatedClock
@@ -36,6 +36,11 @@ NOW = datetime(2024, 7, 10, 21, 0, tzinfo=UTC)
 def app() -> FastAPI:
     application = create_app()
     application.dependency_overrides[get_clock] = lambda: SimulatedClock(NOW)
+    # These tests are about the exchange calendar, not about who is asking. Overriding the
+    # one dependency that answers that keeps them so — `tests/unit/
+    # test_api_contract.py` is where the enforcement itself is held, from the
+    # outside, against every route at once (ADR 0008).
+    application.dependency_overrides[get_current_user] = lambda: "test-operator"
     return application
 
 

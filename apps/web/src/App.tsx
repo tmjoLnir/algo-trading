@@ -5,8 +5,10 @@ import Backtests from './pages/Backtests'
 import Positions from './pages/Positions'
 import Orders from './pages/Orders'
 import Analytics from './pages/Analytics'
+import Login from './pages/Login'
 import RunModeBanner from './components/RunModeBanner'
 import HaltBanner from './components/HaltBanner'
+import { useLogout, useSession } from './api/session'
 
 const NAV = [
   { to: '/', label: 'Dashboard' },
@@ -17,7 +19,37 @@ const NAV = [
   { to: '/analytics', label: 'Analytics' },
 ]
 
+function Centred({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-slate-950 px-4 text-sm text-slate-400">
+      {children}
+    </div>
+  )
+}
+
 export default function App() {
+  const { user, isAuthenticated, isPending, error } = useSession()
+  const logout = useLogout()
+
+  // Three states, not two. "Not logged in" and "cannot tell" are different, and
+  // rendering the login form for the second would have the operator typing a
+  // password at a server that is not in a position to check it — and reading
+  // the failure as their mistake.
+  if (isPending) return <Centred>Checking your session…</Centred>
+  if (error) {
+    return (
+      <Centred>
+        <div className="text-center">
+          <p className="text-slate-300">Cannot reach the API.</p>
+          <p className="mt-1 text-xs">
+            This is not a sign-in problem — the server did not answer. It will retry on its own.
+          </p>
+        </div>
+      </Centred>
+    )
+  }
+  if (!isAuthenticated) return <Login />
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
       {/* Both banners are above the nav on purpose: whether this is real money,
@@ -26,7 +58,7 @@ export default function App() {
       <RunModeBanner />
       <HaltBanner />
 
-      <nav className="flex gap-1 border-b border-slate-800 px-4">
+      <nav className="flex items-center gap-1 border-b border-slate-800 px-4">
         {NAV.map(({ to, label }) => (
           <NavLink
             key={to}
@@ -39,6 +71,22 @@ export default function App() {
             {label}
           </NavLink>
         ))}
+
+        {/* Who you are signed in as, at the far end. Not decoration: every
+            halt and every manual order is now recorded against this name, so
+            it should be visible before you press the red button rather than
+            discovered in the audit log afterwards. */}
+        <div className="ml-auto flex items-center gap-3 text-xs text-slate-500">
+          <span>{user}</span>
+          <button
+            type="button"
+            onClick={() => logout.mutate()}
+            disabled={logout.isPending}
+            className="rounded border border-slate-700 px-2 py-1 text-slate-400 hover:text-slate-200 disabled:opacity-50"
+          >
+            Sign out
+          </button>
+        </div>
       </nav>
 
       <main className="p-4">

@@ -153,6 +153,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Static, and first, because it is about what the committed file *says*
+      # rather than what starts. The platform has no authentication, so a
+      # service published on 0.0.0.0 puts the trading database, the Redis
+      # holding the kill-switch state, or the API itself on every interface of
+      # the host. That should fail a build, not wait to be found by whoever
+      # scans the subnet first. docs/SAFETY.md, "Access control".
+      - name: No service binds every interface
+        run: make check-bindings
+
       # No `.env` is created first, deliberately: this must work on a clone with
       # nothing but the tracked files, which is exactly what a new contributor
       # has. `make up` is responsible for producing one from .env.example.

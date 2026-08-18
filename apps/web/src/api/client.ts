@@ -20,6 +20,12 @@ export class ApiError extends Error {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${apiBase()}${path}`, {
     ...init,
+    // The session is an HttpOnly cookie, so this is how it travels — there is
+    // no token for the page to attach, deliberately (ADR 0008). `include`
+    // rather than the `same-origin` default so a build pointed at an API on
+    // another origin still authenticates; the API sets explicit CORS origins
+    // and allow-credentials, which the spec requires for this to be honoured.
+    credentials: 'include',
     headers: { 'Content-Type': 'application/json', ...init?.headers },
   })
   if (!res.ok) {

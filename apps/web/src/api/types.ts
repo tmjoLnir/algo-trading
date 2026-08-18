@@ -45,3 +45,9 @@ export type EquityPointView = Schemas['EquityPointView']
  * mode falls through to the loudest branch rather than to none.
  */
 export type RunMode = 'backtest' | 'paper' | 'live'
+
+/** Who the session belongs to (`/auth/me`, `/auth/login`). */
+export type WhoAmI = Schemas['WhoAmI']
+
+/** What the login screen may know before there is a session. */
+export type PreSessionContext = Schemas['PreSessionContext']

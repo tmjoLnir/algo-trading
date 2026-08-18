@@ -17,11 +17,13 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from atp_api.deps import get_current_user
 from atp_api.routers import (
     analytics,
+    auth,
     backtests,
     dashboard,
     health,
@@ -62,6 +64,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     else:
         log.info("startup", run_mode=settings.run_mode, broker_url=settings.broker_base_url)
+
+    # Fail closed, and say so here rather than at the login screen. With no hash
+    # configured there is no password that works — not "any password works" —
+    # so the API is safe but unusable, and the difference between those two is
+    # exactly what an operator needs told at startup rather than discovered.
+    if not settings.api_password_hash.get_secret_value():
+        log.critical(
+            "startup.no_credentials",
+            msg="API_PASSWORD_HASH is unset — every login will be refused",
+            fix="uv run python scripts/hash_password.py, then put the line in .env",
+        )
 
     # Pools belong to the application, not to a dependency. A client built
     # lazily on first use has nowhere to be closed, and an API that exits
@@ -125,8 +138,25 @@ def create_app() -> FastAPI:
     # when the API version bumps is a probe that fails for no real reason.
     unversioned = (health.router, ws_router)
 
+    # Everything that is not on this list requires a session (ADR 0008). Stated
+    # as an allow-list on purpose: a router added to the loop below and to
+    # nothing else comes out authenticated, which is the safe direction for the
+    # mistake. `tests/unit/test_api_contract.py` holds the same line from the
+    # outside, against the generated schema, so neither this list nor that test
+    # can drift alone.
+    #
+    # `health` — orchestrators hit /healthz and /readyz, including this repo's
+    #   own Docker HEALTHCHECK and compose `depends_on` gates.
+    # `auth`   — you cannot log in through a door that requires being logged in.
+    # `ws`     — authenticates inside its handler instead. A dependency raising
+    #   HTTPException cannot close a WebSocket handshake politely; it surfaces
+    #   as a transport error rather than a refusal the client can act on.
+    open_routers = (health.router, auth.router, ws_router)
+    session_required = [Depends(get_current_user)]
+
     for router in (
         health.router,
+        auth.router,
         dashboard.router,
         strategies.router,
         backtests.router,
@@ -137,7 +167,11 @@ def create_app() -> FastAPI:
         risk.router,
         ws_router,
     ):
-        app.include_router(router, prefix="" if router in unversioned else "/api/v1")
+        app.include_router(
+            router,
+            prefix="" if router in unversioned else "/api/v1",
+            dependencies=[] if router in open_routers else session_required,
+        )
 
     return app
 

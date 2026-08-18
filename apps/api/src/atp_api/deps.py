@@ -21,6 +21,7 @@ from fastapi import Depends, HTTPException, Request, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from atp_api.auth import COOKIE_NAME, read_session_token
 from atp_core.backtest.costs import alpaca_equities_default
 from atp_core.brokers import AlpacaBroker, BrokerPort, SimulatedBroker
 from atp_core.clock import Clock, SystemClock, TradingCalendar
@@ -182,11 +183,33 @@ async def get_broker(settings: Annotated[Settings, Depends(get_settings)]) -> Br
     return _broker_instance
 
 
-async def get_current_user() -> str:
-    """Resolve the acting user.
+async def get_current_user(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    clock: Annotated[Clock, Depends(get_clock)],
+) -> str:
+    """Resolve the acting user from the session cookie, or refuse the request.
 
-    Authentication is deliberately a stub in the skeleton — see docs/SAFETY.md
-    'Access control'. Do NOT expose this API on a public interface until it is
-    implemented: every endpoint under /risk and /orders can move real money.
+    One operator, one cookie, one signature check — the whole design is ADR 0008.
+
+    This is the *only* place a request becomes a named actor. Handlers that
+    record who did something take `CurrentUser` below rather than accepting an
+    `actor` field, because an actor the caller fills in is not an audit trail;
+    it is a form with a name box on it.
+
+    Every rejection is the same 401 with the same body. Distinguishing "no
+    cookie" from "expired" from "bad signature" tells whoever is probing which
+    half of the problem they have solved, and the client's response is identical
+    in all three cases: log in again.
     """
-    raise NotImplementedError
+    subject = read_session_token(request.cookies.get(COOKIE_NAME, ""), settings, clock.now())
+    if subject is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="not authenticated",
+        )
+    return subject
+
+
+#: The acting user, for handlers that record who did something.
+CurrentUser = Annotated[str, Depends(get_current_user)]

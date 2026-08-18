@@ -8,6 +8,8 @@ from decimal import Decimal
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from atp_api.deps import CurrentUser
+
 router = APIRouter(prefix="/orders", tags=["orders"])
 
 
@@ -34,7 +36,7 @@ async def list_orders(
 
 
 @router.post("", status_code=202)
-async def submit_manual_order(payload: ManualOrderRequest, actor: str) -> dict[str, object]:
+async def submit_manual_order(payload: ManualOrderRequest, actor: CurrentUser) -> dict[str, object]:
     """Human-initiated order.
 
     Goes through the SAME `OrderRouter` and risk engine as a strategy order
@@ -45,10 +47,10 @@ async def submit_manual_order(payload: ManualOrderRequest, actor: str) -> dict[s
 
 
 @router.delete("/{order_id}")
-async def cancel_order(order_id: str, actor: str) -> dict[str, object]:
+async def cancel_order(order_id: str, actor: CurrentUser) -> dict[str, object]:
     raise NotImplementedError
 
 
 @router.post("/cancel-all")
-async def cancel_all_orders(symbol: str | None = None, actor: str = "") -> dict[str, int]:
+async def cancel_all_orders(actor: CurrentUser, symbol: str | None = None) -> dict[str, int]:
     raise NotImplementedError

@@ -8,7 +8,12 @@ dependencies = [
   "fastapi>=0.111",
   "uvicorn[standard]>=0.30",
   "python-jose[cryptography]>=3.3",
-  "passlib[bcrypt]>=1.7",
+  # bcrypt directly, not passlib[bcrypt] as this originally declared. passlib
+  # 1.7.4 (2020, and the current release) detects its backend by reading
+  # `bcrypt.__about__.__version__`, which bcrypt removed — so on bcrypt 5 the
+  # backend fails to load and every hash() raises. The declared dependency did
+  # not run. See ADR 0008.
+  "bcrypt>=4.0",
 ]
 
 [build-system]

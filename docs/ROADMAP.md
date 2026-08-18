@@ -926,8 +926,15 @@ wording if it is not the demonstration you want.
   it; `make lint` and CI now gate web formatting the way they always did
   Python's.
 
-  Unticked, and the gap is the demonstration rather than the code: no browser
-  has rendered a book that a worker actually published.
+  Unticked, and the gap is the demonstration rather than the code. It has
+  narrowed without closing: a browser has now rendered this dashboard from the
+  built bundle, through the proxy, against a live API — so the front end, the
+  serving layer and the endpoint are shown to work as one. What is missing is
+  the subject of this phase's *Verifiable:* line, a book that a **worker**
+  published. With nothing trading, the screen correctly reports "No book
+  published", which demonstrates the null-book path and says nothing whatever
+  about agreement between the worker's numbers and the screen's — which is the
+  only property that makes the screen worth reading.
 - [ ] Trade reconstruction, attribution, MAE/MFE.
   Two prerequisites are worth naming here because #45 found them and did not
   fix them. `SignalRow` exists in the schema with **no writer** — the
@@ -956,13 +963,46 @@ agreement between what the worker believes and what the screen says, which is
 the only property that makes the screen worth reading.
 
 ## Phase 6 — Production readiness
-- [ ] **Authentication and authorisation** — blocking for any deployment
+- [x] **Authentication** — @claude. One operator, `API_USER` and a bcrypt
+  `API_PASSWORD_HASH`, with the session in a signed `HttpOnly`,
+  `SameSite=Strict` cookie. Everything under `/api/v1` requires it and so does
+  the WebSocket, which refuses the handshake with close code 1008 rather than
+  accepting a socket it would then send the whole book down. Design, and the
+  four choices worth arguing with, are ADR 0008.
+
+  The change that matters most is not the login screen. `actor` was a **query
+  parameter the caller filled in themselves** on `/risk/halt`, `/risk/resume`,
+  `/risk/flatten-all`, `/orders`, `/positions/{symbol}/close` and
+  `/positions/{symbol}/stop`. It now comes from the session. An audit trail with
+  a name box on it was not one, and it was going to be wrong on exactly the day
+  those handlers stopped being stubs.
+
+  Two things found on the way, both by running it rather than by reading it.
+  `passlib[bcrypt]`, which this package declared from the start, **does not
+  run**: passlib 1.7.4 reads `bcrypt.__about__.__version__`, bcrypt removed it,
+  and every `hash()` raises on bcrypt 5. It is replaced by `bcrypt` directly
+  rather than pinned to a 2020 release. And the login screen's run-mode banner
+  was broken in a way its unit test could not see — it read the API's root `/`,
+  which nginx serves the dashboard from, so the browser got `index.html` and the
+  banner silently never rendered. A stub matching paths by suffix made `'/'`
+  match every request in the suite. Both the endpoint and the stub are fixed.
+
+  **Not** ready for a public address, and this item should not be read as
+  saying so: no rate limit on the login endpoint, no revocation before a
+  session expires, no TLS of our own, no secrets manager. The items below are
+  the difference.
+- [ ] Authorisation — unstarted, and deliberately so: with one account there is
+  nothing to distinguish, and a role column with one value in it would imply a
+  permission model that does not exist. Split from the item above, which
+  conflated two pieces of work of very different sizes — one done, one with
+  nothing yet to do. Worth a reviewer's eye, as splits by the same hand that
+  ticks half of them always are.
 - [ ] Rate limiting, audit log surfaced in UI
 - [ ] Alerting to a phone (feed loss, halt, reconciliation failure)
 - [ ] Metrics/tracing
 - [ ] Backups and a tested restore
 - [ ] Deployment target chosen; secrets manager
-- [ ] Dashboard served as a built bundle rather than a dev server — @claude (wip).
+- [x] Dashboard served as a built bundle rather than a dev server — @claude (#46).
   `infra/docker/web.Dockerfile` gained a `prod` stage: the `npm run build`
   output served by nginx, with `/api`, `/ws` and the health probes proxied so
   the browser only ever sees one origin (`make up-prod`, port 8080). The
@@ -978,18 +1018,94 @@ the only property that makes the screen worth reading.
   had `http://localhost:8000` compiled into it, which was confirmed by building
   one before the change.
 
-  Unticked, and Phase 6 has no *Verifiable:* line to tick anything against —
-  the same gap that left #16's calendar endpoint untickable through the whole
-  of Phase 1. What has been shown: the nginx config validated, then *run*,
-  serving the real built bundle — SPA fallback on a client-side route, the
-  cache headers, gzip, the `/api/v1` prefix and query string arriving
-  unstripped, and the WebSocket upgrade headers forwarded. What has not: the
-  image has never been built and nothing has been served from the container, no
-  Docker daemon being available where this was written.
+  Ticked against the serving-layer line proposed at the end of this phase. What
+  that rests on is worth stating precisely, because the two halves were shown
+  by different means and neither is the other. CI's `stack` job builds the
+  image, starts it, and asserts with curl that the bundle carries no
+  compiled-in host, that `/healthz` answers through nginx on the dashboard's
+  own origin, and that a client-side route survives a hard refresh — first
+  green on the #46 merge, run 32099581786, and re-run on every push since.
+  Separately, headless Chromium rendered the dashboard from the real config and
+  the real bundle against a live API, which is what showed the SPA fallback,
+  the cache headers, gzip, the `/api/v1` prefix and query string arriving
+  unstripped, and the WebSocket upgrade headers forwarded. CI drives the image
+  but no browser; the browser run served the config directly rather than from
+  the image. The line is written to what CI mechanically re-checks, so it does
+  not claim the half only a human has watched.
 
-  It does not make the platform deployable. The item above it is unstarted and
-  the authentication item at the top of this phase is still blocking: this
-  serves the dashboard to a private network and nowhere else.
+  The caveat that stood here — that the image had never been built and nothing
+  had ever been served from the container — is no longer true, and is corrected
+  in place rather than left reading as current. The `stack` job built the image
+  and served from it on the #46 merge commit (CI run 32099581786): the bundle
+  carried no compiled-in host, `/healthz` answered through nginx on the
+  dashboard's own origin, and a client-side route survived a hard refresh. Every
+  push re-checks it, which is the point of putting it there rather than in a
+  deployment runbook.
+
+  Exposure is a decision now rather than a default. Every port in
+  `docker-compose.yml` binds `127.0.0.1`: the API, the `atp`/`atp` Postgres and
+  the passwordless Redis holding the kill-switch state were all published on
+  `0.0.0.0`, which contradicted docs/SAFETY.md's own "bind to localhost only"
+  rule for as long as both have existed. The dashboard's port is the single
+  deliberate exception, through `ATP_WEB_BIND_ADDR`, and `make check-bindings`
+  refuses both a wildcard and a publicly routable address — in CI, and as a
+  pre-flight on `make up-prod` itself, before anything starts. Moving that one
+  port is safe only because nginx reaches the API across the compose network, so
+  putting the dashboard on a LAN does not put an unauthenticated API on it too.
+
+  The public-address half of that check was added after someone set
+  `ATP_WEB_BIND_ADDR` to the address `what is my IP` returned — their router's
+  public one. A wildcard check waves that through: it is a specific address, and
+  it is the worst available value for it. The test is `is_global` and not
+  `is_private`, because Tailscale allocates from 100.64.0.0/10, which reports as
+  not-private while being unroutable from the internet — an `is_private` check
+  would have refused precisely the route docs/DASHBOARD.md recommends.
+
+  It still does not make the platform deployable. The item above this is
+  unstarted and the authentication item at the top of the phase is still
+  blocking: this serves the dashboard to a private network and nowhere else.
+
+*Verifiable (sign-in, proposed):* every route under `/api/v1` and the WebSocket
+refuse a caller with no session; a correct username and password return a cookie
+that admits both; a wrong password and an unknown user are refused with the same
+message; and `actor`, wherever a handler records one, comes from that session
+rather than from the request.
+**Shown** — @claude. The refusals are held by an exhaustive contract test that
+walks every path in the generated schema, so a route added later is covered
+without anyone remembering to cover it. The rest was shown by driving a real
+browser against the real nginx config and the real built bundle: the login
+screen renders unauthenticated with no dashboard behind it, a wrong password
+gives the one message, a correct one lands on the book, the cookie arrives
+`HttpOnly` and `SameSite=Strict` through the proxy, **the WebSocket opens and
+stays open** — which is the whole argument for a cookie over a bearer token,
+since a browser cannot put a header on a handshake — and signing out clears it.
+
+What that did not cover: it ran nginx and the API as host processes rather than
+from the compose stack, and it has never met TLS, so `Secure` on the cookie is
+correct-by-construction rather than observed. Scoped to sign-in on purpose — it
+says nothing about rate limiting, revocation or authorisation, which are
+unstarted. *Proposed and ticked by the same hand; it wants a reviewer's eye.*
+
+*Verifiable (serving layer, proposed):* the dashboard is served from the built
+image with no hostname compiled into its bundle; the API answers on the
+dashboard's own origin through the proxy; a client-side route survives a hard
+refresh; and no service in the compose file publishes a port on a wildcard or a
+publicly routable address — all of it re-checked on every push, and on every
+`make up-prod`, rather than discovered at deploy time.
+**Shown** — @claude. Proposed because this phase states no line at all, which
+is the same defect #45 named in Phase 5 and that left #16's calendar endpoint
+implemented and untickable through the whole of Phase 1: a phase without a line
+cannot tick anything, however much of it is built. It is scoped to *serving* on
+purpose. It says nothing about authentication, rate limiting, alerting,
+metrics, backups or a secrets manager — the other six items here, which are
+genuinely unstarted — and it must not be read as evidence for any of them.
+*Proposed and ticked by the same hand, so it wants a reviewer's eye rather than
+mine.*
+
+The phase still needs a line covering production readiness as a whole, and the
+blocking item at the top of it is why there is no point writing one yet:
+nothing here is deployable until authentication lands, so a line written now
+could only describe a system nobody should run.
 
 ## Later
 Declarative rule builder UI · walk-forward optimisation · sector/factor exposure

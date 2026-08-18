@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 .PHONY: help install up up-prod down logs migrate revision seed backfill test test-unit \
-        test-integration lint typecheck fmt check gen-types build-web dev-api dev-worker \
-        dev-web clean
+        test-integration lint typecheck fmt check check-bindings gen-types build-web \
+        dev-api dev-worker dev-web clean
 
 WEB := apps/web
 
@@ -28,19 +28,32 @@ up: .env  ## Start the full stack
 	@echo "worker → market-data ingestion + scheduled jobs"
 	@echo "         it places no orders yet; set WORKER_SYMBOLS to give it a watchlist"
 
-up-prod: .env  ## Start the stack with the BUILT dashboard behind nginx
+up-prod: .env check-bindings  ## Start the stack with the BUILT dashboard behind nginx
 	@# `web` is the dev server and stays that way; this starts `web-prod`
 	@# instead, which is the bundle `npm run build` produces served by nginx
 	@# with /api and /ws proxied onto the same origin. Services are named
 	@# explicitly so the dev server does not come up alongside it on 5173.
 	docker compose --profile prod up -d --build db redis api worker web-prod
-	@echo
-	@echo "dashboard → http://localhost:8080   (built bundle; API on the same origin)"
-	@echo "api       → http://localhost:8000/docs"
-	@echo
-	@echo "!! NO AUTHENTICATION — this is ROADMAP Phase 6 and it is not built."
-	@echo "!! Bind port 8080 to a private network: anyone who can reach it reads"
-	@echo "!! the entire book, and the risk endpoints ask nobody who is calling."
+	@# Asked of compose rather than recomputed here. ATP_WEB_BIND_ADDR is
+	@# usually set in .env, which compose reads for interpolation and make does
+	@# not — so a message assembled from make's own environment would confidently
+	@# report the wrong address exactly when it matters.
+	@bound=$$(docker compose --profile prod port web-prod 80 2>/dev/null); \
+	 bound=$${bound:-127.0.0.1:8080}; \
+	 echo; \
+	 echo "dashboard → http://$$bound   (built bundle; API on the same origin)"; \
+	 echo "api       → http://127.0.0.1:8000/docs   (loopback only, by design)"; \
+	 echo; \
+	 case "$$bound" in \
+	   127.0.0.1:*|localhost:*) \
+	     echo "   Reachable from this host only. To share it, set ATP_WEB_BIND_ADDR in"; \
+	     echo "   .env to a LAN or VPN address — docs/DASHBOARD.md, 'Reaching it from"; \
+	     echo "   another machine'.";; \
+	   *) \
+	     echo "!! NO AUTHENTICATION (ROADMAP Phase 6). Anyone who reaches $$bound reads"; \
+	     echo "!! the entire book and can call the risk endpoints. check-bindings has"; \
+	     echo "!! confirmed that address is private; keep the network it is on trusted.";; \
+	 esac
 
 down:  ## Stop the stack
 	@# --profile prod so this also takes down web-prod, which is otherwise
@@ -111,6 +124,13 @@ check-tracked:  ## Fail if any source file is excluded by .gitignore
 	  exit 1; \
 	fi; \
 	echo "check-tracked: no source files are gitignored"
+
+check-bindings:  ## Fail if any compose service publishes a port on every interface
+	@# Not part of `check`, which deliberately needs no Docker daemon. CI runs
+	@# this in the `stack` job. Plain python3 rather than `uv run`: the script
+	@# is stdlib-only, and the CI job that needs it most has docker but no
+	@# synced Python environment.
+	python3 scripts/check_port_bindings.py
 
 check: check-tracked lint typecheck test  ## Everything CI runs — green before you push
 

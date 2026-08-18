@@ -21,7 +21,15 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import { apiGet } from '@/api/client'
 import { wsUrl } from '@/api/origin'
+import { SESSION_KEY } from '@/api/session'
 import type { EquityCurveView, LiveDashboard } from '@/api/types'
+
+/**
+ * Close code 1008, "policy violation" — what `ws.py` refuses an unauthenticated
+ * handshake with. Named because a bare 1008 in a condition reads as a magic
+ * number, and this one carries a decision.
+ */
+const WS_POLICY_VIOLATION = 1008
 
 const DEFAULT_REFRESH_MS = 5 * 60 * 1000
 
@@ -175,8 +183,20 @@ export function useDashboardStream(symbols: string[]) {
         }
       }
 
-      ws.onclose = () => {
+      ws.onclose = (event) => {
         if (closed) return
+
+        // 1008 is the server refusing this socket on policy — here, no valid
+        // session (ADR 0008). Retrying cannot fix it: every reconnect sends the
+        // same cookie and is refused the same way, forever, at whatever backoff.
+        // Dropping the session instead sends the app to the login screen, which
+        // is the only thing that *can* fix it.
+        if (event.code === WS_POLICY_VIOLATION) {
+          closed = true
+          queryClient.setQueryData(SESSION_KEY, null)
+          return
+        }
+
         // Exponential backoff, capped at 30s. Reconnecting in a tight loop
         // against a server that is already struggling makes it worse.
         const delay = Math.min(1000 * 2 ** attempt++, 30_000)
