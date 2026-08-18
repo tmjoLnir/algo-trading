@@ -239,8 +239,21 @@ published Docker port means writing into the `DOCKER-USER` chain. The bind
 address is the control that actually holds; a firewall is defence in depth
 behind it, never instead of it.
 
-`make check-bindings` refuses a wildcard bind, and CI runs it before the stack
-starts — a compose file that puts any of this on `0.0.0.0` fails the build.
+**The address must be a private one.** `make check-bindings` refuses two values,
+and the second is the one people actually reach for: `0.0.0.0`, and any publicly
+routable address. Looking up "what is my IP" returns the address your *router*
+presents to the internet, not your machine's — setting that here asks Docker to
+serve the book to anyone who connects. Take the value from `ip -4 -brief addr`
+(192.168.x, 10.x) or `tailscale ip -4` (100.x) instead.
+
+The test is `is_global` rather than `is_private`, which matters for the route
+recommended above: Tailscale allocates from the shared CGNAT range
+100.64.0.0/10, which reports as *not* private while being unroutable from the
+internet. An `is_private` check would have refused exactly the option worth
+preferring.
+
+CI runs the check before the stack starts, so a compose file that puts any of
+this on a wildcard or a public address fails the build.
 
 ### It should not leave a private network at all
 

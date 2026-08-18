@@ -28,7 +28,7 @@ up: .env  ## Start the full stack
 	@echo "worker → market-data ingestion + scheduled jobs"
 	@echo "         it places no orders yet; set WORKER_SYMBOLS to give it a watchlist"
 
-up-prod: .env  ## Start the stack with the BUILT dashboard behind nginx
+up-prod: .env check-bindings  ## Start the stack with the BUILT dashboard behind nginx
 	@# `web` is the dev server and stays that way; this starts `web-prod`
 	@# instead, which is the bundle `npm run build` produces served by nginx
 	@# with /api and /ws proxied onto the same origin. Services are named
@@ -45,18 +45,14 @@ up-prod: .env  ## Start the stack with the BUILT dashboard behind nginx
 	 echo "api       → http://127.0.0.1:8000/docs   (loopback only, by design)"; \
 	 echo; \
 	 case "$$bound" in \
-	   0.0.0.0:*|:::*|\[::\]:*) \
-	     echo "!! ATP_WEB_BIND_ADDR is a wildcard: the dashboard is on EVERY interface"; \
-	     echo "!! of this machine, and there is no authentication in front of it."; \
-	     echo "!! Set it to the one LAN or VPN address you meant.";; \
 	   127.0.0.1:*|localhost:*) \
 	     echo "   Reachable from this host only. To share it, set ATP_WEB_BIND_ADDR in"; \
 	     echo "   .env to a LAN or VPN address — docs/DASHBOARD.md, 'Reaching it from"; \
 	     echo "   another machine'.";; \
 	   *) \
-	     echo "!! NO AUTHENTICATION (ROADMAP Phase 6). Anyone who can reach $$bound"; \
-	     echo "!! reads the entire book and can call the risk endpoints. Keep that"; \
-	     echo "!! address on a private network.";; \
+	     echo "!! NO AUTHENTICATION (ROADMAP Phase 6). Anyone who reaches $$bound reads"; \
+	     echo "!! the entire book and can call the risk endpoints. check-bindings has"; \
+	     echo "!! confirmed that address is private; keep the network it is on trusted.";; \
 	 esac
 
 down:  ## Stop the stack
