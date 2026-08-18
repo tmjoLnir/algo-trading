@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import pytest
 
-from atp_api.deps import get_clock, get_current_user
+from atp_api.auth import Scope, Session
+from atp_api.deps import get_clock, get_current_session
 from atp_api.main import create_app
 from atp_api.routers.marketdata import MAX_CALENDAR_DAYS
 from atp_core.clock import SimulatedClock
@@ -39,8 +40,12 @@ def app() -> FastAPI:
     # These tests are about the exchange calendar, not about who is asking. Overriding the
     # one dependency that answers that keeps them so — `tests/unit/
     # test_api_contract.py` is where the enforcement itself is held, from the
-    # outside, against every route at once (ADR 0008).
-    application.dependency_overrides[get_current_user] = lambda: "test-operator"
+    # outside, against every route at once (ADR 0008, ADR 0009). A FULL
+    # session because these exercise reads and the routes they drive are not
+    # about scope.
+    application.dependency_overrides[get_current_session] = lambda: Session(
+        "test-operator", Scope.FULL
+    )
     return application
 
 

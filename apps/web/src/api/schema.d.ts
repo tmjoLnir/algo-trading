@@ -652,8 +652,13 @@ export interface paths {
          * Flatten All
          * @description Liquidate everything at market.
          *
-         *     Requires `confirm` to equal the literal string "FLATTEN ALL POSITIONS".
-         *     Irreversible: it realises every open P&L at whatever the market offers.
+         *     Requires `confirm` to equal the literal string "FLATTEN ALL POSITIONS", and
+         *     the account password with it. Irreversible: it realises every open P&L at
+         *     whatever the market offers.
+         *
+         *     Both proofs, not either. The phrase shows the caller knows what this does;
+         *     the password shows they are the person entitled to do it. A copied session
+         *     cookie satisfies neither on its own.
          */
         post: operations["flatten_all_api_v1_risk_flatten_all_post"];
         delete?: never;
@@ -740,7 +745,9 @@ export interface paths {
          * @description Resume trading. Requires a named human and is audit-logged.
          *
          *     Deliberately asymmetric with `/halt`: stopping is reflexive, restarting is
-         *     a decision.
+         *     a decision. The password is where that asymmetry stops being a comment and
+         *     starts being enforced — `/halt` asks for nothing at all, and a read-only
+         *     session may call it; this one asks again and a read-only session may not.
          */
         post: operations["clear_kill_switch_api_v1_risk_resume_post"];
         delete?: never;
@@ -1052,6 +1059,16 @@ export interface components {
              */
             ts: string;
         };
+        /**
+         * FlattenAllRequest
+         * @description Liquidating the book. Two proofs, because it cannot be undone.
+         */
+        FlattenAllRequest: {
+            /** Confirm */
+            confirm: string;
+            /** Password */
+            password: string;
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -1137,6 +1154,11 @@ export interface components {
         LoginRequest: {
             /** Password */
             password: string;
+            /**
+             * Read Only
+             * @default false
+             */
+            read_only: boolean;
             /** Username */
             username: string;
         };
@@ -1258,6 +1280,21 @@ export interface components {
         PreSessionContext: {
             /** Run Mode */
             run_mode: string;
+        };
+        /**
+         * ResumeRequest
+         * @description Clearing a halt, with the password that proves someone is still there.
+         */
+        ResumeRequest: {
+            /** Password */
+            password: string;
+            /**
+             * Scope
+             * @default global
+             */
+            scope: string;
+            /** Target */
+            target?: string | null;
         };
         /**
          * SessionView
@@ -1431,6 +1468,8 @@ export interface components {
         };
         /** WhoAmI */
         WhoAmI: {
+            /** Scope */
+            scope: string;
             /** User */
             user: string;
         };
@@ -2403,14 +2442,16 @@ export interface operations {
     };
     flatten_all_api_v1_risk_flatten_all_post: {
         parameters: {
-            query: {
-                confirm: string;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FlattenAllRequest"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {
@@ -2526,15 +2567,16 @@ export interface operations {
     };
     clear_kill_switch_api_v1_risk_resume_post: {
         parameters: {
-            query: {
-                scope: string;
-                target?: string | null;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResumeRequest"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {

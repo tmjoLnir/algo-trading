@@ -17,6 +17,8 @@ import re
 import httpx
 import pytest
 
+from atp_api.auth import Scope, Session
+from atp_api.deps import READ_ONLY_MAY_CALL, SAFE_METHODS, get_current_session
 from atp_api.main import create_app
 from atp_api.ws import websocket_endpoint
 
@@ -190,3 +192,104 @@ async def test_a_valid_session_cookie_gets_past_the_handshake() -> None:
 
     assert socket.accepted, "a valid session was refused at the handshake"
     assert socket.closed_with is None or socket.closed_with[0] != 1008
+
+
+def _mutating_routes(spec: dict) -> list[tuple[str, str]]:
+    """Every (method, path) that is not a safe read."""
+    return [
+        (method.upper(), path)
+        for path, operations in spec["paths"].items()
+        for method in operations
+        if method.upper() not in SAFE_METHODS
+    ]
+
+
+async def _walk(app, spec, methods_and_paths):
+    """Call each route and yield what it answered.
+
+    `raise_app_exceptions=False` because most handlers here are still
+    `NotImplementedError` stubs: a permitted call reaches one and raises, and
+    the point of these tests is the gate in front of it, not the hole behind.
+    """
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        for method, path in methods_and_paths:
+            concrete = re.sub(r"\{[^}]+\}", "placeholder", path)
+            response = await client.request(method, concrete, json={})
+            yield method, path, response.status_code
+
+
+async def test_a_read_only_session_cannot_reach_a_mutating_route() -> None:
+    """Every write is refused to a read-only session, bar the named exception.
+
+    Exhaustive over the generated schema, like the session check above and for
+    the same reason: `require_write_scope` decides from the method and the path,
+    so a route added later is refused by default — and this is what notices if
+    someone adds one to the exception list instead.
+    """
+    app = create_app()
+    app.dependency_overrides[get_current_session] = lambda: Session(user="reader", scope=Scope.READ)
+    spec = app.openapi()
+
+    checked = 0
+    async for method, path, status in _walk(app, spec, _mutating_routes(spec)):
+        if path in OPEN_WITHOUT_A_SESSION:
+            continue  # login and logout answer for themselves
+        if path in READ_ONLY_MAY_CALL:
+            assert status != 403, (
+                f"{method} {path} is listed as callable by a read-only session "
+                f"and was refused anyway"
+            )
+        else:
+            assert status == 403, (
+                f"{method} {path} answered {status} to a read-only session — it must "
+                f"be 403, or be listed in deps.READ_ONLY_MAY_CALL with a reason"
+            )
+        checked += 1
+
+    assert checked > 0, "no mutating routes were checked"
+
+
+async def test_the_kill_switch_is_the_exception_and_still_works_read_only() -> None:
+    """Halting is permitted to a read-only session, deliberately.
+
+    Pinned on its own rather than left implicit in the sweep above, because it
+    is the one place the rule bends and the reason is a domain rule rather than
+    a convenience: docs/RISK.md — engaging needs no confirmation, hesitation is
+    the expensive part. The person watching the book from a phone is exactly who
+    most needs to be able to stop it, and least needs to place an order.
+    """
+    assert frozenset({"/api/v1/risk/halt"}) == READ_ONLY_MAY_CALL, (
+        "the read-only exception list changed — every entry needs a domain reason"
+    )
+
+    app = create_app()
+    app.dependency_overrides[get_current_session] = lambda: Session(user="reader", scope=Scope.READ)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        halt = await client.post("/api/v1/risk/halt", json={"scope": "global"})
+        resume = await client.post("/api/v1/risk/resume", json={"scope": "global", "password": "x"})
+
+    assert halt.status_code != 403, "a read-only session must still be able to halt"
+    # The asymmetry docs/RISK.md asks for: stopping is reflexive, restarting is
+    # a decision — and a decision needs authority this session does not have.
+    assert resume.status_code == 403, "a read-only session must not clear a halt"
+
+
+async def test_a_full_session_is_refused_nowhere_on_scope() -> None:
+    """The converse. A gate that refused everything would pass the test above."""
+    app = create_app()
+    app.dependency_overrides[get_current_session] = lambda: Session(
+        user="operator", scope=Scope.FULL
+    )
+    spec = app.openapi()
+
+    async for method, path, status in _walk(app, spec, _mutating_routes(spec)):
+        assert status != 403, (
+            f"{method} {path} refused a FULL session with 403 — scope is not the "
+            f"reason anything should be refused here"
+        )

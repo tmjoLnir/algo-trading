@@ -11,8 +11,8 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
-from atp_api.auth import COOKIE_NAME, authenticate, create_session_token
-from atp_api.deps import CurrentUser, get_clock
+from atp_api.auth import COOKIE_NAME, Scope, authenticate, create_session_token
+from atp_api.deps import CurrentSession, get_clock
 from atp_core.clock import Clock
 from atp_core.config import Settings, get_settings
 from atp_core.logging import get_logger
@@ -29,10 +29,17 @@ class LoginRequest(BaseModel):
     #: is checked and discarded, and the type would only make the handler
     #: unwrap it.
     password: str = Field(min_length=1, max_length=1024)
+    #: Ask for a session that can look but not act (ADR 0009). Requested at
+    #: sign-in rather than toggled later, because a session that can promote
+    #: itself is not a read-only session — it is a full one with a preference.
+    read_only: bool = False
 
 
 class WhoAmI(BaseModel):
     user: str
+    #: "read" or "full". The dashboard reads this to decide what to disable; the
+    #: server does not trust that decision, it re-checks on every request.
+    scope: str
 
 
 class PreSessionContext(BaseModel):
@@ -83,7 +90,8 @@ async def login(
             detail="invalid username or password",
         )
 
-    token = create_session_token(subject, settings, clock.now())
+    scope = Scope.READ if payload.read_only else Scope.FULL
+    token = create_session_token(subject, settings, clock.now(), scope)
     response.set_cookie(
         COOKIE_NAME,
         token,
@@ -93,8 +101,8 @@ async def login(
         secure=_is_https(request),
         path="/",
     )
-    log.info("auth.login", user=subject)
-    return WhoAmI(user=subject)
+    log.info("auth.login", user=subject, scope=scope.value)
+    return WhoAmI(user=subject, scope=scope.value)
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
@@ -119,7 +127,7 @@ async def logout(request: Request, response: Response) -> None:
 
 
 @router.get("/me", response_model=WhoAmI)
-async def me(user: CurrentUser) -> WhoAmI:
+async def me(session: CurrentSession) -> WhoAmI:
     """Who the caller is, or 401.
 
     The dashboard's first call on load: a 200 renders the app, a 401 renders the
@@ -127,7 +135,7 @@ async def me(user: CurrentUser) -> WhoAmI:
     rather than something the client infers from a cookie it cannot read —
     `HttpOnly` means the page genuinely cannot see it.
     """
-    return WhoAmI(user=user)
+    return WhoAmI(user=session.user, scope=session.scope.value)
 
 
 @router.get("/context", response_model=PreSessionContext)

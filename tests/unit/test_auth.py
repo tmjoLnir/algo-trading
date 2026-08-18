@@ -12,19 +12,27 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
+from jose import jwt
 from pydantic import SecretStr
 
 from atp_api.auth import (
+    ALGORITHM,
     MAX_PASSWORD_BYTES,
     PasswordTooLongError,
+    Scope,
+    Session,
     authenticate,
     create_session_token,
     hash_password,
     read_session_token,
+    signing_key,
     verify_password,
 )
-from atp_core.config import Settings
+from atp_api.deps import get_current_session
+from atp_api.main import create_app
+from atp_core.config import Settings, get_settings
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=UTC)
 PASSWORD = "a-perfectly-ordinary-password"
@@ -96,7 +104,7 @@ class TestSessionTokens:
     def test_a_token_round_trips_to_its_subject(self) -> None:
         settings = settings_for()
         token = create_session_token("operator", settings, NOW)
-        assert read_session_token(token, settings, NOW) == "operator"
+        assert read_session_token(token, settings, NOW) == Session("operator", Scope.FULL)
 
     def test_a_token_is_valid_up_to_its_expiry_and_not_after(self) -> None:
         settings = settings_for(api_session_hours=12)
@@ -105,7 +113,7 @@ class TestSessionTokens:
         just_inside = NOW + timedelta(hours=12) - timedelta(seconds=1)
         just_outside = NOW + timedelta(hours=12) + timedelta(seconds=1)
 
-        assert read_session_token(token, settings, just_inside) == "operator"
+        assert read_session_token(token, settings, just_inside) == Session("operator", Scope.FULL)
         assert read_session_token(token, settings, just_outside) is None
 
     def test_expiry_is_judged_against_the_passed_clock_not_the_wall_clock(self) -> None:
@@ -164,3 +172,141 @@ class TestAuthenticate:
         settings = settings_for(api_user="joshua")
         assert authenticate("joshua", PASSWORD, settings) == "joshua"
         assert authenticate("operator", PASSWORD, settings) is None
+
+
+class TestScopes:
+    """What a session may do, which is not the same question as who holds it."""
+
+    def test_a_session_is_full_unless_asked_otherwise(self) -> None:
+        settings = settings_for()
+        token = create_session_token("operator", settings, NOW)
+        session = read_session_token(token, settings, NOW)
+        assert session is not None
+        assert session.scope is Scope.FULL
+        assert session.may_act
+
+    def test_a_read_only_session_round_trips_as_one(self) -> None:
+        settings = settings_for()
+        token = create_session_token("operator", settings, NOW, Scope.READ)
+        session = read_session_token(token, settings, NOW)
+        assert session is not None
+        assert session.scope is Scope.READ
+        assert not session.may_act
+
+    def test_the_scope_is_signed_and_cannot_be_edited_by_its_holder(self) -> None:
+        """The property the whole design rests on.
+
+        A read-only session whose holder can promote it is a full session with a
+        preference. Re-signing the payload with a different scope requires the
+        key, and forging it without one must not validate.
+        """
+        settings = settings_for()
+        read_token = create_session_token("operator", settings, NOW, Scope.READ)
+
+        claims = jwt.decode(
+            read_token,
+            signing_key(settings),
+            algorithms=[ALGORITHM],
+            options={"verify_exp": False},
+        )
+        assert claims["scp"] == "read"
+
+        forged = jwt.encode({**claims, "scp": "full"}, "a-key-we-do-not-have", algorithm=ALGORITHM)
+        assert read_session_token(forged, settings, NOW) is None
+
+        # And re-signed with the real key it *would* be full — which is the
+        # point: only something holding the key can say so.
+        legitimate = jwt.encode(
+            {**claims, "scp": "full"}, signing_key(settings), algorithm=ALGORITHM
+        )
+        session = read_session_token(legitimate, settings, NOW)
+        assert session is not None and session.scope is Scope.FULL
+
+    @pytest.mark.parametrize("claim", [None, "", "admin", "FULL", "superuser", 7])
+    def test_an_absent_or_unknown_scope_falls_back_to_read(self, claim: object) -> None:
+        """Fail closed.
+
+        A token minted before scopes existed, or carrying a value this version
+        does not know, is downgraded rather than trusted. The cost of guessing
+        wrong this way is a disabled button; the cost the other way is an
+        irreversible action taken by a session that was never granted it.
+        """
+        settings = settings_for()
+        payload: dict[str, object] = {
+            "sub": "operator",
+            "iat": int(NOW.timestamp()),
+            "exp": int((NOW + timedelta(hours=1)).timestamp()),
+        }
+        if claim is not None:
+            payload["scp"] = claim
+        token = jwt.encode(payload, signing_key(settings), algorithm=ALGORITHM)
+
+        session = read_session_token(token, settings, NOW)
+        assert session is not None
+        assert session.scope is Scope.READ
+
+
+class TestStepUp:
+    """Re-presenting the password for the two acts that cannot be undone."""
+
+    @staticmethod
+    def client(settings: Settings) -> httpx.AsyncClient:
+        app = create_app()
+        app.dependency_overrides[get_settings] = lambda: settings
+        app.dependency_overrides[get_current_session] = lambda: Session("operator", Scope.FULL)
+        return httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        )
+
+    async def test_resume_without_the_password_is_rejected_by_the_schema(self) -> None:
+        async with self.client(settings_for()) as client:
+            response = await client.post("/api/v1/risk/resume", json={"scope": "global"})
+        assert response.status_code == 422
+
+    async def test_resume_with_the_wrong_password_is_forbidden(self) -> None:
+        async with self.client(settings_for()) as client:
+            response = await client.post(
+                "/api/v1/risk/resume", json={"scope": "global", "password": "wrong"}
+            )
+        assert response.status_code == 403
+
+    async def test_resume_with_the_right_password_passes_the_gate(self) -> None:
+        """A valid session and the password get through to the handler.
+
+        The handler is still a stub, so "through" is a 500 rather than a 200 —
+        which is the honest assertion to make here. A test expecting 200 would
+        be testing an implementation that does not exist yet.
+        """
+        async with self.client(settings_for()) as client:
+            response = await client.post(
+                "/api/v1/risk/resume", json={"scope": "global", "password": PASSWORD}
+            )
+        assert response.status_code != 403
+
+    async def test_flatten_all_needs_the_password_as_well_as_the_phrase(self) -> None:
+        """Both proofs, not either.
+
+        The phrase shows the caller knows what the button does. The password
+        shows they are entitled to press it. A copied cookie plus a phrase read
+        off the documentation is not enough.
+        """
+        async with self.client(settings_for()) as client:
+            wrong = await client.post(
+                "/api/v1/risk/flatten-all",
+                json={"confirm": "FLATTEN ALL POSITIONS", "password": "wrong"},
+            )
+            right = await client.post(
+                "/api/v1/risk/flatten-all",
+                json={"confirm": "FLATTEN ALL POSITIONS", "password": PASSWORD},
+            )
+        assert wrong.status_code == 403
+        assert right.status_code != 403
+
+    async def test_the_password_is_never_a_query_parameter(self) -> None:
+        """It must travel in the body. nginx logs query strings verbatim."""
+        spec = create_app().openapi()
+        for path in ("/api/v1/risk/resume", "/api/v1/risk/flatten-all"):
+            for operation in spec["paths"][path].values():
+                names = {p["name"] for p in operation.get("parameters", [])}
+                assert "password" not in names, f"{path} takes the password in the URL"

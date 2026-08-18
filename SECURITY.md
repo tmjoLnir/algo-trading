@@ -29,8 +29,10 @@ as the cleanup takes.
   guesses at it. bcrypt's quarter-second verification is a brake, not a lock.
 - **Sessions cannot be revoked before they expire.** Stateless tokens with no
   denylist: a stolen cookie is good until `API_SESSION_HOURS` elapses.
-- **No authorisation model.** There is one account, so there is nothing to
-  distinguish; a second principal needs one built.
+- **No authorisation between people.** There is one account. Authorisation
+  exists, but it is about the act — read-only sessions, and a password re-check
+  on the two irreversible endpoints (ADR 0009). A second principal would need a
+  users table, which scopes compose with rather than replace.
 - **Still not ready for a public address.** No TLS termination of our own, no
   secrets manager, no chosen deployment target. Keep the bind addresses private
   — `make check-bindings` refuses a wildcard or a public one.

@@ -106,13 +106,27 @@ filled in themselves. Until this landed, `POST /risk/halt?actor=whoever` let the
 caller name themselves in the audit trail — which is a form with a name box on
 it, not an audit trail.
 
+**Sessions are scoped, and the two irreversible acts ask again.** A session is
+`full` or `read`, chosen at sign-in and carried in the signed token so its holder
+cannot change it. A read-only session may read everything and is refused every
+write with 403 — except `/risk/halt`, which it may still call, because someone
+watching the book from a phone is exactly who most needs to be able to stop
+trading and least needs to place an order. Clearing a halt is not on that list:
+stopping is reflexive, restarting is a decision.
+
+`/risk/resume` and `/risk/flatten-all` additionally require the account password
+in the request body. A cookie proves someone signed in within the last twelve
+hours; it does not prove anyone is at the keyboard now, and these two cannot be
+taken back. There is deliberately no "recently authenticated" window — that
+would be minutes during which a walked-away laptop can flatten the book. Design:
+ADR 0009.
+
 **Still missing, and still Phase 6:** there is no rate limit on `/auth/login`
-(bcrypt's quarter-second verification is a brake, not a lock), sessions cannot
-be revoked before they expire, and there is no authorisation model — with one
-account there is nothing to distinguish. Do not read "the API authenticates" as
-"this is ready for a public address": TLS, a secrets manager and a chosen
-deployment target are all still unbuilt, and the bind-address rules below still
-apply.
+(bcrypt's quarter-second verification is a brake, not a lock), and sessions
+cannot be revoked before they expire. Do not read "the API authenticates and
+authorises" as "this is ready for a public address": TLS, a secrets manager and
+a chosen deployment target are all still unbuilt, and the bind-address rules
+below still apply.
 
 **This is enforced now, not merely stated.** Every port in `docker-compose.yml`
 binds `127.0.0.1` — the API, Postgres (whose credentials are `atp`/`atp`), the

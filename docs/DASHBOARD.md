@@ -281,10 +281,15 @@ Stated here rather than left to be discovered:
   stores `strategy_id` as null (a strategies row must exist first, and nothing
   writes one), so a position cannot be traced to the strategy that opened it.
   The snapshot names the strategy running the whole book instead.
-- **Authentication exists; authorisation does not.** Signing in is one operator
-  against a bcrypt hash, with the session in an `HttpOnly` cookie that the
-  WebSocket handshake carries by itself (ADR 0008). What is *not* built: any
-  rate limit on the login endpoint, revocation before a session expires, and any
-  notion of roles — with one account there is nothing to distinguish. `actor` is
-  no longer a query parameter the caller fills in for themselves, which is the
-  change that makes the audit trail worth keeping.
+- **Sign-in and scopes exist; rate limiting and revocation do not.** Signing in
+  is one operator against a bcrypt hash, with the session in an `HttpOnly` cookie
+  the WebSocket handshake carries by itself (ADR 0008). Sessions are `full` or
+  `read`, chosen at sign-in (ADR 0009): a read-only session reads everything, may
+  still hit the kill switch, and is refused every other write with 403. Note what
+  that does **not** change on this screen — the kill switch is currently the only
+  acting control here, so a read-only session looks almost identical; the badge
+  in the nav is there because otherwise the difference would be invisible until
+  something was refused. What it changes is what the API permits, so a stolen
+  cookie cannot trade. What is *not* built: any rate limit on the login endpoint,
+  revocation before a session expires, and any notion of roles — with one account
+  there is nothing to distinguish.

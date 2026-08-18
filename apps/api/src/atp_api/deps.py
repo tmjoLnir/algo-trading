@@ -21,7 +21,7 @@ from fastapi import Depends, HTTPException, Request, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from atp_api.auth import COOKIE_NAME, read_session_token
+from atp_api.auth import COOKIE_NAME, Session, read_session_token
 from atp_core.backtest.costs import alpaca_equities_default
 from atp_core.brokers import AlpacaBroker, BrokerPort, SimulatedBroker
 from atp_core.clock import Clock, SystemClock, TradingCalendar
@@ -183,12 +183,12 @@ async def get_broker(settings: Annotated[Settings, Depends(get_settings)]) -> Br
     return _broker_instance
 
 
-async def get_current_user(
+async def get_current_session(
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
     clock: Annotated[Clock, Depends(get_clock)],
-) -> str:
-    """Resolve the acting user from the session cookie, or refuse the request.
+) -> Session:
+    """Resolve the session from the cookie, or refuse the request.
 
     One operator, one cookie, one signature check — the whole design is ADR 0008.
 
@@ -202,14 +202,67 @@ async def get_current_user(
     half of the problem they have solved, and the client's response is identical
     in all three cases: log in again.
     """
-    subject = read_session_token(request.cookies.get(COOKIE_NAME, ""), settings, clock.now())
-    if subject is None:
+    session = read_session_token(request.cookies.get(COOKIE_NAME, ""), settings, clock.now())
+    if session is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="not authenticated",
         )
-    return subject
+    return session
+
+
+#: The verified session — who, and what they may do.
+CurrentSession = Annotated[Session, Depends(get_current_session)]
+
+
+async def get_current_user(session: CurrentSession) -> str:
+    """The acting user's name, for handlers that record who did something."""
+    return session.user
 
 
 #: The acting user, for handlers that record who did something.
 CurrentUser = Annotated[str, Depends(get_current_user)]
+
+
+#: HTTP methods that cannot change anything, and so need no scope.
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+#: The one mutating route a read-only session may still call.
+#:
+#: Halting is not an exception grudgingly made; it is the rule the domain asks
+#: for. docs/DASHBOARD.md keeps the kill switch always visible and never behind
+#: a menu, docs/RISK.md says engaging it needs no confirmation because
+#: "hesitation is the expensive part", and ws.py delivers halts to clients that
+#: subscribed to nothing because a trading halt is not something to opt into. A
+#: read-only session held by someone watching the book from a phone is exactly
+#: the case where the ability to stop trading matters most and the ability to
+#: place an order matters least.
+#:
+#: Clearing a halt is deliberately NOT here. The asymmetry is docs/RISK.md's:
+#: stopping is reflexive, restarting is a decision — and a decision needs the
+#: authority that a read-only session is defined by not having.
+READ_ONLY_MAY_CALL = frozenset({"/api/v1/risk/halt"})
+
+
+async def require_write_scope(request: Request, session: CurrentSession) -> None:
+    """Refuse a mutating request from a read-only session.
+
+    Decided from the request's method and path in one place rather than route by
+    route, for the same reason the session requirement is: a rule applied per
+    handler is a rule someone adds a handler without. A new POST is refused to
+    read-only sessions by default, and admitting one means saying so above.
+
+    403, not 401. The caller *is* authenticated and the credential is fine —
+    re-presenting it would change nothing, and answering 401 would send the
+    dashboard to the login screen to solve a problem logging in cannot solve.
+    """
+    if request.method in SAFE_METHODS:
+        return
+    if request.url.path in READ_ONLY_MAY_CALL:
+        return
+    if session.may_act:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="this session is read-only",
+    )

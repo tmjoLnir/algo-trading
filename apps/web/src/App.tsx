@@ -28,7 +28,7 @@ function Centred({ children }: { children: React.ReactNode }) {
 }
 
 export default function App() {
-  const { user, isAuthenticated, isPending, error } = useSession()
+  const { user, mayAct, isAuthenticated, isPending, error } = useSession()
   const logout = useLogout()
 
   // Three states, not two. "Not logged in" and "cannot tell" are different, and
@@ -78,6 +78,19 @@ export default function App() {
             discovered in the audit log afterwards. */}
         <div className="ml-auto flex items-center gap-3 text-xs text-slate-500">
           <span>{user}</span>
+          {/* Stated rather than implied. A read-only session behaves almost
+              identically today — the only acting control on this screen is the
+              kill switch, which read-only sessions may deliberately still use —
+              so without this badge the difference would be invisible until
+              something was refused. */}
+          {!mayAct ? (
+            <span
+              className="rounded border border-slate-700 px-1.5 py-0.5 text-slate-400"
+              title="This session can see the book and halt trading, but cannot place, cancel or close anything."
+            >
+              read-only
+            </span>
+          ) : null}
           <button
             type="button"
             onClick={() => logout.mutate()}
