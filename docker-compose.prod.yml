@@ -1,0 +1,113 @@
+# The deployed shape of the stack.
+#
+# `docker-compose.yml` is a development stack and stays one — bind-mounted
+# source, a hot-reloading API, a Vite dev server. This overlay is what turns it
+# into something you can leave running on a host, and it is applied on top:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# or `make deploy`, which is that command with the checks that must pass first.
+# The deployment target this is written for — one always-on VM, reached over a
+# VPN — and the reasoning behind choosing it are ADR 0011; the procedure for
+# using it is docs/DEPLOYMENT.md.
+#
+# Three things the base file does are right for a laptop and wrong for a host
+# that runs unattended. Each is corrected below, and each was a real defect
+# rather than a hypothetical one:
+#
+#   1. `db`, `redis` and `api` carry no restart policy while `worker` does. A
+#      host reboot therefore brings back the worker and nothing it depends on.
+#      The kill switch fails closed against an unreachable Redis, so the first
+#      thing that lone worker does is halt — the stack comes back up refusing
+#      to trade, and looks alive while doing it.
+#   2. `api` and `worker` bind-mount `./libs` and `./apps/*` over the code baked
+#      into the image, so what runs is whatever is in the checkout on the host
+#      rather than what was built and tested. `api` additionally runs uvicorn
+#      with `--reload`, which turns a `git pull` into a hot deploy in the middle
+#      of a session — the one thing docs/SAFETY.md rule 4 is written to stop.
+#   3. `web` is the dev server and starts by default; `web-prod`, the built
+#      bundle behind nginx, is behind a profile.
+#
+# **`!reset` is load-bearing.** Writing `volumes: []` in an override does NOT
+# remove the base file's bind mounts: compose merges the two lists by target
+# path and the mounts survive, silently, which is exactly the failure this file
+# exists to prevent. That was verified by running it, not assumed. It needs
+# Compose v2.24 or newer — and rather than trust the tag, `make check-bindings`
+# re-checks the *resolved* configuration, so a compose that ignored it fails the
+# check instead of quietly deploying the wrong code.
+#
+# Configuration is deliberately NOT set here. It belongs in `.env`, read through
+# `atp_core.config.Settings`, which is the one place this codebase keeps it —
+# an overlay that also set log levels and run modes would be a second source of
+# truth that only applies in production. The exception is the database password,
+# below, which is structural: the base file's is a literal `atp`.
+
+services:
+  db:
+    restart: unless-stopped
+    environment:
+      # The base file hardcodes `atp`/`atp`, which is fine for a laptop on
+      # loopback and not for a host. `:?` rather than `:-`: an unset value fails
+      # the command with this message instead of silently deploying the
+      # development password, and there is no safe default to fall back to.
+      #
+      # Postgres reads this at initdb and NEVER again. Set it before the first
+      # start; changing it against an existing volume needs `ALTER USER atp
+      # PASSWORD ...` and this variable updated to match, or the stack comes up
+      # unable to authenticate to its own database. docs/DEPLOYMENT.md has both.
+      POSTGRES_PASSWORD: ${ATP_DB_PASSWORD:?set ATP_DB_PASSWORD in .env - the base file default is the development password}
+    logging: &log_rotation
+      # Bars grow without bound (ADR 0004) and so do container logs, which have
+      # no such justification. The default json-file driver never rotates: on a
+      # host that runs for months, the logs and the hypertable compete for the
+      # same disk, and the one that matters loses.
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}
+
+  redis:
+    restart: unless-stopped
+    logging: *log_rotation
+
+  api:
+    restart: unless-stopped
+    # The image's own CMD is already the correct production command —
+    # `uvicorn atp_api.main:app --host 0.0.0.0 --port 8000`, no `--reload`
+    # (infra/docker/api.Dockerfile). It is the base compose file that overrides
+    # it with the development one, so this resets rather than restates it:
+    # there is then one definition of how the API starts, in the image, and no
+    # second copy here to drift from it.
+    command: !reset null
+    volumes: !reset []
+    environment:
+      DATABASE_URL: postgresql+asyncpg://atp:${ATP_DB_PASSWORD}@db:5432/atp
+    logging: *log_rotation
+
+  worker:
+    # `restart: unless-stopped` is already set in the base file, for a reason
+    # stated there. Repeated here anyway: this file is what a reader consults to
+    # know what the deployed stack does, and a policy that lives only in the
+    # other file reads as absent.
+    restart: unless-stopped
+    volumes: !reset []
+    environment:
+      DATABASE_URL: postgresql+asyncpg://atp:${ATP_DB_PASSWORD}@db:5432/atp
+    logging: *log_rotation
+
+  web:
+    # The Vite dev server, moved behind a profile so it cannot come up here.
+    # Not deleted — there is no way to delete a service in an overlay, and a
+    # profile is the honest expression of "this exists and is not part of this
+    # configuration" anyway. It serves the same unauthenticated dashboard with
+    # source bind-mounted; on a host running against a broker it has no business
+    # being reachable at all.
+    profiles: ["dev"]
+
+  web-prod:
+    # The counterpart: in the base file this is behind `profiles: ["prod"]` so
+    # that `make up` and CI's `stack` job are unaffected by it. Here it is the
+    # dashboard, so the profile is dropped and it starts by default. That is
+    # what makes the deploy command a plain `up -d` with no `--profile` flag to
+    # forget.
+    profiles: !reset []
+    restart: unless-stopped
+    logging: *log_rotation

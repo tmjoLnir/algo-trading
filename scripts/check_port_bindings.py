@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail if any compose service publishes a port on every interface.
+"""Fail if the compose stack would expose a port, or deploy the wrong code.
 
 The platform has no authentication — `get_current_user()` is a stub, and every
 endpoint under /risk, /orders and /positions is reachable by anyone who can
@@ -30,12 +30,27 @@ route this project documents as the one to prefer.
 Interpolation is resolved by compose before this sees it, so running with
 `ATP_WEB_BIND_ADDR` set checks what you are about to start, not only what is
 committed.
+
+**Both configurations are checked**, because there are two. `docker-compose.yml`
+is the development stack; `docker-compose.prod.yml` overlays it into the
+deployed one (ADR 0011). The deployed file is the one where a wrong bind matters
+most, and until it was added here it was the one file nothing looked at.
+
+The deployed configuration is additionally checked for *shape*, which is a
+different question from exposure and is here for the same reason. The overlay
+removes the base file's source bind mounts and its `--reload` with compose's
+`!reset` tag; a compose too old to know that tag, or an overlay someone edits
+later, leaves them in place **silently**, and the stack then runs whatever
+source is in the checkout on the host instead of the image that was built and
+tested. Asserting the resolved configuration is the only way to tell — reading
+the file tells you what was intended, not what compose did with it.
 """
 
 from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import subprocess
 import sys
 
@@ -44,21 +59,56 @@ import sys
 #: form, which is the one that looks innocuous and means 0.0.0.0.
 WILDCARD_HOSTS = {None, "", "0.0.0.0", "::"}
 
-COMPOSE_CONFIG = ("docker", "compose", "--profile", "prod", "config", "--format", "json")
+#: The two configurations, by the command that resolves each. The development
+#: one asks for the `prod` profile so that `web-prod` is included; the deployed
+#: one does not, because the overlay takes that service out of its profile and
+#: puts the dev server into one.
+CONFIGS = (
+    ("development", ("docker", "compose", "--profile", "prod", "config", "--format", "json")),
+    (
+        "deployed",
+        (
+            "docker",
+            "compose",
+            "-f",
+            "docker-compose.yml",
+            "-f",
+            "docker-compose.prod.yml",
+            "config",
+            "--format",
+            "json",
+        ),
+    ),
+)
+
+#: Services whose code must come from the image rather than from the host. The
+#: database is deliberately not one of them: its bind mount is `infra/db/init`,
+#: which is configuration read once at initdb, not code.
+CODE_SERVICES = ("api", "worker")
 
 
-def main() -> int:
+def _resolve(command: tuple[str, ...]) -> dict:
+    """Run `docker compose config` and parse it, or exit explaining why not."""
+    env = dict(os.environ)
+    # The deployed overlay requires this and fails closed without it, which is
+    # the point of it — but that is a *deploy-time* requirement about the value.
+    # This check is about ports and shape, neither of which the password affects,
+    # so a placeholder stands in when the operator has not set one. Their own
+    # value is used when they have.
+    env.setdefault("ATP_DB_PASSWORD", "placeholder-for-config-check")
     try:
-        raw = subprocess.run(COMPOSE_CONFIG, capture_output=True, text=True, check=True).stdout
+        raw = subprocess.run(command, capture_output=True, text=True, check=True, env=env).stdout
     except FileNotFoundError:
         print("docker not found — cannot check port bindings", file=sys.stderr)
-        return 2
+        raise SystemExit(2) from None
     except subprocess.CalledProcessError as exc:
         print(f"docker compose config failed:\n{exc.stderr}", file=sys.stderr)
-        return 2
+        raise SystemExit(2) from None
+    return json.loads(raw)
 
-    services = json.loads(raw).get("services", {})
 
+def check_bindings(label: str, services: dict) -> list[str]:
+    """Report every published port that is not bound to a specific private address."""
     exposed: list[str] = []
     public: list[str] = []
     unclassifiable: list[str] = []
@@ -86,37 +136,90 @@ def main() -> int:
             else:
                 bound.append(f"{name}: {host_ip}:{published}")
 
-    if exposed or public or unclassifiable:
-        if exposed:
-            print("ERROR: a service publishes a port on every interface.")
-            for line in exposed:
-                print(f"  {line}")
-        if public:
-            print("ERROR: a service publishes a port on a PUBLIC address.")
-            for line in public:
-                print(f"  {line}")
-            print()
-            print("That address is routable from the internet. If you looked up")
-            print('"my IP address" to find it, that is your router\'s public address,')
-            print("not your machine's — you want the private one from `ip -4 -brief")
-            print("addr` (192.168.x, 10.x) or `tailscale ip -4` (100.x).")
-        if unclassifiable:
-            print("ERROR: a host address that is not an IP literal.")
-            for line in unclassifiable:
-                print(f"  {line}")
-            print()
-            print("A name can resolve anywhere, and somewhere else tomorrow. Use a")
-            print("literal address so what is exposed is readable from this file.")
+    if exposed:
+        print(f"ERROR [{label}]: a service publishes a port on every interface.")
+        for line in exposed:
+            print(f"  {line}")
+    if public:
+        print(f"ERROR [{label}]: a service publishes a port on a PUBLIC address.")
+        for line in public:
+            print(f"  {line}")
         print()
+        print("That address is routable from the internet. If you looked up")
+        print('"my IP address" to find it, that is your router\'s public address,')
+        print("not your machine's — you want the private one from `ip -4 -brief")
+        print("addr` (192.168.x, 10.x) or `tailscale ip -4` (100.x).")
+    if unclassifiable:
+        print(f"ERROR [{label}]: a host address that is not an IP literal.")
+        for line in unclassifiable:
+            print(f"  {line}")
+        print()
+        print("A name can resolve anywhere, and somewhere else tomorrow. Use a")
+        print("literal address so what is exposed is readable from this file.")
+
+    if not (exposed or public or unclassifiable):
+        print(f"port bindings [{label}]: every published port is bound to a specific address")
+        for line in bound:
+            print(f"  {line}")
+    return exposed + public + unclassifiable
+
+
+def check_deployed_shape(services: dict) -> list[str]:
+    """Report anything that would deploy the checkout instead of the image.
+
+    Each of these is a property the overlay claims and compose has to actually
+    have delivered. `!reset` needs Compose v2.24+, and a version that does not
+    know the tag leaves the base file's mounts and `--reload` in place without
+    saying so.
+    """
+    problems: list[str] = []
+
+    for name in CODE_SERVICES:
+        service = services.get(name)
+        if service is None:
+            problems.append(f"{name} is missing from the deployed configuration")
+            continue
+        for volume in service.get("volumes") or []:
+            problems.append(
+                f"{name} still bind-mounts {volume.get('source')} -> {volume.get('target')}"
+            )
+        command = service.get("command") or []
+        if "--reload" in command:
+            problems.append(f"{name} still runs with --reload: {' '.join(command)}")
+
+    for name, service in sorted(services.items()):
+        if not service.get("restart"):
+            problems.append(f"{name} has no restart policy — a host reboot leaves it down")
+
+    if problems:
+        print("ERROR [deployed]: the deployed configuration is not the deployed shape.")
+        for line in problems:
+            print(f"  {line}")
+        print()
+        print("A source mount or a --reload here means the stack runs whatever is in")
+        print("the checkout rather than the image that was built and tested, and a")
+        print("missing restart policy means a reboot brings the stack back in pieces.")
+        print("`!reset` needs Compose v2.24+ — check `docker compose version`.")
+    else:
+        print("deployed shape: code comes from the image, and every service restarts")
+    return problems
+
+
+def main() -> int:
+    failures: list[str] = []
+    for label, command in CONFIGS:
+        services = _resolve(command).get("services", {})
+        failures += check_bindings(label, services)
+        if label == "deployed":
+            failures += check_deployed_shape(services)
+        print()
+
+    if failures:
         print("There is no authentication in front of any of this (docs/SAFETY.md):")
         print("whoever reaches the port reads the whole book. Bind 127.0.0.1 for")
         print("everything except the dashboard, and one private LAN or VPN address")
         print("via ATP_WEB_BIND_ADDR for that one.")
         return 1
-
-    print("port bindings: every published port is bound to a specific address")
-    for line in bound:
-        print(f"  {line}")
     return 0
 
 

@@ -34,9 +34,19 @@ as the cleanup takes.
   exists, but it is about the act — read-only sessions, and a password re-check
   on the two irreversible endpoints (ADR 0009). A second principal would need a
   users table, which scopes compose with rather than replace.
-- **Still not ready for a public address.** No TLS termination of our own, no
-  secrets manager, no chosen deployment target. Keep the bind addresses private
-  — `make check-bindings` refuses a wildcard or a public one.
+- **Still not ready for a public address.** No TLS termination of our own and
+  no secrets manager. The deployment target is now chosen (ADR 0011) but
+  nothing is provisioned, and it puts the platform on a tailnet rather than on
+  a public address — which is the arrangement the two gaps below assume. Keep
+  the bind addresses private — `make check-bindings` refuses a wildcard or a
+  public one, in both the development and the deployed configuration.
+- **Behind `tailscale serve`, the session cookie is not marked `Secure`.** TLS
+  terminates at Tailscale, which forwards plain HTTP to nginx; nginx sets
+  `X-Forwarded-Proto` from its own `$scheme`, so `_is_https()` sees `http` and
+  leaves the flag off even though the browser's connection is encrypted. The
+  traffic is still encrypted over the tailnet; what is missing is the flag that
+  stops a browser sending the cookie over plain HTTP. Fixing it means choosing
+  which proxy's headers to trust (docs/DEPLOYMENT.md, "Known limitations").
 - No encryption at rest for credentials beyond the host's own.
 
 ## Practices

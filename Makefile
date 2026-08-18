@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install up up-prod down logs migrate revision seed backfill test test-unit \
+.PHONY: help install up up-prod deploy down logs migrate revision seed backfill test test-unit \
         test-integration lint typecheck fmt check check-bindings gen-types build-web \
         dev-api dev-worker dev-web clean
 
@@ -55,9 +55,39 @@ up-prod: .env check-bindings  ## Start the stack with the BUILT dashboard behind
 	     echo "!! confirmed that address is private; keep the network it is on trusted.";; \
 	 esac
 
+deploy: check-bindings  ## Deploy on a host: built dashboard, code from the images
+	@# Not `up-prod`, which is the built dashboard on top of the *development*
+	@# stack — source bind-mounted over the image, uvicorn reloading, and no
+	@# restart policy on the database. This applies docker-compose.prod.yml as
+	@# well, which is the difference between a demo and a deployment. Why this
+	@# target exists and what it is deploying onto: ADR 0011, docs/DEPLOYMENT.md.
+	@#
+	@# Deliberately no `.env` prerequisite, unlike `up` and `up-prod`. On a
+	@# developer's machine writing one from .env.example is a convenience; on a
+	@# host it is the deployment's entire configuration, and conjuring one that
+	@# says ATP_RUN_MODE=backtest with no credentials would be a silent wrong
+	@# answer. Compose names what is missing instead.
+	@#
+	@# `up -d` recreates a changed container by stopping the old one before
+	@# starting the new — it never runs both. That is not a detail here: Alpaca
+	@# refuses a second stream connection per key, and two workers is the
+	@# duplicate-position incident in docs/RUNBOOK.md. Do not replace this with
+	@# anything that overlaps instances.
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+	@bound=$$(docker compose -f docker-compose.yml -f docker-compose.prod.yml port web-prod 80 2>/dev/null); \
+	 bound=$${bound:-127.0.0.1:8080}; \
+	 echo; \
+	 echo "dashboard → http://$$bound"; \
+	 echo; \
+	 echo "   Deployed shape: code from the images, every service restarts, no"; \
+	 echo "   source mounted from this checkout. Confirm what is actually running"; \
+	 echo "   before you trust it — docs/DEPLOYMENT.md, 'After every deploy'."
+
 down:  ## Stop the stack
 	@# --profile prod so this also takes down web-prod, which is otherwise
-	@# outside the set of services `down` considers.
+	@# outside the set of services `down` considers. Covers a `make deploy`
+	@# stack too: containers are removed by project name, which the overlay
+	@# does not change.
 	docker compose --profile prod down
 
 logs:  ## Tail all service logs
