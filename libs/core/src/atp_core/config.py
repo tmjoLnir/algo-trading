@@ -150,6 +150,18 @@ class Settings(BaseSettings):
     #: the wrong moment to demand one.
     api_session_hours: int = 12
 
+    #: How many sign-in attempts one client address may make per window before
+    #: the endpoint refuses to try. Guessing is the only attack the login
+    #: endpoint has; bcrypt's quarter-second verification is a brake and this is
+    #: the lock (ADR 0010).
+    #:
+    #: Counted per address rather than per username on purpose: counting per
+    #: username lets anyone who knows the operator's name lock them out of their
+    #: own trading platform by failing to log in as them, which turns a
+    #: brute-force defence into a denial of service.
+    api_login_attempts: int = 10
+    api_login_window_seconds: int = 300
+
     risk: RiskLimits = Field(default_factory=RiskLimits)
 
     @model_validator(mode="after")

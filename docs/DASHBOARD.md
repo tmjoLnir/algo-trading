@@ -146,6 +146,34 @@ No running server is needed. `src/api/types.ts` is nothing but aliases over the
 generated `schema.d.ts`; if one stops compiling, the server contract changed and
 the components reading it need to change too. That is the alarm working.
 
+## The audit page
+
+`audit_log` had been in the schema since the first migration with nothing
+writing it and nowhere to read it. It is written now, and it is on a screen —
+the second half being the point, because a record nobody can see is a record
+nobody checks.
+
+Two rules it inherits from the rest of this document:
+
+- **An unreadable trail is not an empty one.** A 503 renders as "the audit trail
+  could not be read… nothing can be concluded from this screen", never as
+  "nothing recorded yet". Same distinction as "nothing published is not an empty
+  book" — the reader is looking at this page *because* something went wrong, and
+  telling them nothing happened is the one answer that is actively misleading.
+- **An action with no target renders `—`.** Signing out is not done *to*
+  anything, and that should read as "no object" rather than as missing data.
+
+Colour is an accent, never the signal: every row names its action in words, and
+`login_failed`, `rate_limited` and `forbidden` are merely tinted on top of text
+that already says so.
+
+Paging is by cursor (`before_id`), not offset. Rows arrive while the page is
+being read — most of all during whatever is being investigated — and an offset
+shifts under the reader every time one does.
+
+What is recorded today is authentication and refusals. Order flow and
+kill-switch changes are not, because those handlers are stubs; see ADR 0010.
+
 ## Serving it
 
 Two ways, and they resolve the API identically on purpose.

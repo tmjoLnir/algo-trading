@@ -51,3 +51,7 @@ export type WhoAmI = Schemas['WhoAmI']
 
 /** What the login screen may know before there is a session. */
 export type PreSessionContext = Schemas['PreSessionContext']
+
+/** One row of the audit trail, and a page of them. */
+export type AuditEntryView = Schemas['AuditEntryView']
+export type AuditPage = Schemas['AuditPage']

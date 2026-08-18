@@ -1020,7 +1020,39 @@ the only property that makes the screen worth reading.
   `main.tsx`, which no test loads, so every web test ran against a query client
   that did not have it and the rule was asserted nowhere. It is
   `api/queryClient.ts` now, and both the 401 and the 403 behaviours are pinned.
-- [ ] Rate limiting, audit log surfaced in UI
+- [x] **Rate limiting, audit log surfaced in UI** — @claude. Two halves,
+  related because the second is how anyone finds out the first mattered.
+
+  Sign-in is limited to ten attempts per five minutes per client address —
+  address rather than username, because counting per username hands anyone who
+  knows the operator's name a way to lock them out of their own platform.
+  Attempts rather than failures, because otherwise the guess that happens to be
+  right is the one that gets through. It fails open on an unreachable Redis: the
+  degraded state is bcrypt alone, and failing closed locks the operator out
+  during the outage they most need to look at. `/risk/halt` is never limited.
+
+  The audit trail is the more interesting half. `AuditLogRow` has been in the
+  schema and the initial migration since the first commit with **nothing writing
+  it and nothing reading it** — the state `SignalRow` is still in — while
+  `killswitch.py` claimed clearing a halt was "always audit-logged" and
+  `models.py` promised "every consequential human action". What "audit-logged"
+  actually meant was a structlog line: an operational stream, rotated away, in a
+  format nobody promised. There is a port, a Postgres adapter, a read endpoint
+  and an **Audit** page now.
+
+  It records less than that docstring implies, deliberately: signing in and out,
+  failed attempts, lockouts, and actions refused to a read-only session. Order
+  flow and kill-switch changes are **not** wired, because every one of those
+  handlers is still a `NotImplementedError` stub and a write behind a stub is
+  dead code. They land with their handlers. The table's docstring is now the
+  optimistic document and this item is the honest one.
+
+  Two rules the design turns on. A failed audit *write* never fails the action —
+  the actions worth auditing include halting trading, and refusing to stop
+  because Postgres is down has the failure modes inverted. A failed audit *read*
+  is a 503 and never an empty page, which is ADR 0007's "nothing published is not
+  an empty book" applied to the record instead of the book. Full reasoning and
+  five rejected alternatives: ADR 0010.
 - [ ] Alerting to a phone (feed loss, halt, reconciliation failure)
 - [ ] Metrics/tracing
 - [ ] Backups and a tested restore
@@ -1087,6 +1119,26 @@ the only property that makes the screen worth reading.
   It still does not make the platform deployable. The item above this is
   unstarted and the authentication item at the top of the phase is still
   blocking: this serves the dashboard to a private network and nowhere else.
+
+*Verifiable (rate limiting and audit, proposed):* a run of wrong passwords from
+one address ends in 429 with a `Retry-After`, a correct password from that
+address is refused too while the window holds, and the same password from
+another address is not; and every one of those events, plus a write refused to a
+read-only session, is readable afterwards on the Audit page — with an unreadable
+trail saying so rather than rendering as an empty one.
+**Shown** — @claude. Driven end to end against a real PostgreSQL and a real
+Redis through the real nginx config: four wrong passwords, a fifth answered 429
+with `Retry-After: 299`, a read-only sign-in from a second address that was
+unaffected, and a `POST /api/v1/orders` refused 403. All seven events were then
+read back from the table and rendered on the page — `login_failed` x4,
+`rate_limited` with its retry, `login` with `scope=read`, and `forbidden`
+carrying the path and method — with the action filter narrowing to four. The
+storage behaviour has its own integration tests against a real database,
+including that a write which cannot land returns rather than raising.
+
+Scoped to these two: it says nothing about what is *not* audited, which is most
+of what the table's docstring anticipates and all of which is still stubbed.
+*Proposed and ticked by the same hand; it wants a reviewer's eye.*
 
 *Verifiable (authorisation, proposed):* a read-only session is refused every
 mutating route with 403 and is permitted `/risk/halt`; a full session is refused

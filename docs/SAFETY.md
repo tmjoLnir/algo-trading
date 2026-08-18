@@ -121,12 +121,24 @@ taken back. There is deliberately no "recently authenticated" window — that
 would be minutes during which a walked-away laptop can flatten the book. Design:
 ADR 0009.
 
-**Still missing, and still Phase 6:** there is no rate limit on `/auth/login`
-(bcrypt's quarter-second verification is a brake, not a lock), and sessions
-cannot be revoked before they expire. Do not read "the API authenticates and
-authorises" as "this is ready for a public address": TLS, a secrets manager and
-a chosen deployment target are all still unbuilt, and the bind-address rules
-below still apply.
+**Sign-in is rate limited, and consequential actions are recorded.** Ten
+attempts per five minutes per client address, counted per *address* rather than
+per username — counting per username would let anyone who knows the operator's
+name lock them out. A correct password is refused too once the limit is reached,
+because otherwise the guess that happens to be right is the one that gets
+through. `/risk/halt` is never rate limited, whatever is added later.
+
+The audit trail lives in `audit_log` and is on the dashboard's **Audit** page.
+It records signing in and out, failed attempts, lockouts, and actions refused to
+a read-only session. It does **not** yet record order flow or kill-switch
+changes: those handlers are stubs, and a write behind a stub is dead code. Both
+halves: ADR 0010.
+
+**Still missing, and still Phase 6:** sessions cannot be revoked before they
+expire. Do not read "the API authenticates, authorises and records" as "this is
+ready for a public address": TLS, a secrets manager and a chosen deployment
+target are all still unbuilt, the rate limiter trusts `X-Forwarded-For` because
+it sits behind our own nginx, and the bind-address rules below still apply.
 
 **This is enforced now, not merely stated.** Every port in `docker-compose.yml`
 binds `127.0.0.1` — the API, Postgres (whose credentials are `atp`/`atp`), the

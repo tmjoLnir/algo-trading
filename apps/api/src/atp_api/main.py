@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from atp_api.deps import get_current_session, require_write_scope
 from atp_api.routers import (
     analytics,
+    audit,
     auth,
     backtests,
     dashboard,
@@ -163,6 +164,7 @@ def create_app() -> FastAPI:
     for router in (
         health.router,
         auth.router,
+        audit.router,
         dashboard.router,
         strategies.router,
         backtests.router,

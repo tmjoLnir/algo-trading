@@ -107,6 +107,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/audit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Audit Entries
+         * @description Newest first.
+         *
+         *     Depends on the database directly rather than through the tolerant sink the
+         *     *writers* use. That asymmetry is deliberate and is the same rule the
+         *     dashboard applies to the book: a write that cannot land must not stop the
+         *     action, but a read that cannot happen must not be rendered as "nothing
+         *     happened". An empty page and an unreachable record are different sentences,
+         *     and only one of them is safe to believe — so a missing database is the 503
+         *     `get_session_factory` already answers with.
+         */
+        get: operations["list_audit_entries_api_v1_audit_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/context": {
         parameters: {
             query?: never;
@@ -969,6 +997,36 @@ export interface components {
             /** Unrealized Pnl */
             unrealized_pnl: string;
         };
+        /**
+         * AuditEntryView
+         * @description One row, as the dashboard reads it.
+         */
+        AuditEntryView: {
+            /** Action */
+            action: string;
+            /** Actor */
+            actor: string;
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Detail */
+            detail?: {
+                [key: string]: unknown;
+            };
+            /** Id */
+            id: number;
+            /** Target */
+            target?: string | null;
+        };
+        /** AuditPage */
+        AuditPage: {
+            /** Entries */
+            entries?: components["schemas"]["AuditEntryView"][];
+            /** Next Before Id */
+            next_before_id?: number | null;
+        };
         /** BacktestOut */
         BacktestOut: {
             /** Error */
@@ -1642,6 +1700,39 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     }[];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_audit_entries_api_v1_audit_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                before_id?: number | null;
+                action?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditPage"];
                 };
             };
             /** @description Validation Error */

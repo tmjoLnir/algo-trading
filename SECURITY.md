@@ -24,9 +24,10 @@ as the cleanup takes.
 
 ## Known gaps in the skeleton
 
-- **No rate limiting on `/auth/login`.** Authentication itself now exists — one
-  operator, bcrypt, a signed `HttpOnly` cookie (ADR 0008) — but nothing throttles
-  guesses at it. bcrypt's quarter-second verification is a brake, not a lock.
+- **The rate limiter trusts `X-Forwarded-For`.** It has to: behind nginx every
+  request otherwise shares one bucket. Only safe because this stack always sits
+  behind its own proxy — exposed directly, an attacker could rotate the header
+  to sidestep the limit (ADR 0010).
 - **Sessions cannot be revoked before they expire.** Stateless tokens with no
   denylist: a stolen cookie is good until `API_SESSION_HOURS` elapses.
 - **No authorisation between people.** There is one account. Authorisation
