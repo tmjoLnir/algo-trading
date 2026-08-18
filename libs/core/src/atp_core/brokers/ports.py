@@ -23,7 +23,11 @@ if TYPE_CHECKING:
     from datetime import datetime
     from decimal import Decimal
 
-    from atp_core.domain import Order, Position
+    from atp_core.domain import Fill, Order, OrderStatus, Position
+
+    #: Everything `AlpacaBroker.stream_trade_updates()` can yield.
+    #: `TradeUpdatesReconnected` is in here on purpose — see its docstring.
+    type TradeUpdateEvent = TradeUpdate | TradeUpdatesReconnected
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +42,68 @@ class AccountSnapshot:
     is_pattern_day_trader: bool
     trading_blocked: bool
     as_of: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class TradeUpdate:
+    """One account event, in our vocabulary rather than the venue's.
+
+    This is the *push* view of an order and it is not interchangeable with the
+    REST one. `BrokerPort.get_order` reports running totals — 300 filled at an
+    average of 101.4 — whereas this carries the individual print that moved it,
+    which is the fill *sequence* a position update has to handle (CLAUDE.md §5)
+    and the thing REST cannot reconstruct.
+
+    `status` is the state the venue is telling us the order is now in, or None
+    for an event that carries no status change (a cancel that was itself
+    rejected leaves the order exactly as it was). A fill's status is
+    deliberately not set here: `Order.apply_fill` owns that, because only the
+    arithmetic knows whether this print completed the order.
+    """
+
+    #: The venue's event name, normalised to lower case. Kept as a string
+    #: rather than an enum: it is for logs and for the applier's refusal
+    #: messages, and an unrecognised one is refused at the adapter rather than
+    #: silently becoming a member here.
+    event: str
+    client_order_id: str
+    broker_order_id: str
+    symbol: str
+    at: datetime
+    status: OrderStatus | None = None
+    #: Present only on a fill or partial fill. Carries `venue_fill_id`, which
+    #: is what makes a redelivered event safe to discard rather than
+    #: double-count.
+    fill: Fill | None = None
+    #: The venue's position size after this fill. Not applied — it is a
+    #: cross-check against our own arithmetic, and reconciliation is where a
+    #: disagreement gets resolved.
+    position_qty: Decimal | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TradeUpdatesReconnected:
+    """The stream dropped and came back. Every event in between is gone.
+
+    Carried *in* the event stream rather than handed to a callback, for the
+    same reason `data.ports.FeedReconnected` is: one `async for` body runs to
+    completion before the next event is delivered, so a consumer's catch-up
+    provably happens before it sees the first event of the new connection. An
+    out-of-band notification cannot promise that ordering.
+
+    The catch-up is not optional and it is not a backfill. Alpaca does not
+    replay trade updates, so the only way to learn what happened during the gap
+    is to re-read the open orders over REST — and a missed fill means our
+    position view is wrong in the direction that keeps trading (CLAUDE.md §5).
+    """
+
+    #: The last instant the order state is known good — the last event received
+    #: before the drop, or the connection's open time if it never delivered one.
+    gap_since: datetime
+    reconnected_at: datetime
+    #: Connection attempts it took to get back; 1 means it returned first try.
+    attempts: int
 
 
 @runtime_checkable
@@ -87,3 +153,15 @@ class BrokerPort(Protocol):
         ...
 
     async def is_market_open(self) -> bool: ...
+
+    # `stream_trade_updates` is deliberately **not** on this protocol.
+    #
+    # A pushed order stream is a property of a venue, not of brokers in
+    # general: `SimulatedBroker` fills in-process and has nothing to push, and
+    # requiring it here would oblige two implementations to supply an empty
+    # generator pretending to be a capability they do not have — the kind of
+    # stub that reads as "no fills happened". `AlpacaBroker` exposes it
+    # directly, and the types it yields live below so a consumer can be written
+    # against the vocabulary rather than against Alpaca. Promote it here when a
+    # second venue actually streams, which is the point at which the shape of
+    # the abstraction is known rather than guessed.
