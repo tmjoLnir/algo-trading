@@ -80,27 +80,107 @@ Fill in, at minimum:
 
 ### Secrets
 
-ADR 0011 chose **SOPS + age**: the encrypted env file lives in the repo and is
-decrypted at deploy time to the root-owned `.env` above. That tooling is **not
-written yet** — the roadmap item is open. Until it is, `.env` on the host is the
-secret store, `chmod 600`, and the rules in `SECURITY.md` apply unchanged: paper
-and live pairs never shared, and on exposure you revoke at the broker *first*.
+ADR 0011 chose **SOPS + age**: the encrypted bundle lives in the repository and
+is decrypted at deploy time to the `0600` `.env` above. `scripts/manage_secrets.py` is
+that tooling — a thin wrapper, since `sops` does the cryptography and `age`
+holds the key.
 
-Two things stay out of any secret bundle, now and later:
+Both are separate installs, neither is a daemon:
 
-- **`ATP_ALLOW_LIVE_TRADING` and `WORKER_ALLOW_LIVE_ORDERS`** belong to host
-  configuration. No rotation, sync or restored backup should be able to turn on
-  live trading as a side effect. "Two independent locks stay two" applies to the
-  deployment tooling as much as to the code.
+```bash
+# sops — one binary
+curl -fsSLo /usr/local/bin/sops \
+  https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64
+chmod +x /usr/local/bin/sops
+# age
+apt-get install -y age      # or https://github.com/FiloSottile/age
+```
+
+**Once, on the machine that edits secrets:**
+
+```bash
+uv run python scripts/manage_secrets.py init
+```
+
+That writes an age key to `~/.config/sops/age/keys.txt` (`0600`) and a
+`.sops.yaml` naming its public half as the recipient. **Commit `.sops.yaml`** —
+a recipient is a public key, and every machine that edits a bundle needs the
+same list. **Back up the private key offline.** It is the one thing here that
+cannot be regenerated: lose it and every bundle encrypted to it is unreadable,
+and the only way back is re-creating each one from the credentials at source.
+
+**Then, per host — one bundle per run mode, because paper and live are separate
+machines with separate keys:**
+
+```bash
+uv run python scripts/manage_secrets.py import --env paper --from .env   # encrypt what you have
+uv run python scripts/manage_secrets.py check  --env paper               # decrypts; prints key names only
+shred -u .env                                                     # the plaintext has served its purpose
+```
+
+`infra/env/paper.sops.env` is now committable, and should be committed. SOPS
+encrypts dotenv *values* and leaves the *keys* readable, so the diff of a
+rotation reads `ALPACA_API_SECRET changed` rather than showing one opaque blob —
+which is what a reviewer needs to see, and the value is what they must not.
+
+To change a secret later, `edit` opens the bundle in `$EDITOR` and re-encrypts
+on save:
+
+```bash
+uv run python scripts/manage_secrets.py edit --env paper
+```
+
+**On the host, at deploy time:**
+
+```bash
+make secrets-install env=paper     # writes .env, mode 0600, atomically
+```
+
+This is a step in the deploy sequence below rather than something `make deploy`
+does for you. Decrypting needs a private key and writes plaintext to disk, and
+that should not be a side effect of a command a developer also runs on a laptop.
+
+#### What a bundle may not contain
+
+`scripts/manage_secrets.py` refuses these — on import *and* again on install, because a
+bundle can acquire one later through `sops` directly or a hand edit:
+
+| Key | Why |
+|---|---|
+| `ATP_RUN_MODE` | `docs/SAFETY.md` layer 1 |
+| `ATP_ALLOW_LIVE_TRADING` | layer 2 |
+| `WORKER_ALLOW_LIVE_ORDERS` | the worker's own lock |
+
+These are host configuration, not secrets. A bundle is a thing that gets copied
+between hosts, restored from a backup and re-synced by tooling, and none of
+those events may switch on live trading as a side effect — "two independent
+locks stay two" applies to the deployment tooling as much as to the code. Set
+them in the host's `.env` **after** `secrets-install`, or in the environment.
+
+> ADR 0011 named the latter two. `ATP_RUN_MODE` is refused here for the same
+> reason, which extends that decision rather than restating it — a reviewer
+> should either accept it or strike it.
+
+A key present with an **empty value** is refused too. SOPS leaves an empty value
+unencrypted, so it neither carries a secret nor protects one, and the process
+reading it falls back to its default exactly as though the line were absent.
+
+#### Two things that are not the bundle's job
+
 - **`ATP_DB_PASSWORD` is read by Postgres at initdb and never again.** Set it
   before the first start. Changing it later means `ALTER USER atp PASSWORD ...`
-  *and* updating both this file and `DATABASE_URL`, or the stack comes up unable
-  to authenticate against its own database.
+  *and* updating both the bundle and `DATABASE_URL`, or the stack comes up
+  unable to authenticate against its own database.
+- **On exposure, revoke at the broker first.** `SECURITY.md` has the order and
+  it does not change here: a revoked key in a git history is harmless, and a
+  live key removed from a bundle is not. Re-encrypting is the last step, not the
+  first.
 
 ## First deploy
 
 ```bash
 cd /opt/atp
+make secrets-install env=paper   # .env, from the committed bundle
 make deploy          # check-bindings, then build and start
 make migrate         # schema — from the host, against the loopback port
 make backfill sym=SPY from=2021-01-01
@@ -121,8 +201,9 @@ to watch it:
 # 1. Stop new risk. Positions keep their broker-side stops throughout.
 uv run python scripts/halt.py engage --by "<your name>" --detail "deploy"
 
-# 2. Take the new code.
+# 2. Take the new code, and the secrets that go with it.
 git pull
+make secrets-install env=paper
 
 # 3. Rebuild and restart. Compose stops each changed container before starting
 #    its replacement — it never runs two workers, which is the point.
@@ -146,6 +227,7 @@ a change that *has* been rebuilt without being committed is unreproducible.
 ## After every deploy
 
 ```bash
+make secrets-check env=paper               # the bundle decrypts and breaks no rule
 uv run python scripts/status.py            # halts, quote freshness, latest bars, the venue
 docker compose ps                          # every service up, none restarting
 curl -sf http://127.0.0.1:8000/healthz     # API on loopback

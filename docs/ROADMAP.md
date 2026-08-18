@@ -1056,7 +1056,7 @@ the only property that makes the screen worth reading.
 - [ ] Alerting to a phone (feed loss, halt, reconciliation failure)
 - [ ] Metrics/tracing
 - [ ] Backups and a tested restore
-- [ ] Deployment target chosen; secrets manager — @claude (wip #50).
+- [ ] Deployment target chosen; secrets manager — @claude (wip #50, #51).
   **The target is chosen and recorded; nothing is deployed.** ADR 0011: one
   always-on VM per run mode in a US-East region, the existing compose stack,
   reached over Tailscale, deployed by an explicit operator action, with paper
@@ -1105,12 +1105,47 @@ the only property that makes the screen worth reading.
   egress policy answers 403 for its blob storage. CI has that access and builds
   both in the `stack` job on every push.
 
-  **Unticked, and not close.** Nothing has been provisioned and nothing has been
-  deployed: this is a decision, a compose file and a runbook, none of which is a
-  running host. The secrets-manager half is unstarted — ADR 0011 chooses SOPS +
-  age and no tooling is written, so `.env` at `0600` is still the secret store.
-  Alerting and backups, the two items above, are what a live host would need
-  next, and docs/DEPLOYMENT.md says so rather than implying a host is ready.
+  **The secrets half is built** (#51), which closes the gap this item recorded
+  when the target was chosen. `scripts/manage_secrets.py` wraps SOPS and age: `init`
+  generates the key and writes `.sops.yaml`, `import` encrypts an existing
+  `.env` into `infra/env/<mode>.sops.env`, `edit` re-encrypts on save, `check`
+  decrypts in memory, and `install` writes the host's `.env` — `0600`, created
+  with that mode rather than chmod-ed into it, and replaced atomically so a
+  crash mid-write cannot leave the stack holding half its credentials.
+
+  Dotenv rather than YAML, because SOPS encrypts dotenv *values* and leaves the
+  *keys* readable: a rotation diffs as `ALPACA_API_SECRET changed` instead of one
+  opaque blob, which is what a reviewer needs to see and the value is what they
+  must not.
+
+  Two refusals are the point of it being a wrapper rather than a shell alias.
+  **The run-mode locks may not be in a bundle** — a bundle is copied between
+  hosts, restored from backups and re-synced by tooling, and none of that may
+  switch on live trading. They are refused on import *and* again on install,
+  because a bundle can acquire one afterwards through `sops` directly. ADR 0011
+  named `ATP_ALLOW_LIVE_TRADING` and `WORKER_ALLOW_LIVE_ORDERS`; `ATP_RUN_MODE`
+  is refused too, which extends that decision rather than restating it and wants
+  a reviewer's eye. And **a failure never quotes plaintext**: on the decrypt path
+  `sops`'s stdout *is* the secret, so only stderr is ever put in an error, which
+  is a unit test rather than a convention.
+
+  Two traps in `.gitignore` were in the way and are now handled. `secrets/` is
+  unanchored, so a bundle under it would be ignored at every depth — and git
+  cannot re-include a file whose parent directory is excluded, so no negation
+  could rescue it; bundles live in `infra/env/` instead, which is ignored
+  *except* for `*.sops.env`, so ciphertext is committable and a stray plaintext
+  is not. `make check-tracked` covers that path, and `secrets.py` refuses to
+  write a bundle git would ignore — an encrypted bundle nothing tracks is a
+  deployment that silently has no credentials.
+
+  **Unticked, and for a narrower reason than before.** Nothing has been
+  provisioned and nothing has been deployed: this is a decision, a compose file,
+  a runbook and now a key-management tool, none of which is a running host. The
+  proposed *Verifiable:* line below asks for a week of unattended uptime and for
+  no plaintext secret on the host outside the `0600` runtime file; the second
+  clause is now buildable and the first still needs a machine. Alerting and
+  backups, the two items above, are what a live host would need next, and
+  docs/DEPLOYMENT.md says so rather than implying a host is ready.
 
   One thing found on the way and recorded rather than fixed: `tailscale serve`
   is the documented way to get HTTPS, but TLS terminates at Tailscale and nginx
