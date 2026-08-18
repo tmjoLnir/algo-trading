@@ -34,12 +34,13 @@ as the cleanup takes.
   exists, but it is about the act — read-only sessions, and a password re-check
   on the two irreversible endpoints (ADR 0009). A second principal would need a
   users table, which scopes compose with rather than replace.
-- **Still not ready for a public address.** No TLS termination of our own and
-  no secrets manager. The deployment target is now chosen (ADR 0011) but
-  nothing is provisioned, and it puts the platform on a tailnet rather than on
-  a public address — which is the arrangement the two gaps below assume. Keep
-  the bind addresses private — `make check-bindings` refuses a wildcard or a
-  public one, in both the development and the deployed configuration.
+- **Still not ready for a public address.** No TLS termination of our own. The
+  deployment target is chosen (ADR 0011) and secrets are encrypted at rest
+  (below), but nothing is provisioned, and the arrangement puts the platform on
+  a tailnet rather than on a public address — which is what the two gaps below
+  assume. Keep the bind addresses private — `make check-bindings` refuses a
+  wildcard or a public one, in both the development and the deployed
+  configuration.
 - **Behind `tailscale serve`, the session cookie is not marked `Secure`.** TLS
   terminates at Tailscale, which forwards plain HTTP to nginx; nginx sets
   `X-Forwarded-Proto` from its own `$scheme`, so `_is_https()` sees `http` and
@@ -51,7 +52,18 @@ as the cleanup takes.
 
 ## Practices
 
-- Secrets in `.env` (gitignored) or a secrets manager. Never in code.
+- Secrets are encrypted at rest with **SOPS + age** and live in the repository
+  as ciphertext (`infra/env/*.sops.env`, `scripts/manage_secrets.py`, ADR 0011). The
+  private key never enters the repository. On a host they are decrypted to a
+  `0600` `.env`; `.env` itself stays gitignored and is never the source of
+  truth.
+- **The run-mode locks are not secrets and may not be in a bundle** —
+  `ATP_RUN_MODE`, `ATP_ALLOW_LIVE_TRADING`, `WORKER_ALLOW_LIVE_ORDERS`. A bundle
+  is copied between hosts and restored from backups; none of that may switch on
+  live trading. `scripts/manage_secrets.py` refuses them on import and again on
+  install, so this is enforced rather than remembered.
+- Losing the age private key makes every bundle encrypted to it unreadable.
+  Back it up offline. It is the one item here with no recovery path.
 - Paper and live use separate key pairs.
 - `structlog` redacts known credential keys, but do not rely on it — never pass
   a secret to a log call.

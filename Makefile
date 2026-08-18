@@ -1,5 +1,6 @@
 .DEFAULT_GOAL := help
-.PHONY: help install up up-prod deploy down logs migrate revision seed backfill test test-unit \
+.PHONY: help install up up-prod deploy down logs migrate revision seed backfill \
+        secrets-check secrets-install test test-unit \
         test-integration lint typecheck fmt check check-bindings gen-types build-web \
         dev-api dev-worker dev-web clean
 
@@ -83,6 +84,19 @@ deploy: check-bindings  ## Deploy on a host: built dashboard, code from the imag
 	 echo "   source mounted from this checkout. Confirm what is actually running"; \
 	 echo "   before you trust it — docs/DEPLOYMENT.md, 'After every deploy'."
 
+# ── secrets ─────────────────────────────────────────────────────────────────
+# ADR 0011 chose SOPS + age. scripts/manage_secrets.py has the rest, including why the
+# run-mode locks may not live in a bundle.
+secrets-check:  ## Decrypt a bundle in memory and report:  make secrets-check env=paper
+	uv run python scripts/manage_secrets.py check --env "$(env)"
+
+secrets-install:  ## Write .env from the bundle:  make secrets-install env=paper
+	@# Deliberately not a prerequisite of `deploy`. Decrypting secrets needs a
+	@# private key and writes plaintext to disk; making that a side effect of a
+	@# build command means it happens on every run of it, including the ones a
+	@# developer does on a laptop. docs/DEPLOYMENT.md sequences the two.
+	uv run python scripts/manage_secrets.py install --env "$(env)"
+
 down:  ## Stop the stack
 	@# --profile prod so this also takes down web-prod, which is otherwise
 	@# outside the set of services `down` considers. Covers a `make deploy`
@@ -146,7 +160,8 @@ check-tracked:  ## Fail if any source file is excluded by .gitignore
 	    -- 'libs/core/src/**/*.py' 'apps/api/src/**/*.py' 'apps/worker/src/**/*.py' \
 	       'tests/**/*.py' 'scripts/**/*.py' \
 	       'apps/web/src/**/*.ts' 'apps/web/src/**/*.tsx' \
-	       'infra/**/*.sql' 'infra/**/*.py' 'docs/**/*.md'); \
+	       'infra/**/*.sql' 'infra/**/*.py' 'docs/**/*.md' \
+	       'infra/env/*.sops.env'); \
 	if [ -n "$$ignored" ]; then \
 	  echo "ERROR: source files excluded by .gitignore (CI will not see these):"; \
 	  echo "$$ignored" | sed 's/^/  /'; \

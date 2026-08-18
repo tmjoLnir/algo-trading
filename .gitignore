@@ -6,6 +6,22 @@
 *.key
 secrets/
 
+# The one deliberate exception, and it is not one: a SOPS bundle is ciphertext
+# and IS committed — that is the whole design (ADR 0011, scripts/manage_secrets.py).
+# Everything else that turns up in infra/env/ is plaintext, whether from a
+# careless `sops -d > file` or a half-finished import, so the directory is
+# ignored except for the bundles themselves.
+#
+# Anchored with a leading slash, per the lesson spelled out in the data/ block
+# below. Note also why the bundles do not live in `secrets/`: that rule is
+# unanchored, so it matches at every depth, and git cannot re-include a file
+# whose parent directory is excluded — a bundle under it could not be rescued
+# by any negation. `make check-tracked` covers this path so a future edit that
+# swallows a bundle fails the build instead of producing a host with no
+# credentials.
+/infra/env/*
+!/infra/env/*.sops.env
+
 # --- python ---
 __pycache__/
 *.py[cod]
