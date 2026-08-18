@@ -698,11 +698,15 @@ above.
   the runner tracks what it submitted, which is what makes orphan detection
   mean anything.
 
-  **Step 6 of the ordering is half done as of #44.** The durable half is real:
-  every pass saves the working orders and snapshots the book, and `warmup`
-  restores what was working before reconciling. *Publishing* is still not done
-  — the dashboard that would consume it is Phase 5 and there is no publisher on
-  this class.
+  **Step 6 of the ordering is complete as of #45.** The durable half landed in
+  #44 — every pass saves the working orders and snapshots the book, and `warmup`
+  restores what was working before reconciling. The publishing half is now
+  there too: the runner builds a `LiveSnapshot` from the same portfolio and
+  order set the pass just used, puts it where the API reads it, and announces
+  each signal and each fill on the channels `atp_core.channels` names. All of
+  it is best-effort and swallowed — an unreachable Redis must not fail an
+  evaluation, because three failures in a row halt trading and stopping a
+  strategy to protect a screen is a cure worse than the disease.
 
   The other gap recorded here — that `atp_worker.main` did not construct a
   runner — is closed by #40, which wires it behind an opt-in.
@@ -856,17 +860,100 @@ demonstrated can disagree with the wire in three ways at once. Adjust the
 wording if it is not the demonstration you want.
 
 ## Phase 5 — Dashboard & analytics (requirements #6, #7)
-- [ ] `/dashboard/live` aggregate endpoint
+- [ ] `/dashboard/live` aggregate endpoint — @claude (wip #45).
+  Implemented, along with `/dashboard/equity-curve` and the WebSocket that
+  carries events between polls. The decision is ADR 0007 and it is the part to
+  review: the **worker** computes the book once, at the end of the evaluation it
+  just acted on, and the API serves it verbatim rather than recomputing it from
+  the order table and the quote cache. It could recompute it — and that version
+  would be computed at a different instant from the one the trading loop used,
+  which is the same "two instants" problem the aggregate endpoint exists to
+  prevent, moved somewhere harder to see.
+
+  The run mode, whether the market is open, and the active halts are
+  deliberately *not* in the published book. Each must still be correct when the
+  worker is dead, and a halt banner sourced from a snapshot nobody is
+  publishing would say "not halted" at exactly the moment that matters most.
+
+  Three refusals worth recording, because the tempting version of each is the
+  flattering one:
+
+  - **A number we cannot know is null, never zero.** An unmarked position is
+    not a position worth nothing; leverage against no equity is undefined, not
+    unlevered. `PositionView`'s mark-dependent fields became nullable here —
+    the skeleton had them required, and that was the model that was wrong.
+  - **"Nothing published" is not "you hold nothing".** A worker that is not
+    trading publishes nothing, which is the default posture, and that is
+    reported as itself with the banners and halts still rendering.
+  - **An unreadable store is a 503.** A dashboard rendering "no positions"
+    because Redis blinked would be telling its reader they are flat.
+
+  `buying_power` was dropped from the account view: it is the venue's number
+  and reading it costs a broker call per poll on the process placing orders
+  against the same rate limit, while `BuyingPowerRule` constrains against cash.
+
+  Unticked. Every test drives fakes or an ASGI transport; nothing here has
+  served a book that a real worker put into a real Redis.
 - [ ] `/market-data/calendar` sessions endpoint — @claude (#16).
   Implemented and tested: sessions, holidays and early closes over a range,
-  straight from the exchange rules. Unticked because this phase states no
-  *Verifiable:* line to tick against and nothing consumes it yet — the
-  dashboard that would is not built. Worth a *Verifiable:* line of its own when
-  someone writes one.
-- [ ] React dashboard, 5-min refresh + WS
-- [ ] Trade reconstruction, attribution, MAE/MFE
+  straight from the exchange rules. Still unticked, and the reason has narrowed
+  rather than gone away: this phase has a *Verifiable:* line now (#45), but
+  that line is about the live book, and nothing consumes this endpoint even
+  with the dashboard built — `market_open` is answered from the same
+  `TradingCalendar` in-process, without an HTTP round trip. It is for the
+  charting views that will grey out non-trading days, and it wants a
+  *Verifiable:* line of its own when one of those exists.
+- [ ] React dashboard, 5-min refresh + WS — @claude (wip #45).
+  The six stub components render the book now, and `src/api/types.ts` stopped
+  being a hand-written copy of a server contract: `make gen-types` dumps the
+  OpenAPI document straight from the app — no running server, which is what
+  made the old target something people worked around — and the file is aliases
+  over the generated `schema.d.ts`.
+
+  There is no decimal library on the front end and there does not need to be:
+  the dashboard performs no arithmetic on money at all, because every derived
+  figure is computed server-side, so `src/lib/money.ts` formats decimal
+  *strings* and never parses one. The single float conversion is
+  `toChartNumber`, for chart geometry, named so any other use reads as a
+  mistake.
+
+  Test infrastructure grew for this. There was no way to test a component — no
+  jsdom, no testing-library, no vitest config — so the suite could only ever
+  have asserted on the props a component was handed, and every rule in
+  docs/DASHBOARD.md lives in what a person reads instead. A `.prettierrc.json`
+  came with it, because prettier's defaults disagreed with every file in the
+  app and `make fmt` would have rewritten 27 of them the first time anyone ran
+  it; `make lint` and CI now gate web formatting the way they always did
+  Python's.
+
+  Unticked, and the gap is the demonstration rather than the code: no browser
+  has rendered a book that a worker actually published.
+- [ ] Trade reconstruction, attribution, MAE/MFE.
+  Two prerequisites are worth naming here because #45 found them and did not
+  fix them. `SignalRow` exists in the schema with **no writer** — the
+  dashboard's signal feed is a bounded in-memory ring on the runner, so a
+  restart empties it — and writing one needs a `strategies` row to satisfy its
+  foreign key, which nothing creates either. `PostgresOrderRepository` stores
+  `strategy_id` and `signal_id` as null for the same reason, so an order cannot
+  currently be traced back to the decision that caused it. Attribution is that
+  chain.
 - [ ] Live-vs-backtest comparison
 - [ ] Daily report
+
+*Verifiable:* with the stack up and a worker trading paper, a browser opened at
+any moment shows the same positions, cash and equity the worker's own log
+reports for its latest evaluation; the age of that book is on the screen and
+advances; halting from the dashboard makes the banner appear without a reload
+and the next order is refused; and every monetary value is a string from the
+`Decimal` in the runner to the pixels, with no `parseFloat` between them.
+
+**Proposed** — @claude (#45). This phase had no *Verifiable:* line at all,
+which is why #16's calendar endpoint has sat implemented and untickable since
+Phase 1. It is written from the dashboard's side because that is what
+requirement #7 asks for; the analytics items above will want their own, and
+"the dashboard renders" is deliberately not enough — the line asks for
+agreement between what the worker believes and what the screen says, which is
+the only property that makes the screen worth reading.
 
 ## Phase 6 — Production readiness
 - [ ] **Authentication and authorisation** — blocking for any deployment
