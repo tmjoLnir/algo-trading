@@ -1056,7 +1056,7 @@ the only property that makes the screen worth reading.
 - [ ] Alerting to a phone (feed loss, halt, reconciliation failure)
 - [ ] Metrics/tracing
 - [ ] Backups and a tested restore
-- [ ] Deployment target chosen; secrets manager — @claude (wip).
+- [ ] Deployment target chosen; secrets manager — @claude (wip #50).
   **The target is chosen and recorded; nothing is deployed.** ADR 0011: one
   always-on VM per run mode in a US-East region, the existing compose stack,
   reached over Tailscale, deployed by an explicit operator action, with paper
