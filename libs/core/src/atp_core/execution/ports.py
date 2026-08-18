@@ -15,12 +15,33 @@ says so in the section on what a paper week cannot prove.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from datetime import datetime
+    from decimal import Decimal
 
     from atp_core.domain import Order, Portfolio, RunMode
+
+
+@dataclass(frozen=True, slots=True)
+class EquityPoint:
+    """One row of the account's history — the equity curve, point by point.
+
+    A named type rather than the `(ts, equity)` tuple `Portfolio.equity_curve`
+    keeps in memory, because this one leaves the process: it is what the
+    dashboard's headline chart is drawn from and what day P&L is measured
+    against. Cash and gross exposure travel with it because they were recorded
+    in the same row at the same instant, and a chart that wanted to show
+    exposure alongside equity would otherwise have to ask twice and hope the
+    two reads agreed.
+    """
+
+    ts: datetime
+    equity: Decimal
+    cash: Decimal
+    gross_exposure: Decimal
 
 
 class OrderRepository(Protocol):
@@ -69,5 +90,23 @@ class PortfolioRepository(Protocol):
         mean is "the read failed" — a failure raises, because a runner that
         silently adopted after a database outage would be doing exactly the
         thing this repository exists to stop.
+        """
+        ...
+
+    async def equity_history(
+        self, run_mode: RunMode, *, start: datetime, end: datetime
+    ) -> list[EquityPoint]:
+        """Every recorded equity point in `[start, end]`, oldest first.
+
+        Two readers, and naming both is the argument for it being one method.
+        The dashboard's equity chart draws the series; day P&L subtracts the
+        first point at or after the session open from the current book. Neither
+        belongs in the trading loop — the runner writes this history and does
+        not read it back, so a display query can never slow down or fail an
+        evaluation.
+
+        Inclusive of both ends, because the arguments are instants a caller
+        computed from a session's bounds and a range that quietly dropped its
+        last point would put the wrong number under "day P&L".
         """
         ...

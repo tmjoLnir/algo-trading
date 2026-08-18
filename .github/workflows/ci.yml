@@ -125,6 +125,10 @@ jobs:
         if: ${{ !cancelled() && steps.install.conclusion == 'success' }}
         run: npm run lint
 
+      - name: Format check
+        if: ${{ !cancelled() && steps.install.conclusion == 'success' }}
+        run: npm run format:check
+
       - name: Type check
         if: ${{ !cancelled() && steps.install.conclusion == 'success' }}
         run: npm run typecheck

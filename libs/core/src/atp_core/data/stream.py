@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from atp_core.channels import CHANNEL_BARS, CHANNEL_QUOTES
 from atp_core.clock import SystemClock
 from atp_core.data.backfill import backfill_bars
 from atp_core.data.ports import FeedReconnected
@@ -50,10 +51,6 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
-CHANNEL_QUOTES = "atp:md:quotes"
-CHANNEL_BARS = "atp:md:bars"
-CHANNEL_ORDERS = "atp:exec:orders"
-CHANNEL_SIGNALS = "atp:exec:signals"
 
 #: Who a halt engaged from here is attributed to. A halt is cleared by a named
 #: human, so the record has to say plainly what stopped trading.

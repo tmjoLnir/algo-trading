@@ -13,11 +13,13 @@ clear is a switch someone clears at 3am to make an alert go away.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
+from atp_core.channels import CHANNEL_HALTS
 from atp_core.risk.killswitch import (
     HaltReason,
     HaltScope,
@@ -30,6 +32,7 @@ class FakeRedis:
 
     def __init__(self, broken: bool = False) -> None:
         self.store: dict[str, str] = {}
+        self.published: list[tuple[str, str]] = []
         self.broken = broken
 
     def _guard(self) -> None:
@@ -56,6 +59,11 @@ class FakeRedis:
         self._guard()
         prefix = match.rstrip("*")
         return [k for k in self.store if k.startswith(prefix)]
+
+    def publish(self, channel: str, message: str) -> int:
+        self._guard()
+        self.published.append((channel, message))
+        return 0
 
 
 def switch(**kwargs: Any) -> tuple[RedisKillSwitch, FakeRedis]:
@@ -203,3 +211,79 @@ class TestRoundTrip:
             target="AAPL",
         )
         assert ks.active_halts() == [original]
+
+
+class TestAnnouncements:
+    """A halt on the screen within a second, not within five minutes.
+
+    The state is in Redis before any of this runs and every risk check reads
+    that state, so what is under test here is the *notification*: `atp_api.ws`
+    fans it out to every open dashboard regardless of what the client
+    subscribed to, because a trading halt is not something to opt into.
+    """
+
+    def test_engaging_announces_the_record(self) -> None:
+        ks, redis = switch()
+
+        ks.engage(HaltScope.GLOBAL, HaltReason.DAILY_LOSS_LIMIT, "risk_engine", detail="-3.2%")
+
+        channel, raw = redis.published[-1]
+        message = json.loads(raw)
+        assert channel == CHANNEL_HALTS
+        assert message["type"] == "halt"
+        assert message["transition"] == "engaged"
+        assert message["reason"] == "daily_loss_limit"
+        assert message["engaged_by"] == "risk_engine"
+
+    def test_clearing_announces_it_too(self) -> None:
+        """The banner has to come *down* as well. An operator who cleared a halt
+        and watched the screen stay red would clear it again."""
+        ks, redis = switch()
+        ks.engage(HaltScope.SYMBOL, HaltReason.MANUAL, "ops", target="AAPL")
+
+        ks.clear(HaltScope.SYMBOL, cleared_by="alice", target="AAPL")
+
+        message = json.loads(redis.published[-1][1])
+        assert message["transition"] == "cleared"
+        assert message["target"] == "AAPL"
+        assert message["actor"] == "alice"
+
+    def test_clearing_a_halt_that_was_not_engaged_announces_nothing(self) -> None:
+        """There is no transition to report, and a phantom "cleared" would take
+        a banner down that another scope's halt is still holding up."""
+        ks, redis = switch()
+
+        ks.clear(HaltScope.GLOBAL, cleared_by="alice")
+
+        assert redis.published == []
+
+    def test_re_engaging_does_not_announce_twice(self) -> None:
+        """`engage` is idempotent and keeps the original record. A second
+        announcement would carry the same halt with the same timestamp and tell
+        every dashboard something happened that did not."""
+        ks, redis = switch()
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        assert len(redis.published) == 1
+
+    def test_a_failed_announcement_does_not_fail_the_halt(self) -> None:
+        """Engaging must never fail quietly, and an exception raised on the way
+        out of the announcement would break that promise in the one direction
+        that matters — by making an unpublishable halt look like one that did
+        not happen.
+        """
+        ks, redis = switch()
+
+        class Unpublishable(type(redis)):  # type: ignore[misc]
+            def publish(self, channel: str, message: str) -> int:
+                raise ConnectionError("pub/sub is down")
+
+        broken = Unpublishable()
+        ks._client = broken  # type: ignore[attr-defined]
+
+        record = ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        assert record.reason is HaltReason.MANUAL
+        assert ks.is_engaged() is True

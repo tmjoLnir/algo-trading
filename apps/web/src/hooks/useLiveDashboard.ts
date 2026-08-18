@@ -20,9 +20,20 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import { apiGet } from '@/api/client'
-import type { LiveDashboard } from '@/api/types'
+import type { EquityCurveView, LiveDashboard } from '@/api/types'
 
 const DEFAULT_REFRESH_MS = 5 * 60 * 1000
+
+/** Where the socket writes ticks. Its own key: the poll owns the book. */
+export const LIVE_QUOTES_KEY = ['quotes', 'live'] as const
+
+/** One tick, as the socket delivers it. Prices stay strings (rule §1.1). */
+export interface LiveQuote {
+  symbol: string
+  bid: string
+  ask: string
+  ts: string
+}
 
 export function useLiveDashboard() {
   const query = useQuery<LiveDashboard>({
@@ -47,14 +58,59 @@ export function useLiveDashboard() {
 }
 
 /**
+ * The equity curve behind the headline chart.
+ *
+ * A separate query from the dashboard's, on purpose. It is a *history*, not
+ * part of the current picture, so it does not need to share the aggregate's
+ * instant — and putting it in the aggregate would make every 5-minute poll drag
+ * a month of points behind it. It refreshes on the same cadence because the
+ * newest point is the one the reader is looking at.
+ */
+export function useEquityCurve(days = 30, resolution?: string) {
+  const suffix = resolution ? `&resolution=${resolution}` : ''
+  return useQuery<EquityCurveView>({
+    queryKey: ['dashboard', 'equity-curve', days, resolution ?? 'auto'],
+    queryFn: () => apiGet<EquityCurveView>(`/api/v1/dashboard/equity-curve?days=${days}${suffix}`),
+    refetchInterval: DEFAULT_REFRESH_MS,
+    refetchIntervalInBackground: false,
+    staleTime: DEFAULT_REFRESH_MS - 30_000,
+    retry: 2,
+  })
+}
+
+/** The latest tick per symbol, as delivered by the socket since the last poll. */
+export function useLiveQuotes(): Record<string, LiveQuote> {
+  const { data } = useQuery<Record<string, LiveQuote>>({
+    queryKey: LIVE_QUOTES_KEY,
+    // Never fetched — the socket is the only writer. `initialData` gives the
+    // cache an entry to be written into before the first message arrives.
+    queryFn: () => Promise.resolve({}),
+    initialData: {},
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+  })
+  return data
+}
+
+/**
  * Live push between polls.
  *
- * The socket writes into the same React Query cache the poll owns, so the UI
- * has one source of state. Ticks patch prices; the poll remains authoritative
- * and corrects any drift every 5 minutes.
+ * **Ticks do not patch the book.** A quote goes into its own cache entry and is
+ * rendered as its own, clearly-labelled live price; the position's mark, its
+ * P&L and every percentage beside it stay exactly as the poll delivered them,
+ * with the book's age shown. The alternative — writing a fresh price into the
+ * position and leaving the P&L computed from the old one — produces precisely
+ * the screen assembled from two instants that the single aggregate endpoint
+ * exists to prevent, and recomputing the P&L here would mean doing arithmetic
+ * on money in IEEE 754 (rule §1.1).
  *
- * A halt message invalidates the whole query immediately — that is the one
- * event where waiting up to 5 minutes to find out is not acceptable.
+ * A fill or a halt refetches instead: both change more of the picture than one
+ * message carries, and the poll is the authoritative path.
+ *
+ * The socket opens even when there is nothing to subscribe to. Halts are
+ * delivered to every client regardless of subscription, and a dashboard holding
+ * no positions is exactly the one that most needs to be told trading has
+ * stopped.
  */
 export function useDashboardStream(symbols: string[]) {
   const queryClient = useQueryClient()
@@ -65,10 +121,9 @@ export function useDashboardStream(symbols: string[]) {
   const symbolKey = symbols.join(',')
 
   useEffect(() => {
-    if (!symbolKey) return
     // Rebuild the list from the key rather than closing over `symbols`, so the
     // effect's dependencies are genuinely exhaustive and cannot go stale.
-    const subscribed = symbolKey.split(',')
+    const subscribed = symbolKey ? symbolKey.split(',') : []
 
     const url = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8000/ws'
     let ws: WebSocket | null = null
@@ -87,10 +142,28 @@ export function useDashboardStream(symbols: string[]) {
       }
 
       ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data)
+        let msg: { type?: string; symbol?: string; bid?: string; ask?: string; ts?: string }
+        try {
+          msg = JSON.parse(event.data)
+        } catch {
+          // A frame we cannot read is a server bug, not a reason to tear the
+          // socket down and reconnect into the same bug.
+          return
+        }
         switch (msg.type) {
           case 'quote':
-            // TODO: patch the cached position's last_price and unrealized P&L.
+            if (msg.symbol && msg.bid && msg.ask && msg.ts) {
+              const quote: LiveQuote = {
+                symbol: msg.symbol,
+                bid: msg.bid,
+                ask: msg.ask,
+                ts: msg.ts,
+              }
+              queryClient.setQueryData<Record<string, LiveQuote>>(LIVE_QUOTES_KEY, (current) => ({
+                ...(current ?? {}),
+                [quote.symbol]: quote,
+              }))
+            }
             break
           case 'fill':
           case 'halt':

@@ -27,7 +27,11 @@ from atp_core.domain import Fill, Order, OrderStatus, OrderType, Portfolio, Posi
 from atp_core.errors import BrokerConnectionError, OrderRejectedError
 
 if TYPE_CHECKING:
+    from typing import Any
+
+    from atp_core.dashboard.snapshot import LiveSnapshot
     from atp_core.domain import Side
+    from atp_core.execution.ports import EquityPoint
 
 
 class FakeBroker:
@@ -206,6 +210,11 @@ class FakeKillSwitch:
     def __init__(self, engaged: bool = False) -> None:
         self.engaged = engaged
         self.engagements: list[tuple[str, str, str, str]] = []
+        #: What `active_halts` reports. Seeded by a test that needs the halt
+        #: banner to have something to render; the engagement list above is a
+        #: record of calls rather than of state, and the two are separate
+        #: because a test usually cares about exactly one of them.
+        self.halts: list[object] = []
 
     def is_engaged(self, strategy_id: str | None = None, symbol: str | None = None) -> bool:
         return self.engaged
@@ -226,7 +235,7 @@ class FakeKillSwitch:
         self.engaged = False
 
     def active_halts(self) -> list[object]:
-        return []
+        return list(self.halts)
 
 
 class FakeOrderRepository:
@@ -261,6 +270,10 @@ class FakePortfolioRepository:
     def __init__(self) -> None:
         self.snapshots: list[tuple[datetime, Portfolio]] = []
         self.stored: Portfolio | None = None
+        #: Seeded by a test to stand for the `equity_snapshots` history the day
+        #: anchor and the dashboard's chart are both read from.
+        self.equity_points: list[EquityPoint] = []
+        self.history_error: Exception | None = None
 
     async def snapshot(self, portfolio: Portfolio, *, at: datetime, run_mode: object) -> None:
         # Copied for the same reason as above: the runner keeps mutating this
@@ -273,3 +286,61 @@ class FakePortfolioRepository:
 
     async def latest(self, run_mode: object) -> Portfolio | None:
         return self.stored
+
+    async def equity_history(
+        self, run_mode: object, *, start: datetime, end: datetime
+    ) -> list[EquityPoint]:
+        """Whatever a test seeded, filtered to the window.
+
+        The filtering is real rather than a pass-through: `dashboard._day_pnl`
+        takes the *first* point in the range as the day's anchor, so a fake that
+        ignored `start` would hand back a point from before the session opened
+        and make the assertion pass for the wrong reason.
+        """
+        if self.history_error is not None:
+            raise self.history_error
+        return [p for p in self.equity_points if start <= p.ts <= end]
+
+
+class FakeSnapshotStore:
+    """In-memory `SnapshotStore`.
+
+    `get` returns None until something is put, which is the state a dashboard
+    meets when the worker is up but not trading — the case that must render
+    banners and halts rather than an empty book.
+    """
+
+    def __init__(self) -> None:
+        self.puts: list[LiveSnapshot] = []
+        self.stored: dict[str, LiveSnapshot] = {}
+        #: Set by a test to stand for an unreachable or unreadable Redis. The
+        #: read path must fail the request rather than report an empty book.
+        self.get_error: Exception | None = None
+        self.put_error: Exception | None = None
+
+    async def put(self, snapshot: LiveSnapshot) -> None:
+        if self.put_error is not None:
+            raise self.put_error
+        self.puts.append(snapshot)
+        self.stored[snapshot.run_mode.value] = snapshot
+
+    async def get(self, run_mode: object) -> LiveSnapshot | None:
+        if self.get_error is not None:
+            raise self.get_error
+        return self.stored.get(getattr(run_mode, "value", str(run_mode)))
+
+
+class FakePublisher:
+    """Records what would have gone out on Redis pub/sub."""
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.published: list[tuple[str, dict[str, Any]]] = []
+        self.error = error
+
+    async def publish(self, channel: str, message: dict[str, Any]) -> None:
+        if self.error is not None:
+            raise self.error
+        self.published.append((channel, message))
+
+    def on(self, channel: str) -> list[dict[str, Any]]:
+        return [m for c, m in self.published if c == channel]

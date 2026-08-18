@@ -398,3 +398,100 @@ class TestBookSnapshots:
         assert paper_book is not None and live_book is not None
         assert paper_book.cash == Decimal("50000.25")
         assert live_book.cash == Decimal("777")
+
+
+def a_portfolio(cash: str = "1000") -> Portfolio:
+    """A book worth exactly 1000 of exposure, so the arithmetic below is legible."""
+    book = Portfolio(cash=Decimal(cash), starting_equity=Decimal("10000"))
+    book.positions["SPY"] = Position(
+        symbol="SPY",
+        qty=Decimal("10"),
+        avg_entry_price=Decimal("95"),
+        last_price=Decimal("100"),
+        opened_at=T0,
+    )
+    return book
+
+
+class TestEquityHistory:
+    """The series the dashboard's chart is drawn from, and the day-P&L anchor.
+
+    Written by `snapshot` on every runner pass and read back here. Worth an
+    integration test rather than a unit one because the whole of it is SQL:
+    an inclusive `BETWEEN`, an ascending order, and a `run_mode` filter — each
+    of which is a one-character mistake away from a chart that quietly omits its
+    newest point or mixes a paper account into a live one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_nothing_recorded_reads_as_an_empty_series(
+        self, book: PostgresPortfolioRepository
+    ) -> None:
+        history = await book.equity_history(
+            RunMode.PAPER, start=T0 - timedelta(days=1), end=T0 + timedelta(days=1)
+        )
+
+        assert history == []
+
+    @pytest.mark.asyncio
+    async def test_points_come_back_oldest_first(self, book: PostgresPortfolioRepository) -> None:
+        """`downsample` keeps the last point in each bucket, so an unordered
+        series would hand the chart whichever point the planner returned last."""
+        for minutes in (30, 0, 15):
+            await book.snapshot(
+                a_portfolio(cash=str(1000 + minutes)),
+                at=T0 + timedelta(minutes=minutes),
+                run_mode=RunMode.PAPER,
+            )
+
+        history = await book.equity_history(RunMode.PAPER, start=T0, end=T0 + timedelta(hours=1))
+
+        assert [p.ts for p in history] == sorted(p.ts for p in history)
+        assert len(history) == 3
+
+    @pytest.mark.asyncio
+    async def test_both_ends_of_the_window_are_included(
+        self, book: PostgresPortfolioRepository
+    ) -> None:
+        """The arguments are instants a caller computed from a session's bounds.
+        A range that quietly dropped its last point would put the wrong number
+        under "day P&L"."""
+        await book.snapshot(a_portfolio(), at=T0, run_mode=RunMode.PAPER)
+        await book.snapshot(a_portfolio(), at=T0 + timedelta(hours=1), run_mode=RunMode.PAPER)
+
+        history = await book.equity_history(RunMode.PAPER, start=T0, end=T0 + timedelta(hours=1))
+
+        assert len(history) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_point_outside_the_window_is_excluded(
+        self, book: PostgresPortfolioRepository
+    ) -> None:
+        """Yesterday's close is not today's open. Anchoring day P&L on it would
+        report the overnight gap as part of the day's move."""
+        await book.snapshot(a_portfolio(), at=T0 - timedelta(days=1), run_mode=RunMode.PAPER)
+        await book.snapshot(a_portfolio(), at=T0, run_mode=RunMode.PAPER)
+
+        history = await book.equity_history(RunMode.PAPER, start=T0, end=T0 + timedelta(hours=1))
+
+        assert [p.ts for p in history] == [T0]
+
+    @pytest.mark.asyncio
+    async def test_run_modes_do_not_share_a_series(self, book: PostgresPortfolioRepository) -> None:
+        await book.snapshot(a_portfolio(), at=T0, run_mode=RunMode.PAPER)
+
+        assert await book.equity_history(RunMode.LIVE, start=T0, end=T0) == []
+
+    @pytest.mark.asyncio
+    async def test_equity_and_exposure_survive_exactly(
+        self, book: PostgresPortfolioRepository
+    ) -> None:
+        """`NUMERIC`, not `DOUBLE PRECISION` (rule §1.1). The fractional cash
+        below is the part a float would round."""
+        await book.snapshot(a_portfolio(cash="1234.56789"), at=T0, run_mode=RunMode.PAPER)
+
+        point = (await book.equity_history(RunMode.PAPER, start=T0, end=T0))[0]
+
+        assert point.cash == Decimal("1234.56789")
+        assert point.gross_exposure == Decimal("1000")
+        assert point.equity == Decimal("2234.56789")

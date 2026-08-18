@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 
 from atp_core.domain import Portfolio, Position
+from atp_core.execution.ports import EquityPoint
 from atp_core.logging import get_logger
 from atp_core.persistence.db import session_scope
 from atp_core.persistence.models import EquitySnapshotRow, PositionSnapshotRow
@@ -108,6 +109,45 @@ class PostgresPortfolioRepository:
         for position in positions:
             portfolio.positions[position.symbol] = position
         return portfolio
+
+    async def equity_history(
+        self, run_mode: RunMode, *, start: datetime, end: datetime
+    ) -> list[EquityPoint]:
+        """The equity series over a window, oldest first.
+
+        Read from `equity_snapshots` rather than reconstructed from fills. The
+        rows are what the runner actually recorded at the time, so a chart drawn
+        from them shows the account as it was believed to be at each instant —
+        which is the thing an operator is checking against their memory of the
+        day. A reconstruction would instead show what today's code thinks
+        yesterday's fills add up to, and quietly disagree with every number that
+        was on the screen at the time.
+        """
+        async with session_scope(self._session_factory) as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(EquitySnapshotRow)
+                        .where(
+                            EquitySnapshotRow.run_mode == run_mode.value,
+                            EquitySnapshotRow.ts >= start,
+                            EquitySnapshotRow.ts <= end,
+                        )
+                        .order_by(EquitySnapshotRow.ts.asc())
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [
+            EquityPoint(
+                ts=row.ts,
+                equity=row.equity,
+                cash=row.cash,
+                gross_exposure=row.gross_exposure,
+            )
+            for row in rows
+        ]
 
     @staticmethod
     async def _positions_at(

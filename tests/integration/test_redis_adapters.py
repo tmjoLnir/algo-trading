@@ -19,7 +19,9 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from atp_core.domain import Quote
+from atp_core.dashboard import build_snapshot
+from atp_core.domain import Portfolio, Position, Quote, RunMode
+from atp_core.persistence.dashboard import RedisSnapshotStore
 from atp_core.persistence.events import RedisEventPublisher
 from atp_core.persistence.quotes import RedisQuoteCache
 from atp_core.persistence.redis_client import close_redis, create_redis
@@ -37,6 +39,7 @@ TS = datetime(2024, 6, 3, 14, 30, tzinfo=UTC)
 #: their own keys without touching a developer's live cache.
 TEST_PREFIX = "atp:test:quote:"
 TEST_CHANNEL = "atp:test:quotes"
+TEST_SNAPSHOT_PREFIX = "atp:test:dashboard:"
 
 
 def make_quote(symbol: str = "SPY", bid: str = "0.1", ask: str = "0.3") -> Quote:
@@ -71,7 +74,9 @@ async def client() -> AsyncIterator[Redis]:
 
 
 async def _delete_test_keys(redis: Redis) -> None:
-    keys = [key async for key in redis.scan_iter(match=f"{TEST_PREFIX}*")]
+    keys: list[str] = []
+    for pattern in (f"{TEST_PREFIX}*", f"{TEST_SNAPSHOT_PREFIX}*"):
+        keys.extend([key async for key in redis.scan_iter(match=pattern)])
     if keys:
         await redis.delete(*keys)
 
@@ -171,3 +176,90 @@ async def _next_message(subscriber: object, *, kind: str, timeout: float = 5.0) 
         if message is not None and message.get("type") == kind:
             return dict(message)
     raise AssertionError(f"no {kind!r} frame arrived within {timeout}s")
+
+
+def a_book() -> Portfolio:
+    book = Portfolio(cash=Decimal("1234.56789"), starting_equity=Decimal("10000"))
+    book.positions["SPY"] = Position(
+        symbol="SPY",
+        qty=Decimal("10"),
+        avg_entry_price=Decimal("100.333333333"),
+        last_price=Decimal("110.1"),
+        stop_loss_price=Decimal("90"),
+        opened_at=TS,
+    )
+    return book
+
+
+@pytest.fixture
+def snapshots(client: Redis) -> RedisSnapshotStore:
+    return RedisSnapshotStore(client, key_prefix=TEST_SNAPSHOT_PREFIX)
+
+
+class TestSnapshotStore:
+    """The dashboard's read path, against a real server.
+
+    Two things here are properties of Redis rather than of our code and cannot
+    be asserted against a fake: that a document round-trips through `SET`/`GET`
+    with its `Decimal`s intact, and that two run modes really do occupy
+    different keys.
+    """
+
+    async def test_nothing_published_reads_as_none(self, snapshots: RedisSnapshotStore) -> None:
+        """The ordinary state of a worker that is up but not trading — and the
+        one the endpoint must render banners for rather than an empty book."""
+        assert await snapshots.get(RunMode.PAPER) is None
+
+    async def test_a_snapshot_round_trips_exactly(self, snapshots: RedisSnapshotStore) -> None:
+        """Exactly, not approximately. The entry price below has more digits
+        than a double can hold; a float round trip loses them silently."""
+        original = build_snapshot(a_book(), at=TS, run_mode=RunMode.PAPER, symbols=["SPY"])
+
+        await snapshots.put(original)
+
+        assert await snapshots.get(RunMode.PAPER) == original
+
+    async def test_run_modes_do_not_share_a_key(self, snapshots: RedisSnapshotStore) -> None:
+        """Paper and live share a datastore. A paper book served to a live
+        dashboard would show positions that are not the ones at risk."""
+        await snapshots.put(build_snapshot(a_book(), at=TS, run_mode=RunMode.PAPER))
+
+        assert await snapshots.get(RunMode.PAPER) is not None
+        assert await snapshots.get(RunMode.LIVE) is None
+
+    async def test_a_later_put_replaces_the_earlier_one(
+        self, snapshots: RedisSnapshotStore
+    ) -> None:
+        """One key, one current picture. Anything that could hold half of one
+        snapshot and half of the next is the thing the aggregate exists to make
+        impossible."""
+        await snapshots.put(build_snapshot(a_book(), at=TS, run_mode=RunMode.PAPER))
+        later = build_snapshot(
+            Portfolio(cash=Decimal(0), starting_equity=Decimal(0)), at=TS, run_mode=RunMode.PAPER
+        )
+
+        await snapshots.put(later)
+
+        stored = await snapshots.get(RunMode.PAPER)
+        assert stored is not None
+        assert stored.positions == ()
+
+    async def test_the_key_carries_a_ttl(
+        self, client: Redis, snapshots: RedisSnapshotStore
+    ) -> None:
+        """Garbage collection for a run mode nobody runs any more — not a
+        freshness mechanism, which is what `as_of` is for."""
+        await snapshots.put(build_snapshot(a_book(), at=TS, run_mode=RunMode.PAPER))
+
+        assert await client.ttl(f"{TEST_SNAPSHOT_PREFIX}paper") > 0
+
+    async def test_an_unreadable_payload_raises_rather_than_reading_as_empty(
+        self, client: Redis, snapshots: RedisSnapshotStore
+    ) -> None:
+        """The opposite of `RedisQuoteCache`, deliberately. A missing quote
+        stops trading on that symbol, which is safe; a book that read as empty
+        would tell a dashboard's reader they are flat."""
+        await client.set(f"{TEST_SNAPSHOT_PREFIX}paper", "{ not json")
+
+        with pytest.raises(ValueError):
+            await snapshots.get(RunMode.PAPER)

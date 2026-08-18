@@ -1,94 +1,47 @@
 /**
- * API payload types.
+ * API payload types — aliases over the GENERATED schema.
  *
- * These are hand-written PLACEHOLDERS for the skeleton. Once the API is
- * running, generate them instead:
+ * These used to be hand-written placeholders. They are not any more:
+ * `src/api/schema.d.ts` is produced from the server's own OpenAPI document by
  *
- *     make gen-types      # openapi-typescript → src/api/schema.d.ts
+ *     make gen-types
  *
- * and re-export from the generated schema. Hand-maintained duplicates of a
- * server contract drift, and the drift shows up as a runtime undefined in a
- * P&L figure rather than a compile error (CLAUDE.md §4).
+ * which dumps the schema straight from the FastAPI app (no running server
+ * needed) and runs `openapi-typescript` over it. Re-run it whenever a response
+ * model changes and commit the result.
+ *
+ * The point of the indirection is that a hand-maintained duplicate of a server
+ * contract drifts, and the drift shows up as a runtime `undefined` inside a P&L
+ * figure rather than as a compile error (CLAUDE.md §4). Everything below is a
+ * name, not a definition — if one of these stops compiling, the server changed
+ * and the components that read it need to change too. That is the alarm
+ * working.
  *
  * Note every monetary field is `string`, not `number`: the backend serialises
- * Decimal as a string so JSON's float representation cannot corrupt it in
- * transit. Parse with a decimal library for arithmetic; never `parseFloat` a
- * balance and add to it.
+ * `Decimal` as a string so JSON's float representation cannot corrupt it in
+ * transit. Never `parseFloat` a balance — see `src/lib/money.ts`, which formats
+ * these for display without ever making one a number.
  */
 
-export interface AccountView {
-  equity: string
-  cash: string
-  buying_power: string
-  gross_exposure: string
-  net_exposure: string
-  leverage: string
-  day_pnl: string
-  day_pnl_pct: string
-  open_position_count: number
-}
+import type { components } from './schema'
 
-export interface PositionView {
-  symbol: string
-  qty: string
-  avg_entry_price: string
-  last_price: string
-  market_value: string
-  unrealized_pnl: string
-  unrealized_pnl_pct: string
-  stop_loss_price: string | null
-  take_profit_price: string | null
-  distance_to_stop_pct: string | null
-  strategy_id: string | null
-  strategy_name: string | null
-  opened_at: string
-}
+type Schemas = components['schemas']
 
-export interface SignalView {
-  id: string
-  ts: string
-  strategy_name: string
-  symbol: string
-  action: string
-  reason: string
-  indicators: Record<string, number>
-  acted_on: boolean
-  rejection_reason: string | null
-}
+export type AccountView = Schemas['AccountView']
+export type PositionView = Schemas['PositionView']
+export type SignalView = Schemas['SignalView']
+export type OrderView = Schemas['OrderView']
+export type HaltView = Schemas['HaltView']
+export type LiveDashboard = Schemas['LiveDashboard']
+export type EquityCurveView = Schemas['EquityCurveView']
+export type EquityPointView = Schemas['EquityPointView']
 
-export interface OrderView {
-  id: string
-  ts: string
-  symbol: string
-  side: string
-  order_type: string
-  qty: string
-  filled_qty: string
-  limit_price: string | null
-  avg_fill_price: string | null
-  status: string
-  strategy_name: string | null
-}
-
-export interface HaltView {
-  scope: string
-  reason: string
-  engaged_at: string
-  engaged_by: string
-  detail: string
-  target: string | null
-}
-
-export interface LiveDashboard {
-  as_of: string
-  run_mode: 'backtest' | 'paper' | 'live'
-  market_open: boolean
-  account: AccountView
-  positions: PositionView[]
-  recent_signals: SignalView[]
-  working_orders: OrderView[]
-  active_halts: HaltView[]
-  refresh_seconds: number
-  data_feed_healthy: boolean
-  last_data_at: string | null
-}
+/**
+ * The run modes the UI branches on.
+ *
+ * The generated type is a bare `string` — FastAPI serialises the enum's value
+ * and does not narrow it — so this is the one place the union is restated. It
+ * is a display concern (which banner to show), not a contract: an unrecognised
+ * mode falls through to the loudest branch rather than to none.
+ */
+export type RunMode = 'backtest' | 'paper' | 'live'
