@@ -120,12 +120,20 @@ class TestOrderRoundTrip:
         self, orders: PostgresOrderRepository
     ) -> None:
         """Rebuilt through `apply_fill` rather than assigned, so the stored
-        average has to agree with the stored prints."""
-        order = an_order()
+        average has to agree with the stored prints.
+
+        Left partially filled deliberately. `open_orders` is the only reader,
+        and it excludes terminal orders — filling a 100-share order 40 then 60
+        makes it FILLED, and asking that reader for it back is asking the wrong
+        question rather than finding a bug. The average being checked is the
+        same arithmetic at either size.
+        """
+        order = an_order(qty="200")
         order.status = OrderStatus.SUBMITTED
         order.apply_fill(a_fill(order, "40", "100", "e1"))
         order.apply_fill(a_fill(order, "60", "110", "e2"))
         expected = order.avg_fill_price
+        assert order.status is OrderStatus.PARTIALLY_FILLED
 
         await orders.save(order, run_mode=RunMode.PAPER)
         restored = (await orders.open_orders(RunMode.PAPER))[0]
@@ -133,6 +141,7 @@ class TestOrderRoundTrip:
         assert len(restored.fills) == 2
         assert restored.filled_qty == Decimal("100")
         assert restored.avg_fill_price == expected == Decimal("106")
+        assert restored.status is OrderStatus.PARTIALLY_FILLED
 
     @pytest.mark.asyncio
     async def test_a_terminal_order_is_not_returned_as_working(
@@ -144,6 +153,56 @@ class TestOrderRoundTrip:
         await orders.save(order, run_mode=RunMode.PAPER)
 
         assert await orders.open_orders(RunMode.PAPER) == []
+
+    @pytest.mark.asyncio
+    async def test_a_completed_order_keeps_its_prints_though_no_reader_returns_it(
+        self, orders: PostgresOrderRepository, clean_execution_tables: str
+    ) -> None:
+        """A filled order is written and then never handed back. That is the
+        intended shape, and it is stated here because it does not look like it.
+
+        `open_orders` is the port's only reader because the port exists to
+        restore what is still working, and a completed order needs no
+        restoring — its effect is already in the position snapshot. The prints
+        are still stored: they are the audit trail P&L is reconstructed from,
+        so this asserts against the table rather than through a reader that is
+        correct to exclude them.
+
+        What this deliberately does not claim: that the order row and the book
+        cannot disagree. A crash between booking a fill and snapshotting the
+        book leaves a FILLED order whose position was never written, and
+        nothing here replays it. Reconciliation against the venue is what
+        catches that, which is why it runs at boot.
+        """
+        order = an_order()
+        order.status = OrderStatus.SUBMITTED
+        order.apply_fill(a_fill(order, "40", "100", "e1"))
+        order.apply_fill(a_fill(order, "60", "110", "e2"))
+        assert order.status is OrderStatus.FILLED
+
+        await orders.save(order, run_mode=RunMode.PAPER)
+        await orders.save(order, run_mode=RunMode.PAPER)
+
+        assert await orders.open_orders(RunMode.PAPER) == []
+
+        conn = await asyncpg.connect(
+            clean_execution_tables.replace("postgresql+asyncpg://", "postgresql://")
+        )
+        try:
+            prints = await conn.fetch(
+                "SELECT qty, price FROM fills WHERE order_id = $1 ORDER BY qty", order.id
+            )
+            status = await conn.fetchval("SELECT status FROM orders WHERE id = $1", order.id)
+        finally:
+            await conn.close()
+
+        # Twice saved, printed once each: the derived fill id is what stops the
+        # second save from doubling the audit trail.
+        assert [(row["qty"], row["price"]) for row in prints] == [
+            (Decimal("40"), Decimal("100")),
+            (Decimal("60"), Decimal("110")),
+        ]
+        assert status == OrderStatus.FILLED.value
 
     @pytest.mark.asyncio
     async def test_paper_and_live_do_not_see_each_other(
@@ -195,7 +254,9 @@ class TestSavingTwice:
 
     @pytest.mark.asyncio
     async def test_a_later_save_carries_the_new_fill(self, orders: PostgresOrderRepository) -> None:
-        order = an_order()
+        """Partially filled for the same reason as the replay test above: the
+        order has to still be working for `open_orders` to hand it back."""
+        order = an_order(qty="200")
         order.status = OrderStatus.SUBMITTED
         order.apply_fill(a_fill(order, "40", "100", "e1"))
         await orders.save(order, run_mode=RunMode.PAPER)
@@ -205,7 +266,8 @@ class TestSavingTwice:
 
         restored = (await orders.open_orders(RunMode.PAPER))[0]
         assert len(restored.fills) == 2
-        assert restored.status is OrderStatus.FILLED or restored.filled_qty == Decimal("100")
+        assert restored.filled_qty == Decimal("100")
+        assert restored.avg_fill_price == Decimal("106")
 
     @pytest.mark.asyncio
     async def test_the_status_moves_on_a_re_save(self, orders: PostgresOrderRepository) -> None:
