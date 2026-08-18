@@ -11,12 +11,12 @@ supervisor engages the kill switch before exiting — a worker that half-runs is
 more dangerous than one that is plainly down, because monitoring still sees a
 live process while positions go unmanaged.
 
-**Two of the three run today.** `StrategyRunner` is still a stub, and it depends
-on two more that are unstarted — a `BrokerPort` adapter and reconciliation — so
-there is nothing to supervise yet. This worker therefore ingests market data,
-watchdogs it, and runs the schedule; it places no orders. That is stated in the
-startup log rather than left for a reader to infer from a quiet process, because
-"the worker is up" and "the worker is trading" must never be the same
+**All three can run now**, but the third is opt-in and stays off unless somebody
+turns it on. `WORKER_STRATEGY` names the strategy to trade and is empty by
+default; live additionally needs `WORKER_ALLOW_LIVE_ORDERS`. The locks and the
+reasoning behind them are in `trading.py`, and whichever way they land is stated
+in the startup log rather than left for a reader to infer from a quiet process
+— because "the worker is up" and "the worker is trading" must never be the same
 observation.
 """
 
@@ -27,6 +27,8 @@ import signal
 from contextlib import AsyncExitStack
 from typing import TYPE_CHECKING, Any
 
+from atp_core.brokers.alpaca import AlpacaBroker
+from atp_core.clock import SystemClock, TradingCalendar
 from atp_core.config import get_settings
 from atp_core.data.providers.alpaca import AlpacaHistoricalProvider, AlpacaRealtimeFeed
 from atp_core.data.stream import StalenessMonitor, StreamIngestor
@@ -39,6 +41,7 @@ from atp_core.persistence.events import RedisEventPublisher
 from atp_core.persistence.quotes import RedisQuoteCache
 from atp_core.persistence.redis_client import close_redis, create_redis, create_sync_redis
 from atp_core.risk.killswitch import HaltReason, HaltScope, RedisKillSwitch
+from atp_worker import trading
 from atp_worker.scheduler import run_scheduler
 
 if TYPE_CHECKING:
@@ -147,13 +150,53 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
                 hint="set WORKER_SYMBOLS=SPY,QQQ to give the ingestor a watchlist",
             )
 
+        decision = trading.decide(settings, symbols)
+        if decision.enabled:
+            # `ingestor` is bound whenever `symbols` is non-empty, which
+            # `trading.decide` has already made a condition of trading.
+            broker = AlpacaBroker(settings)
+            stack.push_async_callback(broker.aclose)
+            clock = SystemClock()
+
+            runner, reconciler = trading.build_runner(
+                settings,
+                symbols,
+                broker=broker,
+                kill_switch=kill_switch,
+                bar_repo=bar_repo,
+                quote_cache=quote_cache,
+                clock=clock,
+                calendar=TradingCalendar(),
+                last_tick_at=ingestor.last_tick_at,
+            )
+            portfolio = await trading.adopt_broker_state(reconciler, clock)
+
+            responsibilities["strategy_runner"] = lambda: runner.run(portfolio)
+            responsibilities["trade_updates"] = lambda: trading.consume_trade_updates(
+                broker, runner, reconciler, portfolio
+            )
+            # Positions are left open with their broker-side stops intact, which
+            # is what makes a deploy a restart rather than a liquidation.
+            stack.push_async_callback(runner.shutdown)
+
+        if decision.enabled and settings.is_live:
+            log.critical("worker.trading_live", msg=decision.reason)
+        elif decision.enabled:
+            log.warning("worker.trading", msg=decision.reason)
+        elif decision.blocked:
+            # Somebody asked for trading and a lock refused. Louder than an
+            # unset strategy, which is a choice rather than a thwarted one.
+            log.critical("worker.trading_blocked", msg=decision.reason)
+        else:
+            log.info("worker.not_trading", msg=decision.reason)
+
         log.info(
             "worker.ready",
             run_mode=settings.run_mode,
             symbols=symbols,
             responsibilities=sorted(responsibilities),
-            trading=False,
-            msg="no StrategyRunner exists yet — this worker does not place orders",
+            trading=decision.enabled,
+            msg=decision.reason,
         )
 
         await supervise(responsibilities, stop_event=stop_event, kill_switch=kill_switch)

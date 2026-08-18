@@ -82,6 +82,12 @@ class IngestorStats:
     last_message_at: datetime | None = None
     gaps_backfilled: int = 0
     symbols: set[str] = field(default_factory=set)
+    #: symbol → when that symbol last printed a quote. Distinct from
+    #: `last_message_at`, which is the *feed's* pulse: on a watchlist where one
+    #: name is halted and the rest are busy, the feed looks healthy while that
+    #: one symbol has not traded for an hour. `StaleDataRule` has to refuse an
+    #: order priced off the halted one, so it needs the per-symbol answer.
+    last_tick_at: dict[str, datetime] = field(default_factory=dict)
 
 
 class StreamIngestor:
@@ -187,6 +193,14 @@ class StreamIngestor:
 
         log.warning("data.stream.ended", msg="the feed's stream finished without an error")
 
+    def last_tick_at(self, symbol: str) -> datetime | None:
+        """When `symbol` last printed, for `risk.rules.StaleDataRule`.
+
+        Sync and cheap on purpose: the risk chain runs inside order submission
+        and cannot await, and this is consulted before every single order.
+        """
+        return self.stats.last_tick_at.get(symbol)
+
     async def _dispatch(self, event: StreamEvent) -> None:
         """Route one event. Every branch is awaited before the next arrives."""
         if isinstance(event, FeedReconnected):
@@ -212,6 +226,10 @@ class StreamIngestor:
     async def _handle_quote(self, quote: Quote) -> None:
         """Cache and publish. Do not persist every quote — the volume is
         enormous and the value is almost entirely in the latest one."""
+        # The quote's own timestamp, not the clock: what the rule needs to know
+        # is how old the *price* is, and a vendor replaying a backlog would
+        # otherwise stamp stale prices as fresh on arrival.
+        self.stats.last_tick_at[quote.symbol] = quote.ts
         await self.quote_cache.set_quote(quote)
         await self._publish(CHANNEL_QUOTES, _quote_message(quote))
 

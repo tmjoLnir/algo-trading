@@ -90,6 +90,43 @@ class Settings(BaseSettings):
     #: of the two — a symbol can legitimately go a minute without printing.
     worker_max_silence_seconds: int = 60
 
+    #: The strategy this worker trades, by registry name (`WORKER_STRATEGY=
+    #: sma_crossover`). **Empty means it places no orders** — the same posture
+    #: as an empty `worker_symbols`: a worker that starts trading because it was
+    #: deployed, rather than because somebody chose to, is the accident this
+    #: default exists to prevent. Ingestion and the schedule run either way.
+    worker_strategy: str = ""
+
+    #: Strategy parameters as JSON (`WORKER_STRATEGY_PARAMS={"fast":20}`). Empty
+    #: means the strategy's own defaults.
+    worker_strategy_params: str = ""
+
+    #: How the runner sizes an order: one of the `PositionSizeSpec` methods and
+    #: its value. `risk_pct` with 0.01 is docs/RISK.md's default pair — size so
+    #: that hitting the stop loses 1% of equity.
+    worker_sizing_method: Literal[
+        "fixed_qty", "fixed_notional", "equity_pct", "risk_pct", "volatility_target"
+    ] = "risk_pct"
+    worker_sizing_value: Decimal = Decimal("0.01")
+
+    #: The protective stop armed on every entry. ATR at 2× is docs/RISK.md's
+    #: recommendation over a fixed percentage, which is too tight on a volatile
+    #: name and too loose on a dull one.
+    worker_stop_type: Literal[
+        "fixed_pct", "fixed_amount", "trailing_pct", "atr", "time", "chandelier"
+    ] = "atr"
+    worker_stop_multiplier: Decimal = Decimal("2")
+    worker_stop_period: int = 14
+
+    #: The **third** lock, and it exists only for live. `ATP_RUN_MODE=live` and
+    #: `ATP_ALLOW_LIVE_TRADING=true` between them say "this process may trade
+    #: real money"; this one says "this worker, specifically, may place the
+    #: orders". They are different decisions made by different people at
+    #: different times — enabling live mode is a deployment choice, and letting
+    #: an unattended loop act on it is an operational one. Paper is unaffected:
+    #: `worker_strategy` alone is the opt-in there.
+    worker_allow_live_orders: bool = False
+
     # ── api ─────────────────────────────────────────────────────────────────
     api_host: str = "0.0.0.0"
     api_port: int = 8000
