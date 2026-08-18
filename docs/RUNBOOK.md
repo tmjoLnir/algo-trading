@@ -5,9 +5,16 @@ during the incident.
 
 ## First move, always
 
-**HALT.** Dashboard, top right. No confirmation needed.
+**HALT.** Diagnose second — a halt costs missed opportunity; hesitation costs
+money.
 
-Diagnose second. A halt costs missed opportunity; hesitation costs money.
+> **The dashboard button does not exist yet.** It is Phase 5, and
+> `POST /api/v1/risk/halt` still raises `NotImplementedError`. Until both land,
+> the halt is a command, and you should have it ready *before* you need it —
+> see `FIRST_PAPER_RUN.md` 'Read this part first: how to stop', which carries
+> the exact invocation for engaging and clearing the switch. Stopping the
+> worker (`docker compose stop worker`) is not the same thing: it leaves other
+> processes free to trade and deliberately does not halt.
 
 Halting is *not* flattening. Halting stops new risk. Flattening realises
 existing P&L and is a separate decision.

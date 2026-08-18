@@ -47,7 +47,8 @@ people deploy without checking.
 
 **The system**
 - [ ] `make check` green
-- [ ] Reconciliation runs clean against the paper account
+- [ ] Reconciliation runs clean against the paper account — the procedure for
+      a first run, and what it can and cannot prove, is `FIRST_PAPER_RUN.md`
 - [ ] Kill switch tested end to end — engage it and confirm orders are actually refused
 - [ ] Every strategy has a stop loss configured; there are no unprotected positions
 - [ ] Data-feed disconnect tested (kill the network, confirm it halts rather than trading on stale prices)
