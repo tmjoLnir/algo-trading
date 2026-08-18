@@ -11,15 +11,21 @@ something consults it, and a plain `order.status = ...` consults nothing.
 **One status change deliberately does not come through here.**
 `Order.apply_fill` sets `PARTIALLY_FILLED` / `FILLED` itself, because `domain/`
 imports nothing from its siblings (CLAUDE.md §2) and a fill is an accounting
-event that has to stay in the entity that accumulates it. That leaves one gap
+event that has to stay in the entity that accumulates it. That left one gap
 worth naming rather than papering over: a fill applied to an order in a status
 the table would not have allowed to fill — a `PENDING_RISK` order, say — is
-accepted. In practice a fill arrives against an order the venue acknowledged,
-so the order is `SUBMITTED` or `PARTIALLY_FILLED` and the move is legal anyway;
-the guard belongs with whatever consumes the trade-updates stream, which is
-where an event of unknown provenance first meets an order (a separate Phase 4
-item). Closing it here would mean either `domain` importing `execution` or this
-module reimplementing fill accounting, and both are worse than the gap.
+accepted here. Closing it *in this module* would mean either `domain` importing
+`execution` or this module reimplementing fill accounting, and both are worse
+than the gap.
+
+It is closed where it belongs instead. `execution.trade_updates
+.apply_trade_update` is the consumer of the venue's push stream, which is where
+an event of unknown provenance first meets an order, and it refuses a fill from
+a status this table would not have allowed to fill — deriving that set from
+`TRANSITIONS` rather than restating it, so the two cannot drift. It also
+discards a fill the venue has already sent us once, which is the other half of
+the same problem: `apply_fill` is arithmetic and has no way to know it is being
+told the same thing twice.
 """
 
 from __future__ import annotations

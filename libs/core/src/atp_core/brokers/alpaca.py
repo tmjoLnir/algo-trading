@@ -41,13 +41,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import random
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from atp_core.brokers.ports import AccountSnapshot
+from atp_core import ws
+from atp_core.brokers.ports import AccountSnapshot, TradeUpdate, TradeUpdatesReconnected
 from atp_core.domain import Fill, Order, OrderStatus, OrderType, Position, Side, TimeInForce
 from atp_core.domain.enums import RunMode
 from atp_core.errors import (
@@ -59,8 +61,9 @@ from atp_core.errors import (
 from atp_core.logging import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
+    from atp_core.brokers.ports import TradeUpdateEvent
     from atp_core.config import Settings
 
 log = get_logger(__name__)
@@ -107,6 +110,64 @@ _ORDER_TYPE: dict[OrderType, str] = {
 }
 _ORDER_TYPE_BACK = {v: k for k, v in _ORDER_TYPE.items()}
 
+#: The one account stream this adapter listens to.
+_TRADE_UPDATES_STREAM = "trade_updates"
+
+#: Alpaca's trade-update **event** vocabulary → ours. A separate map from
+#: `_STATUS` above on purpose: these are event names, not statuses, and they
+#: disagree with the REST spellings in exactly the places that matter
+#: (`fill` vs `filled`, `partial_fill` vs `partially_filled`). Folding them
+#: into one map would mean one of the two vocabularies quietly accepting
+#: strings the venue never sends on that channel.
+#:
+#: A fill's entry is None because `Order.apply_fill` owns the resulting status:
+#: only the arithmetic knows whether this print completed the order.
+_STREAM_EVENTS: dict[str, OrderStatus | None] = {
+    # Working at the venue.
+    "new": OrderStatus.SUBMITTED,
+    "pending_new": OrderStatus.SUBMITTED,
+    "accepted": OrderStatus.SUBMITTED,
+    "stopped": OrderStatus.SUBMITTED,
+    "calculated": OrderStatus.SUBMITTED,
+    "held": OrderStatus.SUBMITTED,
+    "pending_cancel": OrderStatus.SUBMITTED,
+    "pending_replace": OrderStatus.SUBMITTED,
+    # Fills — status decided by the arithmetic, not by the event name.
+    "fill": None,
+    "partial_fill": None,
+    # Terminal.
+    "canceled": OrderStatus.CANCELLED,
+    "expired": OrderStatus.EXPIRED,
+    "done_for_day": OrderStatus.EXPIRED,
+    "rejected": OrderStatus.REJECTED,
+    "suspended": OrderStatus.REJECTED,
+    "replaced": OrderStatus.CANCELLED,
+    # A cancel or replace the venue refused. The order is untouched by it, so
+    # there is no status change to make — but it is a real event and silently
+    # dropping it would leave a caller believing its cancel took effect.
+    "order_cancel_rejected": None,
+    "order_replace_rejected": None,
+}
+
+#: The two that carry an execution.
+_FILL_EVENTS = frozenset({"fill", "partial_fill"})
+
+
+class _PermanentStreamError(BrokerError):
+    """The stream refused in a way another connection would not fix.
+
+    Internal: callers see `BrokerError`. It exists so the reconnect loop can
+    tell "try again" from "stop and tell somebody" without inspecting messages.
+    """
+
+
+def _iter_messages(raw: str | bytes) -> list[dict[str, Any]]:
+    """A frame's messages. Alpaca sends a bare object here; tolerate an array."""
+    payload = json.loads(raw, parse_float=Decimal)
+    if isinstance(payload, dict):
+        return [payload]
+    return [m for m in payload if isinstance(m, dict)]
+
 
 def _as_decimal(value: object) -> Decimal:
     """Money and quantities are `Decimal`, never `float` (CLAUDE.md §1.1).
@@ -146,6 +207,13 @@ class AlpacaBroker:
         *,
         client: httpx.AsyncClient | None = None,
         backoff_base_seconds: float = _BACKOFF_BASE_SECONDS,
+        connect: Callable[[str], Awaitable[ws.WebSocketConnection]] | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        rng: random.Random | None = None,
+        stream_backoff_base_seconds: float = ws.BACKOFF_BASE_SECONDS,
+        stream_backoff_max_seconds: float = ws.BACKOFF_MAX_SECONDS,
+        max_reconnect_attempts: int = ws.MAX_RECONNECT_ATTEMPTS,
+        handshake_timeout_seconds: float = ws.HANDSHAKE_TIMEOUT_SECONDS,
     ) -> None:
         if settings.run_mode is RunMode.BACKTEST:
             raise ValueError("AlpacaBroker cannot serve a backtest; use SimulatedBroker")
@@ -156,6 +224,23 @@ class AlpacaBroker:
         #: Only close what we opened — an injected client belongs to its owner.
         self._owns_client = client is None
         self._backoff_base_seconds = backoff_base_seconds
+
+        # ── trade-updates stream seams ──────────────────────────────────────
+        # Injected so the reconnect and handshake state machine is drivable off
+        # a scripted fake, with no network anywhere (CLAUDE.md §1.7).
+        self._connect: Callable[[str], Awaitable[ws.WebSocketConnection]] = (
+            connect if connect is not None else ws.connect_websocket
+        )
+        self._sleep: Callable[[float], Awaitable[None]] = (
+            sleep if sleep is not None else ws.sleep_seconds
+        )
+        #: Jitter, not cryptography — a seeded one is what makes the backoff
+        #: schedule assertable in a test.
+        self._rng = rng if rng is not None else random.Random()
+        self._backoff_base_seconds_stream = stream_backoff_base_seconds
+        self._backoff_max_seconds = stream_backoff_max_seconds
+        self._max_reconnect_attempts = max_reconnect_attempts
+        self._handshake_timeout_seconds = handshake_timeout_seconds
 
     @property
     def name(self) -> str:
@@ -429,15 +514,224 @@ class AlpacaBroker:
             raise BrokerError("Alpaca returned no clock")
         return bool(payload["is_open"])
 
-    async def stream_trade_updates(self) -> AsyncIterator[dict[str, Any]]:
+    async def stream_trade_updates(self) -> AsyncIterator[TradeUpdateEvent]:
         """Fill and status events, pushed.
 
         Reconnect with backoff on drop, then reconcile open orders via REST —
         events during the gap are lost, and a missed fill means our position
         view is wrong (CLAUDE.md §5).
+
+        That reconciliation is the *consumer's* job and this yields
+        `TradeUpdatesReconnected` to demand it. The adapter deliberately does
+        not re-read open orders itself: it holds no book to correct, and a
+        catch-up it performed silently would be one the consumer could not
+        order against its own state. Carrying the signal in the stream is what
+        makes "close the gap before handling the next event" a guarantee rather
+        than a hope — the same reasoning as `data.ports.FeedReconnected`.
+
+        Unlike the market-data feed, there is nothing to re-subscribe on
+        reconnect beyond the single `trade_updates` stream, and nothing to
+        replay: Alpaca does not re-send events for the gap. REST is the only
+        way back.
         """
-        raise NotImplementedError
-        yield {}  # pragma: no cover — makes the signature an async generator
+        attempts = 0
+        #: The last instant the order state is known good. Seeded with "now"
+        #: rather than left empty: before the first event there is nothing to
+        #: be missing, and a first connection that takes four attempts to come
+        #: up has genuinely missed whatever filled while it was struggling.
+        gap_since = datetime.now(UTC)
+        reconnecting = False
+
+        while True:
+            try:
+                connection = await self._open_stream()
+            except _PermanentStreamError:
+                raise
+            except Exception as exc:  # every transport failure retries alike
+                attempts += 1
+                if attempts > self._max_reconnect_attempts:
+                    raise BrokerConnectionError(
+                        f"Alpaca trade updates did not come back after "
+                        f"{self._max_reconnect_attempts} attempts: {exc}"
+                    ) from exc
+                log.warning(
+                    "broker.alpaca.trade_updates_reconnecting",
+                    attempt=attempts,
+                    error=str(exc),
+                )
+                await self._sleep(
+                    ws.backoff_delay(
+                        attempts,
+                        base_seconds=self._backoff_base_seconds_stream,
+                        max_seconds=self._backoff_max_seconds,
+                        rng=self._rng,
+                    )
+                )
+                reconnecting = True
+                continue
+
+            if reconnecting:
+                reconnecting = False
+                yield TradeUpdatesReconnected(
+                    gap_since=gap_since,
+                    reconnected_at=datetime.now(UTC),
+                    attempts=attempts + 1,
+                )
+
+            #: Reset only once the connection has proved itself by delivering
+            #: something. Resetting on connect alone would turn a server that
+            #: accepts and immediately drops us into a hot loop that never
+            #: backs off.
+            delivered = False
+
+            while True:
+                try:
+                    raw = await connection.recv()
+                except Exception as exc:  # a closed socket arrives in many shapes
+                    log.warning("broker.alpaca.trade_updates_disconnected", error=str(exc))
+                    await ws.close_quietly(connection)
+                    break
+
+                if not delivered:
+                    delivered = True
+                    attempts = 0
+
+                for message in _iter_messages(raw):
+                    update = self._to_trade_update(message)
+                    if update is not None:
+                        gap_since = update.at
+                        yield update
+
+            reconnecting = True
+
+    # ── trade-updates transport ─────────────────────────────────────────────
+
+    @property
+    def stream_url(self) -> str:
+        """The account stream, derived from the REST host.
+
+        Deliberately derived rather than configured: paper and live trade
+        updates must come from the same account the orders went to, and a
+        separately-configured URL is one edit away from watching the paper
+        account while trading the live one.
+        """
+        return f"{self._base_url.replace('https://', 'wss://').rstrip('/')}/stream"
+
+    async def _open_stream(self) -> ws.WebSocketConnection:
+        """Connect, authenticate and listen, or clean up trying."""
+        connection = await self._connect(self.stream_url)
+        try:
+            async with asyncio.timeout(self._handshake_timeout_seconds):
+                await self._authenticate_stream(connection)
+                await self._listen(connection)
+        except BaseException:
+            # Includes the timeout and a cancellation. A half-authenticated
+            # socket left open still holds a connection slot, so the retry
+            # would be refused by our own leak.
+            await ws.close_quietly(connection)
+            raise
+
+        log.info("broker.alpaca.trade_updates_connected", account=self.name)
+        return connection
+
+    async def _authenticate_stream(self, connection: ws.WebSocketConnection) -> None:
+        """Send credentials and wait for the server to accept them.
+
+        The account stream's handshake is **not** the market-data one: the
+        action is `authenticate`, the credentials are nested under `data`, and
+        they are named `key_id`/`secret_key`. Sending the market-data frame
+        here authenticates nothing and the server simply never answers, which
+        is why the two are not shared despite looking alike.
+
+        No credential reaches a log line or an exception message (rule §1.6) —
+        the frame is built inline and the errors quote only the server's own
+        words.
+        """
+        await connection.send(
+            json.dumps(
+                {
+                    "action": "authenticate",
+                    "data": {
+                        "key_id": self._settings.alpaca_api_key.get_secret_value(),
+                        "secret_key": self._settings.alpaca_api_secret.get_secret_value(),
+                    },
+                }
+            )
+        )
+
+        for _ in range(ws.MAX_HANDSHAKE_FRAMES):
+            for message in _iter_messages(await connection.recv()):
+                if message.get("stream") != "authorization":
+                    continue  # listening confirmations and stray frames
+                status = str((message.get("data") or {}).get("status", ""))
+                if status == "authorized":
+                    return
+                raise _PermanentStreamError(
+                    f"Alpaca refused the trade-updates handshake: {status or 'unauthorized'}. "
+                    "Check that these are the credentials for this account — paper and live "
+                    "use separate key pairs."
+                )
+
+        raise BrokerConnectionError(
+            f"Alpaca sent {ws.MAX_HANDSHAKE_FRAMES} frames without authorizing the stream"
+        )
+
+    @staticmethod
+    async def _listen(connection: ws.WebSocketConnection) -> None:
+        """Subscribe to the one stream this adapter wants."""
+        await connection.send(
+            json.dumps({"action": "listen", "data": {"streams": [_TRADE_UPDATES_STREAM]}})
+        )
+
+    def _to_trade_update(self, message: dict[str, Any]) -> TradeUpdate | None:
+        """One frame's message → a `TradeUpdate`, or None if it is not one.
+
+        Handshake confirmations and anything on another stream are not events
+        and are skipped. An `event` we have no mapping for is **refused**: the
+        plausible default is "ignore it", and an ignored `rejected` is an order
+        our book believes is still working.
+        """
+        if message.get("stream") != _TRADE_UPDATES_STREAM:
+            return None
+
+        data = message.get("data") or {}
+        event = str(data.get("event", "")).lower()
+        if event not in _STREAM_EVENTS:
+            raise BrokerError(
+                f"unrecognised Alpaca trade-update event {event!r} — refusing to guess "
+                "whether it leaves the order working"
+            )
+
+        payload = data.get("order") or {}
+        order = self._from_alpaca_order(payload)
+        at = _parse_ts(data.get("timestamp")) or datetime.now(UTC)
+
+        fill = None
+        if event in _FILL_EVENTS:
+            fill = Fill(
+                order_id=order.id,
+                ts=at,
+                qty=_as_decimal(data["qty"]),
+                price=_as_decimal(data["price"]),
+                # Fees are not on this event; they arrive on the account
+                # activities feed. Zero rather than estimated — a guessed fee
+                # is a wrong number in the P&L ledger.
+                fee=Decimal(0),
+                venue_fill_id=str(data["execution_id"]) if data.get("execution_id") else None,
+            )
+
+        position_qty = data.get("position_qty")
+        return TradeUpdate(
+            event=event,
+            client_order_id=order.client_order_id,
+            broker_order_id=str(payload.get("id", "")),
+            symbol=order.symbol,
+            at=at,
+            status=_STREAM_EVENTS[event],
+            fill=fill,
+            position_qty=None if position_qty is None else _as_decimal(position_qty),
+            reason=str(payload.get("reject_reason")) if payload.get("reject_reason") else None,
+        )
 
     # ── translation ─────────────────────────────────────────────────────────
 

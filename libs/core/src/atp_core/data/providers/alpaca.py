@@ -24,10 +24,11 @@ import json
 import random
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from atp_core import ws
 from atp_core.clock import SystemClock
 from atp_core.data.ports import FeedReconnected
 from atp_core.domain import Bar, Quote, Timeframe, Trade
@@ -438,19 +439,15 @@ _TRANSIENT_ERROR_CODES = frozenset({407, 500})
 #: few thousand tickers in one frame is how you find that limit in production.
 _MAX_SYMBOLS_PER_FRAME = 250
 
-#: How long the auth/subscribe exchange may take before the connection is
-#: written off and retried. Alpaca answers in milliseconds; ten seconds of
-#: silence is a half-open socket, which otherwise hangs the ingestor for as long
-#: as the OS keep-alive takes to notice.
-_HANDSHAKE_TIMEOUT_SECONDS = 10.0
-
-#: Frames the handshake will read before giving up. Bounded so a server that
-#: chats without ever saying "authenticated" cannot spin here.
-_MAX_HANDSHAKE_FRAMES = 20
-
-_STREAM_BACKOFF_BASE_SECONDS = 1.0
-_STREAM_BACKOFF_MAX_SECONDS = 60.0
-_MAX_RECONNECT_ATTEMPTS = 8
+#: The stream's transport knobs live in `atp_core.ws`, shared with the trade-
+#: updates stream so two connections to the same vendor behave the same way
+#: under the same outage. Aliased here because this module's own tests and
+#: constructor defaults read them by these names.
+_HANDSHAKE_TIMEOUT_SECONDS = ws.HANDSHAKE_TIMEOUT_SECONDS
+_MAX_HANDSHAKE_FRAMES = ws.MAX_HANDSHAKE_FRAMES
+_STREAM_BACKOFF_BASE_SECONDS = ws.BACKOFF_BASE_SECONDS
+_STREAM_BACKOFF_MAX_SECONDS = ws.BACKOFF_MAX_SECONDS
+_MAX_RECONNECT_ATTEMPTS = ws.MAX_RECONNECT_ATTEMPTS
 
 
 class _PermanentFeedError(DataError):
@@ -461,19 +458,10 @@ class _PermanentFeedError(DataError):
     """
 
 
-class _WebSocketConnection(Protocol):
-    """The slice of a `websockets` client this class actually uses.
-
-    Narrow on purpose: it is what lets the tests drive the whole reconnect and
-    handshake state machine off a scripted fake, with no network anywhere
-    (CLAUDE.md §1.7).
-    """
-
-    async def send(self, message: str) -> None: ...
-
-    async def recv(self) -> str | bytes: ...
-
-    async def close(self) -> None: ...
+#: The narrow transport seam, from `atp_core.ws`. Aliased rather than renamed
+#: throughout: it is the same protocol, and the scripted fakes in
+#: `test_alpaca_realtime_feed.py` are written against this name.
+_WebSocketConnection = ws.WebSocketConnection
 
 
 class AlpacaRealtimeFeed:
@@ -686,21 +674,18 @@ class AlpacaRealtimeFeed:
         await _close_quietly(connection)
 
     def _backoff_delay(self, attempt: int) -> float:
-        """Exponential, capped, jittered.
+        """Exponential, capped, jittered — `atp_core.ws.backoff_delay`.
 
-        Jitter is not decoration: every consumer of a vendor that just came back
-        reconnects at the same instant otherwise, and the thundering herd is why
-        it goes down again.
-
-        The base is `2.0` rather than `2` because `int ** int` is typed `Any`:
-        a negative exponent makes it a float, so typeshed cannot promise an int
-        and hands back `Any`, which would then leak out of this function's
-        declared `float` under `--strict`.
+        Shared with the trade-updates stream rather than written twice, so two
+        connections to the same vendor cannot end up with two different retry
+        cadences that nobody can tell apart in an incident.
         """
-        delay: float = min(
-            self._backoff_base_seconds * (2.0 ** (attempt - 1)), self._backoff_max_seconds
+        return ws.backoff_delay(
+            attempt,
+            base_seconds=self._backoff_base_seconds,
+            max_seconds=self._backoff_max_seconds,
+            rng=self._rng,
         )
-        return delay * (0.5 + self._rng.random() / 2)
 
     def _note_disconnect(self, exc: Exception) -> None:
         self._connected = False
@@ -899,32 +884,11 @@ def _iter_messages(raw: str | bytes) -> list[dict[str, Any]]:
     return [m for m in payload if isinstance(m, dict)]
 
 
-async def _close_quietly(connection: _WebSocketConnection) -> None:
-    """Close, ignoring the failure. The socket is already going away."""
-    try:
-        await connection.close()
-    except Exception as exc:
-        log.debug("data.alpaca.stream_close_failed", error=str(exc))
-
-
-async def _connect_websocket(url: str) -> _WebSocketConnection:
-    """Open the real socket.
-
-    `websockets` is imported here rather than at module scope so that importing
-    this module for its REST provider — which is what a backfill or a backtest
-    does — does not pull the WebSocket stack in.
-    """
-    from websockets.asyncio.client import connect
-
-    # Cast rather than a type: ignore — the client's `send`/`recv`/`close` do
-    # satisfy the protocol above, and an ignore that stops being needed is an
-    # error in itself here (`warn_unused_ignores`).
-    return cast("_WebSocketConnection", await connect(url))
-
-
-async def _sleep_seconds(seconds: float) -> None:
-    """The default backoff sleep, wrapped so the injected one has a plain type."""
-    await asyncio.sleep(seconds)
+#: Transport glue, from `atp_core.ws`. Aliased rather than inlined at the call
+#: sites so the injection seams in this module keep their names.
+_close_quietly = ws.close_quietly
+_connect_websocket = ws.connect_websocket
+_sleep_seconds = ws.sleep_seconds
 
 
 def _union(groups: Iterable[set[str]]) -> set[str]:

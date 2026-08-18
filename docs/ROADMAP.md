@@ -493,7 +493,9 @@ above.
   `filled_qty` and `filled_avg_price` as running totals, so a fill read this
   way is **one** synthetic `Fill` for the whole quantity. That is right for
   P&L and wrong for anything inspecting the sequence, and it is the reason the
-  trade-updates item below exists.
+  trade-updates item below exists. That item has since landed (#37), so the
+  sequence is available on the streamed path; a fill learned from REST — a
+  reconnect catch-up, a reconciliation sweep — is still the collapsed one.
 
   Unticked. Every test is against recorded responses through `respx`; nothing
   in this item has yet been pointed at Alpaca's paper endpoint, and the phase's
@@ -593,10 +595,13 @@ above.
 
   It needed a `BrokerPort` adapter and reconciliation, and as of #36 the first
   of those exists — `SimulatedBroker` and `AlpacaBroker` are both implemented
-  and `deps.get_broker` binds one per run mode. Reconciliation is still a stub,
-  so there is still nothing to start a loop safely against: a runner that comes
-  up without reconciling is a runner sizing orders against a book it has not
-  checked.
+  and `deps.get_broker` binds one per run mode. #37 adds the trade-updates
+  stream and `apply_trade_update`, so `on_fill_event` now has something to
+  delegate to rather than reimplement. Reconciliation is still a stub, so there
+  is still nothing to start a loop safely against: a runner that comes up
+  without reconciling is a runner sizing orders against a book it has not
+  checked — and the reconnect path needs it twice over, since
+  `TradeUpdatesReconnected` is a demand for exactly that sweep.
 
   The second half of this item — drop the `worker` compose profile so the worker
   rejoins the default stack "once it can actually start" — **is done** (#35), and
@@ -611,19 +616,49 @@ above.
   and the startup log says so on every boot rather than leaving "the worker is
   up" and "the worker is trading" as the same observation. Unticked on that
   basis: this item is the live loop, and the live loop does not exist.
-- [ ] Trade-updates WS with reconnect.
-  `AlpacaBroker.stream_trade_updates` is deliberately still a stub after #36,
-  which implemented every REST method around it. It is left for this item
-  rather than folded into the adapter because it is where two known gaps close,
-  and both need the stream rather than the socket:
+- [ ] Trade-updates WS with reconnect — @claude (wip #37).
+  `AlpacaBroker.stream_trade_updates` is implemented, and so is the consumer
+  that makes it mean anything. Both gaps this item existed to close are closed:
 
-  - REST reports fills as running totals, so `_from_alpaca_order` synthesises
-    one `Fill` for the whole filled quantity. The individual prints — the fill
-    *sequence* CLAUDE.md §5 is about — exist only on this stream.
-  - `execution/state.py` names the one hole in the order state machine: a fill
-    applied to an order in a status the table would not have allowed to fill.
-    It says the guard belongs "with whatever consumes the trade-updates
-    stream", which is this item.
+  - **The fill sequence.** REST reports running totals, so a fill read that way
+    is one synthetic `Fill` for the whole quantity. The stream carries the
+    individual print, and `TradeUpdate` carries it as a `Fill` with the venue's
+    `execution_id` on it.
+  - **The state-machine hole.** `execution/state.py` named it and said the
+    guard belonged "with whatever consumes the trade-updates stream". That
+    consumer is now `execution/trade_updates.py`, which refuses a fill from a
+    status the table would not have allowed to fill — deriving that set from
+    `TRANSITIONS` rather than restating it. `state.py` is updated in the same
+    diff to point at the guard rather than describe the gap.
+
+  Three refusals in the applier, each one silent in the version that just calls
+  `apply_fill`. A redelivered fill is discarded on the venue's execution id —
+  without it a re-sent event doubles the position, and an id-less fill is
+  deliberately *not* treated as a duplicate because two prints of the same size
+  at the same price are ordinary. A fill against an order our book has already
+  killed raises `ReconciliationError` rather than picking a side: applying it
+  resurrects a dead order, dropping it leaves us disagreeing with the venue,
+  and neither is recoverable in code. And a fill arriving before we recorded
+  the submit walks the order forward through `SUBMITTED` instead — the event is
+  proof the venue has it, so refusing on a technicality would leave a real
+  position unrecorded.
+
+  The reconnect signal is carried *in* the stream as `TradeUpdatesReconnected`,
+  the same shape as `data.ports.FeedReconnected` and for the same reason: one
+  `async for` body runs to completion before the next event, so the consumer's
+  REST catch-up provably happens before it handles anything from the new
+  connection. The adapter deliberately does not re-read open orders itself — it
+  holds no book to correct.
+
+  The account handshake is **not** the market-data one (`authenticate` with
+  nested `key_id`/`secret_key`, versus `auth` with flat `key`/`secret`), and
+  that is pinned by a test, because sending the wrong frame authenticates
+  nothing and the server simply never answers.
+
+  Unticked. Every frame here is shaped from Alpaca's documentation and nothing
+  has been pointed at a live account stream — which is exactly the caveat #34
+  turned into a finding when the market-data wire disagreed with the docs three
+  ways at once. What is tested is our handling, not the vendor's shape.
 
 *Verifiable:* a strategy trades the paper account for a week and reconciles clean.
 
