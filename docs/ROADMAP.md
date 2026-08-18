@@ -588,7 +588,56 @@ above.
   Unticked, and the reason is the same as the item above: the phase's
   *Verifiable:* line is a paper week, and this has only ever met synthetic
   bars.
-- [ ] Reconciliation
+- [ ] Reconciliation — @claude (wip #38).
+  `Reconciler.reconcile` and `adopt_broker_state` are implemented — docs/SAFETY
+  .md's layer 7. All four documented checks: every broker position matched on
+  **signed** quantity, no local position the broker does not have, every open
+  broker order accounted for, and cash within a tolerance.
+
+  Signed rather than absolute is the one to read twice. A long we believe is a
+  short matches on magnitude and is the disagreement that *doubles* the loss
+  when acted on, because every exit is then sized in the wrong direction. Pinned
+  by a test, and verified by making the comparison `abs()` — which reports that
+  book as clean.
+
+  Four decisions worth naming:
+
+  - **A broker we cannot read halts.** That table names layer 7's failure mode
+    as "reconciliation itself is not running", so an unreachable broker is not
+    a reason to skip the check and carry on — it engages `BROKER_UNREACHABLE`
+    and re-raises. An unverified book and a book known to be wrong are the same
+    thing to anyone about to size an order against it.
+  - **Equity is deliberately not compared, only cash.** Equity is cash plus
+    marks, and our marks come from our feed while the broker's come from
+    theirs; two feeds a tick apart on an open position is not a book
+    discrepancy, and reporting it as one would make layer 7 fire on every
+    volatile day. Cash is arithmetic on fills, so drift there means a fill one
+    of us does not know about — which is the thing worth catching.
+  - **An orphan order is reported, never cancelled.** It is most often a
+    protective stop placed before a restart, and cancelling it blindly leaves
+    the position it guards naked — a worse state than the one being reported.
+  - **`known_orders` has no default.** Defaulting it to empty would report
+    every real order as an orphan and halt on the first healthy run; defaulting
+    it to "skip check 3" would silently disable a documented safety check. The
+    caller is the only thing that knows what it submitted.
+
+  An adopted position carries **no** protective levels. The broker knows a
+  position exists; it does not know the stop we intended for it, and inventing
+  one from the venue's average entry price would arm a level no strategy chose.
+  So a position adopted after a mismatch is unprotected until something re-arms
+  it — which is the honest state, and why docs/RUNBOOK.md has the operator
+  reconcile *before* clearing the halt.
+
+  Unticked, and the blocker is worth stating precisely because it is not the
+  usual one. `scheduler.reconcile_with_broker` is already on the 5-minute
+  schedule layer 7 asks for and stays a `NotImplementedError` stub: it can
+  build a broker and a kill switch from settings, but it has nothing to
+  *compare them against*. The live portfolio belongs to `StrategyRunner`, which
+  does not exist, and there is no position-snapshot repository to load one from
+  — `PositionSnapshotRow` is a table with no reader. Reconciling against an
+  empty portfolio would report every real position as `missing_position` and
+  halt on the first run, so the job is left honestly unbuilt; the scheduler
+  already treats a stub as unbuilt rather than failed.
 - [ ] `StrategyRunner` live loop — @claude (wip).
   Untouched: `warmup`, `run`, `evaluate`, `on_fill_event` and `shutdown` all
   still raise.
@@ -597,11 +646,15 @@ above.
   of those exists — `SimulatedBroker` and `AlpacaBroker` are both implemented
   and `deps.get_broker` binds one per run mode. #37 adds the trade-updates
   stream and `apply_trade_update`, so `on_fill_event` now has something to
-  delegate to rather than reimplement. Reconciliation is still a stub, so there
-  is still nothing to start a loop safely against: a runner that comes up
-  without reconciling is a runner sizing orders against a book it has not
-  checked — and the reconnect path needs it twice over, since
-  `TradeUpdatesReconnected` is a demand for exactly that sweep.
+  delegate to rather than reimplement, and #38 adds the `Reconciler` that
+  `warmup` and the `TradeUpdatesReconnected` catch-up both need.
+
+  So the dependencies are built and the direction of the blocker has now
+  reversed: reconciliation is no longer waiting on the runner, the runner is
+  what reconciliation is waiting for. `Reconciler.reconcile` needs a live
+  `Portfolio` and the set of orders we believe are working, and this loop is
+  the thing that would own both. Until it exists, layer 7's scheduled job has
+  nothing to compare and stays stubbed.
 
   The second half of this item — drop the `worker` compose profile so the worker
   rejoins the default stack "once it can actually start" — **is done** (#35), and
