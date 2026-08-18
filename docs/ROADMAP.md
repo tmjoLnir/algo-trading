@@ -695,15 +695,14 @@ above.
   the runner tracks what it submitted, which is what makes orphan detection
   mean anything.
 
-  **Two things are deliberately not done, and both are visible.** Step 6 of the
-  ordering — persist and publish — is a no-op with a comment saying why: there
-  is no order or position repository (`PositionSnapshotRow` is still a table
-  with no reader) and no publisher on this class, and a half-persistence only
-  some restarts could read would be worse than the honest gap, since `warmup`
-  reconciles against the broker anyway. And `atp_worker.main` still does not
-  construct a runner, so the worker continues to say it is not trading on every
-  boot. Wiring it changes what the worker *does* in production and deserves its
-  own change and its own review.
+  **Step 6 of the ordering — persist and publish — is a no-op with a comment
+  saying why**: there is no order or position repository (`PositionSnapshotRow`
+  is still a table with no reader) and no publisher on this class, and a
+  half-persistence only some restarts could read would be worse than the honest
+  gap, since `warmup` reconciles against the broker anyway.
+
+  The other gap recorded here — that `atp_worker.main` did not construct a
+  runner — is closed by #40, which wires it behind an opt-in.
 
   Unticked. Phase 4's *Verifiable:* line is a paper week, and this loop has
   never been pointed at a venue — every test drives it off fakes.
@@ -750,6 +749,50 @@ above.
   has been pointed at a live account stream — which is exactly the caveat #34
   turned into a finding when the market-data wire disagreed with the docs three
   ways at once. What is tested is our handling, not the vendor's shape.
+- [ ] Worker wired to trade — @claude (wip #40).
+  `atp_worker.main` now constructs a `StrategyRunner`, a `Reconciler` and an
+  `OrderRouter` over the Alpaca adapter, and supervises two new
+  responsibilities: the strategy loop and the trade-updates consumer. The
+  startup log no longer says no runner exists, because one does.
+
+  **It is off by default and stays off until somebody turns it on.** Three
+  locks, in `atp_worker.trading.decide`, which is a pure function so the answer
+  to "does this configuration place orders?" lives in one readable place rather
+  than being inferred from a wiring block:
+
+  1. `WORKER_STRATEGY` names a strategy; empty means no orders. Same posture as
+     an empty `WORKER_SYMBOLS` — a worker that starts trading because it was
+     *deployed* rather than because somebody chose to is the accident this
+     prevents.
+  2. Rule §1.8's existing pair, enforced in `Settings` itself.
+  3. `WORKER_ALLOW_LIVE_ORDERS`, live only. The first two say this process may
+     trade real money; the third says this unattended loop may place the
+     orders. Different decisions, made by different people at different times.
+     Paper ignores it deliberately — requiring it there would train operators
+     to set it, which is how a lock stops working.
+
+  Every branch is tested in both directions, and the third lock was verified by
+  removing it, which lets a live configuration through and fails the test.
+
+  Two things worth a reviewer's eye. **Boot adopts the broker's book**, in
+  `trading.adopt_broker_state` rather than inside `warmup`: at boot we hold no
+  book, so there is nothing for the broker's to disagree with, and without this
+  a worker restarted holding positions would refuse to start forever
+  (docs/RUNBOOK.md says `warmup()` adopts on restart; docs/SAFETY.md's checklist
+  requires a restart to adopt rather than double). Mid-session drift keeps the
+  old behaviour — it halts. With no persistence, *every* boot takes the adopt
+  path, which means a bug that lost our state is indistinguishable from a clean
+  restart. That is one of the reasons the repositories matter.
+
+  And `StreamIngestor` now tracks **per-symbol** last-tick times, because
+  `StaleDataRule` needs them and `last_message_at` is the feed's pulse rather
+  than the symbol's: on a watchlist where one name is halted and the rest are
+  busy, the feed looks healthy while that symbol has not traded for an hour.
+
+  Unticked, and the reason is now only the demonstration. Nothing here has been
+  run against the paper account — no credentials and no session from this
+  environment — so what is shown is that the wiring assembles and the locks
+  hold, not that a strategy traded.
 
 *Verifiable:* a strategy trades the paper account for a week and reconciles clean.
 
