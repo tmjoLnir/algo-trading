@@ -26,8 +26,9 @@ import json
 import uuid
 from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
+from atp_api.auth import COOKIE_NAME, read_session_token
 from atp_core.channels import (
     CHANNEL_BARS,
     CHANNEL_HALTS,
@@ -36,6 +37,8 @@ from atp_core.channels import (
     CHANNEL_SIGNALS,
     DASHBOARD_CHANNELS,
 )
+from atp_core.clock import SystemClock
+from atp_core.config import get_settings
 from atp_core.logging import get_logger
 from atp_core.ws import backoff_delay
 
@@ -293,13 +296,29 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     `halt` messages reach the client even if it subscribed to nothing — a
     trading halt is not something to opt into.
 
-    Deliberately unauthenticated, like the rest of the API: `deps
-    .get_current_user` is still a stub and docs/SAFETY.md says not to expose
-    this on a public interface until it is not. What this socket carries is
-    read-only — no message a client can send places an order or moves money —
-    so the exposure is disclosure rather than control, which is why it is not a
-    separate blocker from the one Phase 6 already records.
+    **Authenticated, in here rather than by a dependency.** Everything this
+    socket carries is the book — positions, fills, signals — so a reader is a
+    disclosure whether or not they can send anything. The check is inline
+    because a dependency raising `HTTPException` cannot refuse a WebSocket
+    politely: it surfaces to the browser as a transport error indistinguishable
+    from a dead server, and the client reconnects forever against it. Closing
+    with 1008 gives the dashboard something it can act on, which is to stop
+    retrying and show the login screen (ADR 0008).
+
+    The cookie arrives on the handshake by itself. That is the whole reason the
+    session is a cookie and not a bearer token: a browser cannot set headers on
+    a WebSocket, so bearer would have meant the token in a query string, and
+    from there into nginx's access log on every reconnect.
     """
+    settings = get_settings()
+    if read_session_token(ws.cookies.get(COOKIE_NAME, ""), settings, SystemClock().now()) is None:
+        # Refused before `accept()`, so nothing is ever delivered to an
+        # unauthenticated socket — not even the halt broadcast that every other
+        # client gets unconditionally.
+        await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="not authenticated")
+        log.info("ws.rejected_unauthenticated")
+        return
+
     client_id = uuid.uuid4().hex
     await manager.connect(client_id, ws)
     try:

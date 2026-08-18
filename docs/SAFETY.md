@@ -83,12 +83,36 @@ people deploy without checking.
 
 ## Access control
 
-**The API in this skeleton has no authentication.** `get_current_user()` is a
-stub. Every endpoint under `/risk`, `/orders` and `/positions` can move money.
+**The API authenticates.** One operator, `API_USER` and `API_PASSWORD_HASH`,
+against a bcrypt hash; the session is a signed, `HttpOnly`, `SameSite=Strict`
+cookie. Everything under `/api/v1` requires it, and so does the WebSocket —
+which refuses the handshake with close code 1008 rather than accepting a socket
+it will send the whole book down. Open without a session: `/healthz`, `/readyz`,
+`/docs`, `/` and the login endpoints, each listed with its reason in
+`create_app` and again in `tests/unit/test_api_contract.py`. Design: ADR 0008.
 
-Until auth is implemented: bind to localhost only, never expose port 8000
-publicly, and do not deploy to a cloud host with a public IP. This is a blocking
-item before any deployment, and it is item one in `docs/ROADMAP.md` Phase 6.
+Set it up with:
+
+```bash
+uv run python scripts/hash_password.py   # prints the API_PASSWORD_HASH line
+openssl rand -hex 32                     # API_SECRET_KEY, so sessions survive a restart
+```
+
+**With no `API_PASSWORD_HASH` configured, every login is refused** and the API
+logs `CRITICAL` at startup. The unconfigured state is no way in, not a free one.
+
+**`actor` now comes from the session**, not from a query parameter the caller
+filled in themselves. Until this landed, `POST /risk/halt?actor=whoever` let the
+caller name themselves in the audit trail — which is a form with a name box on
+it, not an audit trail.
+
+**Still missing, and still Phase 6:** there is no rate limit on `/auth/login`
+(bcrypt's quarter-second verification is a brake, not a lock), sessions cannot
+be revoked before they expire, and there is no authorisation model — with one
+account there is nothing to distinguish. Do not read "the API authenticates" as
+"this is ready for a public address": TLS, a secrets manager and a chosen
+deployment target are all still unbuilt, and the bind-address rules below still
+apply.
 
 **This is enforced now, not merely stated.** Every port in `docker-compose.yml`
 binds `127.0.0.1` — the API, Postgres (whose credentials are `atp`/`atp`), the

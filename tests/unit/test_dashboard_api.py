@@ -23,6 +23,7 @@ import pytest
 
 from atp_api.deps import (
     get_clock,
+    get_current_user,
     get_kill_switch,
     get_portfolio_repository,
     get_snapshot_store,
@@ -128,6 +129,11 @@ def app(
     application.dependency_overrides[get_snapshot_store] = lambda: store
     application.dependency_overrides[get_portfolio_repository] = lambda: repo
     application.dependency_overrides[get_kill_switch] = lambda: kill_switch
+    # These tests are about the book the dashboard serves, not about who is asking. Overriding the
+    # one dependency that answers that keeps them so — `tests/unit/
+    # test_api_contract.py` is where the enforcement itself is held, from the
+    # outside, against every route at once (ADR 0008).
+    application.dependency_overrides[get_current_user] = lambda: "test-operator"
     return application
 
 

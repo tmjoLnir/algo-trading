@@ -963,7 +963,40 @@ agreement between what the worker believes and what the screen says, which is
 the only property that makes the screen worth reading.
 
 ## Phase 6 — Production readiness
-- [ ] **Authentication and authorisation** — blocking for any deployment
+- [x] **Authentication** — @claude. One operator, `API_USER` and a bcrypt
+  `API_PASSWORD_HASH`, with the session in a signed `HttpOnly`,
+  `SameSite=Strict` cookie. Everything under `/api/v1` requires it and so does
+  the WebSocket, which refuses the handshake with close code 1008 rather than
+  accepting a socket it would then send the whole book down. Design, and the
+  four choices worth arguing with, are ADR 0008.
+
+  The change that matters most is not the login screen. `actor` was a **query
+  parameter the caller filled in themselves** on `/risk/halt`, `/risk/resume`,
+  `/risk/flatten-all`, `/orders`, `/positions/{symbol}/close` and
+  `/positions/{symbol}/stop`. It now comes from the session. An audit trail with
+  a name box on it was not one, and it was going to be wrong on exactly the day
+  those handlers stopped being stubs.
+
+  Two things found on the way, both by running it rather than by reading it.
+  `passlib[bcrypt]`, which this package declared from the start, **does not
+  run**: passlib 1.7.4 reads `bcrypt.__about__.__version__`, bcrypt removed it,
+  and every `hash()` raises on bcrypt 5. It is replaced by `bcrypt` directly
+  rather than pinned to a 2020 release. And the login screen's run-mode banner
+  was broken in a way its unit test could not see — it read the API's root `/`,
+  which nginx serves the dashboard from, so the browser got `index.html` and the
+  banner silently never rendered. A stub matching paths by suffix made `'/'`
+  match every request in the suite. Both the endpoint and the stub are fixed.
+
+  **Not** ready for a public address, and this item should not be read as
+  saying so: no rate limit on the login endpoint, no revocation before a
+  session expires, no TLS of our own, no secrets manager. The items below are
+  the difference.
+- [ ] Authorisation — unstarted, and deliberately so: with one account there is
+  nothing to distinguish, and a role column with one value in it would imply a
+  permission model that does not exist. Split from the item above, which
+  conflated two pieces of work of very different sizes — one done, one with
+  nothing yet to do. Worth a reviewer's eye, as splits by the same hand that
+  ticks half of them always are.
 - [ ] Rate limiting, audit log surfaced in UI
 - [ ] Alerting to a phone (feed loss, halt, reconciliation failure)
 - [ ] Metrics/tracing
@@ -1031,6 +1064,27 @@ the only property that makes the screen worth reading.
   It still does not make the platform deployable. The item above this is
   unstarted and the authentication item at the top of the phase is still
   blocking: this serves the dashboard to a private network and nowhere else.
+
+*Verifiable (sign-in, proposed):* every route under `/api/v1` and the WebSocket
+refuse a caller with no session; a correct username and password return a cookie
+that admits both; a wrong password and an unknown user are refused with the same
+message; and `actor`, wherever a handler records one, comes from that session
+rather than from the request.
+**Shown** — @claude. The refusals are held by an exhaustive contract test that
+walks every path in the generated schema, so a route added later is covered
+without anyone remembering to cover it. The rest was shown by driving a real
+browser against the real nginx config and the real built bundle: the login
+screen renders unauthenticated with no dashboard behind it, a wrong password
+gives the one message, a correct one lands on the book, the cookie arrives
+`HttpOnly` and `SameSite=Strict` through the proxy, **the WebSocket opens and
+stays open** — which is the whole argument for a cookie over a bearer token,
+since a browser cannot put a header on a handshake — and signing out clears it.
+
+What that did not cover: it ran nginx and the API as host processes rather than
+from the compose stack, and it has never met TLS, so `Secure` on the cookie is
+correct-by-construction rather than observed. Scoped to sign-in on purpose — it
+says nothing about rate limiting, revocation or authorisation, which are
+unstarted. *Proposed and ticked by the same hand; it wants a reviewer's eye.*
 
 *Verifiable (serving layer, proposed):* the dashboard is served from the built
 image with no hostname compiled into its bundle; the API answers on the

@@ -255,17 +255,17 @@ preferring.
 CI runs the check before the stack starts, so a compose file that puts any of
 this on a wildcard or a public address fails the build.
 
-### It should not leave a private network at all
+### It should still not face the public internet
 
-There is no authentication of any kind (below). What is exposed *today* is
-disclosure: the entire book — positions, equity, P&L, the signals and the
-reasoning behind them — to anyone who can reach the port. The mutating endpoints
-are still `NotImplementedError` stubs, so the kill switch on this screen
-currently 500s rather than doing anything; that is an accident of build order
-and not a protection, and it stops being true the moment Phase 3's risk
-endpoints land. On a LAN or a VPN this is a contained risk. On a public address
-it is the whole platform. Authentication is ROADMAP Phase 6 and blocking — see
-docs/SAFETY.md.
+Signing in is required now (below), which is a floor rather than a finish. What
+is still absent is everything around it: no rate limit on the login endpoint, no
+way to revoke a session before it expires, no TLS of our own, and no secrets
+manager. A password is the only thing between a reachable port and the whole
+book, and there is nothing slowing down guesses at it but bcrypt.
+
+On a LAN or a VPN that is a reasonable place to be. On a public address it is
+not, and `make check-bindings` refuses to start the stack bound to one. The
+remaining Phase 6 items are the difference — see docs/SAFETY.md.
 
 ## Not built yet
 
@@ -281,12 +281,10 @@ Stated here rather than left to be discovered:
   stores `strategy_id` as null (a strategies row must exist first, and nothing
   writes one), so a position cannot be traced to the strategy that opened it.
   The snapshot names the strategy running the whole book instead.
-- **There is no authentication.** docs/SAFETY.md's access-control item is Phase
-  6 and blocking for any deployment. The socket is read-only, but everything it
-  carries is disclosure — the whole book, to anyone who can reach the port. Nor
-  is the API behind it designed read-only: the kill switch on this screen POSTs
-  to `/api/v1/risk/halt`, `/api/v1/risk/flatten-all` is specified to liquidate
-  everything at market, and `actor` is a query parameter the caller fills in for
-  themselves. Both are `NotImplementedError` stubs today — build order, not a
-  safeguard. Until this item lands, "serving it" (above) means serving it to a
-  private network.
+- **Authentication exists; authorisation does not.** Signing in is one operator
+  against a bcrypt hash, with the session in an `HttpOnly` cookie that the
+  WebSocket handshake carries by itself (ADR 0008). What is *not* built: any
+  rate limit on the login endpoint, revocation before a session expires, and any
+  notion of roles — with one account there is nothing to distinguish. `actor` is
+  no longer a query parameter the caller fills in for themselves, which is the
+  change that makes the audit trail worth keeping.

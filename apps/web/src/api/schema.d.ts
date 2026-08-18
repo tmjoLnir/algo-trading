@@ -107,6 +107,126 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/auth/context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Context
+         * @description The run mode, before there is a session.
+         *
+         *     docs/DASHBOARD.md calls the run-mode banner the most important pixel on the
+         *     screen, and the moment before signing in is not an exception — it is when
+         *     the operator is still deciding whether to open a live-money system. So the
+         *     login screen needs this one fact, and needs it unauthenticated.
+         *
+         *     It cannot come from the root `/` handler, which returns the same thing: in
+         *     the deployed arrangement nginx serves the dashboard at `/`, so a request
+         *     there gets `index.html` and never reaches the API at all. That is not a
+         *     proxy misconfiguration — `/` is where the SPA belongs — it just means
+         *     anything the browser needs must live under `/api`. This was found by
+         *     signing in through the real proxy, having passed a unit test whose stub
+         *     matched the path too loosely.
+         *
+         *     Deliberately nothing else. Run mode discloses whether real money is at
+         *     stake, which is a warning rather than a secret; the book, the account and
+         *     the halts all stay behind the session.
+         */
+        get: operations["context_api_v1_auth_context_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Login
+         * @description Exchange a username and password for a session cookie.
+         *
+         *     There is no rate limit here yet — that is its own Phase 6 item. What stands
+         *     in for one meanwhile is bcrypt itself: a cost-12 hash takes roughly a
+         *     quarter-second to verify, which is a poor rate for guessing and is why the
+         *     work factor is not tuned down. It is a brake, not a lock, and the item above
+         *     it in the roadmap is the lock.
+         *
+         *     The failure is one 401 with one message. "No such user" and "wrong password"
+         *     are the same answer here, because telling them apart confirms which usernames
+         *     exist.
+         */
+        post: operations["login_api_v1_auth_login_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Logout
+         * @description Clear the session cookie.
+         *
+         *     Unauthenticated on purpose: logging out with an already-expired session must
+         *     work, and it is the one action whose whole effect is to remove authority.
+         *
+         *     The token itself is not revoked — nothing here keeps a denylist, so a token
+         *     already copied off the machine stays valid until it expires. That is the
+         *     honest cost of stateless sessions and the reason `api_session_hours` is
+         *     hours rather than weeks.
+         */
+        post: operations["logout_api_v1_auth_logout_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Me
+         * @description Who the caller is, or 401.
+         *
+         *     The dashboard's first call on load: a 200 renders the app, a 401 renders the
+         *     login screen. That keeps "am I logged in" a question the server answers,
+         *     rather than something the client infers from a cookie it cannot read —
+         *     `HttpOnly` means the page genuinely cannot see it.
+         */
+        get: operations["me_api_v1_auth_me_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/backtests": {
         parameters: {
             query?: never;
@@ -1013,6 +1133,13 @@ export interface components {
             /** Working Orders */
             working_orders?: components["schemas"]["OrderView"][];
         };
+        /** LoginRequest */
+        LoginRequest: {
+            /** Password */
+            password: string;
+            /** Username */
+            username: string;
+        };
         /** ManualOrderRequest */
         ManualOrderRequest: {
             /** Limit Price */
@@ -1123,6 +1250,14 @@ export interface components {
             unrealized_pnl: string | null;
             /** Unrealized Pnl Pct */
             unrealized_pnl_pct: string | null;
+        };
+        /**
+         * PreSessionContext
+         * @description What the login screen is allowed to know before anyone has signed in.
+         */
+        PreSessionContext: {
+            /** Run Mode */
+            run_mode: string;
         };
         /**
          * SessionView
@@ -1293,6 +1428,11 @@ export interface components {
             msg: string;
             /** Error Type */
             type: string;
+        };
+        /** WhoAmI */
+        WhoAmI: {
+            /** User */
+            user: string;
         };
     };
     responses: never;
@@ -1472,6 +1612,97 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    context_api_v1_auth_context_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PreSessionContext"];
+                };
+            };
+        };
+    };
+    login_api_v1_auth_login_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LoginRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WhoAmI"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    logout_api_v1_auth_logout_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    me_api_v1_auth_me_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WhoAmI"];
                 };
             };
         };
@@ -1937,9 +2168,7 @@ export interface operations {
     };
     submit_manual_order_api_v1_orders_post: {
         parameters: {
-            query: {
-                actor: string;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -1976,7 +2205,6 @@ export interface operations {
         parameters: {
             query?: {
                 symbol?: string | null;
-                actor?: string;
             };
             header?: never;
             path?: never;
@@ -2008,9 +2236,7 @@ export interface operations {
     };
     cancel_order_api_v1_orders__order_id__delete: {
         parameters: {
-            query: {
-                actor: string;
-            };
+            query?: never;
             header?: never;
             path: {
                 order_id: string;
@@ -2109,9 +2335,7 @@ export interface operations {
     };
     close_position_api_v1_positions__symbol__close_post: {
         parameters: {
-            query: {
-                actor: string;
-            };
+            query?: never;
             header?: never;
             path: {
                 symbol: string;
@@ -2146,7 +2370,6 @@ export interface operations {
         parameters: {
             query: {
                 stop_loss_price: number | string;
-                actor: string;
             };
             header?: never;
             path: {
@@ -2181,7 +2404,6 @@ export interface operations {
     flatten_all_api_v1_risk_flatten_all_post: {
         parameters: {
             query: {
-                actor: string;
                 confirm: string;
             };
             header?: never;
@@ -2214,9 +2436,7 @@ export interface operations {
     };
     engage_kill_switch_api_v1_risk_halt_post: {
         parameters: {
-            query: {
-                actor: string;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -2308,7 +2528,6 @@ export interface operations {
         parameters: {
             query: {
                 scope: string;
-                actor: string;
                 target?: string | null;
             };
             header?: never;

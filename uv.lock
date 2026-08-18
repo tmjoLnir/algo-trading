@@ -212,6 +212,7 @@ dev = [
     { name = "respx" },
     { name = "ruff" },
     { name = "types-python-dateutil" },
+    { name = "types-python-jose" },
 ]
 
 [package.metadata]
@@ -228,6 +229,7 @@ dev = [
     { name = "respx", specifier = ">=0.21" },
     { name = "ruff", specifier = ">=0.5" },
     { name = "types-python-dateutil" },
+    { name = "types-python-jose" },
 ]
 
 [[package]]
@@ -236,8 +238,8 @@ version = "0.1.0"
 source = { editable = "apps/api" }
 dependencies = [
     { name = "atp-core" },
+    { name = "bcrypt" },
     { name = "fastapi" },
-    { name = "passlib", extra = ["bcrypt"] },
     { name = "python-jose", extra = ["cryptography"] },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -245,8 +247,8 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "atp-core", editable = "libs/core" },
+    { name = "bcrypt", specifier = ">=4.0" },
     { name = "fastapi", specifier = ">=0.111" },
-    { name = "passlib", extras = ["bcrypt"], specifier = ">=1.7" },
     { name = "python-jose", extras = ["cryptography"], specifier = ">=3.3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
@@ -1412,20 +1414,6 @@ wheels = [
 ]
 
 [[package]]
-name = "passlib"
-version = "1.7.4"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/b6/06/9da9ee59a67fae7761aab3ccc84fa4f3f33f125b370f1ccdb915bf967c11/passlib-1.7.4.tar.gz", hash = "sha256:defd50f72b65c5402ab2c573830a6978e5f202ad0d984793c8dde2c4152ebe04", size = 689844, upload-time = "2020-10-08T19:00:52.121Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/3b/a4/ab6b7589382ca3df236e03faa71deac88cae040af60c071a78d254a62172/passlib-1.7.4-py2.py3-none-any.whl", hash = "sha256:aa6bca462b8d8bda89c70b382f0c298a20b5560af6cbfa2dce410c0a2fb669f1", size = 525554, upload-time = "2020-10-08T19:00:49.856Z" },
-]
-
-[package.optional-dependencies]
-bcrypt = [
-    { name = "bcrypt" },
-]
-
-[[package]]
 name = "pathspec"
 version = "1.1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1914,12 +1902,33 @@ wheels = [
 ]
 
 [[package]]
+name = "types-pyasn1"
+version = "0.6.0.20260724"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/24/ba/a3be5620ec108bfb21481a7796a3c352e627969fa67db6a033cdaeacd117/types_pyasn1-0.6.0.20260724.tar.gz", hash = "sha256:00b9324c1ce8167ec1dc503018cc7d4f190f5770dd3e9a365e897e290e0532db", size = 17373, upload-time = "2026-07-24T04:57:47.402Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ce/ab/9936badd94cfbfb73d2ec83409e203fee44fc83a744e09a8779b37042f45/types_pyasn1-0.6.0.20260724-py3-none-any.whl", hash = "sha256:487987e4492ce2e1ba6f0048f025165383c49d5d16a345ae5dfe7d44045b7910", size = 24054, upload-time = "2026-07-24T04:57:46.482Z" },
+]
+
+[[package]]
 name = "types-python-dateutil"
 version = "2.9.0.20260807"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/c8/4e/b3fa538f9cb38dfece0d6ccf6d3d0d925bdedb144fb9c8129dfc007cd003/types_python_dateutil-2.9.0.20260807.tar.gz", hash = "sha256:e0b8a90d464c8684c66b7b8e4556d9074afdddcc56ca45323f0987134f9e7034", size = 17618, upload-time = "2026-08-07T04:17:13.491Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e4/5e/3715867caea2f4cea56ccb04c851cde23ed063449c3b004c7a047f20dd48/types_python_dateutil-2.9.0.20260807-py3-none-any.whl", hash = "sha256:54aa3707350ed7a9cc0776fd2f6739679d6967d11b40150985e81edcb86df4db", size = 18486, upload-time = "2026-08-07T04:17:12.504Z" },
+]
+
+[[package]]
+name = "types-python-jose"
+version = "3.5.0.20260408"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "types-pyasn1" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a1/b1/87cdb410d22913df39d7aad8864f94a4f5ad8d507ee07556888fdbe55e19/types_python_jose-3.5.0.20260408.tar.gz", hash = "sha256:3f8dccdc327bfffea7a81084ea1cea722fa499f13c1d04f7978b491dd36e0cf1", size = 11989, upload-time = "2026-04-08T04:34:10.577Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d3/83/df2b34e64f0a674935d718471cf10fb392a7e5bdb0e9e7c739885b62d274/types_python_jose-3.5.0.20260408-py3-none-any.whl", hash = "sha256:968d8a8eac1ff9da249d6335a2bb9f82288d59ba23afe91fcc2662eb9f485e2a", size = 14694, upload-time = "2026-04-08T04:34:09.747Z" },
 ]
 
 [[package]]

@@ -133,6 +133,23 @@ class Settings(BaseSettings):
     api_cors_origins: str = "http://localhost:5173"
     api_secret_key: SecretStr = SecretStr("")
 
+    #: The single operator. There is no users table and deliberately none: this
+    #: platform is run by one person, and inventing user CRUD to say so would be
+    #: machinery standing in for a requirement nobody has (ADR 0008).
+    #:
+    #: The password is stored ONLY as a bcrypt hash — never the password itself,
+    #: in this file or any other. `scripts/hash_password.py` produces one.
+    #: `SecretStr` so a settings dump cannot print it: the hash is not a
+    #: credential you can log in with, but it is one you can attack offline.
+    api_user: str = "operator"
+    api_password_hash: SecretStr = SecretStr("")
+
+    #: How long a login lasts. Short enough that a forgotten open tab is not a
+    #: standing key, long enough not to interrupt a trading session — the
+    #: dashboard polls every 5 minutes and a re-login mid-incident is exactly
+    #: the wrong moment to demand one.
+    api_session_hours: int = 12
+
     risk: RiskLimits = Field(default_factory=RiskLimits)
 
     @model_validator(mode="after")

@@ -6,6 +6,8 @@ from decimal import Decimal
 
 from fastapi import APIRouter
 
+from atp_api.deps import CurrentUser
+
 router = APIRouter(prefix="/positions", tags=["positions"])
 
 
@@ -20,13 +22,15 @@ async def get_position(symbol: str) -> dict[str, object]:
 
 
 @router.post("/{symbol}/close")
-async def close_position(symbol: str, actor: str) -> dict[str, object]:
+async def close_position(symbol: str, actor: CurrentUser) -> dict[str, object]:
     """Flatten one position at market. Audit-logged."""
     raise NotImplementedError
 
 
 @router.patch("/{symbol}/stop")
-async def update_stop(symbol: str, stop_loss_price: Decimal, actor: str) -> dict[str, object]:
+async def update_stop(
+    symbol: str, stop_loss_price: Decimal, actor: CurrentUser
+) -> dict[str, object]:
     """Adjust a protective stop.
 
     Widening a stop (moving it away from price) requires an explicit override

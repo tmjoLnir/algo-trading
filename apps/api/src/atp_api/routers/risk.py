@@ -10,6 +10,8 @@ from __future__ import annotations
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from atp_api.deps import CurrentUser
+
 router = APIRouter(prefix="/risk", tags=["risk"])
 
 
@@ -33,7 +35,7 @@ async def get_risk_status() -> dict[str, object]:
 
 
 @router.post("/halt")
-async def engage_kill_switch(payload: HaltRequest, actor: str) -> dict[str, object]:
+async def engage_kill_switch(payload: HaltRequest, actor: CurrentUser) -> dict[str, object]:
     """STOP TRADING. Takes effect immediately for all processes.
 
     No confirmation step by design — hesitation is the expensive part. Clearing
@@ -43,7 +45,9 @@ async def engage_kill_switch(payload: HaltRequest, actor: str) -> dict[str, obje
 
 
 @router.post("/resume")
-async def clear_kill_switch(scope: str, actor: str, target: str | None = None) -> dict[str, object]:
+async def clear_kill_switch(
+    scope: str, actor: CurrentUser, target: str | None = None
+) -> dict[str, object]:
     """Resume trading. Requires a named human and is audit-logged.
 
     Deliberately asymmetric with `/halt`: stopping is reflexive, restarting is
@@ -53,7 +57,7 @@ async def clear_kill_switch(scope: str, actor: str, target: str | None = None) -
 
 
 @router.post("/flatten-all")
-async def flatten_all(actor: str, confirm: str) -> dict[str, object]:
+async def flatten_all(actor: CurrentUser, confirm: str) -> dict[str, object]:
     """Liquidate everything at market.
 
     Requires `confirm` to equal the literal string "FLATTEN ALL POSITIONS".

@@ -24,10 +24,16 @@ as the cleanup takes.
 
 ## Known gaps in the skeleton
 
-- **No authentication.** `get_current_user()` is a stub. Every endpoint under
-  `/risk`, `/orders` and `/positions` can move money. Bind to localhost only
-  until this is implemented — it is a blocking item for any deployment.
-- No rate limiting on the API.
+- **No rate limiting on `/auth/login`.** Authentication itself now exists — one
+  operator, bcrypt, a signed `HttpOnly` cookie (ADR 0008) — but nothing throttles
+  guesses at it. bcrypt's quarter-second verification is a brake, not a lock.
+- **Sessions cannot be revoked before they expire.** Stateless tokens with no
+  denylist: a stolen cookie is good until `API_SESSION_HOURS` elapses.
+- **No authorisation model.** There is one account, so there is nothing to
+  distinguish; a second principal needs one built.
+- **Still not ready for a public address.** No TLS termination of our own, no
+  secrets manager, no chosen deployment target. Keep the bind addresses private
+  — `make check-bindings` refuses a wildcard or a public one.
 - No encryption at rest for credentials beyond the host's own.
 
 ## Practices
