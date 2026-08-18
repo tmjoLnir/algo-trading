@@ -42,6 +42,11 @@ export function useSession() {
 
   return {
     user: query.data?.user ?? null,
+    scope: query.data?.scope ?? null,
+    // What this session may do, as the server last reported it. The screen uses
+    // it to avoid offering controls that would only be refused; the server does
+    // not take the screen's word for it and re-checks every request (ADR 0009).
+    mayAct: query.data?.scope === 'full',
     isAuthenticated: query.data != null,
     isPending: query.isPending,
     error: query.error,
@@ -51,7 +56,7 @@ export function useSession() {
 export function useLogin() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (credentials: { username: string; password: string }) =>
+    mutationFn: (credentials: { username: string; password: string; read_only: boolean }) =>
       apiPost<WhoAmI>('/api/v1/auth/login', credentials),
     onSuccess: (who) => {
       // Seed rather than invalidate: the response already says who logged in,

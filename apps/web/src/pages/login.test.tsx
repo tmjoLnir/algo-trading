@@ -1,4 +1,5 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { QueryClientProvider } from '@tanstack/react-query'
+import { createQueryClient } from '../api/queryClient'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MemoryRouter } from 'react-router-dom'
@@ -32,7 +33,7 @@ afterEach(() => {
  * actually made hit nginx's SPA fallback and came back as HTML.
  */
 function stubApi(routes: Record<string, { status: number; body?: unknown }>) {
-  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
     const url = new URL(String(input), 'http://test').pathname
     const match = Object.keys(routes).find((path) => url === path)
     const route = match ? routes[match]! : { status: 404, body: { detail: 'not stubbed' } }
@@ -48,8 +49,13 @@ function stubApi(routes: Record<string, { status: number; body?: unknown }>) {
 }
 
 function renderApp() {
-  const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  // The app's real client, not a bare one — the 401 rule lives on it, and a
+  // test that built its own would be asserting against a client production
+  // never uses.
+  const queryClient = createQueryClient()
+  queryClient.setDefaultOptions({
+    queries: { ...queryClient.getDefaultOptions().queries, retry: false },
+    mutations: { retry: false },
   })
   return render(
     <QueryClientProvider client={queryClient}>
@@ -87,7 +93,7 @@ describe('the gate', () => {
 
   it('renders the dashboard shell once signed in', async () => {
     stubApi({
-      '/api/v1/auth/me': { status: 200, body: { user: 'operator' } },
+      '/api/v1/auth/me': { status: 200, body: { user: 'operator', scope: 'full' } },
       '/api/v1/dashboard/live': { status: 503, body: { detail: 'no store here' } },
       '/api/v1/dashboard/equity-curve': { status: 503, body: { detail: 'no store here' } },
     })
@@ -146,7 +152,7 @@ describe('signing in', () => {
   it('shows the shell after a successful sign-in, without a reload', async () => {
     stubApi({
       '/api/v1/auth/me': { status: 401, body: { detail: 'not authenticated' } },
-      '/api/v1/auth/login': { status: 200, body: { user: 'operator' } },
+      '/api/v1/auth/login': { status: 200, body: { user: 'operator', scope: 'full' } },
       '/api/v1/dashboard/live': { status: 503, body: { detail: 'no store here' } },
       '/api/v1/dashboard/equity-curve': { status: 503, body: { detail: 'no store here' } },
     })
@@ -182,5 +188,108 @@ describe('the run mode is visible before signing in', () => {
     renderApp()
 
     expect(await screen.findByText(/real money at risk/i)).toBeTruthy()
+  })
+})
+
+describe('read-only sessions', () => {
+  it('asks for one when the box is ticked', async () => {
+    const fetchMock = stubApi({
+      '/api/v1/auth/me': { status: 401, body: { detail: 'not authenticated' } },
+      '/api/v1/auth/login': { status: 200, body: { user: 'operator', scope: 'read' } },
+      '/api/v1/dashboard/live': { status: 503, body: { detail: 'no store here' } },
+      '/api/v1/dashboard/equity-curve': { status: 503, body: { detail: 'no store here' } },
+    })
+    renderApp()
+
+    fireEvent.change(await screen.findByLabelText(/username/i), { target: { value: 'operator' } })
+    fireEvent.change(screen.getByLabelText(/password/i), { target: { value: 'hunter2' } })
+    fireEvent.click(screen.getByRole('checkbox', { name: /read-only/i }))
+    fireEvent.click(screen.getByRole('button', { name: /sign in/i }))
+
+    await waitFor(() => expect(screen.getByRole('link', { name: 'Positions' })).toBeTruthy())
+
+    const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/auth/login'))
+    expect(call).toBeTruthy()
+    const body = JSON.parse(String(call![1]?.body))
+    expect(body.read_only).toBe(true)
+  })
+
+  it('defaults to a full session when the box is left alone', async () => {
+    const fetchMock = stubApi({
+      '/api/v1/auth/me': { status: 401, body: { detail: 'not authenticated' } },
+      '/api/v1/auth/login': { status: 200, body: { user: 'operator', scope: 'full' } },
+      '/api/v1/dashboard/live': { status: 503, body: { detail: 'no store here' } },
+      '/api/v1/dashboard/equity-curve': { status: 503, body: { detail: 'no store here' } },
+    })
+    renderApp()
+
+    fireEvent.change(await screen.findByLabelText(/username/i), { target: { value: 'operator' } })
+    fireEvent.change(screen.getByLabelText(/password/i), { target: { value: 'hunter2' } })
+    fireEvent.click(screen.getByRole('button', { name: /sign in/i }))
+
+    await waitFor(() => expect(screen.getByRole('link', { name: 'Positions' })).toBeTruthy())
+
+    const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/auth/login'))
+    const body = JSON.parse(String(call![1]?.body))
+    expect(body.read_only).toBe(false)
+  })
+
+  it('says so on screen, because otherwise the difference is invisible', async () => {
+    stubApi({
+      '/api/v1/auth/me': { status: 200, body: { user: 'operator', scope: 'read' } },
+      '/api/v1/dashboard/live': { status: 503, body: { detail: 'no store here' } },
+      '/api/v1/dashboard/equity-curve': { status: 503, body: { detail: 'no store here' } },
+    })
+    renderApp()
+
+    expect(await screen.findByText(/read-only/i)).toBeTruthy()
+  })
+
+  it('shows no badge on a full session', async () => {
+    stubApi({
+      '/api/v1/auth/me': { status: 200, body: { user: 'operator', scope: 'full' } },
+      '/api/v1/dashboard/live': { status: 503, body: { detail: 'no store here' } },
+      '/api/v1/dashboard/equity-curve': { status: 503, body: { detail: 'no store here' } },
+    })
+    renderApp()
+
+    await screen.findByRole('link', { name: 'Positions' })
+    expect(screen.queryByText(/read-only/i)).toBeNull()
+  })
+})
+
+describe('a refusal is not a logout', () => {
+  it('stays signed in when a request comes back 403', async () => {
+    // The distinction that matters. A 403 is a read-only session being refused a
+    // write, or a step-up wanting the password — the credential is fine. Dropping
+    // the session over one would throw away a working login to "fix" a refusal
+    // that was correct, and would send the operator to a login screen that cannot
+    // help them.
+    stubApi({
+      '/api/v1/auth/me': { status: 200, body: { user: 'operator', scope: 'read' } },
+      '/api/v1/dashboard/live': { status: 403, body: { detail: 'this session is read-only' } },
+      '/api/v1/dashboard/equity-curve': { status: 403, body: { detail: 'read-only' } },
+    })
+    renderApp()
+
+    expect(await screen.findByRole('link', { name: 'Positions' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /^sign in$/i })).toBeNull()
+  })
+
+  it('does send you to sign in when the session has actually expired', async () => {
+    // Every endpoint 401s, because that is what an expired session looks like —
+    // the cookie is stale for `/auth/me` exactly as it is for the book. An
+    // earlier version of this test stubbed `/auth/me` as 200 while a data query
+    // 401'd, to isolate the global handler. That state cannot occur, and the
+    // test failed for the right reason: the session query re-established
+    // authentication from the 200 as fast as the handler cleared it.
+    stubApi({
+      '/api/v1/auth/me': { status: 401, body: { detail: 'not authenticated' } },
+      '/api/v1/dashboard/live': { status: 401, body: { detail: 'not authenticated' } },
+      '/api/v1/dashboard/equity-curve': { status: 401, body: { detail: 'not authenticated' } },
+    })
+    renderApp()
+
+    expect(await screen.findByRole('button', { name: /sign in/i })).toBeTruthy()
   })
 })

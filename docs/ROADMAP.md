@@ -991,12 +991,35 @@ the only property that makes the screen worth reading.
   saying so: no rate limit on the login endpoint, no revocation before a
   session expires, no TLS of our own, no secrets manager. The items below are
   the difference.
-- [ ] Authorisation — unstarted, and deliberately so: with one account there is
-  nothing to distinguish, and a role column with one value in it would imply a
-  permission model that does not exist. Split from the item above, which
-  conflated two pieces of work of very different sizes — one done, one with
-  nothing yet to do. Worth a reviewer's eye, as splits by the same hand that
-  ticks half of them always are.
+- [x] **Authorisation** — @claude. Not roles: this platform still has one
+  account, and the note that stood here — that a role column with one value in
+  it would describe a permission model rather than enforce one — is still true.
+  What was wrong about it was the conclusion that there was therefore nothing to
+  build. docs/RISK.md already stated an authorisation rule that nothing enforced:
+  *"engaging needs no confirmation — hesitation is the expensive part. Clearing
+  requires a named human."* That is about two acts, not two kinds of person, and
+  it is the shape authority takes everywhere in this codebase.
+
+  So: **session scopes** and **step-up**. A session is `full` or `read`, chosen
+  at sign-in and carried in the signed token, so its holder cannot promote it. A
+  read-only session reads everything and is refused every write with 403, with
+  one exception — `/risk/halt`, which it may still call. That exception is a
+  domain rule rather than a convenience: someone watching the book from a phone
+  on the LAN is exactly who most needs to stop trading and least needs to place
+  an order. Clearing a halt is deliberately not on the list, which is the
+  asymmetry docs/RISK.md asks for, enforced instead of described.
+
+  `/risk/resume` and `/risk/flatten-all` additionally require the account
+  password in the request body — never a query parameter, which nginx logs
+  verbatim. There is no elevation window on purpose: a "recently authenticated"
+  period is a stretch of minutes during which a walked-away laptop can flatten
+  the book. Design and the four rejected alternatives are ADR 0009.
+
+  One thing found by testing rather than reading, and worth recording because it
+  had been true since the previous PR: the 401-ends-your-session rule lived in
+  `main.tsx`, which no test loads, so every web test ran against a query client
+  that did not have it and the rule was asserted nowhere. It is
+  `api/queryClient.ts` now, and both the 401 and the 403 behaviours are pinned.
 - [ ] Rate limiting, audit log surfaced in UI
 - [ ] Alerting to a phone (feed loss, halt, reconciliation failure)
 - [ ] Metrics/tracing
@@ -1064,6 +1087,29 @@ the only property that makes the screen worth reading.
   It still does not make the platform deployable. The item above this is
   unstarted and the authentication item at the top of the phase is still
   blocking: this serves the dashboard to a private network and nowhere else.
+
+*Verifiable (authorisation, proposed):* a read-only session is refused every
+mutating route with 403 and is permitted `/risk/halt`; a full session is refused
+none of them on scope; clearing a halt and flattening the book require the
+account password and are refused without it; and being refused does not end the
+session.
+**Shown** — @claude. The two sweeps are exhaustive over the generated schema,
+walking every mutating route as a read-only session and again as a full one, so
+a route added later is refused by default and it is *adding one to the exception
+list* that this notices. The exception itself is pinned separately, along with
+the halt/resume asymmetry. Step-up is checked at all three outcomes: refused by
+the schema with no password, 403 with the wrong one, past the gate with the
+right one — "past the gate" being a 500 into a stub, which is the honest
+assertion while the handler is unbuilt.
+
+Then driven in a real browser through the real nginx config: the read-only badge
+renders, `/dashboard/live` returns 200, `/risk/halt` is not refused, `/orders`
+and `/positions/{symbol}/close` and `/risk/resume` are each 403 — and after four
+consecutive refusals the operator is **still signed in**, which is the property
+the 401/403 distinction exists for and the one a naive implementation gets
+wrong. Scoped to authorisation: it says nothing about rate limiting or
+revocation, which remain unbuilt. *Proposed and ticked by the same hand; it
+wants a reviewer's eye.*
 
 *Verifiable (sign-in, proposed):* every route under `/api/v1` and the WebSocket
 refuse a caller with no session; a correct username and password return a cookie

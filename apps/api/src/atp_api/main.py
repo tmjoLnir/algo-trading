@@ -20,7 +20,7 @@ from typing import Any
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from atp_api.deps import get_current_user
+from atp_api.deps import get_current_session, require_write_scope
 from atp_api.routers import (
     analytics,
     auth,
@@ -152,7 +152,13 @@ def create_app() -> FastAPI:
     #   HTTPException cannot close a WebSocket handshake politely; it surfaces
     #   as a transport error rather than a refusal the client can act on.
     open_routers = (health.router, auth.router, ws_router)
-    session_required = [Depends(get_current_user)]
+    # Both, and in this order, for reading rather than for effect:
+    # `require_write_scope` resolves the session itself, so it alone would
+    # enforce authentication too. Naming the session dependency beside it keeps
+    # the list saying what it does — a list holding only a scope check reads
+    # like scope is all it checks. FastAPI caches the shared sub-dependency, so
+    # the session is resolved once per request either way.
+    session_required = [Depends(get_current_session), Depends(require_write_scope)]
 
     for router in (
         health.router,

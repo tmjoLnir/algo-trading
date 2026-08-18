@@ -55,6 +55,7 @@ function RunMode() {
 export default function Login() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [readOnly, setReadOnly] = useState(false)
   const login = useLogin()
 
   /**
@@ -78,7 +79,7 @@ export default function Login() {
         <form
           onSubmit={(event) => {
             event.preventDefault()
-            login.mutate({ username, password })
+            login.mutate({ username, password, read_only: readOnly })
           }}
           className="w-full max-w-sm rounded-lg border border-slate-800 bg-slate-900/60 p-6"
         >
@@ -110,6 +111,26 @@ export default function Login() {
             onChange={(event) => setPassword(event.target.value)}
             className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-sky-500"
           />
+
+          {/* Offered at sign-in and nowhere else. A session that could promote
+              itself would not be read-only; it would be a full one with a
+              preference (ADR 0009). Changing your mind means signing in again,
+              which is the honest cost of that. */}
+          <label className="mt-4 flex items-start gap-2 text-xs text-slate-400">
+            <input
+              type="checkbox"
+              checked={readOnly}
+              onChange={(event) => setReadOnly(event.target.checked)}
+              className="mt-0.5"
+            />
+            <span>
+              Read-only session
+              <span className="mt-0.5 block text-slate-500">
+                Can see the book and halt trading, but cannot place, cancel or close anything. For a
+                device you would rather not trust with the whole account.
+              </span>
+            </span>
+          </label>
 
           {message ? (
             <p role="alert" className="mt-4 text-sm text-rose-400">

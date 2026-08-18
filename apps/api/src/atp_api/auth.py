@@ -24,7 +24,9 @@ not run. bcrypt's own API is four lines of the same thing, so this uses it and
 from __future__ import annotations
 
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import StrEnum
 
 import bcrypt
 from jose import JWTError, jwt
@@ -46,6 +48,37 @@ ALGORITHM = "HS256"
 #: passwords sharing a prefix hash identically — so this refuses at the same
 #: boundary rather than trimming on the caller's behalf.
 MAX_PASSWORD_BYTES = 72
+
+
+class Scope(StrEnum):
+    """What a session is allowed to do — not who its holder is.
+
+    Authorisation here is about the act, which is the shape docs/RISK.md already
+    argues for: "engaging needs no confirmation — hesitation is the expensive
+    part. Clearing requires a named human." That is a statement about two
+    actions, not about two kinds of person, and this platform has exactly one
+    person (ADR 0008). Roles would have been a column with one value in it.
+
+    READ is the interesting one. It exists for a real situation rather than a
+    hypothetical org chart: looking at the book from a phone on the LAN, where
+    you want to see what you hold without carrying the ability to liquidate it
+    if the device is lost or the tab is left open in a café.
+    """
+
+    READ = "read"
+    FULL = "full"
+
+
+@dataclass(frozen=True, slots=True)
+class Session:
+    """A verified session: who, and what they may do."""
+
+    user: str
+    scope: Scope
+
+    @property
+    def may_act(self) -> bool:
+        return self.scope is Scope.FULL
 
 
 class PasswordTooLongError(ATPError):
@@ -117,8 +150,17 @@ def signing_key(settings: Settings) -> str:
     return _ephemeral_key
 
 
-def create_session_token(subject: str, settings: Settings, now: datetime) -> str:
+def create_session_token(
+    subject: str,
+    settings: Settings,
+    now: datetime,
+    scope: Scope = Scope.FULL,
+) -> str:
     """Mint a session token for `subject`, expiring `api_session_hours` from now.
+
+    The scope goes in the *signed* payload rather than anywhere the client can
+    reach. A scope the browser could edit would be a suggestion, and the point
+    of a read-only session is that its holder cannot decide to stop being one.
 
     `now` is passed in rather than read here, so this never touches the wall
     clock (CLAUDE.md §1.2) and a test can pin expiry without sleeping.
@@ -126,14 +168,15 @@ def create_session_token(subject: str, settings: Settings, now: datetime) -> str
     expires = now + timedelta(hours=settings.api_session_hours)
     claims = {
         "sub": subject,
+        "scp": scope.value,
         "iat": int(now.timestamp()),
         "exp": int(expires.timestamp()),
     }
     return jwt.encode(claims, signing_key(settings), algorithm=ALGORITHM)
 
 
-def read_session_token(token: str, settings: Settings, now: datetime) -> str | None:
-    """The subject of a valid, unexpired token, or None.
+def read_session_token(token: str, settings: Settings, now: datetime) -> Session | None:
+    """The session a valid, unexpired token represents, or None.
 
     Expiry is checked here against the injected `now` rather than left to
     `jose`, which would read the system clock inside the library — the one thing
@@ -161,7 +204,19 @@ def read_session_token(token: str, settings: Settings, now: datetime) -> str | N
         return None
 
     subject = claims.get("sub")
-    return subject if isinstance(subject, str) and subject else None
+    if not isinstance(subject, str) or not subject:
+        return None
+
+    # An unrecognised or absent scope resolves to READ, not FULL. A token minted
+    # before scopes existed, or one whose claim is a value this version does not
+    # know, is downgraded rather than trusted — the failure of a stale session is
+    # then "that button is disabled" rather than "it did the irreversible thing".
+    try:
+        scope = Scope(claims.get("scp", ""))
+    except ValueError:
+        scope = Scope.READ
+
+    return Session(user=subject, scope=scope)
 
 
 def authenticate(username: str, password: str, settings: Settings) -> str | None:
