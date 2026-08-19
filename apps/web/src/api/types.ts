@@ -55,3 +55,16 @@ export type PreSessionContext = Schemas['PreSessionContext']
 /** One row of the audit trail, and a page of them. */
 export type AuditEntryView = Schemas['AuditEntryView']
 export type AuditPage = Schemas['AuditPage']
+
+/**
+ * The analytics endpoints — history, not the live book.
+ *
+ * `TradeView` is all decimal strings and goes through `src/lib/money.ts`.
+ * `PerformanceResponse.metrics` is a bag of JSON numbers and goes through
+ * `src/lib/stats.ts` — the split is explained at the top of that file.
+ */
+export type TradeView = Schemas['TradeView']
+export type TradesResponse = Schemas['TradesResponse']
+export type PerformanceResponse = Schemas['PerformanceResponse']
+export type AttributionRowView = Schemas['AttributionRowView']
+export type AttributionResponse = Schemas['AttributionResponse']

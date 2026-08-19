@@ -205,6 +205,55 @@ know which is which.
 Every monetary value crosses the wire as a **string** and nothing downstream
 parses one back (docs/DASHBOARD.md).
 
+## The screen
+
+`/analytics` in the dashboard, and it is the only consumer of the three
+endpoints above. It is a fold over stored fills and adds no server capability of
+its own.
+
+**Three requests, one window.** docs/DASHBOARD.md refuses to assemble the live
+screen from six fetches, because a P&L computed at one instant beside a price
+fetched at another disagree and the reader cannot tell which to trust. That
+argument does not reach here, for the same reason these endpoints reconstruct on
+request rather than serving something the worker published: a round trip that
+finished last Tuesday has finished, and its P&L is the same number in all three
+responses. The page sends `start` and `end` explicitly on all three so they are
+demonstrably describing one period rather than three that coincide, and each
+panel renders or fails on its own — a reader who can still see their trades is
+better served than one looking at an error page.
+
+**Nothing polls.** The live dashboard refreshes every five minutes because the
+book moves. A finished period does not, and a poll would re-run a reconstruction
+that reads the whole order history to produce an identical answer.
+
+Four things the screen refuses to do, each of which is the tempting version:
+
+- **A period with no closed trades is a sentence, not a grid of zeros.**
+  `compute_all` legitimately returns 0.0 for every ratio it cannot compute, and
+  nineteen of them on screen read as a flat month rather than as an empty one.
+  The same rule the dashboard applies to a single figure — a number we do not
+  know is `—`, never `0` — applied to a whole panel.
+- **The annualisation basis is on screen beside the ratios it scales.** A reader
+  who disagrees with a Sharpe should be able to check `periods_per_year` before
+  doubting the arithmetic.
+- **An unmeasured excursion is a dash; a measured zero is a zero.** Straight
+  through from the null this module is careful to send.
+- **The money-shaped statistics are labelled as statistics.** `expectancy`,
+  `avg_win`, `avg_loss`, `largest_win` and `largest_loss` are floats — computed
+  in float space by `backtest/metrics.py`, deliberately shared with the backtest
+  — and formatting them with the ledger's formatter would claim a precision the
+  response does not carry. `src/lib/money.ts` accepts only strings, so the
+  compiler refuses the confusion rather than relying on anyone remembering it;
+  `src/lib/stats.ts` is the other half and says where the boundary runs. Exact
+  per-trade P&L is in the trade table, as a string, all the way to the pixels.
+
+One thing it adds that the API does not: **the hour grouping is labelled UTC.**
+`by=hour` keys on the entry's UTC hour, while every timestamp on the screen
+renders in the reader's local time, and a bare `14` beside a local-time trade
+list invites a comparison between two different clocks. The weekday needs no
+such treatment — a US equity session never straddles UTC midnight, so its UTC
+day is its session day.
+
 ## Not built yet
 
 Stated here rather than left to be discovered:
@@ -221,8 +270,9 @@ Stated here rather than left to be discovered:
   other three things the report wants are not gathered anywhere one query can
   reach: rejections are in `signals`, halts are in the kill switch's records,
   and feed incidents exist only in the worker's logs.
-- **No UI.** These endpoints have no screen. The dashboard renders the live book
-  and nothing here.
+- **No period comparison.** The screen reports one window at a time. "Is this
+  month worse than last?" is answered by changing the dates and remembering,
+  which is the shape of question a stored trade table would make cheap.
 - **A trade opened by one strategy and closed by another is attributed to the
   first.** The entry names the strategy. Two strategies trading one symbol
   cannot be told apart per position, and nothing in the platform stops that
