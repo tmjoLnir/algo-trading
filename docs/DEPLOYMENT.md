@@ -366,14 +366,19 @@ unreachable Redis. The stack came up halted and looked alive.
 
 ## What this does not give you
 
-Two Phase 6 items are unbuilt, and a host does not supply them:
+One Phase 6 item is unbuilt, and a host does not supply it:
 
-- **No alerting.** Nothing reaches a phone. `docs/SAFETY.md`'s go-live checklist
-  requires it, so a live host is not compliant with our own checklist until it
-  exists.
 - **No backups.** There is no backup and no tested restore, which means one VM
   is one VM. Take a `pg_dump` on a cron before you care about the data, and
   restore it somewhere once — an untested backup is a belief, not a backup.
+
+**Alerting works and is no longer on this list**, but it is not something a host
+gives you either: it is configuration plus one confirmation. Set a transport,
+run `scripts/check_alerts.py --by you`, and look at the phone. Until somebody
+has done that on *this* deployment, `docs/SAFETY.md`'s checklist line is not met
+here no matter what the roadmap says — the credential is per-host, and a
+platform with no working transport behaves exactly like one that has never
+needed to alert.
 
 **Metrics and tracing exist now** and are the third item's replacement in this
 list, but read the boundary carefully. The platform *exports* Prometheus text on

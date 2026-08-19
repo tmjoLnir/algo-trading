@@ -62,9 +62,14 @@ people deploy without checking.
 - [ ] Every strategy has a stop loss configured; there are no unprotected positions
 - [ ] Data-feed disconnect tested (kill the network, confirm it halts rather than trading on stale prices)
 - [ ] Worker restart tested with open positions — it must adopt them, not double them
-- [ ] Alerts reach a human on a phone, not just a log file — set
-      `ALERT_NTFY_TOPIC` and *confirm one arrives* by engaging a halt; an
-      alerting path nobody has watched work is not one (ADR 0012)
+- [ ] Alerts reach a human on a phone, not just a log file — set a transport
+      (`ALERT_NTFY_TOPIC`, or `ALERT_TELEGRAM_TOKEN` and
+      `ALERT_TELEGRAM_CHAT_ID`), run `scripts/check_alerts.py --by you`, and
+      *confirm one arrives on the phone*; an alerting path nobody has watched
+      work is not one (ADR 0012). Unticked here on purpose even though the
+      platform's own alerting is built and demonstrated: the credential is
+      per-deployment, so this is a check every host repeats, not a fact the
+      repository can hold on your behalf
 
 **The account**
 - [ ] Broker-side max position size and daily loss limits set
