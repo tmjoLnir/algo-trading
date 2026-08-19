@@ -1286,6 +1286,20 @@ has met a database holding a real strategy's history.
   of a loop erroring every tick: it "looks alive to a health check". Every state
   worth catching here is one where `/healthz` answers `ok` throughout.
 
+  The probes themselves are real now, which is a smaller thing than metrics and
+  was blocking something concrete. `/readyz` raised `NotImplementedError` and so
+  answered `500` — the one endpoint an operator reaches for when the dashboard
+  is broken read as a *third* fault, on top of whatever they were chasing. It
+  checks Postgres and Redis concurrently, each bounded, and reports them
+  separately: `ok`, `unreachable` or `absent`, with `503` unless all are `ok`.
+  It reports no exception text, because it is open without a session and a
+  driver's connection error quotes the DSN — that goes to the log instead
+  (CLAUDE.md §1.6). `/healthz` stays dependency-free, deliberately: it is what
+  the Docker HEALTHCHECK and compose's `depends_on` gate on, and a version of it
+  that consulted Postgres would let a slow database get a healthy API killed.
+  This does not tick anything — the line here is about a collector scraping
+  across a trading day, and nothing scrapes yet.
+
   So **each process exports its own `/metrics` and the worker does not push**,
   which is the decision worth arguing with. The natural alternative was for the
   worker to write its numbers into Redis — already the cross-process bus for the
@@ -1481,15 +1495,26 @@ has met a database holding a real strategy's history.
   What landed with it is `docker-compose.prod.yml`, which is the more useful
   half today. `docker-compose.yml` is a development stack — that is deliberate
   and documented — and deploying it as-is would have been three quiet faults at
-  once: `db`, `redis` and `api` carry no restart policy while `worker` does, so
+  once: `db`, `redis` and `api` carried no restart policy while `worker` did, so
   a reboot brought back the worker alone, whose kill switch fails closed against
   an unreachable Redis and which therefore came up halted while looking alive;
   `api` and `worker` bind-mount `./libs` and `./apps/*` over the code baked into
   the images, so what runs is the checkout rather than what was built and
   tested; and `api` runs uvicorn with `--reload`, which makes a `git pull` a hot
-  deploy mid-session. The overlay corrects all three, `make deploy` applies it,
-  and docs/DEPLOYMENT.md is the procedure — the page README.md has linked to
+  deploy mid-session. The overlay corrects the last two, `make deploy` applies
+  it, and docs/DEPLOYMENT.md is the procedure — the page README.md has linked to
   since the skeleton and which did not exist.
+
+  **The first of those three is no longer among them, and correcting it here is
+  the point rather than a tidy-up.** Treating a missing restart policy as a
+  *deployment* concern was the mistake: the base file also serves the dashboard,
+  through `make up-prod`, and there the asymmetry had a second cost nobody had
+  named. `web-prod` restarted forever and `api` did not, so a single API exit
+  left nginx serving the whole dashboard against nothing — `Failed to load
+  dashboard: Error: 502: Bad Gateway`, permanently, from a page that rendered
+  perfectly. `db`, `redis` and `api` carry `restart: unless-stopped` in
+  `docker-compose.yml` now; the overlay's copies are a restatement, and its
+  header says so.
 
   `scripts/check_port_bindings.py` now checks **both** configurations. It read
   only the development one, so the deployed file — where a wrong bind matters
@@ -1600,6 +1625,22 @@ has met a database holding a real strategy's history.
   dashboard's own origin, and a client-side route survived a hard refresh. Every
   push re-checks it, which is the point of putting it there rather than in a
   deployment runbook.
+
+  **What this item also introduced, and did not account for, is the 502.** Once
+  the browser reaches the API through nginx, every way the API can be
+  unreachable arrives on screen as one indistinguishable string —
+  `Failed to load dashboard: Error: 502: Bad Gateway` — and the dashboard around
+  it renders perfectly, because the bundle is static files off disk and only the
+  poll crosses the proxy. Three different faults produce it: the API is not
+  running, the API is up and cannot reach Redis or Postgres, or nginx cannot
+  resolve it. The item shipped with no way to tell them apart and one of them
+  made permanent by a missing restart policy (see the deployment item above).
+  Both halves are addressed now — `/readyz` is implemented rather than raising
+  `NotImplementedError`, so `/healthz` and `/readyz` together separate the three
+  from the same browser, and the client says which condition it hit instead of
+  repeating nginx's wording at the reader. docs/RUNBOOK.md, "Dashboard shows 502
+  Bad Gateway". This does not touch the tick: the serving-layer line is about
+  what CI re-checks, and it still holds.
 
   Exposure is a decision now rather than a default. Every port in
   `docker-compose.yml` binds `127.0.0.1`: the API, the `atp`/`atp` Postgres and

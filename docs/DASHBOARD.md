@@ -223,8 +223,12 @@ hides that it has.
 - Proxies `/api/`, `/healthz`, `/readyz` and `/ws`, passing the path through
   unstripped, and forwards the WebSocket upgrade with a read timeout long enough
   that a quiet market does not look like a broken feed. The health probes keep
-  their unversioned names, so `/healthz` through the proxy answers "is the whole
-  chain up".
+  their unversioned names, so the pair answers "is the whole chain up" from the
+  same browser that is showing the problem: both `502` means the API is not
+  running, `200` on `/healthz` with `503` on `/readyz` means it is up and a
+  dependency behind it is not, and `/readyz`'s body names which. That is the
+  ladder in docs/RUNBOOK.md, "Dashboard shows 502 Bad Gateway" — the one symptom
+  this arrangement produces and the one it exists to make legible.
 - Resolves the API's address per request via Docker's DNS. nginx otherwise
   resolves an upstream once at startup and caches it forever, and goes on
   proxying to a dead address after the api container restarts on a new one.
