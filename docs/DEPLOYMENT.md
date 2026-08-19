@@ -86,6 +86,7 @@ Fill in, at minimum:
 | `ATP_ENV=production` | |
 | `WORKER_SYMBOLS` | The watchlist. Empty means the worker idles |
 | `ALERT_NTFY_TOPIC` | Where halts reach a phone. Empty means log-only — see below |
+| `ALERT_TELEGRAM_TOKEN` / `_CHAT_ID` | The other transport. Set both, or neither |
 
 `ATP_RUN_MODE` and the two live locks are the ones to be deliberate about.
 `paper` is where a host starts and where it stays for at least the four weeks
@@ -196,23 +197,43 @@ than a log file. Every automated halt goes out this way — a lost feed, a
 reconciliation mismatch, a worker task dying — plus manual halts and resumes.
 Design and what is deliberately *not* alerted: ADR 0012.
 
+Two transports. Pick either, or set both — configuring both sends to both, on
+the grounds that one push service having a bad day should not be the same as
+having no alerting.
+
+**ntfy** — nothing to sign up for, an app on both platforms, self-hostable:
+
 ```bash
 python -c "import uuid; print('atp-' + uuid.uuid4().hex)"   # a topic nobody will guess
 ```
 
-Put it in the bundle rather than in a commit, install the ntfy app on the
-phone, and subscribe it to that topic:
+Put it in the bundle rather than in a commit, install the ntfy app on the phone,
+and subscribe it to that topic.
+
+**Telegram** — nothing to install if you already have it:
+
+1. Message `@BotFather`, send `/newbot`, keep the token it gives you.
+2. **Message your new bot once.** A bot cannot open a conversation, so without
+   this it has nowhere to deliver and every alert fails.
+3. `curl https://api.telegram.org/bot<TOKEN>/getUpdates` and read
+   `result[].message.chat.id`.
+
+Either way, the credentials go in the bundle:
 
 ```bash
-uv run python scripts/manage_secrets.py edit --env paper    # add ALERT_NTFY_TOPIC=...
+uv run python scripts/manage_secrets.py edit --env paper
+#   ALERT_NTFY_TOPIC=...           and/or
+#   ALERT_TELEGRAM_TOKEN=...  ALERT_TELEGRAM_CHAT_ID=...
 make secrets-install env=paper
 ```
 
-**The topic is a credential.** On the public `ntfy.sh` server it is the only
-thing between your halt notifications and anyone who guesses it, in *both*
-directions — reading them and forging one that says trading resumed. Hence a
-random topic in the secret bundle. If the alerts matter, self-host ntfy and set
-`ALERT_NTFY_TOKEN`; then it is not a guess away.
+**Both are addressed by a credential.** An ntfy topic on the public server is
+the only thing between your halt notifications and anyone who guesses it, in
+*both* directions — reading them and forging one that says trading resumed. A
+Telegram bot token is worse: it *is* the bot, it travels in the URL path, and
+whoever holds it can read the chat and post as you. Hence the bundle, and hence
+nothing logs either — including on the failure paths. If the alerts matter,
+self-host ntfy and set `ALERT_NTFY_TOKEN`; then it is not a guess away.
 
 Alerts deliberately carry no numbers from the book — a reason and a scope, never
 a balance or a position. A notification renders on a lock screen and travels

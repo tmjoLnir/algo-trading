@@ -5,13 +5,21 @@ phone, not just a log file". The port is in `ports`, the transports in `sinks`.
 """
 
 from atp_core.alerts.ports import Alert, AlertSink, Severity
-from atp_core.alerts.sinks import LoggingAlertSink, NtfyAlertSink, build_alert_sink
+from atp_core.alerts.sinks import (
+    FanOutAlertSink,
+    LoggingAlertSink,
+    NtfyAlertSink,
+    TelegramAlertSink,
+    build_alert_sink,
+)
 
 __all__ = [
     "Alert",
     "AlertSink",
+    "FanOutAlertSink",
     "LoggingAlertSink",
     "NtfyAlertSink",
     "Severity",
+    "TelegramAlertSink",
     "build_alert_sink",
 ]

@@ -1066,10 +1066,21 @@ the only property that makes the screen worth reading.
   makes for one submit path.
 
   `atp_core.alerts` is the port and its transports — `NtfyAlertSink` (no
-  account, one POST, self-hostable) and `LoggingAlertSink`, which is the
-  default and is a real sink rather than a no-op so an unconfigured platform is
-  loud in its logs instead of quietly un-alerted. Bound in the worker, the API
-  and `scripts/halt.py`, so a halt from any of the three reaches the same place.
+  account, one POST, self-hostable), `TelegramAlertSink` (a bot messaging the
+  operator's own chat, nothing to install for anyone who already has Telegram)
+  and `LoggingAlertSink`, which is the default and is a real sink rather than a
+  no-op so an unconfigured platform is loud in its logs instead of quietly
+  un-alerted. Configure both phone transports and both are sent, via
+  `FanOutAlertSink`: two configured transports is a request for two, and
+  quietly picking a winner would be a surprise discovered during an incident.
+  Bound in the worker, the API and `scripts/halt.py`, so a halt from any of the
+  three reaches the same place.
+
+  Telegram carries one trap worth naming, because getting it wrong fails
+  silently: **`{"ok": false}` arrives with HTTP 200**. A revoked token or a
+  chat the bot was removed from comes back with a successful status line, so a
+  sink that trusted `raise_for_status` would report a bot deleted months ago as
+  delivering every halt. The body is read instead.
 
   Two properties are the reason it is a wrapper around one choke point rather
   than a `structlog` handler. **Deduplication is the Redis state**: `engage`
@@ -1087,13 +1098,20 @@ the only property that makes the screen worth reading.
   of it. Hence also that the topic is a credential, lives in the SOPS bundle,
   and is never logged — including on the failure path.
 
-  What was actually shown: 26 unit tests, and the failure path exercised
-  against a real network refusal rather than a mock — this environment's egress
-  policy answers 403 for `ntfy.sh`, and the sink logged
-  `THE ALERT DID NOT GO OUT — the event it describes still did`, did not raise,
-  and did not print the topic. What was **not** shown is the only thing that
-  matters to the item: no notification has ever been delivered to a phone, and
-  no test suite can show that one was.
+  What was actually shown: 49 unit tests, and **both** transports' failure paths
+  exercised against a real network refusal rather than a mock — this
+  environment's egress policy answers 403 for `ntfy.sh` and for
+  `api.telegram.org` alike. Each logged
+  `THE ALERT DID NOT GO OUT — the event it describes still did`, neither raised,
+  and neither printed its credential. The two "a failure never logs the credential"
+  tests were checked by making the sinks log their URLs and watching both fail;
+  before that they asserted against `caplog`, which captures nothing from
+  structlog here, so they had been passing against an empty string and proving
+  nothing. They read the captured event dicts now.
+
+  What was **not** shown is the only thing that matters to the item: no
+  notification has ever been delivered to a phone, over either transport, and no
+  test suite can show that one was.
 
   Not alerted, deliberately: `order.submit_indeterminate` and
   `order.position_unprotected`, both `CRITICAL` in docs/RUNBOOK.md and neither

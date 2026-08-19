@@ -62,10 +62,19 @@ somebody go and look at the dashboard, which is behind authentication.
 **Synchronous, because `KillSwitch` is.** An async sink would mean either an
 event loop inside the halt path or a halt that cannot alert.
 
-**ntfy first.** No account, one HTTP POST, apps on both platforms, and
-self-hostable — which matters, because the alternative to self-hosting is
-telling a public server when your trading system stops. Pushover, Telegram and
-Twilio are each one class implementing the port.
+**Two transports ship: ntfy and Telegram.** ntfy needs no account, is one HTTP
+POST, has apps on both platforms and can be self-hosted — which matters, because
+the alternative to self-hosting is telling a public server when your trading
+system stops. Telegram costs a `@BotFather` conversation and reaches an operator
+who already has the app, with delivery handled by a real service rather than by
+an unauthenticated topic. Neither is obviously better, which is the argument for
+the port; Pushover and a Twilio SMS would each be one more class here.
+
+**Configuring both sends to both.** An operator who has configured two
+transports has asked for two, and the usual reason to want two is that neither
+service is owed that much trust. `FanOutAlertSink` isolates failures per sink,
+so one being down is not the same as having no alerting — quietly picking a
+winner would be a surprise discovered during an incident.
 
 ## Consequences
 
@@ -86,8 +95,18 @@ logs `data.staleness.halt_unavailable` — "TRADING IS NOT HALTED" — and that 
 the one case where the most important message is the one that cannot go out.
 Misconfiguration, caught at startup rather than by alerting.
 
-**The topic is a credential and is now part of the secret surface.** It goes in
-the SOPS bundle (ADR 0011). Nothing logs it, including the failure path.
+**Both transports are addressed by a credential, and both are part of the secret
+surface.** The ntfy topic and the Telegram bot token go in the SOPS bundle
+(ADR 0011); the token is the more dangerous of the two, since it is the bot
+itself and travels in the URL path. Nothing logs either, including on the
+failure paths, and that is asserted by tests that were checked to fail when a
+secret leaks.
+
+**Telegram reports application errors inside HTTP 200.** A revoked token or a
+deleted chat comes back as `{"ok": false}` with a successful status line, so
+`TelegramAlertSink` reads the body rather than trusting `raise_for_status`.
+Getting this wrong makes a bot that was deleted months ago look like it is
+still delivering every halt.
 
 **Alerting depends on outbound HTTPS from the worker**, and on nothing else
 about the deployment — no inbound port, no DNS, no relationship to whatever
@@ -120,3 +139,12 @@ not a lost halt. If the wait becomes the problem the queue goes behind
 others. SMS via Twilio is genuinely good and costs an account, a number and a
 per-message charge; it is one class implementing the port on the day the
 operator wants it.
+
+**Picking one transport when both are configured.** Rejected: it makes a
+configured credential silently do nothing, which is discovered at the worst
+possible time. Fanning out costs a `for` loop.
+
+**Telegram with `parse_mode`.** Rejected: the alert body carries
+operator-supplied text (`halt.py --detail`), and Telegram rejects a message
+whose markup does not balance. An unclosed asterisk in a note typed during an
+incident would make the notification about that incident fail to send.
