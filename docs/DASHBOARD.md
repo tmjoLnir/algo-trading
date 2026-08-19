@@ -174,6 +174,39 @@ shifts under the reader every time one does.
 What is recorded today is authentication and refusals. Order flow and
 kill-switch changes are not, because those handlers are stubs; see ADR 0010.
 
+## The analytics page
+
+`/analytics`, over the three endpoints in docs/ANALYTICS.md — the metric set,
+the attribution breakdown and the closed-trade list. Same shape of gap as the
+audit page: the endpoints had been built and tested since #58 with nothing
+reading them, and a report nobody can open is a report nobody reads.
+
+It is the one screen in this app that is deliberately **not** one aggregate
+request, and the exception proves the rule stated at the top of this document.
+Six fetches are refused for the live book because a P&L computed at one instant
+beside a price fetched at another disagree. A finished period has no such
+problem — a round trip that closed last Tuesday is the same number in every
+response — so the three panels are three requests that name one explicit window
+and fail independently. Nothing here polls, either: a finished period does not
+move, and a poll would re-run a reconstruction over the whole order history to
+produce an identical answer.
+
+Two rules from this document reach it unchanged, and one is new:
+
+- **A figure we do not know renders as `—`, never as `0`** — applied to a whole
+  panel rather than a cell. A period with no closed trades reports that in
+  words; `compute_all` returns 0.0 for every ratio it cannot compute, and
+  nineteen zeros on screen read as a flat month rather than an empty one.
+- **Never render a monetary value from a float.** Every per-trade figure is a
+  decimal string through `money.ts` as usual. The metric set is not: it is a bag
+  of JSON numbers, five of which are money-shaped statistics computed in float
+  space by the same functions the backtest uses. `src/lib/stats.ts` formats
+  those and says so on screen — `money.ts` takes only strings, so the compiler
+  keeps the two apart.
+- **New here: a grouping in UTC says UTC.** Attribution by hour keys on the
+  entry's UTC hour while every timestamp on the screen is local, and an
+  unlabelled `14` invites a comparison between two clocks.
+
 ## Serving it
 
 Two ways, and they resolve the API identically on purpose.
@@ -303,6 +336,15 @@ remaining Phase 6 items are the difference — see docs/SAFETY.md.
 
 Stated here rather than left to be discovered:
 
+- **Four of the seven tabs are still stubs.** Strategies, Backtests, Positions
+  and Orders render "not yet implemented", and the reason is not the front end
+  in any of the four: `apps/api/src/atp_api/routers/` has `strategies.py`,
+  `backtests.py`, `positions.py` and `orders.py` raising `NotImplementedError`
+  in every handler. Analytics went first because it was the only one whose
+  server side was already built. Positions and Orders are the next two within
+  reach — the live book already carries both, and `PostgresOrderRepository`
+  already reads order history — while Backtests additionally needs a worker task
+  and a reader for `backtest_runs`.
 - **The signal feed on *this screen* does not survive a restart**, though the
   signals themselves now do. The feed is still a bounded in-memory ring on the
   strategy runner, so a deploy empties what the dashboard shows;

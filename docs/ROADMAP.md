@@ -1020,6 +1020,32 @@ wording if it is not the demonstration you want.
   first boot wrote. Each was verified by mutation — restoring the hardcoded
   `None` fails the first two, and a naive upsert fails the third.
 
+  **These endpoints have a screen now.** `/analytics` in the dashboard renders
+  all three — the metric set, the attribution breakdown with its dimension
+  selector, and the closed-trade list with MAE/MFE — and it is a front-end
+  change only: no handler, model or query was touched to put it there.
+  docs/ANALYTICS.md had listed "No UI" under *Not built yet*, which was the
+  same shape of gap the audit page closed in #57: a report nobody can open is a
+  report nobody reads, and these had been built and tested with no consumer
+  since this item landed.
+
+  The screen is the one place in the app that is deliberately not a single
+  aggregate request, and the reason is the same one ADR 0015 gives for
+  reconstructing on demand: three reads of a *finished* period cannot disagree.
+  Two refusals are worth a reviewer's eye, because the flattering version of
+  each is the one that writes itself — a period with no closed trades reports
+  that in a sentence rather than as a grid of the zeros `compute_all` correctly
+  returns, and the five money-shaped metrics are labelled as the float
+  statistics they are rather than formatted with the ledger's formatter, which
+  would claim a precision the response does not carry. 17 web tests cover those
+  and the rest of the rules; `src/lib/stats.ts` holds the float/decimal
+  boundary and `money.ts` accepts only strings, so the compiler enforces it.
+
+  It changes nothing about what is ticked below. The proposed analytics
+  *Verifiable:* line asks whether the reconstruction agrees with the broker's
+  own statement after a paper week, which is a claim about the numbers and not
+  about the screen showing them.
+
   Unticked all the same, and the reason has narrowed to exactly one thing.
   This phase's *Verifiable:* line is about the dashboard and cannot demonstrate
   any of it; a line these items can be held against is proposed below. What has
