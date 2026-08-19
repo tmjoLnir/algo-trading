@@ -190,7 +190,7 @@ Fill in, at minimum:
 | `DATABASE_URL` | Must carry the same password — `make migrate` and the scripts run from the host |
 | `ALPACA_API_KEY` / `_SECRET` | The pair for *this host's* run mode, never the other's |
 | `API_SECRET_KEY` | `openssl rand -hex 32`. Stored, not generated at boot, or every restart signs everyone out |
-| `API_USER` / `API_PASSWORD_HASH` | `uv run python scripts/hash_password.py`. With no hash configured every login is refused |
+| `API_USER` / `API_PASSWORD_HASH` | `uv run --package atp-api python scripts/hash_password.py` — that form does not care how you synced. With no hash configured every login is refused |
 | `ATP_WEB_BIND_ADDR` | The `tailscale ip -4` address. Left empty the dashboard is reachable from the host only |
 | `ATP_LOG_FORMAT=json` | The default is `console`, which is for a terminal |
 | `ATP_ENV=production` | |

@@ -3,6 +3,15 @@
 
     uv run python scripts/hash_password.py
 
+That form needs the workspace installed — `make install`, which is
+`uv sync --all-packages`. A plain `uv sync` installs only the workspace root,
+which declares no runtime dependencies, and this script then cannot import what
+it hashes with. It says so and how to fix it rather than raising. The form that
+works either way, because it resolves the environment of the package that
+declares those dependencies:
+
+    uv run --package atp-api python scripts/hash_password.py
+
 The password is read without echo and never printed, never logged, and never
 taken as an argument — an argument would put it in the shell history and in the
 process list of every other user on the machine, which is the whole thing
@@ -20,7 +29,44 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "api" / "src"))
 
-from atp_api.auth import MAX_PASSWORD_BYTES, PasswordTooLongError, hash_password
+
+def _dependency_help(missing: str) -> str:
+    """What to print when the hashing code's own imports do not resolve.
+
+    Defined above the import it serves, which reads oddly and has to: the import
+    is the thing that can fail.
+
+    The `sys.path` line above is what makes this failure worth its own message.
+    It puts `apps/api/src` on the path, so the *first-party* import resolves
+    from a bare checkout — and then dies one layer down on a third-party package
+    that has to be genuinely installed. `bcrypt` is declared by `atp-api`, a
+    workspace member; the workspace ROOT declares no runtime dependencies at
+    all. So a plain `uv sync` leaves this script importable and unusable, and
+    the traceback it produced named `bcrypt` without naming the remedy — on the
+    first command a new operator runs, before there is any password to log in
+    with at all.
+    """
+    return (
+        f"{missing} is not installed in this environment.\n"
+        "\n"
+        "This script hashes with the `atp-api` package's code, so it needs that\n"
+        "package's dependencies. A plain `uv sync` installs only the workspace\n"
+        "root, which declares none of them.\n"
+        "\n"
+        "Install the workspace:\n"
+        "\n"
+        "    make install                 # uv sync --all-packages\n"
+        "\n"
+        "or run this against the package that declares them, without re-syncing:\n"
+        "\n"
+        "    uv run --package atp-api python scripts/hash_password.py"
+    )
+
+
+try:
+    from atp_api.auth import MAX_PASSWORD_BYTES, PasswordTooLongError, hash_password
+except ImportError as exc:  # pragma: no cover - driven by a subprocess test
+    raise SystemExit(_dependency_help(exc.name or "A dependency")) from exc
 
 
 def main() -> int:

@@ -110,9 +110,16 @@ it will send the whole book down. Open without a session: `/healthz`, `/readyz`,
 Set it up with:
 
 ```bash
+make install                             # or the next line cannot import what it hashes with
 uv run python scripts/hash_password.py   # prints the API_PASSWORD_HASH line
 openssl rand -hex 32                     # API_SECRET_KEY, so sessions survive a restart
 ```
+
+`make install` is `uv sync --all-packages`. A plain `uv sync` installs only the
+workspace root, which declares no runtime dependencies, so the hashing code's
+`bcrypt` is not there — the script says that and how to fix it rather than
+raising. `uv run --package atp-api python scripts/hash_password.py` works
+whichever way you synced.
 
 **With no `API_PASSWORD_HASH` configured, every login is refused** and the API
 logs `CRITICAL` at startup. The unconfigured state is no way in, not a free one.
