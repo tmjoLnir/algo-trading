@@ -1011,12 +1011,22 @@ wording if it is not the demonstration you want.
   ADR 0015 names the threshold and says the fix is a stored trade table, not a
   truncated read — a truncated read does not get slower, it gets wrong.
 
-  Unticked. This phase's *Verifiable:* line is about the dashboard and cannot
-  demonstrate any of it; a line these items can be held against is proposed
-  below. Nothing here has run against a database holding a real strategy's
-  history — the integration tests that exercise the new repositories are
-  written and were **not run in the environment this was built in**, which had
-  no Docker.
+  The SQL is exercised against a real PostgreSQL 16 with TimescaleDB 2.15.2 —
+  the version `docker-compose.yml` pins — by 21 integration tests, and the whole
+  suite is green with nothing skipped (1,467 Python, 81 web). The three that
+  earn their keep are the refusals: an order naming a signal nobody recorded is
+  rejected by the foreign key, a signal naming an unregistered strategy is
+  rejected by the other one, and a second `ensure` does not overwrite the row a
+  first boot wrote. Each was verified by mutation — restoring the hardcoded
+  `None` fails the first two, and a naive upsert fails the third.
+
+  Unticked all the same, and the reason has narrowed to exactly one thing.
+  This phase's *Verifiable:* line is about the dashboard and cannot demonstrate
+  any of it; a line these items can be held against is proposed below. What has
+  been shown is that the schema, the constraints and the fold behave against a
+  real database on fixtures. What has **not** been shown is any of it against a
+  database holding a real strategy's history, which is what the proposed line
+  asks for and what the paper week produces.
 - [ ] Live-vs-backtest comparison.
   Half exists as of #58: `PerformanceAnalyzer.compare_to_backtest` computes the
   divergence metric by metric, live minus backtest, and is tested. The endpoint
