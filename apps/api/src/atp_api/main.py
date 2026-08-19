@@ -37,6 +37,7 @@ from atp_api.routers import (
 from atp_api.ws import manager as ws_manager
 from atp_api.ws import redis_bridge
 from atp_api.ws import router as ws_router
+from atp_core.alerts import build_alert_sink
 from atp_core.config import get_settings
 from atp_core.logging import configure as configure_logging
 from atp_core.logging import get_logger
@@ -95,7 +96,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.session_factory = create_session_factory(engine)
     app.state.redis = redis
-    app.state.kill_switch = RedisKillSwitch(sync_redis)
+    # The API halts too — /risk/halt, and a read-only session is deliberately
+    # allowed to call it (ADR 0009). Someone stopping trading from their phone
+    # is exactly the case where the notification matters to whoever else is
+    # watching.
+    app.state.kill_switch = RedisKillSwitch(sync_redis, alerts=build_alert_sink(settings))
 
     # Live push. Started here rather than on the first socket so that the
     # subscription exists before any client does — a bridge brought up by the

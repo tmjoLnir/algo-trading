@@ -35,10 +35,10 @@ as the cleanup takes.
   on the two irreversible endpoints (ADR 0009). A second principal would need a
   users table, which scopes compose with rather than replace.
 - **Still not ready for a public address.** No TLS termination of our own. The
-  deployment target is chosen (ADR 0011) and secrets are encrypted at rest
-  (below), but nothing is provisioned, and the arrangement puts the platform on
-  a tailnet rather than on a public address — which is what the two gaps below
-  assume. Keep the bind addresses private — `make check-bindings` refuses a
+  deployment *shape* is chosen (ADR 0011) and secrets are encrypted at rest
+  (below), but **no host has been selected and nothing is provisioned**. The
+  arrangement puts the platform on a private network rather than a public
+  address — which is what the two gaps below assume. Keep the bind addresses private — `make check-bindings` refuses a
   wildcard or a public one, in both the development and the deployed
   configuration.
 - **Behind `tailscale serve`, the session cookie is not marked `Secure`.** TLS
@@ -64,6 +64,14 @@ as the cleanup takes.
   install, so this is enforced rather than remembered.
 - Losing the age private key makes every bundle encrypted to it unreadable.
   Back it up offline. It is the one item here with no recovery path.
+- **Both alert transports are addressed by a credential.**
+  `ALERT_NTFY_TOPIC` on a public ntfy server is the only thing in front of your
+  halt notifications, in both directions: anyone holding it reads when trading
+  stopped and can forge a message saying it resumed. `ALERT_TELEGRAM_TOKEN` is
+  worse — it *is* the bot, it travels in the URL path, and whoever has it can
+  read the chat and post as you. Both live in the bundle, never in a commit,
+  and nothing logs either, including on the failure paths. Alerts carry no
+  balances or positions for the same reason (ADR 0012).
 - Paper and live use separate key pairs.
 - `structlog` redacts known credential keys, but do not rely on it — never pass
   a secret to a log call.

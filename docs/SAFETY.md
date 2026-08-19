@@ -32,6 +32,15 @@ Layer 8 matters and is outside this codebase: **set position and loss limits in
 your broker's own controls too.** They are the only limits that still apply when
 this platform is the thing that is broken.
 
+**Alerting is not a layer and must never be counted as one.** Every layer above
+acts on its own; an alert only tells you one of them did. It carries the fact
+that trading stopped, never a balance or a position — a notification renders on
+a lock screen and travels through a third party, and the numbers are a question
+for the dashboard, which is behind authentication. Set it up (`ALERT_NTFY_TOPIC`,
+docs/DEPLOYMENT.md), watch one arrive, and do not treat a quiet phone as
+evidence that anything is fine: the failure that produces no alert is the one
+where the process that would have sent it is the thing that died.
+
 ## Before you go live — checklist
 
 Do not skip items because the strategy is "simple". The simple ones are the ones
@@ -53,7 +62,9 @@ people deploy without checking.
 - [ ] Every strategy has a stop loss configured; there are no unprotected positions
 - [ ] Data-feed disconnect tested (kill the network, confirm it halts rather than trading on stale prices)
 - [ ] Worker restart tested with open positions — it must adopt them, not double them
-- [ ] Alerts reach a human on a phone, not just a log file
+- [ ] Alerts reach a human on a phone, not just a log file — set
+      `ALERT_NTFY_TOPIC` and *confirm one arrives* by engaging a halt; an
+      alerting path nobody has watched work is not one (ADR 0012)
 
 **The account**
 - [ ] Broker-side max position size and daily loss limits set

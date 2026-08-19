@@ -27,6 +27,7 @@ import argparse
 import sys
 from typing import TYPE_CHECKING
 
+from atp_core.alerts import build_alert_sink
 from atp_core.config import get_settings
 from atp_core.errors import ATPError
 from atp_core.persistence.redis_client import create_sync_redis
@@ -91,7 +92,12 @@ def main(argv: list[str] | None = None) -> int:
     # loudly here, and `is_engaged` is already failing closed on the same
     # outage — so the platform has stopped trading either way, and what an
     # operator needs from this command is to be told, not reassured.
-    kill_switch = RedisKillSwitch(create_sync_redis(settings.redis_url))
+    # Alerts on a manual halt too. The operator running this already knows —
+    # the notification is for whoever else is watching the book, and for the
+    # record on their own phone of when trading stopped.
+    kill_switch = RedisKillSwitch(
+        create_sync_redis(settings.redis_url), alerts=build_alert_sink(settings)
+    )
 
     if args.command == "engage":
         record = kill_switch.engage(

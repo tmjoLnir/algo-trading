@@ -27,6 +27,7 @@ import signal
 from contextlib import AsyncExitStack
 from typing import TYPE_CHECKING, Any
 
+from atp_core.alerts import build_alert_sink
 from atp_core.brokers.alpaca import AlpacaBroker
 from atp_core.clock import SystemClock, TradingCalendar
 from atp_core.config import get_settings
@@ -123,7 +124,11 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
         provider = AlpacaHistoricalProvider(settings)
         stack.push_async_callback(provider.aclose)
 
-        kill_switch = RedisKillSwitch(sync_redis)
+        # Every automated halt this worker can engage — a lost feed, a
+        # reconciliation mismatch, a supervised task dying — goes through this
+        # object, so binding the sink here is what makes all three reach a
+        # phone rather than only a log file (docs/SAFETY.md).
+        kill_switch = RedisKillSwitch(sync_redis, alerts=build_alert_sink(settings))
         session_factory = create_session_factory(engine)
         bar_repo = PostgresBarRepository(session_factory)
         portfolio_repo = PostgresPortfolioRepository(session_factory)
