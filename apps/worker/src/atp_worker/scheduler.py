@@ -18,7 +18,7 @@ from atp_core.config import get_settings
 from atp_core.data.backfill import GapBackfillResult, backfill_gaps
 from atp_core.data.gaps import SUPPORTED_TIMEFRAMES
 from atp_core.data.providers.alpaca import AlpacaHistoricalProvider
-from atp_core.logging import get_logger
+from atp_core.logging import correlation_id, get_logger
 from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.db import create_engine, create_session_factory
 
@@ -335,23 +335,30 @@ async def _run_job(job: _Job, now: datetime, clock: Clock, calendar: TradingCale
         log.debug("worker.scheduler.deferred", job=job.name, next_due=job.due.isoformat())
         return
 
-    log.info("worker.scheduler.job_starting", job=job.name)
-    try:
-        await job.entry["job"]()
-    except NotImplementedError:
-        job.dormant = True
-        log.warning(
-            "worker.scheduler.job_not_implemented",
-            job=job.name,
-            msg="not built yet — this worker will not perform it",
-        )
-        return
-    except Exception as exc:
-        # Deliberately broad: see the docstring on `run_scheduler`. A scheduled
-        # job is unattended, so the alternative to logging is silence.
-        log.error("worker.scheduler.job_failed", job=job.name, error=str(exc), exc_info=True)
-    else:
-        log.info("worker.scheduler.job_done", job=job.name)
+    # One run of one job is a unit of work, so it gets an id and every line it
+    # writes — including from `atp_core` several layers down, which knows
+    # nothing about schedulers — carries it. A nightly backfill logs from four
+    # modules and interleaves with the ingestor; without this, reconstructing
+    # which lines belonged to it means reading timestamps and guessing.
+    with correlation_id():
+        log.info("worker.scheduler.job_starting", job=job.name)
+        try:
+            await job.entry["job"]()
+        except NotImplementedError:
+            job.dormant = True
+            log.warning(
+                "worker.scheduler.job_not_implemented",
+                job=job.name,
+                msg="not built yet — this worker will not perform it",
+            )
+            return
+        except Exception as exc:
+            # Deliberately broad: see the docstring on `run_scheduler`. A
+            # scheduled job is unattended, so the alternative to logging is
+            # silence.
+            log.error("worker.scheduler.job_failed", job=job.name, error=str(exc), exc_info=True)
+        else:
+            log.info("worker.scheduler.job_done", job=job.name)
 
     job.due = next_due(job.entry, clock.now(), calendar)
 

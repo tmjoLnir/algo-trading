@@ -53,8 +53,14 @@ def test_probes_are_unversioned(spec: dict, probe: str) -> None:
 
 
 def test_business_routes_are_versioned(spec: dict) -> None:
-    """Everything that is not a probe lives under /api/v1."""
-    unversioned = {"/healthz", "/readyz", "/"}
+    """Everything that is not a probe lives under /api/v1.
+
+    `/metrics` joins the probes for the same reason they are here: a scraper's
+    target list is configuration on another machine, and a URL that moves when
+    the API version bumps stops collecting silently — the first anyone hears of
+    it is a gap in a graph nobody was looking at.
+    """
+    unversioned = {"/healthz", "/readyz", "/metrics", "/"}
     stray = [p for p in spec["paths"] if p not in unversioned and not p.startswith("/api/v1/")]
     assert not stray, f"unversioned business routes: {stray}"
 

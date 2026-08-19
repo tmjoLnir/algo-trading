@@ -79,6 +79,14 @@ Dependencies point downward only. A violation — core importing from `apps/`, o
 `domain/` importing from `strategy/` — is a review rejection, because it is what
 turns a testable core into an untestable one over about six months.
 
+`logging/` and `metrics/` sit outside that stack rather than on a tier of it.
+Both are module-global and every layer reaches for them without being handed
+one, which is deliberate: threading a logger or a metrics registry through every
+constructor in the platform would buy nothing when there is one process-wide
+answer in each case. Neither does I/O — `metrics/` imports `prometheus_client`'s
+registry and text exposition and none of the parts that open a socket, so
+CLAUDE.md §1.3 still holds. Serving the text is `apps/`' job (ADR 0013).
+
 ## Data flow: a trade, end to end
 
 ```
@@ -155,5 +163,6 @@ symbols on daily or minute bars comfortably.
 | An indicator | `indicators/ta.py` | tests |
 | A risk rule | `risk/rules.py` + `default_rules()` | `docs/RISK.md` |
 | A strategy | `strategy/examples/` or a stored `RuleSet` | — |
-| A metric | `backtest/metrics.py` | shared with analytics automatically |
+| A strategy metric (Sharpe, drawdown) | `backtest/metrics.py` | shared with analytics automatically |
+| An operational metric | `metrics/registry.py` — nowhere else | `docs/OBSERVABILITY.md` |
 | An endpoint | `apps/api/routers/` | `make gen-types` |

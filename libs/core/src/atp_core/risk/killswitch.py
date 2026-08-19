@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from atp_core import metrics
 from atp_core.alerts.ports import Alert, Severity
 from atp_core.channels import CHANNEL_HALTS
 from atp_core.logging import get_logger
@@ -219,6 +220,11 @@ class RedisKillSwitch:
             target=target,
             detail=detail,
         )
+        # Counted here rather than at the top of the method, so that the
+        # early return above — a halt that was already active — is not a second
+        # incident on the graph. The Redis state is the deduplication, exactly
+        # as it is for the notification (ADR 0012).
+        metrics.halt_engaged(scope, reason)
         self._announce("engaged", record)
         self._alert_engaged(record)
         return record
@@ -248,6 +254,7 @@ class RedisKillSwitch:
             original=_decode(record).engaged_by if record is not None else None,
         )
         if removed:
+            metrics.halt_cleared(scope)
             self._announce(
                 "cleared",
                 _decode(record) if record is not None else None,

@@ -88,6 +88,7 @@ env flag plus a typed confirmation.
 | [API.md](docs/API.md) | REST/WS surface and conventions |
 | [TESTING.md](docs/TESTING.md) | Test layout and what must be covered |
 | [DEPLOYMENT.md](docs/DEPLOYMENT.md) | Shipping it somewhere |
+| [OBSERVABILITY.md](docs/OBSERVABILITY.md) | Metrics, the scrape endpoints, correlation ids |
 | [RUNBOOK.md](docs/RUNBOOK.md) | Something is broken in production |
 | [GLOSSARY.md](docs/GLOSSARY.md) | A trading term is unfamiliar |
 | [adr/](docs/adr/) | "Why is it built this way?" |

@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from atp_core import metrics
 from atp_core.channels import CHANNEL_BARS, CHANNEL_QUOTES
 from atp_core.clock import SystemClock
 from atp_core.data.backfill import backfill_bars
@@ -227,17 +228,27 @@ class StreamIngestor:
         # is how old the *price* is, and a vendor replaying a backlog would
         # otherwise stamp stale prices as fresh on arrival.
         self.stats.last_tick_at[quote.symbol] = quote.ts
+        metrics.stream_message("quote")
+        # Exported per symbol as a timestamp rather than an age, for the reason
+        # `registry` gives: an age is only true when it is written, so an
+        # ingestor that stopped would report a small, steady, reassuring number
+        # for as long as it stayed stopped. This is the same value
+        # `StaleDataRule` refuses orders against, so a graph of it and the rule
+        # cannot disagree.
+        metrics.stream_last_tick(quote.symbol, quote.ts.timestamp())
         await self.quote_cache.set_quote(quote)
         await self._publish(CHANNEL_QUOTES, _quote_message(quote))
 
     async def _handle_bar(self, bar: Bar) -> None:
         """Persist and publish. Bars are the durable record."""
+        metrics.stream_message("bar")
         await self.bar_repo.upsert_bars([bar])
         await self._publish(CHANNEL_BARS, _bar_message(bar))
 
     async def _on_reconnect(self, event: FeedReconnected) -> None:
         """Close the data gap the outage left, before anything else is handled."""
         self.stats.reconnects += 1
+        metrics.stream_reconnected()
         self.stats.connected_since = event.reconnected_at
         gap_seconds = (event.reconnected_at - event.gap_since).total_seconds()
         log.warning(
@@ -247,7 +258,9 @@ class StreamIngestor:
             gap_since=event.gap_since.isoformat(),
             symbols=len(self._symbols),
         )
-        self.stats.gaps_backfilled += await self._backfill_gap(event.gap_since)
+        backfilled = await self._backfill_gap(event.gap_since)
+        self.stats.gaps_backfilled += backfilled
+        metrics.stream_gap_bars(backfilled)
 
     async def _backfill_gap(self, since: datetime) -> int:
         """Fetch and store bars missed while disconnected.

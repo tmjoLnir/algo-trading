@@ -29,6 +29,42 @@ money.
 Halting is *not* flattening. Halting stops new risk. Flattening realises
 existing P&L and is a separate decision.
 
+## Reading the numbers
+
+`scripts/status.py` first — it is the operator's view and it needs no token.
+`/metrics` is the second look, and it answers questions status cannot: *how long
+has this been happening*, and *is it happening on both processes*.
+
+```bash
+# what the platform thinks is true right now
+curl -sH "Authorization: Bearer $METRICS_TOKEN" http://127.0.0.1:8000/metrics \
+  | grep -E 'atp_halt_(active|state_readable)|atp_orders_rejected|atp_alerts_failed'
+```
+
+Three readings worth knowing before you need them:
+
+- **`atp_halt_state_readable 0`** — the kill-switch state cannot be read.
+  It fails closed, so *every order is being refused* whether or not anything is
+  halted. This is a Redis problem, not a trading one.
+- **`atp_orders_rejected_total{stage="indeterminate"}` rising** — a submit
+  failed in transport and could not be resolved against the venue. Go to
+  "Indeterminate submit" below; it always comes with a halt.
+- **`atp_alerts_failed_total` rising** — halts are happening and *no phone is
+  ringing*. Whatever you are reading about here, assume nobody else knows.
+
+If a scrape fails entirely, that is information: the worker's exporter dies with
+the worker, which is the point of it being a separate target (ADR 0013). Both
+endpoints also accept your dashboard session, so a browser works if you do not
+have the token to hand. Full reference: [OBSERVABILITY.md](OBSERVABILITY.md).
+
+Every log line inside one unit of work carries a `correlation_id` — one per API
+request, per scheduled job, per pass of the strategy loop. Once you have found
+one interesting line, that field is how you get the rest of what it was doing:
+
+```bash
+docker compose logs worker | grep '"correlation_id": "<the id>"'
+```
+
 ## The phone buzzed
 
 An alert means the platform **has already stopped trading** — every one of them

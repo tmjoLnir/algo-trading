@@ -21,6 +21,7 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from atp_api.deps import get_current_session, require_write_scope
+from atp_api.middleware import ObservabilityMiddleware
 from atp_api.routers import (
     analytics,
     audit,
@@ -29,6 +30,7 @@ from atp_api.routers import (
     dashboard,
     health,
     marketdata,
+    metrics,
     orders,
     positions,
     risk,
@@ -41,6 +43,7 @@ from atp_core.alerts import build_alert_sink
 from atp_core.config import get_settings
 from atp_core.logging import configure as configure_logging
 from atp_core.logging import get_logger
+from atp_core.metrics import build_info
 from atp_core.persistence.db import create_engine, create_session_factory
 from atp_core.persistence.redis_client import close_redis, create_redis, create_sync_redis
 from atp_core.risk.killswitch import RedisKillSwitch
@@ -66,6 +69,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     else:
         log.info("startup", run_mode=settings.run_mode, broker_url=settings.broker_base_url)
+
+    # Labels rather than a value, so a graph can be split by version and mode.
+    # Recorded before anything else can be, so a scrape that arrives during a
+    # slow startup still says which build it reached.
+    build_info(app.version, settings.run_mode.value)
+
+    if not settings.metrics_token.get_secret_value():
+        # Not fatal, and not silent. With no token the endpoint still answers a
+        # signed-in operator, so this is "nothing can scrape you", not
+        # "observability is off" — and the difference is what somebody wants
+        # told before they go looking for the target that never came up.
+        log.warning(
+            "startup.no_metrics_token",
+            msg="METRICS_TOKEN is unset — /metrics answers a session only, no scraper can collect",
+            fix="set METRICS_TOKEN in .env, or in the SOPS bundle (docs/DEPLOYMENT.md)",
+        )
 
     # Fail closed, and say so here rather than at the login screen. With no hash
     # configured there is no password that works — not "any password works" —
@@ -130,6 +149,11 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # Added last, so it runs first. Starlette applies middleware in reverse
+    # order of registration, and this one has to wrap CORS rather than sit
+    # inside it: a request refused by CORS is still a request, and the ones
+    # worth tracing are disproportionately the ones that never reached a
+    # handler.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list,
@@ -137,12 +161,13 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(ObservabilityMiddleware)
 
     # Health probes and the WebSocket are deliberately UNVERSIONED. Orchestrators
     # hit /healthz directly — including this repo's own Docker HEALTHCHECK and
     # compose `depends_on: service_healthy` gates — and a probe URL that moves
     # when the API version bumps is a probe that fails for no real reason.
-    unversioned = (health.router, ws_router)
+    unversioned = (health.router, metrics.router, ws_router)
 
     # Everything that is not on this list requires a session (ADR 0008). Stated
     # as an allow-list on purpose: a router added to the loop below and to
@@ -157,7 +182,11 @@ def create_app() -> FastAPI:
     # `ws`     — authenticates inside its handler instead. A dependency raising
     #   HTTPException cannot close a WebSocket handshake politely; it surfaces
     #   as a transport error rather than a refusal the client can act on.
-    open_routers = (health.router, auth.router, ws_router)
+    # `metrics` — a scraper holds a bearer token and cannot hold a cookie, so
+    #   the session dependency would refuse every legitimate collection. It
+    #   authenticates inside the handler instead and answers 401 without either
+    #   credential, which is why it is absent from the test's open list.
+    open_routers = (health.router, auth.router, metrics.router, ws_router)
     # Both, and in this order, for reading rather than for effect:
     # `require_write_scope` resolves the session itself, so it alone would
     # enforce authentication too. Naming the session dependency beside it keeps
@@ -168,6 +197,7 @@ def create_app() -> FastAPI:
 
     for router in (
         health.router,
+        metrics.router,
         auth.router,
         audit.router,
         dashboard.router,
