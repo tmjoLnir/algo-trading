@@ -1295,11 +1295,17 @@ the only property that makes the screen worth reading.
   exactly what makes their databases look interchangeable). 39 unit tests
   alongside, and 9 integration tests that need a real TimescaleDB.
 
-  **The TimescaleDB half was not driven here.** This environment has no
-  timescaledb extension available and no docker daemon to run the image, so the
-  `pre_restore`/`post_restore` bracket and the hypertable assertions were
-  exercised only in CI, against the same `timescale/timescaledb:2.15.2-pg16` the
-  stack runs. That is a real check and it is not the same as having watched it.
+  **The TimescaleDB half was driven in CI rather than here**, because this
+  environment has no timescaledb extension available and no docker daemon to run
+  the image. It ran against the same `timescale/timescaledb:2.15.2-pg16` the
+  stack uses — 97 integration tests passed, and the *database server's own log*
+  carries the evidence rather than the test runner's exit code: the scratch
+  databases appear in it by name being created and dropped, the extension
+  reports itself installed at 2.15.2 in each one after the restore, and `bars`
+  comes back through `ALTER TABLE bars SET (timescaledb.compress,
+  timescaledb.compress_segmentby = 'symbol, timeframe')`. The compression policy
+  surviving a dump/restore was the one clause written from the documentation
+  rather than from observation; it holds.
 
   Two things found by running it that would have shipped looking plausible.
   `pg_dump --version` **exits 1 with a bare "Try --help"** when connection flags
@@ -1311,7 +1317,11 @@ the only property that makes the screen worth reading.
   forever, on every database this platform uses, including on a host where
   nothing at all was running. The guard counts `backend_type = 'client backend'`
   and the scratch database is dropped `WITH (FORCE)`, because that same worker
-  attaches the moment `post_restore` hands the database back.
+  attaches the moment `post_restore` hands the database back. Both halves were
+  reasoned about first and then *observed*: CI's PostgreSQL log pairs
+  `TimescaleDB background worker scheduler for database 18697 will be stopped`
+  with the `DROP DATABASE ... WITH (FORCE)` that stopped it, which is the worker
+  a plain DROP would have failed on.
 
   **What is missing is what a host would supply.** Nothing runs this: the cron
   lines are two lines in docs/BACKUPS.md and are documentation until there is a
