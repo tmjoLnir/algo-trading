@@ -21,6 +21,47 @@ That last row is the reason there are two exporters rather than one. See ADR
 0013; the short version is that a dead worker's numbers must *disappear*, not
 freeze at their last healthy values.
 
+## The two probes
+
+Metrics answer "is it working". The probes answer the cruder question
+underneath, and there are two of them because it is really two questions.
+
+```
+GET /healthz   liveness    is this process up?              never touches a dependency
+GET /readyz    readiness   can it serve a request now?      checks Postgres and Redis
+```
+
+`/healthz` must stay dependency-free. It is what `infra/docker/api.Dockerfile`
+HEALTHCHECKs and what compose gates `depends_on: service_healthy` on, so a
+version of it that consulted Postgres would let a slow database mark the
+container unhealthy — and the orchestrator would kill an API that was fine while
+the dependency it was waiting on never got the chance to come back.
+
+`/readyz` returns `{"status": "ready" | "not ready", "checks": {...}}`, with each
+dependency `ok`, `unreachable` or `absent` (`absent` meaning this process was
+built without one, not that it is down). It answers `503` unless everything is
+`ok`, so it can be a load-balancer's gate. Both dependencies are checked
+concurrently and each is bounded by `PROBE_TIMEOUT_SECONDS`, because a probe that
+waits as long as its dependency is a probe that hangs.
+
+It deliberately reports no exception text. The endpoint is open without a
+session (ADR 0008) and a driver's connection error quotes the DSN it tried,
+which carries the database password (CLAUDE.md §1.6). The reason goes to the log
+instead — `readyz.dependency_unreachable`, with `dependency`, `error_type` and
+`error` — where a shell on the host reaches it and a browser does not.
+
+**The broker is not checked**, though readiness is where people look for it. A
+probe is polled on a schedule and Alpaca rate-limits per key; in `backtest` mode
+there is no broker to reach; and a broker that is down is not a reason to take
+the API out of service, because the dashboard still has to render the book, the
+halts and the run-mode banner. Broker reachability belongs in an alert.
+
+Both are proxied onto the dashboard's own origin, unversioned
+(`infra/docker/web.nginx.conf`), which is what makes them usable from a browser
+during an incident: `502` on both means the API is not running, `200` and `503`
+means it is up and something behind it is not. docs/RUNBOOK.md, "Dashboard shows
+502 Bad Gateway", is that ladder written out.
+
 ## Two targets
 
 ```

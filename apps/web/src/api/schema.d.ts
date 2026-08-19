@@ -1025,8 +1025,23 @@ export interface paths {
         };
         /**
          * Readyz
-         * @description Readiness: DB, Redis and broker reachable. Fail this to be removed from
-         *     the load balancer without being restarted.
+         * @description Readiness: can this API actually serve a request?
+         *
+         *     Fail this to be removed from a load balancer without being restarted.
+         *
+         *     **The broker is deliberately not checked**, though an earlier draft of this
+         *     docstring said it would be. Three reasons, and they compound: a probe is
+         *     polled on a schedule and Alpaca rate-limits per key, so a readiness check
+         *     that called it spends the request budget the trading path needs; in
+         *     `backtest` mode there is no broker to reach and "not ready" would be wrong
+         *     rather than informative; and the broker being down is not a reason to take
+         *     this API out of service — the dashboard still has to render the book, the
+         *     halts and the run-mode banner, which is most of what it is for and none of
+         *     what a broker answers. Broker reachability is an alert, not a probe
+         *     (docs/OBSERVABILITY.md).
+         *
+         *     Both dependencies are checked concurrently, so a probe costs the slower of
+         *     the two rather than their sum.
          */
         get: operations["readyz_readyz_get"];
         put?: never;

@@ -3,9 +3,11 @@ import { ApiError, apiGet, apiPost } from './client'
 
 /**
  * The API client is thin, but it is the single choke point every monetary
- * figure on the dashboard passes through. Two behaviours matter enough to pin:
- * errors must surface the server's `detail` (a risk rejection explains itself
- * there), and money must arrive as strings so it never touches a JS float.
+ * figure on the dashboard passes through. Three behaviours matter enough to
+ * pin: errors must surface the server's `detail` (a risk rejection explains
+ * itself there), money must arrive as strings so it never touches a JS float,
+ * and an error that did *not* come from the API must say so rather than
+ * repeating a proxy's wording at someone who is trying to fix their stack.
  */
 
 function mockFetch(status: number, body: unknown, ok = status < 400) {
@@ -14,6 +16,24 @@ function mockFetch(status: number, body: unknown, ok = status < 400) {
     status,
     statusText: 'mocked',
     json: async () => body,
+  })
+  vi.stubGlobal('fetch', fn)
+  return fn
+}
+
+/**
+ * A response from something that is not the API — nginx's 502 page, or the Vite
+ * proxy's plain-text 500. Distinguished by the body failing to parse as JSON,
+ * which is exactly how the client tells the two apart.
+ */
+function mockProxyFailure(status: number, statusText: string) {
+  const fn = vi.fn().mockResolvedValue({
+    ok: false,
+    status,
+    statusText,
+    json: async () => {
+      throw new SyntaxError('Unexpected token < in JSON at position 0')
+    },
   })
   vi.stubGlobal('fetch', fn)
   return fn
@@ -43,6 +63,42 @@ describe('apiGet', () => {
   it('falls back to statusText when the error body has no detail', async () => {
     mockFetch(500, {})
     await expect(apiGet('/api/v1/x')).rejects.toThrow(/mocked/)
+  })
+
+  it('explains a 502 instead of repeating "Bad Gateway" at the user', async () => {
+    // What a dashboard showed for real: `Failed to load dashboard: Error: 502:
+    // Bad Gateway`. That is nginx saying it could not reach the API, phrased as
+    // a fact about a machine the reader does not know they have. The status is
+    // still carried — it is what a bug report needs — but the text has to name
+    // the actual condition and where to look next.
+    mockProxyFailure(502, 'Bad Gateway')
+    await expect(apiGet('/api/v1/dashboard/live')).rejects.toThrow(/could not be reached/)
+    await expect(apiGet('/api/v1/dashboard/live')).rejects.toThrow(/readyz/)
+  })
+
+  it('explains the Vite dev proxy 500 the same way', async () => {
+    // The dev server answers 500 where nginx answers 502 for the same fault —
+    // an unreachable upstream — so keying the message off the status alone
+    // would leave `make up` with the unhelpful version.
+    mockProxyFailure(500, 'Internal Server Error')
+    await expect(apiGet('/api/v1/dashboard/live')).rejects.toThrow(/could not be reached/)
+  })
+
+  it("keeps the API's own 503 detail rather than blaming the containers", async () => {
+    // The regression guard for the message above. A 503 from the API itself —
+    // Redis unreadable, so whether trading is halted is unknown — arrives as
+    // JSON and already says the most important thing on the screen. Overwriting
+    // it with advice about `docker compose ps` would replace a fact with a
+    // guess, and this is the one error where that matters most.
+    const detail = 'cannot read the halt state — refusing to report trading'
+    mockFetch(503, { detail })
+
+    const error = await apiGet('/api/v1/dashboard/live').catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(ApiError)
+    expect((error as ApiError).status).toBe(503)
+    expect((error as ApiError).detail).toBe(detail)
+    expect((error as ApiError).message).not.toMatch(/could not be reached/)
   })
 
   it('returns undefined for 204 rather than parsing an empty body', async () => {

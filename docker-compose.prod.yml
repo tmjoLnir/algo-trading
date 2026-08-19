@@ -11,22 +11,28 @@
 # VPN — and the reasoning behind choosing it are ADR 0011; the procedure for
 # using it is docs/DEPLOYMENT.md.
 #
-# Three things the base file does are right for a laptop and wrong for a host
+# Two things the base file does are right for a laptop and wrong for a host
 # that runs unattended. Each is corrected below, and each was a real defect
 # rather than a hypothetical one:
 #
-#   1. `db`, `redis` and `api` carry no restart policy while `worker` does. A
-#      host reboot therefore brings back the worker and nothing it depends on.
-#      The kill switch fails closed against an unreachable Redis, so the first
-#      thing that lone worker does is halt — the stack comes back up refusing
-#      to trade, and looks alive while doing it.
-#   2. `api` and `worker` bind-mount `./libs` and `./apps/*` over the code baked
+#   1. `api` and `worker` bind-mount `./libs` and `./apps/*` over the code baked
 #      into the image, so what runs is whatever is in the checkout on the host
 #      rather than what was built and tested. `api` additionally runs uvicorn
 #      with `--reload`, which turns a `git pull` into a hot deploy in the middle
 #      of a session — the one thing docs/SAFETY.md rule 4 is written to stop.
-#   3. `web` is the dev server and starts by default; `web-prod`, the built
+#   2. `web` is the dev server and starts by default; `web-prod`, the built
 #      bundle behind nginx, is behind a profile.
+#
+# There were three. The first was that `db`, `redis` and `api` carried no
+# restart policy while `worker` did, so a reboot brought back the worker alone —
+# which, with its kill switch failing closed against an unreachable Redis, came
+# up halted and looked alive. That is fixed in the BASE file now rather than
+# here, because it was never only a deployment defect: `make up-prod` serves the
+# dashboard from that file too, and there an api that exited once and stayed
+# exited is a permanent `502 Bad Gateway` behind an nginx that restarts forever.
+# The policies below are therefore a restatement rather than a correction, kept
+# for the same reason `worker`'s is: this file is what a reader consults to know
+# what the deployed stack does.
 #
 # **`!reset` is load-bearing.** Writing `volumes: []` in an override does NOT
 # remove the base file's bind mounts: compose merges the two lists by target

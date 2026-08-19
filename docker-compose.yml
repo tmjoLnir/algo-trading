@@ -24,6 +24,9 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    # Comes back with the machine, like everything else in this file now. See
+    # the note on `api` below for what the absence of this line used to cost.
+    restart: unless-stopped
 
   redis:
     # Latest-quote cache, pub/sub fan-out of market data to the API's WebSocket,
@@ -41,6 +44,10 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    # As db. Redis holds the kill-switch state, and the risk chain fails closed
+    # against an unreachable one — so a Redis that does not come back is a
+    # platform that comes back halted.
+    restart: unless-stopped
 
   api:
     build:
@@ -73,6 +80,31 @@ services:
       - ./libs:/app/libs
       - ./apps/api:/app/apps/api
     command: uvicorn atp_api.main:app --host 0.0.0.0 --port 8000 --reload
+    # THE line that keeps the dashboard working, and it was missing.
+    #
+    # `web-prod` restarts forever and this did not, which made the two ends of
+    # the same request disagree about whether the stack was running. nginx came
+    # back from every exit — a host reboot, an OOM kill, a `docker restart`, a
+    # laptop suspended with the stack up — and went on serving the dashboard
+    # perfectly, against an API that had exited once and stayed exited. What
+    # that looks like in a browser is the whole page rendering and then
+    # `Failed to load dashboard: Error: 502: Bad Gateway`, permanently, because
+    # a 502 is nginx saying it could not reach this container and nothing was
+    # ever going to start it again. The dashboard looked alive, which is what
+    # made it slow to diagnose: the thing that was down was the half nobody was
+    # looking at.
+    #
+    # `unless-stopped` rather than `always`: a `docker compose stop api` to work
+    # on something must stay stopped. The distinction matters more here than it
+    # usually does — this file is also what `make up-prod` runs, and that is the
+    # dashboard on 8080 (docs/DASHBOARD.md, "Serving it").
+    #
+    # This does NOT make a crash-loop invisible, which is the objection the
+    # `worker` note below raises against exactly this line: the API starts
+    # cleanly on a fresh checkout with no credentials, so a container that keeps
+    # exiting here is a real fault rather than an unimplemented entry point, and
+    # `docker compose ps` shows the restart count either way.
+    restart: unless-stopped
 
   worker:
     # Market-data ingestion + the live strategy loop. Deliberately a separate

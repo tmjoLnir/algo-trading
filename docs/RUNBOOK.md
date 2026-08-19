@@ -146,6 +146,52 @@ Likely a retry without `client_order_id` reuse, or two workers running.
 3. Decide immediately: close manually or accept the position. Do not leave it.
 4. Afterwards: why was there no broker-side stop?
 
+## Dashboard shows "502 Bad Gateway"
+
+*Symptom:* the dashboard renders, and then, where the numbers should be,
+`Failed to load dashboard: Error: 502: Bad Gateway`. Under `make up` the dev
+server says `500` for the same fault.
+
+**Read this line before diagnosing: you have not lost control of the book.** A
+502 is the server that sent you the *page* reporting that it could not reach the
+API. Nothing about positions, stops or the halt state has changed, and none of
+the three tools that matter go through the dashboard — `scripts/halt.py` engages
+a halt, `scripts/status.py` reads halts, quote freshness and the venue's account
+and positions, and broker-side stops are held by the venue regardless. Halt
+first if you would have halted anyway; the dashboard is not a prerequisite.
+
+The API never answers 502 itself: everything it has an opinion about comes back
+as JSON, including the 503 it returns when it cannot read the halt state. So the
+status came from nginx (`web-prod`, port 8080), and it means one hop failed —
+nginx to the `api` container.
+
+Three causes look identical on screen. The two probes separate them, and both
+are proxied onto the dashboard's own origin, so they answer in the same browser
+with no shell on the host:
+
+| `/healthz` | `/readyz` | What it is | Where to look |
+|---|---|---|---|
+| 502 | 502 | the API is not running | `docker compose ps`, then `logs api` |
+| 200 | 503 | API up, a dependency is not | the `/readyz` body names `database` or `redis` |
+| 200 | 200 | API and dependencies are fine | reload; then the browser console |
+
+`/readyz` returns `{"status": ..., "checks": {...}}` and marks each dependency
+`ok`, `unreachable` or `absent`. It deliberately does not say *why* — it is open
+without a session, and a driver's connection error quotes the DSN. The reason is
+in the API's log: `docker compose logs api | grep readyz`.
+
+`db`, `redis` and `api` carry `restart: unless-stopped`, so a single exit — an
+OOM kill, a host reboot, a laptop suspended with the stack up — recovers on its
+own and this symptom should clear within seconds. It did not always: nginx
+restarted forever while the API did not, so one exit produced a dashboard that
+rendered perfectly and 502'd permanently. If you are on a checkout without that
+policy, `docker compose up -d api` is the immediate fix.
+
+A container that keeps restarting is the other shape of this, and `docker
+compose ps` distinguishes them — a climbing restart count is a crash loop, not a
+recovery. Read `logs api` for the traceback; a `Settings` validation error at
+startup is the usual cause on a machine where `.env` was edited.
+
 ## Worker crash-looping
 
 1. Halt (the API is independent of the worker).
