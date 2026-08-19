@@ -1053,13 +1053,13 @@ the only property that makes the screen worth reading.
   is a 503 and never an empty page, which is ADR 0007's "nothing published is not
   an empty book" applied to the record instead of the book. Full reasoning and
   five rejected alternatives: ADR 0010.
-- [ ] Alerting to a phone (feed loss, halt, reconciliation failure) — @claude
-  (wip #52, #54, #55). Built, wired, and now driven end to end against the live
-  Telegram API with a real credential: a halt, its repeat, its all-clear and a
-  dead transport all behave as the *Verifiable:* line says. Still unticked, and
-  for the same reason as before — Telegram accepting a message into the
-  operator's chat is not somebody watching their phone light up, which is the
-  entire point of the item. One confirmation short.
+- [x] Alerting to a phone (feed loss, halt, reconciliation failure) — @claude
+  (#52, #54, #55). Driven end to end against the live Telegram API with a real
+  credential — a halt, its repeat, its all-clear and a dead transport all behave
+  as the *Verifiable:* line says — and the operator confirmed all fifteen test
+  messages arrived on their phone. That confirmation is what ticks this: it is
+  the one clause no test suite can close, and it is the entire point of the
+  item, which is why this sat built-but-unticked across #52 and #54.
 
   **The three named events are one event.** `HaltReason` already enumerates
   them, and all three converge on `KillSwitch.engage` — feed loss halts,
@@ -1143,12 +1143,15 @@ the only property that makes the screen worth reading.
   stream directly, for both transports; reverting
   `logging._silence_url_logging_libraries` fails three of them.
 
-  What was **not** shown remains the only thing that matters to the item: with
-  credentials configured, Telegram has now accepted every message the platform
-  sends — halt, all-clear, and every severity — into the operator's own chat,
-  but nobody has yet confirmed one rendered on a phone, and no test suite can
-  show that one did. `scripts/check_alerts.py` sends the set on demand so that
-  confirming it does not require halting anything.
+  What was **not** shown for the length of this item now is. With credentials
+  configured, Telegram accepted every message the platform sends — halt,
+  all-clear, and every severity — into the operator's own chat, and the operator
+  confirmed all fifteen arrived on their phone. No test suite can take that last
+  step, which is exactly why the item stayed unticked while the code sat
+  finished: the thing being verified is that a human is reachable, and the only
+  instrument for it is a human. `scripts/check_alerts.py` sends the set on
+  demand, so re-checking it after a credential rotation does not require
+  halting anything.
 
   Not alerted, deliberately: `order.submit_indeterminate` and
   `order.position_unprotected`, both `CRITICAL` in docs/RUNBOOK.md and neither
@@ -1421,7 +1424,7 @@ puts a notification on a phone that names the reason and carries no numbers from
 the book; re-engaging the same halt for the length of an outage sends exactly one
 more nothing; clearing it sends an all-clear; and a sink pointed at an
 unreachable host leaves the halt in effect and the process running.
-**Partly shown** — @claude. With real `ALERT_TELEGRAM_TOKEN` and
+**Shown** — @claude (#55). With real `ALERT_TELEGRAM_TOKEN` and
 `ALERT_TELEGRAM_CHAT_ID` supplied, all four clauses were driven against the live
 Telegram API rather than a mock, through the sink `build_alert_sink` builds from
 the deployment's own settings and the real `RedisKillSwitch`:
@@ -1440,15 +1443,24 @@ Severity mapping was checked the same way: INFO delivered with
 only lever Telegram gives and the whole difference between an all-clear at 02:00
 and a halt.
 
-Still **unticked**, because the one clause that defines the item is the one no
-code here can close: what was shown is that Telegram *accepted* every message
-into the operator's own chat, and the line says a notification arrives on a
-phone. That last step needs somebody to look at theirs and say so. Everything
-between the kill switch and the push service is now demonstrated rather than
-asserted; what remains is a person confirming receipt.
+The first clause is the one no code here could close — what the run showed is
+that Telegram *accepted* every message into the operator's own chat, and the
+line asks that a notification arrives on a phone. **The operator confirmed
+receipt: all fifteen messages arrived.** That is what completes the line, and it
+is worth being explicit that the evidence came from a person rather than from
+this repository, because it is the only clause in this file that could not have
+come from anywhere else.
 
-`scripts/check_alerts.py` is what makes that repeatable without engaging a real
-halt (#55). Proposed because the item had no line of its own, which is the
+Worth noting against the usual caveat: the line was proposed by @claude and is
+ticked by @claude, which normally wants a reviewer's eye. Here the deciding
+evidence came from the operator, which is a stronger check than a review of the
+tick would have been — but the four clauses *below* the first are still
+self-proposed and self-shown, and those are the ones to re-read sceptically.
+
+`scripts/check_alerts.py` is what makes the whole line repeatable without
+engaging a real halt (#55) — worth re-running after any credential rotation,
+since a revoked token and a working one are indistinguishable from anything
+except a send. Proposed because the item had no line of its own, which is the
 defect #45 and #46 both named.
 
 *Verifiable (metrics and tracing, proposed):* a scrape config collects from
@@ -1575,12 +1587,14 @@ The phase still needs a line covering production readiness as a whole. The
 reason previously given for not writing one — that nothing is deployable until
 authentication lands — no longer holds, since it has. What stands in its way now
 is a shorter list than it was, and a more specific one: **backups**, which are
-unstarted; **alerting**, which is built, now reaches a real chat over a real
-credential, and is one person's confirmation short of reaching a phone; and
-**metrics**, which are exported and have never been collected. Two of those
-three are waiting on the same missing host, and the third is waiting on somebody
-holding a phone. A line written today would still describe a system
-docs/SAFETY.md's own go-live checklist refuses.
+unstarted, and **metrics**, which are exported and have never been collected.
+Both are waiting on the same missing host. **Alerting** has come off this list:
+it reaches a phone over a real credential and is ticked above, which closes the
+one item here that was waiting on a person rather than on a machine — and it is
+the go-live checklist line most likely to be assumed rather than tested, since
+an unalerted platform behaves exactly like an alerted one until the day it
+matters. A line written today would still describe a system docs/SAFETY.md's own
+go-live checklist refuses, but for two reasons now instead of three.
 
 ## Later
 Declarative rule builder UI · walk-forward optimisation · sector/factor exposure
