@@ -131,25 +131,73 @@ class TestNtfyAlertSink:
 
         NtfyAlertSink("https://x", "t", client=_client(handler)).send(_alert())
 
-    def test_a_failure_never_logs_the_topic(self) -> None:
+    @pytest.mark.parametrize("failure", ["transport", 401, 403, 429, 500])
+    def test_a_failure_never_logs_the_topic(self, failure: object) -> None:
         """The topic is the capability: on a public server it is all that stands
         between the alerts and anyone who has it. A failure path that helpfully
         printed the URL would put it in every log aggregator we own.
 
+        **The status codes are the point of the parametrisation.** This test
+        used to cover the transport failure alone, whose message is the socket's
+        and carries no URL — so it passed while `str(HTTPStatusError)`, which
+        quotes the request URL in full, printed the topic on every 4xx. A wrong
+        or revoked credential returns exactly a 4xx, so the one uncovered case
+        was the one that happens in practice.
+
         Asserted over the captured event *dicts* rather than rendered text —
         `caplog` sees nothing here, because structlog does not route through the
-        stdlib logger this configuration, so a `not in caplog.text` assertion
+        stdlib logger in this configuration, so a `not in caplog.text` assertion
         would pass against an empty string and prove nothing.
         """
 
         def handler(request: httpx.Request) -> httpx.Response:
-            raise httpx.ConnectError("boom")
+            if failure == "transport":
+                raise httpx.ConnectError("boom")
+            return httpx.Response(int(failure))  # type: ignore[arg-type]
 
         with capture_logs() as events:
-            NtfyAlertSink("https://x", "s3cret-topic", client=_client(handler)).send(_alert())
+            NtfyAlertSink(
+                "https://ntfy.sh", "s3cret-topic", token="s3cret-token", client=_client(handler)
+            ).send(_alert())
 
         assert any(e["event"] == "alert.send_failed" for e in events)
         assert "s3cret-topic" not in str(events)
+        assert "s3cret-token" not in str(events)
+
+    def test_a_failure_still_says_what_went_wrong(self) -> None:
+        """Scrubbing must not turn the log into silence.
+
+        The failure path is what an operator reads when no alert arrived, and
+        "something failed" would send them to the vendor's status page with
+        nothing to check. The status code survives; only the credential does not.
+        """
+        with capture_logs() as events:
+            NtfyAlertSink(
+                "https://ntfy.sh",
+                "s3cret-topic",
+                client=_client(lambda r: httpx.Response(401)),
+            ).send(_alert())
+
+        assert events[0]["error"] == "HTTP 401 Unauthorized"
+
+    def test_the_topic_is_scrubbed_whatever_the_transport_raises(self) -> None:
+        """The guarantee, held independently of which exception type appears.
+
+        The status-code branch is a judgement about one library's message
+        format; this is the layer under it. An httpx that starts quoting URLs
+        in transport errors, or a proxy echoing the request line back in one,
+        must not reintroduce the leak — so the scrub runs over every message,
+        and this pins that rather than the branch.
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("failed to POST https://ntfy.sh/s3cret-topic")
+
+        with capture_logs() as events:
+            NtfyAlertSink("https://ntfy.sh", "s3cret-topic", client=_client(handler)).send(_alert())
+
+        assert "s3cret-topic" not in str(events)
+        assert "***" in events[0]["error"], "scrubbed, not dropped"
 
     def test_an_injected_client_is_left_open(self) -> None:
         """It belongs to the caller. Closing it here would work exactly once and
@@ -249,11 +297,34 @@ class TestTelegramAlertSink:
             return httpx.Response(200, json={"ok": False, "description": "chat not found"})
 
         with capture_logs() as events:
-            TelegramAlertSink("t", "c", client=_client(handler)).send(_alert())
+            # Realistic credentials rather than "t" and "c". The description is
+            # scrubbed of them before it is logged, and a one-character token
+            # matches inside ordinary English — `test_a_short_credential_is_
+            # still_scrubbed` below pins that deliberately. Here it would only
+            # obscure what this test is actually about.
+            TelegramAlertSink("77777:AA-tok", "chat-9876", client=_client(handler)).send(_alert())
 
         failures = [e for e in events if e["event"] == "alert.send_failed"]
         assert len(failures) == 1
         assert failures[0]["error"] == "chat not found"
+
+    def test_a_short_credential_is_still_scrubbed(self) -> None:
+        """The trade-off, pinned so it stays a decision rather than a surprise.
+
+        Scrubbing by value is unconditional, so a one-character credential
+        matches inside ordinary words and mangles the message. That is
+        deliberate and must not be "fixed" with a minimum-length guard: a short
+        credential is a *guessable* one, so it is the case where leaking it
+        matters most. A mangled log line is the cheaper failure.
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"ok": False, "description": "chat not found"})
+
+        with capture_logs() as events:
+            TelegramAlertSink("t", "c", client=_client(handler)).send(_alert())
+
+        assert events[0]["error"] == "***ha*** no*** found"
 
     def test_a_successful_send_is_not_logged_as_a_failure(self) -> None:
         with capture_logs() as events:
@@ -281,16 +352,26 @@ class TestTelegramAlertSink:
             "t", "c", client=_client(lambda r: httpx.Response(200, text="<html>hi</html>"))
         ).send(_alert())
 
-    @pytest.mark.parametrize("failure", ["transport", "ok_false"])
-    def test_a_failure_never_logs_the_token(self, failure: str) -> None:
+    @pytest.mark.parametrize("failure", ["transport", "ok_false", 401, 403, 404, 500])
+    def test_a_failure_never_logs_the_token(self, failure: object) -> None:
         """The token is in the URL path, so it *is* the bot: anyone holding it
-        reads the chat and posts as you. Neither failure path may print it."""
+        reads the chat and posts as you. No failure path may print it.
+
+        **The status codes are why this test was rewritten.** It covered the
+        transport error and `ok: false` alone — the two whose messages carry no
+        URL — and passed while `str(HTTPStatusError)` printed the whole
+        `.../bot<TOKEN>/sendMessage` on any 4xx. A revoked token answers 401 and
+        a wrong one 404, so the uncovered case was the likeliest one, on the
+        path an operator reads precisely because no alert arrived.
+        """
         secret = "77777:AA-super-secret-bot-token"
 
         def handler(request: httpx.Request) -> httpx.Response:
             if failure == "transport":
                 raise httpx.ConnectError("boom")
-            return httpx.Response(200, json={"ok": False, "description": "unauthorized"})
+            if failure == "ok_false":
+                return httpx.Response(200, json={"ok": False, "description": "unauthorized"})
+            return httpx.Response(int(failure))  # type: ignore[arg-type]
 
         with capture_logs() as events:
             TelegramAlertSink(secret, "chat-9876", client=_client(handler)).send(_alert())
@@ -298,6 +379,35 @@ class TestTelegramAlertSink:
         assert any(e["event"] == "alert.send_failed" for e in events)
         assert "super-secret-bot-token" not in str(events)
         assert "chat-9876" not in str(events)
+
+    def test_a_failure_still_says_what_went_wrong(self) -> None:
+        """401 is the answer a revoked token gives, and naming it is the whole
+        diagnosis. Scrubbing the credential must not scrub the reason."""
+        with capture_logs() as events:
+            TelegramAlertSink(
+                "77777:AA-super-secret-bot-token",
+                "chat-9876",
+                client=_client(lambda r: httpx.Response(401)),
+            ).send(_alert())
+
+        assert events[0]["error"] == "HTTP 401 Unauthorized"
+
+    def test_a_description_quoting_the_credential_is_scrubbed(self) -> None:
+        """Telegram's own words are echoed into the log on `ok: false`, and they
+        are the one string in this path we do not author. A description that
+        quoted the chat id back — which the API does for some errors — would
+        publish it through a field nothing else checks."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json={"ok": False, "description": "chat not found: chat-9876"}
+            )
+
+        with capture_logs() as events:
+            TelegramAlertSink("77777:AA-tok", "chat-9876", client=_client(handler)).send(_alert())
+
+        assert "chat-9876" not in str(events)
+        assert "chat not found" in events[0]["error"], "the diagnosis survives"
 
     @pytest.mark.parametrize(("token", "chat"), [("", "c"), ("t", ""), ("", "")])
     def test_refuses_half_a_configuration(self, token: str, chat: str) -> None:
