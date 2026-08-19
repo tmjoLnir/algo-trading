@@ -31,6 +31,17 @@ URL in its message, `error=str(exc)` printed the topic and the bot token on
 every 4xx — which is exactly what a wrong or revoked credential returns. It is
 `_describe` that makes the claim true now, and the tests cover the status codes
 rather than only the transport error that hid it.
+
+It was false a second time, and worse. `_describe` guards what *this module*
+writes; nothing guarded what `httpx` writes about the request underneath it.
+httpx logs `HTTP Request: POST <url> "HTTP/1.1 200 OK"` at INFO, so at the
+default `ATP_LOG_LEVEL` the bot token went into the log on every **successful**
+alert — not the rare 4xx this module's own scrubbing was built for, but every
+halt, every all-clear, forever. It survived a test file full of scrub
+assertions because those read structlog events via `capture_logs` and this
+record is written by a library to the stdlib stream, where nothing was looking.
+`logging._silence_url_logging_libraries` is what closes it, and the test that
+would have caught it reads the stdlib stream rather than the event list.
 """
 
 from __future__ import annotations

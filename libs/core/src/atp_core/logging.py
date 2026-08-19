@@ -114,10 +114,40 @@ def _redact(logger: Any, method: str, event_dict: dict[str, Any]) -> dict[str, A
     return event_dict
 
 
+def _silence_url_logging_libraries() -> None:
+    """Stop third-party loggers writing a request URL into the log.
+
+    **For two of this platform's HTTP clients the URL *is* the credential.** An
+    ntfy topic and a Telegram bot token each live in the path (`alerts.sinks`),
+    and `httpx` logs `HTTP Request: POST <url> "HTTP/1.1 200 OK"` at INFO on
+    every request it makes. So the scrubbing `alerts.sinks._describe` performs
+    so carefully on the failure path was being undone on the success path — by
+    a logger nobody configured, on every alert the platform sent, at the default
+    log level. CLAUDE.md §1.6 says no API key ever appears in a log line; this
+    is what makes that true of a library we do not control.
+
+    It went unnoticed for the same shape of reason the leak `_describe` fixes
+    did. Those tests assert with structlog's `capture_logs`, which sees
+    structlog events and nothing else — and this record is written to the
+    *stdlib* stream by a library, so a test suite watching only the events this
+    codebase emits could never have seen it. `tests/unit/test_alerts.py` now
+    reads the stdlib stream for exactly this.
+
+    Silenced rather than scrubbed by value: the line carries nothing an operator
+    needs that `alert.sent` does not already carry with more structure, and a
+    value-scrubbing filter would have to be told every credential in the process
+    to be worth having. WARNING rather than the configured level, so that
+    raising `ATP_LOG_LEVEL` to DEBUG during an incident — precisely when
+    somebody is pasting logs into a chat — cannot quietly reintroduce it.
+    """
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
 def configure(level: str = "INFO", fmt: str = "console") -> None:
     """Set up structlog. Call once at process start. Use `json` in production
     so logs are queryable."""
     logging.basicConfig(format="%(message)s", level=getattr(logging, level.upper(), logging.INFO))
+    _silence_url_logging_libraries()
     processors: list[Any] = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
