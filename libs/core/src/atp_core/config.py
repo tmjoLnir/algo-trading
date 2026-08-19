@@ -162,6 +162,23 @@ class Settings(BaseSettings):
     api_login_attempts: int = 10
     api_login_window_seconds: int = 300
 
+    #: Alerting (docs/SAFETY.md: "alerts reach a human on a phone"). Opt-in: an
+    #: empty topic leaves the logging sink in place rather than refusing to
+    #: start, because a platform that would not boot without a push service
+    #: configured has made a notification into a dependency.
+    #:
+    #: **The topic is a credential.** On a public ntfy server it is the only
+    #: thing between your halt notifications and anyone who guesses it, in both
+    #: directions — reading them and forging them. Generate a long random one
+    #: and keep it in the SOPS bundle (docs/DEPLOYMENT.md), not in a commit.
+    alert_ntfy_base_url: str = Field(default="https://ntfy.sh", alias="ALERT_NTFY_BASE_URL")
+    alert_ntfy_topic: str = Field(default="", alias="ALERT_NTFY_TOPIC")
+    alert_ntfy_token: str = Field(default="", alias="ALERT_NTFY_TOKEN")
+    #: Short on purpose. This runs after the halt is already durable, so the
+    #: only thing a longer timeout buys is a longer wait on a path whose whole
+    #: value is being fast.
+    alert_timeout_seconds: float = Field(default=5.0, alias="ALERT_TIMEOUT_SECONDS")
+
     risk: RiskLimits = Field(default_factory=RiskLimits)
 
     @model_validator(mode="after")

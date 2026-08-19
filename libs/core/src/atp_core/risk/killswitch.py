@@ -18,11 +18,14 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from atp_core.alerts.ports import Alert, Severity
 from atp_core.channels import CHANNEL_HALTS
 from atp_core.logging import get_logger
 
 if TYPE_CHECKING:
     from redis import Redis
+
+    from atp_core.alerts.ports import AlertSink
 
 log = get_logger(__name__)
 
@@ -128,9 +131,20 @@ class RedisKillSwitch:
     making it async to reach one key would colour the whole chain.
     """
 
-    def __init__(self, client: Redis, key_prefix: str = "atp:halt") -> None:
+    def __init__(
+        self,
+        client: Redis,
+        key_prefix: str = "atp:halt",
+        *,
+        alerts: AlertSink | None = None,
+    ) -> None:
         self._client = client
         self.key_prefix = key_prefix
+        #: Where a halt goes to reach a human who is not looking at a screen.
+        #: Optional because the kill switch must work without one — an
+        #: unalertable halt is still a halt, and refusing to construct without
+        #: a sink would make a notification into a dependency of stopping.
+        self._alerts = alerts
 
     def _key(self, scope: HaltScope, target: str | None) -> str:
         if scope is HaltScope.GLOBAL:
@@ -206,6 +220,7 @@ class RedisKillSwitch:
             detail=detail,
         )
         self._announce("engaged", record)
+        self._alert_engaged(record)
         return record
 
     def clear(self, scope: HaltScope, cleared_by: str, target: str | None = None) -> None:
@@ -239,6 +254,88 @@ class RedisKillSwitch:
                 scope=scope,
                 target=target,
                 actor=cleared_by,
+            )
+            self._alert_cleared(scope, target, cleared_by)
+
+    def _alert_engaged(self, record: HaltRecord) -> None:
+        """Tell a human trading stopped. Reached only by a *new* halt.
+
+        Placed exactly where `_announce` is, and for the same reason: both sit
+        after the state is durable in Redis, and both are announcements rather
+        than mechanism. The placement is also what makes deduplication free —
+        `engage` returns early when a halt is already active, so a staleness
+        monitor re-engaging every five seconds sends one alert, not twelve a
+        minute. The Redis state is the dedup, so there is no flag here to get
+        out of step with it.
+
+        Nothing from the book goes into the body (`alerts.ports`): the reason
+        and the scope say what to go and look at, and the dashboard — behind
+        authentication — is where the numbers are.
+        """
+        if self._alerts is None:
+            return
+        target = f" [{record.target}]" if record.target else ""
+        lines = [f"{record.scope.value}{target} halted by {record.engaged_by}."]
+        if record.detail:
+            lines.append(record.detail)
+        lines.append("Check the dashboard, then docs/RUNBOOK.md.")
+        self._send_alert(
+            Alert(
+                severity=Severity.CRITICAL,
+                title=f"Trading halted: {record.reason.value}",
+                body="\n".join(lines),
+                key=f"halt.{record.scope.value}.{record.target or 'all'}.{record.reason.value}",
+                context={
+                    "scope": record.scope.value,
+                    "reason": record.reason.value,
+                    "engaged_by": record.engaged_by,
+                },
+            )
+        )
+
+    def _alert_cleared(self, scope: HaltScope, target: str | None, cleared_by: str) -> None:
+        """Tell a human trading resumed. INFO, not CRITICAL.
+
+        Resuming is somebody's deliberate decision and never a surprise to the
+        person who made it — but it is news to anyone else who got the halt, and
+        a halt with no matching all-clear is how an operator ends up assuming
+        the platform is still stopped when it is not.
+        """
+        if self._alerts is None:
+            return
+        suffix = f" [{target}]" if target else ""
+        self._send_alert(
+            Alert(
+                severity=Severity.INFO,
+                title="Trading resumed",
+                body=f"{scope.value}{suffix} cleared by {cleared_by}.",
+                key=f"halt.{scope.value}.{target or 'all'}.cleared",
+                context={"scope": scope.value, "cleared_by": cleared_by},
+            )
+        )
+
+    def _send_alert(self, alert: Alert) -> None:
+        """Send, and never let it matter if it fails.
+
+        `AlertSink` tells implementations not to raise, and both of the ones in
+        this codebase honour it. This exists because "must not raise" is a
+        contract with third-party code on the other side of it — a future sink,
+        or a `requests`-based one somebody adds in a hurry — and the cost of
+        being wrong about that contract is an exception thrown out of the call
+        that just stopped trading, making a successful halt look like a failed
+        one. Same reasoning as `_announce` directly below, which has swallowed
+        for the same reason since it was written.
+        """
+        if self._alerts is None:
+            return
+        try:
+            self._alerts.send(alert)
+        except Exception as exc:
+            log.error(
+                "risk.killswitch.alert_failed",
+                key=alert.key,
+                error=str(exc),
+                msg="the halt IS in effect; only the notification was lost",
             )
 
     def _announce(

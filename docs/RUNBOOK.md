@@ -29,6 +29,25 @@ money.
 Halting is *not* flattening. Halting stops new risk. Flattening realises
 existing P&L and is a separate decision.
 
+## The phone buzzed
+
+An alert means the platform **has already stopped trading** — every one of them
+is sent from the kill switch after the halt is durable (ADR 0012). So there is
+nothing to do in the first instant; the reflex this runbook opens with has
+already happened by itself.
+
+The title carries the reason. Find it below — `data_feed_lost` is "Data feed
+disconnected", `reconciliation_mismatch` is "Reconciliation mismatch",
+`broker_unreachable` is "Broker unreachable" — and work that section.
+
+Deliberately absent from the notification: balances, positions, P&L. Open the
+dashboard for those. A "Trading resumed" alert is somebody clearing the halt; if
+that was not you and you do not know who, treat it as an incident.
+
+**Silence is not health.** Alerts go out from the worker; a worker that is dead,
+partitioned or was never configured with a topic sends nothing at all, and the
+absence of alerts and a working platform look identical from a phone.
+
 ---
 
 ## Data feed disconnected

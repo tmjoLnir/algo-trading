@@ -1053,15 +1053,69 @@ the only property that makes the screen worth reading.
   is a 503 and never an empty page, which is ADR 0007's "nothing published is not
   an empty book" applied to the record instead of the book. Full reasoning and
   five rejected alternatives: ADR 0010.
-- [ ] Alerting to a phone (feed loss, halt, reconciliation failure)
+- [ ] Alerting to a phone (feed loss, halt, reconciliation failure) — @claude
+  (wip #52). Built and wired; unticked because nobody has watched a
+  notification arrive on a phone, which is the entire point of the item.
+
+  **The three named events are one event.** `HaltReason` already enumerates
+  them, and all three converge on `KillSwitch.engage` — feed loss halts,
+  reconciliation mismatch halts, and "halt" is the method. So the sink hangs
+  off the kill switch rather than off three call sites: a halt reason added
+  later alerts without anyone remembering to wire it, and reconciliation is
+  covered before its handler exists. ADR 0012, and the same argument ADR 0005
+  makes for one submit path.
+
+  `atp_core.alerts` is the port and its transports — `NtfyAlertSink` (no
+  account, one POST, self-hostable) and `LoggingAlertSink`, which is the
+  default and is a real sink rather than a no-op so an unconfigured platform is
+  loud in its logs instead of quietly un-alerted. Bound in the worker, the API
+  and `scripts/halt.py`, so a halt from any of the three reaches the same place.
+
+  Two properties are the reason it is a wrapper around one choke point rather
+  than a `structlog` handler. **Deduplication is the Redis state**: `engage`
+  returns early on an already-active halt, so `StalenessMonitor` re-engaging
+  every five seconds through an outage sends one notification, not twelve a
+  minute — there is no flag anywhere that could drift out of step. And **a
+  failing sink cannot fail a halt**: the send happens after the halt is durable
+  and its exceptions are swallowed, which is `_announce`'s rule and ADR 0010's.
+  That second one was a real bug caught by its own test — the first draft let a
+  raising sink propagate straight out of `engage`.
+
+  Alerts carry the reason and the scope and never a balance, a position or a
+  P&L: the transport is a third party, the notification renders on a lock
+  screen, and on a public ntfy server a guessable topic is all that is in front
+  of it. Hence also that the topic is a credential, lives in the SOPS bundle,
+  and is never logged — including on the failure path.
+
+  What was actually shown: 26 unit tests, and the failure path exercised
+  against a real network refusal rather than a mock — this environment's egress
+  policy answers 403 for `ntfy.sh`, and the sink logged
+  `THE ALERT DID NOT GO OUT — the event it describes still did`, did not raise,
+  and did not print the topic. What was **not** shown is the only thing that
+  matters to the item: no notification has ever been delivered to a phone, and
+  no test suite can show that one was.
+
+  Not alerted, deliberately: `order.submit_indeterminate` and
+  `order.position_unprotected`, both `CRITICAL` in docs/RUNBOOK.md and neither
+  of which halts. They are reachable from the same port when somebody decides
+  they should be; ADR 0012 does not decide it for them.
 - [ ] Metrics/tracing
 - [ ] Backups and a tested restore
 - [ ] Deployment target chosen; secrets manager — @claude (wip #50, #51).
-  **The target is chosen and recorded; nothing is deployed.** ADR 0011: one
-  always-on VM per run mode in a US-East region, the existing compose stack,
-  reached over Tailscale, deployed by an explicit operator action, with paper
-  and live on separate hosts so that docs/SAFETY.md layer 3 is structural
-  rather than conventional.
+  **The deployment *shape* is chosen and recorded. No host has been selected,
+  and nothing is deployed.** ADR 0011: one always-on VM per run mode in a
+  US-East region, the existing compose stack, reached over a private network,
+  deployed by an explicit operator action, with paper and live on separate
+  hosts so that docs/SAFETY.md layer 3 is structural rather than conventional.
+  The ADR deliberately did not pick a machine or a vendor, and this item should
+  not be read as saying one was picked — what exists is a specification to buy
+  against.
+
+  **Tailscale is not the deployment target**, and where the docs name it they
+  mean the access layer: the VPN that keeps the dashboard off a public address.
+  WireGuard or an SSH tunnel serve the same purpose (docs/DASHBOARD.md has the
+  three). Whatever host is chosen is a Linux box running Docker; how the
+  dashboard is reached on it is a separate decision from what it runs on.
 
   Two constraints decided it, and both are in the code rather than in anyone's
   preference. Alpaca refuses a second stream connection per key with code 406,
@@ -1216,6 +1270,17 @@ the only property that makes the screen worth reading.
   It still does not make the platform deployable. The item above this is
   unstarted and the authentication item at the top of the phase is still
   blocking: this serves the dashboard to a private network and nowhere else.
+
+*Verifiable (alerting, proposed):* with a topic configured, engaging a halt puts
+a notification on a phone that names the reason and carries no numbers from the
+book; re-engaging the same halt for the length of an outage sends exactly one
+more nothing; clearing it sends an all-clear; and a sink pointed at an
+unreachable host leaves the halt in effect and the process running.
+**Not shown** — the first clause needs a phone and nobody has held one. The
+third and fourth are unit-tested, and the fourth was additionally driven against
+a real 403; that is not the same as the line, and this item stays unticked until
+somebody watches their phone light up. Proposed because the item had no line of
+its own, which is the defect #45 and #46 both named.
 
 *Verifiable (rate limiting and audit, proposed):* a run of wrong passwords from
 one address ends in 429 with a `Retry-After`, a correct password from that

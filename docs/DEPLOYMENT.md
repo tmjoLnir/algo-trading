@@ -11,6 +11,18 @@ are allowed to deploy.
 
 ## What you are deploying onto
 
+> **No host has been selected yet.** ADR 0011 chose the *shape* — one
+> always-on VM per run mode, the compose stack, reached over a private network,
+> deployed by hand — and deliberately did not pick a machine or a vendor. The
+> table below is the specification to buy against, not a description of
+> something that exists. Nothing in this repository has been deployed anywhere.
+>
+> **Tailscale is not the host.** It is the access layer: a VPN that puts the
+> dashboard on a private network instead of a public address. Whatever host is
+> eventually chosen, it is a Linux box running Docker, and Tailscale — or
+> WireGuard, or an SSH tunnel (`docs/DASHBOARD.md` has the three) — is how you
+> reach the dashboard on it.
+
 One always-on x86 VM per run mode, in a **US-East region** — Alpaca's API is
 there, and that is where latency is spent. The dashboard refreshes every five
 minutes, so your own distance from the host does not matter.
@@ -73,6 +85,7 @@ Fill in, at minimum:
 | `ATP_LOG_FORMAT=json` | The default is `console`, which is for a terminal |
 | `ATP_ENV=production` | |
 | `WORKER_SYMBOLS` | The watchlist. Empty means the worker idles |
+| `ALERT_NTFY_TOPIC` | Where halts reach a phone. Empty means log-only — see below |
 
 `ATP_RUN_MODE` and the two live locks are the ones to be deliberate about.
 `paper` is where a host starts and where it stays for at least the four weeks
@@ -175,6 +188,49 @@ reading it falls back to its default exactly as though the line were absent.
   it does not change here: a revoked key in a git history is harmless, and a
   live key removed from a bundle is not. Re-encrypting is the last step, not the
   first.
+
+### Alerting
+
+`docs/SAFETY.md`'s checklist asks that alerts reach a human on a phone rather
+than a log file. Every automated halt goes out this way — a lost feed, a
+reconciliation mismatch, a worker task dying — plus manual halts and resumes.
+Design and what is deliberately *not* alerted: ADR 0012.
+
+```bash
+python -c "import uuid; print('atp-' + uuid.uuid4().hex)"   # a topic nobody will guess
+```
+
+Put it in the bundle rather than in a commit, install the ntfy app on the
+phone, and subscribe it to that topic:
+
+```bash
+uv run python scripts/manage_secrets.py edit --env paper    # add ALERT_NTFY_TOPIC=...
+make secrets-install env=paper
+```
+
+**The topic is a credential.** On the public `ntfy.sh` server it is the only
+thing between your halt notifications and anyone who guesses it, in *both*
+directions — reading them and forging one that says trading resumed. Hence a
+random topic in the secret bundle. If the alerts matter, self-host ntfy and set
+`ALERT_NTFY_TOKEN`; then it is not a guess away.
+
+Alerts deliberately carry no numbers from the book — a reason and a scope, never
+a balance or a position. A notification renders on a lock screen and travels
+through a third party; what the numbers are is a question for the dashboard,
+which is behind authentication. Sending one to yourself to check the wiring:
+
+```bash
+uv run python scripts/halt.py engage --by "you" --detail "testing the alert path"
+uv run python scripts/halt.py clear  --by "you"
+```
+
+That is a real halt, so do it outside market hours or on a host that is not
+trading. It is also the only end-to-end test of this that exists: whether a
+notification arrives on a particular phone is not something the test suite can
+answer.
+
+With no topic configured the platform starts normally and logs what it would
+have sent (`alert.logged`). A notification must not be a dependency of trading.
 
 ## First deploy
 

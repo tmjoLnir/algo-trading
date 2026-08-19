@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from atp_core.alerts import Alert, Severity
 from atp_core.channels import CHANNEL_HALTS
 from atp_core.risk.killswitch import (
     HaltReason,
@@ -286,4 +287,139 @@ class TestAnnouncements:
         record = ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
 
         assert record.reason is HaltReason.MANUAL
+        assert ks.is_engaged() is True
+
+
+class RecordingSink:
+    """An `AlertSink` that keeps what it was given."""
+
+    def __init__(self) -> None:
+        self.sent: list[Alert] = []
+
+    def send(self, alert: Alert) -> None:
+        self.sent.append(alert)
+
+
+class TestAlerting:
+    """Reaching a human who is not looking at a screen (docs/SAFETY.md).
+
+    The kill switch is where this belongs because every automated halt already
+    arrives here — a lost feed, a reconciliation mismatch, a supervised task
+    dying. Hooking the three separately would mean a fourth halt reason added
+    later silently alerts nobody.
+    """
+
+    def test_a_new_halt_alerts_critical(self) -> None:
+        redis = FakeRedis()
+        sink = RecordingSink()
+        ks = RedisKillSwitch(redis, alerts=sink)  # type: ignore[arg-type]
+
+        ks.engage(HaltScope.GLOBAL, HaltReason.DATA_FEED_LOST, "staleness-monitor", "no ticks")
+
+        assert len(sink.sent) == 1
+        alert = sink.sent[0]
+        assert alert.severity is Severity.CRITICAL
+        assert "data_feed_lost" in alert.title
+        assert "staleness-monitor" in alert.body
+
+    def test_re_engaging_an_active_halt_alerts_once(self) -> None:
+        """The property the whole placement exists for. `StalenessMonitor` polls
+        every five seconds and re-engages while the outage lasts; alerting on
+        each would be twelve notifications a minute, which is the same as none.
+
+        There is no dedup flag anywhere — `engage` returns early when a halt is
+        already recorded, so the Redis state *is* the deduplication and cannot
+        drift out of step with it.
+        """
+        redis = FakeRedis()
+        sink = RecordingSink()
+        ks = RedisKillSwitch(redis, alerts=sink)  # type: ignore[arg-type]
+
+        for _ in range(12):
+            ks.engage(HaltScope.GLOBAL, HaltReason.DATA_FEED_LOST, "staleness-monitor")
+
+        assert len(sink.sent) == 1
+
+    def test_a_second_reason_alerts_again(self) -> None:
+        """Different scopes are different halts. Collapsing them would hide the
+        second thing that broke behind the first."""
+        redis = FakeRedis()
+        sink = RecordingSink()
+        ks = RedisKillSwitch(redis, alerts=sink)  # type: ignore[arg-type]
+
+        ks.engage(HaltScope.GLOBAL, HaltReason.DATA_FEED_LOST, "staleness-monitor")
+        ks.engage(HaltScope.SYMBOL, HaltReason.RECONCILIATION_MISMATCH, "reconciler", target="SPY")
+
+        assert len(sink.sent) == 2
+        assert sink.sent[1].severity is Severity.CRITICAL
+        assert "SPY" in sink.sent[1].body
+
+    def test_clearing_alerts_info(self) -> None:
+        """A halt with no matching all-clear is how somebody spends an afternoon
+        believing the platform is stopped when it is trading."""
+        redis = FakeRedis()
+        sink = RecordingSink()
+        ks = RedisKillSwitch(redis, alerts=sink)  # type: ignore[arg-type]
+
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "jo")
+        ks.clear(HaltScope.GLOBAL, cleared_by="jo")
+
+        assert [a.severity for a in sink.sent] == [Severity.CRITICAL, Severity.INFO]
+        assert "jo" in sink.sent[1].body
+
+    def test_clearing_nothing_alerts_nothing(self) -> None:
+        """Clearing an unengaged scope is a no-op, and a notification saying
+        trading resumed when it never stopped is worse than silence."""
+        redis = FakeRedis()
+        sink = RecordingSink()
+        ks = RedisKillSwitch(redis, alerts=sink)  # type: ignore[arg-type]
+
+        ks.clear(HaltScope.GLOBAL, cleared_by="jo")
+
+        assert sink.sent == []
+
+    def test_an_alert_carries_no_numbers_from_the_book(self) -> None:
+        """`alerts.ports` states the rule: a notification renders on a lock
+        screen and travels through a third party, so it says what happened and
+        never what the account is worth. The detail is the caller's, so this
+        pins the fields this class composes."""
+        redis = FakeRedis()
+        sink = RecordingSink()
+        ks = RedisKillSwitch(redis, alerts=sink)  # type: ignore[arg-type]
+
+        ks.engage(HaltScope.GLOBAL, HaltReason.DAILY_LOSS_LIMIT, "risk-engine")
+
+        alert = sink.sent[0]
+        assert "Check the dashboard" in alert.body
+        assert set(alert.context) == {"scope", "reason", "engaged_by"}
+
+    def test_a_failing_sink_does_not_fail_the_halt(self) -> None:
+        """The same rule as the announcement above, and ADR 0010's for the audit
+        trail. A platform that refused to stop trading because a push service
+        was down would have its failure modes exactly inverted.
+
+        `AlertSink` says implementations must not raise; this is what happens
+        when one does anyway, because "must not" is not "cannot".
+        """
+        redis = FakeRedis()
+
+        class Exploding:
+            def send(self, alert: Alert) -> None:
+                raise RuntimeError("push service is down")
+
+        ks = RedisKillSwitch(redis, alerts=Exploding())  # type: ignore[arg-type]
+
+        record = ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        assert record.reason is HaltReason.MANUAL
+        assert ks.is_engaged() is True
+
+    def test_no_sink_still_halts(self) -> None:
+        """Alerting is opt-in and the kill switch predates it. An unalertable
+        halt is still a halt."""
+        redis = FakeRedis()
+        ks = RedisKillSwitch(redis)  # type: ignore[arg-type]
+
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
         assert ks.is_engaged() is True

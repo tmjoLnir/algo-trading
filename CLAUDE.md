@@ -61,6 +61,7 @@ Inside `libs/core/src/atp_core/`:
 | `brokers/` | `BrokerPort` + adapters (Alpaca live, Alpaca paper, simulated, fake). |
 | `execution/` | Order router, order state machine, broker reconciliation. |
 | `risk/` | Pre-trade validation, stop management, the kill switch. |
+| `alerts/` | The alert port and its transports — reaching a human off-screen. |
 | `backtest/` | Historical event loop, portfolio simulation, cost models, metrics. |
 | `analytics/` | Performance statistics and report generation. |
 | `persistence/` | SQLAlchemy models, repositories, session management. |
