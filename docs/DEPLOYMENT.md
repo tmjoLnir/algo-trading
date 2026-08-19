@@ -29,14 +29,96 @@ minutes, so your own distance from the host does not matter.
 
 | | |
 |---|---|
-| Size | 4 vCPU / 8 GB / 160 GB SSD is comfortable; 2 vCPU / 4 GB / 80 GB works for one small watchlist |
 | OS | Any current Linux with Docker Engine and **Compose v2.24+** (`!reset`) |
+| Arch | x86-64 |
 | Region | US-East |
-| Network | Tailscale on the host. Nothing published to the internet, ever |
+| Network | A VPN interface on the host. Nothing published to the internet, ever |
 | Count | **Two hosts if you go live** — one paper, one live, separate key pairs |
 
 That last row is `docs/SAFETY.md` layer 3. Its stated failure mode is "live keys
 deployed to the paper env", and one host running both is how that happens.
+
+### Size
+
+| | Paper host, to start | Comfortable | Broad minute-bar backtesting |
+|---|---|---|---|
+| vCPU | 2 | **4** | 4–8 |
+| RAM | 4 GB | **8 GB** | 16–32 GB |
+| Disk | 40 GB | **80–160 GB** NVMe/SSD | 250 GB+ |
+
+**8 GB / 4 vCPU / 80 GB is the sweet spot** for one operator on a modest
+watchlist. Prefer NVMe to network block storage: Postgres fsync latency is the
+part you feel.
+
+Buy for the backtests, not for the running stack — the stack idles, and the
+numbers below say why.
+
+### What actually consumes each resource
+
+Measured against this codebase rather than estimated. All of it is measurement
+of the *code and the images*, projected onto a host nobody has bought yet.
+
+**RAM is a backtesting question.** `BacktestEngine.run(bars: dict[str, list[Bar]])`
+takes every bar for every symbol fully materialised, and `scripts/run_backtest.py`
+loads them eagerly per symbol before the engine starts. A `Bar` — frozen slots
+dataclass, seven `Decimal` fields — measures **855 bytes resident**, over 200,000
+of them:
+
+| Backtest | Bars | RAM for the bar objects alone |
+|---|---|---|
+| 1 symbol · 5y · daily | 1,260 | negligible |
+| 1 symbol · 1y · 1-minute | 98k | 0.08 GB |
+| 5 symbols · 2y · 1-minute | 983k | 0.84 GB |
+| 10 symbols · 5y · 1-minute | 4.9M | **4.2 GB** |
+| 50 symbols · 5y · 1-minute | 24.6M | 21 GB |
+
+That is before pandas, the equity curve or the engine's own state. Daily-bar
+backtests are free; minute-bar backtests over a wide universe are the only
+reason to buy more than 8 GB.
+
+**Disk is less than ADR 0004 makes it sound.** Loading the real hypertable —
+same columns, same `chunk_time_interval`, same `compress_segmentby` — with
+520,231 rows of a random walk gives **162 bytes/row uncompressed** and **84.8
+compressed**, a ratio of 1.9×. Treat that ratio as a *floor*: random data is
+maximally incompressible, and real series with regular timestamps and small
+price increments do considerably better.
+
+So ADR 0004's "50M rows for 500 symbols" is ≈ 8 GB raw, ≈ 4 GB compressed. A
+ten-symbol five-year minute history is under 1 GB. The disk is sized for Docker,
+not for bars: the TimescaleDB image alone is 756 MB, and `make deploy` builds on
+the host, so image layers, the uv cache and the Vite build all land there.
+**Budget 15–20 GB for Docker before a single bar is stored.**
+
+**CPU is single-core-bound where it matters.** The backtest loop is one Python
+thread, the worker is one asyncio process, and bcrypt at cost 12 is about a
+quarter-second of one core per login. Nothing here scales across cores except
+Postgres itself, so clock speed beats core count.
+
+### What the host has to be able to do
+
+Beyond Docker and the bind addresses, four things this platform genuinely
+depends on:
+
+- **An accurate, NTP-synced clock** (chrony or systemd-timesyncd). Not optional
+  here: bars are stamped at their open, `StalenessMonitor` measures silence in
+  wall-clock seconds against the exchange calendar, and every timestamp is
+  tz-aware UTC (CLAUDE.md §1.2). A drifting clock produces halts that look like
+  feed outages and bar attribution that looks like vendor error.
+- **Outbound HTTPS and WSS** to `api.alpaca.markets`, `data.alpaca.markets` and
+  `stream.data.alpaca.markets`, plus whichever alert transport is configured
+  (`ntfy.sh`, `api.telegram.org`). Alerting needs nothing else — no inbound
+  port, no DNS of its own.
+- **Persistent block storage with snapshots** for the `db_data` and
+  `redis_data` volumes. Redis holds kill-switch state with `appendonly yes`, so
+  that volume is a safety asset rather than a cache. Until "backups and a tested
+  restore" is built, provider snapshots are the entire recovery story.
+- **2–4 GB of swap**, as a cushion against a backtest that misjudged its
+  watchlist. A slow run beats an OOM kill during a session.
+
+Not needed: more than 4 cores for the platform itself, a GPU, a load balancer,
+public DNS, a certificate of our own, IPv6, or any form of HA — broker-side
+stops hold positions while the box is down, which is why ADR 0011 chose
+fail-stopped over multi-node.
 
 ## Provisioning
 
@@ -54,8 +136,36 @@ git clone <your remote> /opt/atp
 
 Then confirm the disk you will actually fill. Bars are the one table that grows
 without bound (ADR 0004): budget for the watchlist you intend, not the one you
-start with, and turn on Timescale compression for old chunks before it is
-urgent.
+start with.
+
+Compression needs no action — the initial migration sets
+`timescaledb.compress` on `bars` and adds a policy that compresses chunks older
+than 30 days. The last 30 days stay uncompressed by design, which is why the
+raw figure above is the one to size against.
+
+### The database tunes itself from the host's RAM, not from yours
+
+The `timescale/timescaledb` image runs `timescaledb-tune` on first init
+(`001_timescaledb_tune.sh`). On a 15 GB machine it wrote:
+
+```
+shared_buffers = 4018MB          # ~25% of HOST RAM
+effective_cache_size = 12056MB   # ~75% of HOST RAM
+work_mem = 10288kB               # per sort node, up to max_connections
+```
+
+Two consequences, and both bite quietly.
+
+**Postgres assumes it has the machine.** On an 8 GB host it claims ~2 GB of
+shared buffers and plans as though 6 GB of page cache were available to it —
+while the worker, the API, nginx and any backtest are also on that box. That is
+survivable at 8 GB and is why the "comfortable" row is not 4 GB; at 4 GB, pin
+`shared_buffers` and `work_mem` explicitly rather than letting the tuner guess.
+
+**It reads the host's RAM, not the container's limit.** Adding a memory limit to
+the `db` service without also pinning those settings gives you a Postgres sized
+for a machine it cannot have, and the OOM killer resolves the disagreement. If
+you constrain the container, configure the database to match in the same change.
 
 ## Configuring
 
