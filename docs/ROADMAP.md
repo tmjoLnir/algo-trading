@@ -711,6 +711,31 @@ above.
   The other gap recorded here — that `atp_worker.main` did not construct a
   runner — is closed by #40, which wires it behind an opt-in.
 
+  **The mirror was not complete, and #58 found the hole while building
+  attribution on top of it.** The claim above — that the loop runs the
+  documented ordering and that a divergence from the engine makes every backtest
+  a claim about a system that does not exist — was pinned by a test on the
+  *order* of the steps, and step 2's *content* had drifted:
+  `BacktestEngine._check_stops` resolves a take-profit against the bar and names
+  `take_profit` as an exit reason, while `_exit_reason` here only ever returned
+  `stop_loss` or `time_exit`. So an armed target was never acted on live. The
+  level was real and persisted — the router arms one from any signal or
+  `StopConfig` that carries it, and migration `a1c4e77b91d2` added the column so
+  it survives a restart — and nothing looked at it. A strategy backtested with a
+  target and run live without one is not the same strategy.
+
+  Closed in #58, with the engine's pessimistic tie-break carried across
+  verbatim: when one bar's range spans both levels the stop is assumed to have
+  filled first, because the bar cannot say which came first and assuming the
+  target would make every live report and every backtest that agreed with it
+  flatter than the truth. Verified by mutation — removing the take-profit check
+  fails one test, and flipping the tie-break fails another.
+
+  Worth naming as a class rather than as an incident: this drifted because the
+  parity test read the *sequence* of the steps and not what each step did. The
+  ordering test is still the right test; it is just not the whole of the
+  property it appears to guarantee.
+
   Unticked. Phase 4's *Verifiable:* line is a paper week, and this loop has
   never been pointed at a venue — every test drives it off fakes.
 - [ ] Trade-updates WS with reconnect — @claude (wip #37).
@@ -935,17 +960,76 @@ wording if it is not the demonstration you want.
   published", which demonstrates the null-book path and says nothing whatever
   about agreement between the worker's numbers and the screen's — which is the
   only property that makes the screen worth reading.
-- [ ] Trade reconstruction, attribution, MAE/MFE.
-  Two prerequisites are worth naming here because #45 found them and did not
-  fix them. `SignalRow` exists in the schema with **no writer** — the
-  dashboard's signal feed is a bounded in-memory ring on the runner, so a
-  restart empties it — and writing one needs a `strategies` row to satisfy its
-  foreign key, which nothing creates either. `PostgresOrderRepository` stores
-  `strategy_id` and `signal_id` as null for the same reason, so an order cannot
-  currently be traced back to the decision that caused it. Attribution is that
-  chain.
-- [ ] Live-vs-backtest comparison
-- [ ] Daily report
+- [ ] Trade reconstruction, attribution, MAE/MFE — @claude (wip #58).
+  Built: `PerformanceAnalyzer` folds stored fills into round trips, measures
+  MAE/MFE against bars, and groups P&L five ways; `/analytics/performance`,
+  `/analytics/trades` and `/analytics/attribution` serve it. docs/ANALYTICS.md
+  and ADR 0015.
+
+  **Both prerequisites #45 named are closed.** `SignalRow` has a writer
+  (`SignalRepository`), a `strategies` row is created by the runner at every
+  session open, and `PostgresOrderRepository` stores real `strategy_id` and
+  `signal_id` instead of the literal `None` it had been storing since #44 — so
+  an order can be traced to the decision that caused it, which is the whole of
+  attribution. The foreign keys make that non-optional rather than
+  best-effort: a runner that skips either write now gets an integrity error
+  where it used to get a null, and a null is how the gap stayed invisible for
+  four phases.
+
+  Two things this had to add before it could report anything honest, both
+  found by building it:
+
+  - **`orders.purpose`** (migration `c3f8b2d5e714`). `OrderRequest.purpose`
+    existed and was already load-bearing — it is part of the `client_order_id`
+    derivation — but it was consumed by that derivation and dropped, and a
+    SHA-256 digest cannot be read backwards. Every engine-side exit reaches the
+    venue as `router.flatten`, so without it a stop, a target and a time exit
+    stored identically and the most actionable table in the platform would have
+    had one bucket. `flatten` gained a `purpose` parameter to match, which
+    changes the idempotency key of an engine-side exit — a correction, since a
+    stop and a time exit firing on the same bar are two decisions and one key
+    for both would silently drop the second.
+  - **A live-vs-backtest divergence in the runner**, recorded against
+    `StrategyRunner` in Phase 4 as well. The engine resolved take-profits and
+    the live loop never looked at one.
+
+  A decision worth a reviewer's eye, argued in ADR 0015: **a trade is a
+  position episode** — flat, through any number of scale-ins and partial exits,
+  back to flat — rather than a tax lot. That is what makes `exit_reason` a
+  single answer and the holding period a well-defined window, and it narrows
+  the FIFO/LIFO question to one place: a fill that carries a position *through*
+  zero, where the split is FIFO and the fee is pro rata. The invariant that
+  matters is a hypothesis property, as docs/TESTING.md asks — over any
+  generated fill sequence, the reconstructed trades sum to the P&L the fills
+  themselves produce.
+
+  The second decision is that these endpoints **reconstruct on request** rather
+  than serving something the worker published, which is the opposite of ADR
+  0007 and needs its reason stated: that ADR is about a quantity still moving,
+  and two processes computing a *closed* round trip from the same stored fills
+  cannot disagree. The cost is a read that grows with the account's lifetime;
+  ADR 0015 names the threshold and says the fix is a stored trade table, not a
+  truncated read — a truncated read does not get slower, it gets wrong.
+
+  Unticked. This phase's *Verifiable:* line is about the dashboard and cannot
+  demonstrate any of it; a line these items can be held against is proposed
+  below. Nothing here has run against a database holding a real strategy's
+  history — the integration tests that exercise the new repositories are
+  written and were **not run in the environment this was built in**, which had
+  no Docker.
+- [ ] Live-vs-backtest comparison.
+  Half exists as of #58: `PerformanceAnalyzer.compare_to_backtest` computes the
+  divergence metric by metric, live minus backtest, and is tested. The endpoint
+  stays a stub because the *other operand* does not exist — `backtest_runs` has
+  no reader and `/backtests` is a stub, so there is no stored backtest to
+  compare against. Running one inside the request would compare live against
+  whatever parameters that request passed rather than against the backtest that
+  approved the strategy, which is the only comparison worth making.
+- [ ] Daily report.
+  Trades and P&L are available from `analytics/` as of #58. The other three
+  things the report wants are not gathered anywhere one query can reach:
+  rejections are in `signals`, halts are in the kill switch's records, and feed
+  incidents exist only in the worker's logs.
 
 *Verifiable:* with the stack up and a worker trading paper, a browser opened at
 any moment shows the same positions, cash and equity the worker's own log
@@ -961,6 +1045,27 @@ requirement #7 asks for; the analytics items above will want their own, and
 "the dashboard renders" is deliberately not enough — the line asks for
 agreement between what the worker believes and what the screen says, which is
 the only property that makes the screen worth reading.
+
+*Verifiable (analytics, proposed):* after a paper week, `/analytics/trades`
+reconstructs every round trip the worker actually took — the count and the
+summed net P&L agree with the broker's own statement for the period, not merely
+with our order table — each trade names the exit that closed it, and
+`/analytics/attribution?by=exit_reason` accounts for the whole of that P&L
+across its buckets.
+**Not yet shown** — @claude (#58). Proposed because the line above is entirely a
+dashboard statement and cannot demonstrate anything in the three analytics
+items, which is the same trap that left #16's calendar endpoint untickable for
+four phases.
+
+The clause doing the work is *"agree with the broker's own statement"*. Checking
+the reconstruction against our own orders table only proves the fold is
+self-consistent — and a fold that drops a position on a reversal is perfectly
+self-consistent, it just reports a smaller loss than the account took. The
+venue's own numbers are the only independent check available, and the paper week
+produces them for free.
+
+It needs the paper week and nothing else: every part is built, and none of it
+has met a database holding a real strategy's history.
 
 ## Phase 6 — Production readiness
 - [x] **Authentication** — @claude. One operator, `API_USER` and a bcrypt

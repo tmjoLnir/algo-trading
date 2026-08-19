@@ -46,10 +46,12 @@ from atp_core.dashboard.snapshot import DEFAULT_SIGNAL_LIMIT
 from atp_core.domain import Order, Portfolio, RunMode, Side, SignalAction
 from atp_core.domain.enums import StopType
 from atp_core.errors import ATPError, DataGapError, ExecutionError
+from atp_core.execution.idempotency import STOP_LOSS, TAKE_PROFIT, TIME_EXIT
 from atp_core.execution.trade_updates import apply_trade_update
 from atp_core.indicators import dispatch
 from atp_core.logging import correlation_id, get_logger
 from atp_core.risk.killswitch import HaltReason, HaltScope
+from atp_core.strategy.ports import SignalOutcome, StrategyRecord
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -66,6 +68,7 @@ if TYPE_CHECKING:
     from atp_core.risk.killswitch import KillSwitch
     from atp_core.risk.stops import StopConfig, StopManager
     from atp_core.strategy.base import Strategy
+    from atp_core.strategy.ports import SignalRepository, StrategyRepository
     from atp_core.strategy.rules import PositionSizeSpec
 
 log = get_logger(__name__)
@@ -254,6 +257,8 @@ class StrategyRunner:
         run_mode: RunMode,
         order_repo: OrderRepository,
         portfolio_repo: PortfolioRepository,
+        strategy_repo: StrategyRepository,
+        signal_repo: SignalRepository,
         snapshot_store: SnapshotStore | None = None,
         publisher: EventPublisher | None = None,
         signal_limit: int = DEFAULT_SIGNAL_LIMIT,
@@ -281,6 +286,15 @@ class StrategyRunner:
         #: defaultable would make that hole reachable by omission.
         self.order_repo = order_repo
         self.portfolio_repo = portfolio_repo
+        #: Required for the same reason, and with one extra teeth to it: an
+        #: order now stores `strategy_id` and `signal_id`, and both are foreign
+        #: keys. A runner without these would write orders naming decisions that
+        #: have no row, which the database refuses outright — so an optional
+        #: version would not degrade to "no attribution", it would degrade to
+        #: "no order was saved". Attribution is the join between the three, and
+        #: a join with a missing side is not a weaker answer but no answer.
+        self.strategy_repo = strategy_repo
+        self.signal_repo = signal_repo
         #: Optional, unlike the two above, and the asymmetry is deliberate.
         #: Losing the durable book is a correctness failure — it is what a
         #: restart reads. Losing the published one costs a dashboard its
@@ -351,6 +365,14 @@ class StrategyRunner:
         self._context = LiveContext(
             self._bars, self._quotes, portfolio, self.clock, tuple(self.symbols)
         )
+
+        # First, before anything can produce a signal or an order. Both store a
+        # foreign key to this row, so a runner that reached step 5 without it
+        # would fail every write from there on — and it fails here instead,
+        # where the message says which strategy has no row rather than surfacing
+        # as an integrity error inside an evaluation.
+        await self._ensure_strategy_row()
+
         needed = max(self.strategy.warmup_bars, 1)
 
         for symbol in self.symbols:
@@ -395,6 +417,37 @@ class StrategyRunner:
             strategy=self.strategy.name,
             symbols=len(self.symbols),
             bars=sum(len(b) for b in self._bars.values()),
+        )
+
+    async def _ensure_strategy_row(self) -> None:
+        """Give this strategy the row every signal and order points at.
+
+        The id is `strategy.name`, not a generated uuid, because that is what
+        `Signal.strategy_id` already carries everywhere in the platform —
+        `SmaCrossover` emits signals naming `"sma_crossover"`, the router copies
+        it onto the order, and both foreign keys resolve against it. Minting a
+        separate primary key here would leave every one of those references
+        pointing at nothing.
+
+        `kind` is `coded`: this runner is handed a `Strategy` instance, and the
+        declarative `ruleset` variant is compiled to one before it gets here.
+        Recording it as a ruleset would put a rule spec in a column nothing
+        wrote a rule spec into.
+
+        Idempotent, and re-run on every session open along with the rest of
+        `warmup` — which is why `ensure` touches only `updated_at` on a row that
+        already exists.
+        """
+        await self.strategy_repo.ensure(
+            StrategyRecord(
+                id=self.strategy.name,
+                name=self.strategy.name,
+                kind="coded",
+                class_name=type(self.strategy).__name__,
+                params=dict(self.strategy.params),
+                universe=tuple(self.symbols),
+                timeframe=self.timeframe.value,
+            )
         )
 
     async def run(self, portfolio: Portfolio) -> None:
@@ -692,7 +745,11 @@ class StrategyRunner:
 
             self.stats.stops_triggered += 1
             log.warning("runner.stop_triggered", symbol=position.symbol, reason=reason)
-            result = await self.router.flatten(position.symbol, portfolio)
+            # `reason` is the exit's `purpose`, so it rides into the order's
+            # idempotency key and into storage. Without it all three engine-side
+            # exits would store as `flatten` and the exit-reason attribution
+            # that makes this data worth keeping would have one bucket.
+            result = await self.router.flatten(position.symbol, portfolio, purpose=reason)
             if not result.submitted:
                 log.error(
                     "runner.stop_exit_refused",
@@ -705,22 +762,68 @@ class StrategyRunner:
     def _exit_reason(self, position: Position, bar: Bar) -> str | None:
         """Why this position should be closed now, or None to hold it.
 
+        Returns a `purpose` from `execution.idempotency`, which is what the exit
+        order is keyed and stored under — so the answer here is also the answer
+        `analytics.performance` reports when asked why the trade ended.
+
         A time stop is checked separately from a price one because it is not a
         level: `StopManager` refuses to give it a price, and a caller that
         asked for one would be inventing it.
+
+        **The take-profit is checked here, and it was not before.**
+        `BacktestEngine._check_stops` resolves both levels against the bar and
+        names `take_profit` as an exit reason; this method only ever returned
+        `stop_loss` or `time_exit`, so an armed target was never acted on live.
+        The router arms one on every position whose signal or `StopConfig`
+        carries one, and `Position.take_profit_price` is restored across a
+        restart (migration `a1c4e77b91d2` added the column for it) — so the
+        level existed, was persisted, and nothing looked at it. A strategy
+        backtested with a target and run live without one is not the same
+        strategy, which is the divergence ADR 0006 exists to refuse.
+
+        The tie-break matches the engine exactly: when one bar's range spans
+        both levels, **the stop is assumed to have filled first**. The bar
+        cannot say which came first and the pessimistic reading is the only
+        honest one at this resolution (docs/BACKTESTING.md). Assuming the target
+        would make every backtest and every live report flatter than the truth.
         """
         if self.stop_config.stop_type is StopType.TIME:
             held = self._bars_held(position)
             if held is not None and self.stop_manager.time_exit_due(held, self.stop_config):
-                return "time_exit"
+                return TIME_EXIT
             return None
 
         if self.stop_config.broker_side:
-            # Resting at the venue. Checking it here as well would double-exit
-            # on the bar the venue also fills.
-            return None
+            # The *stop* is resting at the venue; checking it here as well would
+            # double-exit on the bar the venue also fills. The target is not —
+            # `submit_protective_orders` arms it on the position rather than
+            # sending a second order — so it is still ours to watch, and
+            # returning early on both would leave a broker-side configuration
+            # with no upside exit at all.
+            return TAKE_PROFIT if self._target_hit(position, bar) else None
 
-        return "stop_loss" if self.stop_manager.should_trigger(position, bar) else None
+        if self.stop_manager.should_trigger(position, bar):
+            return STOP_LOSS
+        return TAKE_PROFIT if self._target_hit(position, bar) else None
+
+    @staticmethod
+    def _target_hit(position: Position, bar: Bar) -> bool:
+        """Did this bar trade through the take-profit?
+
+        The mirror of `StopManager.should_trigger`: a long's target is above it,
+        so the bar's HIGH is what reaches it, and a short's is below, so the LOW
+        does. Comparing against the close would miss a bar that spiked through
+        the target and settled back — the position did hit it.
+
+        Lives here rather than on `StopManager` because a target is not a stop:
+        `StopManager` computes levels from a `StopConfig` and refuses to invent
+        one for a config that does not describe a distance from entry, whereas
+        this reads a level already armed on the position by whoever chose it.
+        """
+        target = position.take_profit_price
+        if target is None or position.is_flat:
+            return False
+        return bar.high >= target if position.is_long else bar.low <= target
 
     def _bars_held(self, position: Position) -> int | None:
         """How many completed bars since the position opened."""
@@ -798,8 +901,30 @@ class StrategyRunner:
         outcome such as an exit for a position that is already flat, which the
         router reports as *approved* precisely so it does not inflate the
         rejection count an operator reads to judge whether risk is too tight.
+
+        **Written durably before it is announced**, and before step 6 saves the
+        order that references it. That ordering is what `persistence/events.py`
+        asks for — anything that must not be lost is written first and
+        announced second — and here it is also a foreign key: `orders.signal_id`
+        points at this row, so an order saved before its signal existed would be
+        refused by the database. The whole evaluation is under one lock, so no
+        fill event can slip an order save in between.
+
+        The write is allowed to raise, unlike the announcement below. It is in
+        the same class as the order and the book: a durable record whose absence
+        is a correctness problem rather than a dark screen. There is also no new
+        failure mode in raising — a Postgres that cannot take this signal cannot
+        take the order it produced either.
         """
         decision = result.decision
+        await self.signal_repo.save(
+            signal,
+            SignalOutcome(
+                acted_on=result.submitted,
+                rejection_reason=None if result.submitted else decision.reason or None,
+                rejected_by=None if result.submitted else decision.rule or None,
+            ),
+        )
         summary = SignalSummary(
             id=signal.id,
             ts=signal.ts,

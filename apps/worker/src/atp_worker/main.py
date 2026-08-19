@@ -46,6 +46,8 @@ from atp_core.persistence.orders import PostgresOrderRepository
 from atp_core.persistence.positions import PostgresPortfolioRepository
 from atp_core.persistence.quotes import RedisQuoteCache
 from atp_core.persistence.redis_client import close_redis, create_redis, create_sync_redis
+from atp_core.persistence.signals import PostgresSignalRepository
+from atp_core.persistence.strategies import PostgresStrategyRepository
 from atp_core.risk.killswitch import HaltReason, HaltScope, RedisKillSwitch
 from atp_worker import trading
 from atp_worker.metrics_server import start_metrics_server
@@ -197,6 +199,8 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
                 last_tick_at=ingestor.last_tick_at,
                 order_repo=PostgresOrderRepository(session_factory),
                 portfolio_repo=portfolio_repo,
+                strategy_repo=PostgresStrategyRepository(session_factory, clock),
+                signal_repo=PostgresSignalRepository(session_factory),
                 snapshot_store=snapshot_store,
                 publisher=publisher,
             )

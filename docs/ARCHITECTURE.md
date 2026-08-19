@@ -164,5 +164,6 @@ symbols on daily or minute bars comfortably.
 | A risk rule | `risk/rules.py` + `default_rules()` | `docs/RISK.md` |
 | A strategy | `strategy/examples/` or a stored `RuleSet` | — |
 | A strategy metric (Sharpe, drawdown) | `backtest/metrics.py` | shared with analytics automatically |
+| An attribution dimension | `analytics/performance.py` | `docs/ANALYTICS.md` |
 | An operational metric | `metrics/registry.py` — nowhere else | `docs/OBSERVABILITY.md` |
 | An endpoint | `apps/api/routers/` | `make gen-types` |

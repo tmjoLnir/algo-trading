@@ -299,16 +299,23 @@ remaining Phase 6 items are the difference — see docs/SAFETY.md.
 
 Stated here rather than left to be discovered:
 
-- **The signal feed does not survive a restart.** It is a bounded in-memory ring
-  on the strategy runner. `persistence.models.SignalRow` is the durable home and
-  nothing writes it — that belongs with the roadmap's trade-reconstruction item.
+- **The signal feed on *this screen* does not survive a restart**, though the
+  signals themselves now do. The feed is still a bounded in-memory ring on the
+  strategy runner, so a deploy empties what the dashboard shows;
+  `persistence.models.SignalRow` gained a writer in #58 and holds the durable
+  record, including the refusals. What is left is for this screen to fall back
+  to `SignalRepository.recent` when the ring is cold.
 - **`/dashboard/health` is a stub.** It would report worker heartbeat, broker
   reachability and the last reconciliation result, none of which the worker
   publishes anywhere. Building it means giving the worker a health key to write.
-- **Per-position strategy attribution is absent.** `PostgresOrderRepository`
-  stores `strategy_id` as null (a strategies row must exist first, and nothing
-  writes one), so a position cannot be traced to the strategy that opened it.
-  The snapshot names the strategy running the whole book instead.
+- **Per-position strategy attribution is absent *from this snapshot*.** The
+  underlying gap is closed — `PostgresOrderRepository` stores a real
+  `strategy_id` and `signal_id` now that `strategies` and `signals` have writers
+  (#58), so an order can be traced to the decision that caused it, and
+  `/analytics/attribution?by=strategy` reads that join. What this screen still
+  does is name the strategy running the whole book, because the published
+  snapshot is built from the runner's live `Portfolio` and a `Position` carries
+  no strategy of its own.
 - **Sign-in and scopes exist; rate limiting and revocation do not.** Signing in
   is one operator against a bcrypt hash, with the session in an `HttpOnly` cookie
   the WebSocket handshake carries by itself (ADR 0008). Sessions are `full` or
