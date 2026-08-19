@@ -1098,6 +1098,18 @@ the only property that makes the screen worth reading.
   of it. Hence also that the topic is a credential, lives in the SOPS bundle,
   and is never logged — including on the failure path.
 
+  **That last clause was false when it was written, and #54 is what makes it
+  true.** The credential is in the URL for both transports, `httpx`'s
+  `HTTPStatusError` quotes the URL in its message, and the sinks logged
+  `error=str(exc)` — so a wrong or revoked credential, which answers 401 or
+  404, printed itself into the log on the one path an operator reads *because*
+  no alert arrived. The two tests cited below missed it for a precise reason
+  worth recording: they covered a transport error, whose message is the
+  socket's, and Telegram's `ok: false`, whose message is Telegram's prose.
+  Neither is an HTTP status, so neither ever built the string that carried the
+  URL. Both now parametrise over 401/403/404/500, and reverting the fix fails
+  eleven of them.
+
   What was actually shown: 49 unit tests, and **both** transports' failure paths
   exercised against a real network refusal rather than a mock — this
   environment's egress policy answers 403 for `ntfy.sh` and for

@@ -24,6 +24,13 @@ bot, and it travels in the URL path. Both live in the SOPS bundle
 (docs/DEPLOYMENT.md), and nothing here logs either, including on the failure
 paths. The rule in `ports.py` about never putting the book in an alert exists
 mostly because of this paragraph.
+
+That last claim used to be a hope rather than a mechanism, and it was false.
+Because the credential is *in the URL*, and `httpx.HTTPStatusError` quotes the
+URL in its message, `error=str(exc)` printed the topic and the bot token on
+every 4xx — which is exactly what a wrong or revoked credential returns. It is
+`_describe` that makes the claim true now, and the tests cover the status codes
+rather than only the transport error that hid it.
 """
 
 from __future__ import annotations
@@ -76,6 +83,44 @@ _LOG_LEVEL = {
     Severity.WARNING: "warning",
     Severity.CRITICAL: "critical",
 }
+
+
+def _describe(exc: Exception, *secrets: str) -> str:
+    """What went wrong, in words that carry no credential.
+
+    **`httpx.HTTPStatusError` puts the request URL in its message**, and for
+    both transports here the URL *is* the secret — the ntfy topic and the
+    Telegram bot token each live in the path. So `str(exc)` on a 401 from a
+    revoked token printed that token into the log, on the one path an operator
+    is most likely to be reading. That is the failure this function exists for,
+    and it went unnoticed because the tests covered a transport error (whose
+    message is the socket's, with no URL in it) and Telegram's `ok: false` —
+    but never an HTTP status, which is what a wrong credential actually returns.
+
+    Two layers, because one is a judgement and the other is a guarantee. The
+    status line is rebuilt from the response rather than taken from httpx's
+    prose, which is both safe and more useful in a log than a sentence ending
+    in a link to MDN. The scrub then runs over whatever came out regardless of
+    exception type, so a future httpx that starts quoting URLs in transport
+    errors, or a body echoed back by a proxy, cannot reintroduce this.
+
+    The scrub is unconditional and not length-guarded. A one-character topic
+    would mangle the message — and a one-character topic is the case where
+    leaking it matters most, so a readable log is the wrong thing to protect.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        reason = f"HTTP {exc.response.status_code} {exc.response.reason_phrase}".strip()
+    else:
+        reason = str(exc)
+    return _scrub(reason, *secrets)
+
+
+def _scrub(text: str, *secrets: str) -> str:
+    """Replace every credential with `***`, wherever in `text` it appears."""
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
 
 
 class LoggingAlertSink:
@@ -135,6 +180,9 @@ class NtfyAlertSink:
         if not topic:
             raise ValueError("an ntfy sink needs a topic — use LoggingAlertSink instead")
         self._url = f"{base_url.rstrip('/')}/{topic}"
+        # Kept apart from the URL so the failure path can scrub it by value —
+        # a credential is only removable from a message if you still hold it.
+        self._topic = topic
         self._token = token
         self._timeout = timeout_seconds
         self._client = client
@@ -167,7 +215,7 @@ class NtfyAlertSink:
                 "alert.send_failed",
                 key=alert.key,
                 severity=alert.severity.value,
-                error=str(exc),
+                error=_describe(exc, self._topic, self._token),
                 msg="THE ALERT DID NOT GO OUT — the event it describes still did",
             )
             return
@@ -212,6 +260,9 @@ class TelegramAlertSink:
         # The token sits in the URL path, so this string is a credential in its
         # entirety and is never logged — see the failure path below.
         self._url = f"{base_url.rstrip('/')}/bot{token}/sendMessage"
+        # As above: held so the failure path can remove it from a message, not
+        # because anything else reads it.
+        self._token = token
         self._chat_id = chat_id
         self._timeout = timeout_seconds
         self._client = client
@@ -242,7 +293,7 @@ class TelegramAlertSink:
                 transport="telegram",
                 key=alert.key,
                 severity=alert.severity.value,
-                error=str(exc),
+                error=_describe(exc, self._token, self._chat_id),
                 msg="THE ALERT DID NOT GO OUT — the event it describes still did",
             )
             return
@@ -260,7 +311,11 @@ class TelegramAlertSink:
                 transport="telegram",
                 key=alert.key,
                 severity=alert.severity.value,
-                error=str(body.get("description", "telegram reported ok=false")),
+                error=_scrub(
+                    str(body.get("description", "telegram reported ok=false")),
+                    self._token,
+                    self._chat_id,
+                ),
                 msg="THE ALERT DID NOT GO OUT — the event it describes still did",
             )
             return
