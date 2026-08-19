@@ -14,6 +14,8 @@ would assert that argparse calls the method it obviously calls.
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -214,3 +216,79 @@ class TestCheckAlertsArguments:
         assert check_alerts.EXIT_UNCONFIGURED != 0
         assert check_alerts.EXIT_UNDELIVERED != 0
         assert check_alerts.EXIT_UNCONFIGURED != check_alerts.EXIT_UNDELIVERED
+
+
+class TestHashPasswordDependencies:
+    """The first command a new operator runs, and the one that used to fail worst.
+
+    `scripts/hash_password.py` puts `apps/api/src` on `sys.path`, so the
+    first-party import resolves from a bare checkout and then dies one layer
+    down on `bcrypt` — a third-party package that has to be genuinely
+    installed. It is declared by `atp-api`, a workspace member, while the
+    workspace ROOT declares no runtime dependencies at all, so a plain
+    `uv sync` leaves the script importable and unusable.
+
+    What that produced was `ModuleNotFoundError: No module named 'bcrypt'` and
+    a traceback through `auth.py`, at the moment a person has the least context
+    to act on it — before there is any password to sign in with at all. These
+    pin the message that replaced it, in a real subprocess, because the failure
+    is an import failure and cannot be reached by importing the module.
+    """
+
+    @staticmethod
+    def _run_without_bcrypt(tmp_path: Path) -> subprocess.CompletedProcess[str]:
+        """Run the script for real, with `bcrypt` made unimportable.
+
+        A `sitecustomize` on `PYTHONPATH` rather than an uninstall: the point is
+        to reproduce the *user's* environment without wrecking the one the rest
+        of the suite runs in. `find_spec` raising with `name=` set is what makes
+        `ImportError.name` carry `bcrypt`, which is the same thing a genuinely
+        absent package produces and is what the message quotes back.
+        """
+        (tmp_path / "sitecustomize.py").write_text(
+            "import sys\n"
+            "class _Block:\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            "        if name == 'bcrypt':\n"
+            "            raise ImportError(\"No module named 'bcrypt'\", name='bcrypt')\n"
+            "        return None\n"
+            "sys.meta_path.insert(0, _Block())\n"
+        )
+        env = {**os.environ, "PYTHONPATH": str(tmp_path)}
+        return subprocess.run(
+            [sys.executable, str(SCRIPTS / "hash_password.py")],
+            capture_output=True,
+            text=True,
+            input="",
+            env=env,
+            timeout=120,
+        )
+
+    def test_a_missing_dependency_names_itself_and_the_remedy(self, tmp_path: Path) -> None:
+        result = self._run_without_bcrypt(tmp_path)
+
+        assert result.returncode != 0, "a script that cannot hash must not exit 0"
+        assert "bcrypt is not installed" in result.stderr
+        # Both ways out, because they are not equivalent: one fixes the
+        # environment for everything else too, the other works without
+        # re-syncing anything.
+        assert "uv sync --all-packages" in result.stderr
+        assert "uv run --package atp-api" in result.stderr
+
+    def test_it_does_not_traceback(self, tmp_path: Path) -> None:
+        """A traceback is what this replaced. It named `bcrypt` in a frame of
+        `auth.py` and said nothing about how to proceed."""
+        result = self._run_without_bcrypt(tmp_path)
+
+        assert "Traceback (most recent call last)" not in result.stderr
+        assert "ModuleNotFoundError" not in result.stderr
+
+    def test_the_message_survives_an_unnamed_import_error(self) -> None:
+        """`ImportError.name` is not always set — a re-raise inside a package
+        loses it. The remedy must not depend on knowing which module was
+        missing, so the fallback still reads as a sentence."""
+        hash_password_script = _load("hash_password")
+        message = hash_password_script._dependency_help("A dependency")
+
+        assert message.startswith("A dependency is not installed")
+        assert "uv sync --all-packages" in message
