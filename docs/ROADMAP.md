@@ -1117,7 +1117,7 @@ the only property that makes the screen worth reading.
   `order.position_unprotected`, both `CRITICAL` in docs/RUNBOOK.md and neither
   of which halts. They are reachable from the same port when somebody decides
   they should be; ADR 0012 does not decide it for them.
-- [ ] Metrics/tracing — @claude (wip #PRNUM). Built, wired and driven against
+- [ ] Metrics/tracing — @claude (wip #53). Built, wired and driven against
   running processes; unticked, and the reason is narrower than "not finished".
   **The tracing half is done. The metrics half is an exporter nothing has ever
   collected from**, and a counter nothing samples over time is a number without
