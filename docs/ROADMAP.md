@@ -1117,7 +1117,97 @@ the only property that makes the screen worth reading.
   `order.position_unprotected`, both `CRITICAL` in docs/RUNBOOK.md and neither
   of which halts. They are reachable from the same port when somebody decides
   they should be; ADR 0012 does not decide it for them.
-- [ ] Metrics/tracing
+- [ ] Metrics/tracing — @claude (wip #53). Built, wired and driven against
+  running processes; unticked, and the reason is narrower than "not finished".
+  **The tracing half is done. The metrics half is an exporter nothing has ever
+  collected from**, and a counter nothing samples over time is a number without
+  a denominator — `atp_orders_rejected_total 47` says almost nothing on its own.
+  ADR 0013 and docs/OBSERVABILITY.md.
+
+  **The failure this is built for is not a crash.** `atp_worker.main`'s
+  supervisor already writes it down — *"a worker that half-runs is more
+  dangerous than one that is plainly down, because monitoring still sees a live
+  process while positions go unmanaged"* — and `runner.evaluate` says the same
+  of a loop erroring every tick: it "looks alive to a health check". Every state
+  worth catching here is one where `/healthz` answers `ok` throughout.
+
+  So **each process exports its own `/metrics` and the worker does not push**,
+  which is the decision worth arguing with. The natural alternative was for the
+  worker to write its numbers into Redis — already the cross-process bus for the
+  kill switch, the quote cache and the dashboard snapshot — and let the API
+  serve one endpoint. It was rejected because values pushed into Redis **stay
+  there after the process that wrote them dies**: the last tick rate, the last
+  quote age, no errors — a photograph of a working platform, served for as long
+  as anyone cares to look. That design makes exactly the failure above
+  invisible. A scrape cannot do that, and a failed scrape is the one signal a
+  corpse cannot fake. It is the same objection the Prometheus project documents
+  against its own Pushgateway.
+
+  Every metric sits **beside a log line that already existed, at a choke point
+  that was already the only path** — `KillSwitch.engage`, `RiskEngine.validate`,
+  `OrderRouter._route`, the ingestor's handlers, the alert sinks. That is
+  ADR 0012's argument reused: one line of code produces both, so a metric cannot
+  drift from the log. And every metric name in the platform is declared in one
+  module, with callers given typed functions rather than the instruments, so a
+  mistyped label is a `mypy --strict` error rather than a brand-new series that
+  reads zero forever.
+
+  **There is deliberately no locally-maintained "is it halted" gauge.** That
+  state lives in Redis and several processes write it; a copy kept by whichever
+  one happened to call `engage` disagrees with the platform the moment another
+  one does. The API reads it authoritatively at scrape time, and an unreadable
+  read is reported as `atp_halt_state_readable 0` rather than failing the whole
+  scrape — the kill switch fails closed, so that metric means *every order is
+  being refused*, which is the thing to alert on and the worst possible moment
+  to also lose every other number.
+
+  Tracing is a **correlation id, not spans**: one per API request (from
+  `X-Request-ID` if offered, echoed back), per scheduled job, and per pass of
+  the strategy loop, carried on every event underneath by the
+  `merge_contextvars` that was already in the structlog chain. Two processes on
+  one VM that do not call each other synchronously have no "which hop was slow"
+  question for spans to answer; they have a "which lines belong together" one.
+  An inbound id is sanitised rather than trusted — under the console renderer a
+  caller-supplied newline **writes its own log lines**, which is how somebody
+  who can reach the API forges a log entry about a platform that moves money.
+
+  One thing found by running it rather than reading it, and it would have
+  shipped looking plausible. FastAPI mounts each included router as a
+  *sub-router* rather than flattening its routes, so the route that lands in the
+  request scope is the one inside `positions.router` and its `path_format` is
+  `/positions/{symbol}` — the `/api/v1` that `include_router` added is consumed
+  on the way in and appears nowhere in the scope. Labelling by `path_format`
+  alone dropped the version from every business route in the platform. The
+  template is reconstructed from the concrete path and the matched suffix now,
+  and a test pins the version prefix specifically.
+
+  **What was actually driven**, on two real processes rather than in the suite:
+  the API refused a scrape with no token and with a wrong one, served the right
+  token and a signed-in session, and answered `text/plain; version=1.0.0`. A
+  halt engaged by **a different process** appeared in the API's scrape as
+  `atp_halt_active` while that API's own `atp_halts_engaged_total` stayed empty
+  — which is the authoritative-read design observed rather than asserted, and
+  the counter-based design would have shown nothing there. Redis was then
+  stopped: the scrape stayed 200, reported `atp_halt_state_readable 0.0`, and
+  still served its other 56 series. The worker's exporter refused an unauthenticated
+  scrape, refused a wrong token, answered 404 off `/metrics`, and served the
+  halt it had engaged; **killing that process turned the scrape into a connection
+  refusal** rather than a stale reading, which is the whole argument for the
+  second target. Route labels came back as `/api/v1/positions/{symbol}` for two
+  different symbols and `<unmatched>` for an invented path, with the invented
+  path absent from the body. And one request carrying `X-Request-ID:
+  incident-42` produced a log line from `routers/metrics.py` — code that never
+  sees the id — stamped `correlation_id: incident-42`, while an id with spaces
+  and a 200-character one were both replaced and left nothing of themselves in
+  the log. 59 unit tests alongside.
+
+  **What was not shown is the item's actual value.** No Prometheus has ever
+  scraped this, there is no dashboard and no alerting rule, and no host exists
+  to run one on (ADR 0011). Until something samples these over time the counters
+  are single numbers rather than rates, and the histogram buckets are guesses
+  made from reading the code rather than from a week of trading. The gauges —
+  the halt state, the per-symbol last tick — are useful from one `curl` today,
+  and that is the honest extent of it.
 - [ ] Backups and a tested restore
 - [ ] Deployment target chosen; secrets manager — @claude (wip #50, #51).
   **The deployment *shape* is chosen and recorded. No host has been selected,
@@ -1300,6 +1390,24 @@ a real 403; that is not the same as the line, and this item stays unticked until
 somebody watches their phone light up. Proposed because the item had no line of
 its own, which is the defect #45 and #46 both named.
 
+*Verifiable (metrics and tracing, proposed):* a scrape config collects from
+both processes across a trading day; the platform's state is legible from it
+without reading a log — a halt shows as engaged and cleared, a symbol that
+stopped printing shows as stale, and a loop erroring every tick is
+distinguishable from one that is idle; a worker that dies takes its target down
+rather than leaving its last healthy values readable; and one unit of work's log
+lines can be recovered from a single id taken off a response header.
+**Partly shown** — @claude. Every clause but the first has been driven against
+running processes, including the dead-worker one, which is the design's whole
+argument: killing the exporter turned the scrape into a connection refusal, and
+a halt engaged in one process was read authoritatively by the other. The first
+clause is the one that matters and is **not shown**: nothing has ever scraped
+this, so "across a trading day" has no observer and the counters have never been
+a rate. That is not a defect in the exporter — it is the collector, which needs
+the host ADR 0011 has specified and nobody has bought. Proposed because this
+item had no line of its own, the same defect #45 and #46 named; scoped to
+*metrics and tracing* and saying nothing about alerting or backups.
+
 *Verifiable (rate limiting and audit, proposed):* a run of wrong passwords from
 one address ends in 429 with a `Retry-After`, a correct password from that
 address is refused too while the window holds, and the same password from
@@ -1375,8 +1483,10 @@ is the same defect #45 named in Phase 5 and that left #16's calendar endpoint
 implemented and untickable through the whole of Phase 1: a phase without a line
 cannot tick anything, however much of it is built. It is scoped to *serving* on
 purpose. It says nothing about authentication, rate limiting, alerting,
-metrics, backups or a secrets manager — the other six items here, which are
-genuinely unstarted — and it must not be read as evidence for any of them.
+metrics, backups or a secrets manager, and it must not be read as evidence for
+any of them. (Those six were all unstarted when this was written; four have
+since been built to varying depths and only backups still has nothing at all.
+The scope of this line is unchanged either way — it is about serving.)
 *Proposed and ticked by the same hand, so it wants a reviewer's eye rather than
 mine.*
 
@@ -1389,7 +1499,9 @@ secret sits on the host outside the `0600` runtime file.
 item had no line it could ever be ticked against, which is the defect #45 and
 #46 both named: a phase without a line cannot tick anything, however much of it
 is built. It is scoped to *deployment* on purpose and says nothing about
-alerting, metrics or backups, which are separately unstarted.
+alerting, metrics or backups, which have their own items and their own lines
+above — and, in the case of metrics, a collector that this same missing host is
+what stands in the way of.
 
 That line and Phase 4's are the same week of uptime seen from two ends, which is
 the argument for doing this now rather than at go-live: Phase 4 has eight built
@@ -1400,9 +1512,13 @@ sleeps.
 
 The phase still needs a line covering production readiness as a whole. The
 reason previously given for not writing one — that nothing is deployable until
-authentication lands — no longer holds, since it has; what stands in its way now
-is alerting, backups and metrics, so a line written today would still describe a
-system docs/SAFETY.md's own go-live checklist refuses.
+authentication lands — no longer holds, since it has. What stands in its way now
+is a shorter list than it was, and a more specific one: **backups**, which are
+unstarted; **alerting**, which is built and has never reached a phone; and
+**metrics**, which are exported and have never been collected. Two of those
+three are waiting on the same missing host, and the third is waiting on somebody
+holding a phone. A line written today would still describe a system
+docs/SAFETY.md's own go-live checklist refuses.
 
 ## Later
 Declarative rule builder UI · walk-forward optimisation · sector/factor exposure

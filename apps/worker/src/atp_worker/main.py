@@ -27,6 +27,7 @@ import signal
 from contextlib import AsyncExitStack
 from typing import TYPE_CHECKING, Any
 
+from atp_core import __version__
 from atp_core.alerts import build_alert_sink
 from atp_core.brokers.alpaca import AlpacaBroker
 from atp_core.clock import SystemClock, TradingCalendar
@@ -36,6 +37,7 @@ from atp_core.data.stream import StalenessMonitor, StreamIngestor
 from atp_core.errors import ATPError
 from atp_core.logging import configure as configure_logging
 from atp_core.logging import get_logger
+from atp_core.metrics import build_info
 from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.dashboard import RedisSnapshotStore
 from atp_core.persistence.db import create_engine, create_session_factory
@@ -46,6 +48,7 @@ from atp_core.persistence.quotes import RedisQuoteCache
 from atp_core.persistence.redis_client import close_redis, create_redis, create_sync_redis
 from atp_core.risk.killswitch import HaltReason, HaltScope, RedisKillSwitch
 from atp_worker import trading
+from atp_worker.metrics_server import start_metrics_server
 from atp_worker.scheduler import run_scheduler
 
 if TYPE_CHECKING:
@@ -85,6 +88,11 @@ async def main() -> None:
     else:
         log.info("worker.starting", run_mode=settings.run_mode)
 
+    # Which build, in which mode — the labels are the payload. Recorded in
+    # `main` rather than in `run` so that a test driving `run` directly does not
+    # write into the process-wide registry as a side effect.
+    build_info(__version__, settings.run_mode.value)
+
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -110,6 +118,14 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
     symbols = settings.worker_symbol_list
 
     async with AsyncExitStack() as stack:
+        # Registered first, so it is torn down last: the shutdown path is
+        # exactly when somebody wants to know what this process was doing, and a
+        # listener closed before the ingestor stops reporting nothing about the
+        # stop itself.
+        server = start_metrics_server(settings)
+        if server is not None:
+            stack.callback(server.close)
+
         redis = create_redis(settings.redis_url)
         stack.push_async_callback(close_redis, redis)
 

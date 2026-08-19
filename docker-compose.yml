@@ -101,6 +101,13 @@ services:
     depends_on:
       db: {condition: service_healthy}
       redis: {condition: service_healthy}
+    # `expose`, never `ports`. The worker serves its own /metrics (ADR 0013) and
+    # it is reachable across this network and from nowhere else — the same trust
+    # boundary db and redis sit behind. Publishing it would put the watchlist
+    # and the order flow on the host's interfaces, which is what
+    # `make check-bindings` refuses.
+    expose:
+      - "9101"
     volumes:
       - ./libs:/app/libs
       - ./apps/worker:/app/apps/worker

@@ -939,6 +939,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/metrics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Scrape
+         * @description Prometheus text exposition for this process, plus the halt state.
+         *
+         *     **In the OpenAPI schema on purpose**, despite nothing in the dashboard ever
+         *     calling it. `tests/unit/test_api_contract.py` walks the generated schema and
+         *     asserts every route refuses an unauthenticated caller, and a route hidden
+         *     from that schema is a route the sweep cannot see. Given the choice between
+         *     an unused row in the generated types and an endpoint outside the one check
+         *     that is exhaustive, the row is cheaper — and this endpoint authenticates
+         *     itself rather than through the dependency, which is exactly the arrangement
+         *     worth having checked from outside.
+         */
+        get: operations["scrape_metrics_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/readyz": {
         parameters: {
             query?: never;
@@ -2952,6 +2981,26 @@ export interface operations {
                     "application/json": {
                         [key: string]: string;
                     };
+                };
+            };
+        };
+    };
+    scrape_metrics_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
                 };
             };
         };

@@ -338,7 +338,7 @@ unreachable Redis. The stack came up halted and looked alive.
 
 ## What this does not give you
 
-Three Phase 6 items are unbuilt, and a host does not supply them:
+Two Phase 6 items are unbuilt, and a host does not supply them:
 
 - **No alerting.** Nothing reaches a phone. `docs/SAFETY.md`'s go-live checklist
   requires it, so a live host is not compliant with our own checklist until it
@@ -346,8 +346,20 @@ Three Phase 6 items are unbuilt, and a host does not supply them:
 - **No backups.** There is no backup and no tested restore, which means one VM
   is one VM. Take a `pg_dump` on a cron before you care about the data, and
   restore it somewhere once — an untested backup is a belief, not a backup.
-- **No metrics or tracing.** `docker compose logs` and `scripts/status.py` are
-  the observability.
+
+**Metrics and tracing exist now** and are the third item's replacement in this
+list, but read the boundary carefully. The platform *exports* Prometheus text on
+`/metrics` from the API and the worker separately, and every log line carries a
+correlation id ([OBSERVABILITY.md](OBSERVABILITY.md), ADR 0013). **Nothing is
+scraping it**: there is no Prometheus, no Grafana and no alerting rule in this
+repo, so on a host with nothing else installed the observability is still
+`docker compose logs` and `scripts/status.py` — with the difference that `curl
+-H "Authorization: Bearer $METRICS_TOKEN" .../metrics` is now a diagnostic on
+its own, and a signed-in operator can open the same URL in a browser.
+
+Set `METRICS_TOKEN` when you provision. Unset means nothing can scrape — the
+API still answers a session, the worker answers nobody, and both say so at
+startup.
 
 ## Known limitations of this arrangement
 

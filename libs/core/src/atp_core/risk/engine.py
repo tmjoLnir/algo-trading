@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
+from atp_core import metrics
 from atp_core.errors import ConfigError, RiskLimitBreachedError
 
 if TYPE_CHECKING:
@@ -106,10 +107,16 @@ class RiskEngine:
         for rule in self.rules:
             decision = rule.check(order, portfolio, self.limits)
             if not decision.approved:
+                # Counted with the rule that refused, which is the only label on
+                # these worth having: "risk denied 40 orders today" is a
+                # curiosity, and "the exposure cap denied 40" is a position
+                # sizing bug.
+                metrics.risk_checked("denied", rule=decision.rule)
                 return decision
             if decision.adjusted_qty is not None:
                 adjusted = decision.adjusted_qty
                 order.qty = adjusted
+        metrics.risk_checked("shrunk" if adjusted is not None else "approved")
         return RiskDecision(approved=True, adjusted_qty=adjusted)
 
     def validate_or_raise(self, order: Order, portfolio: Portfolio) -> None:

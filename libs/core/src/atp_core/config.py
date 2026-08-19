@@ -189,6 +189,33 @@ class Settings(BaseSettings):
     #: value is being fast.
     alert_timeout_seconds: float = Field(default=5.0, alias="ALERT_TIMEOUT_SECONDS")
 
+    #: Metrics and tracing (ADR 0013, docs/OBSERVABILITY.md).
+    #:
+    #: **The scrape is a credential.** `/metrics` carries the watchlist, the
+    #: order and rejection counts and the request mix — no balances and no P&L,
+    #: deliberately, but more than enough to tell a stranger what this platform
+    #: trades and when it is broken. So it is guarded like everything else here
+    #: rather than left open the way `/healthz` is, and an unset token means
+    #: *nothing* can scrape rather than *anything* can.
+    #:
+    #: Long and random: this is compared against a header, so it is guessed at
+    #: HTTP speed rather than at login speed, and the rate limiter in front of
+    #: sign-in is not in front of this.
+    metrics_token: SecretStr = Field(default=SecretStr(""), alias="METRICS_TOKEN")
+    #: The worker exposes its own metrics rather than pushing them somewhere the
+    #: API can serve, so that a dead worker is a failed scrape instead of a set
+    #: of gauges frozen at their last healthy values (ADR 0013). Bound inside
+    #: the container and deliberately not published to the host — reachable from
+    #: the compose network, like Postgres and Redis.
+    worker_metrics_port: int = Field(default=9101, alias="WORKER_METRICS_PORT")
+    #: A wildcard bind, deliberately, and safe only because the port is never
+    #: published: inside a container the compose network is the only thing that
+    #: can reach it, and binding 127.0.0.1 there would make it unreachable from
+    #: the API and from a scraper alike. `scripts/check_port_bindings.py` is
+    #: what holds the "never published" half, since that is the half a compose
+    #: edit can quietly get wrong.
+    worker_metrics_addr: str = Field(default="0.0.0.0", alias="WORKER_METRICS_ADDR")
+
     risk: RiskLimits = Field(default_factory=RiskLimits)
 
     @model_validator(mode="after")

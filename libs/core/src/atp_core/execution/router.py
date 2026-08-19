@@ -43,10 +43,12 @@ and there is no layer for targets.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
+from atp_core import metrics
 from atp_core.domain import (
     Order,
     OrderRequest,
@@ -844,6 +846,7 @@ class OrderRouter:
         decision = self.risk_engine.validate(order, portfolio)
         if not decision.approved:
             transition(order, OrderStatus.REJECTED_RISK, reason=decision.reason)
+            metrics.order_rejected("risk")
             log.warning(
                 "order.risk_denied",
                 order_id=order.id,
@@ -863,12 +866,21 @@ class OrderRouter:
         if order.qty <= 0:
             reason = f"risk left {order.qty} of {order.symbol} to trade"
             transition(order, OrderStatus.REJECTED_RISK, reason=reason)
+            metrics.order_rejected("risk")
             return SubmitResult.refused(ROUTING, reason, order)
 
         transition(order, OrderStatus.PENDING_SUBMIT)
+        # Timed around the venue call and nothing else, so the histogram answers
+        # "how slow is the broker" rather than "how slow are we". Wall clock via
+        # `perf_counter` rather than the injected `Clock`: this is a duration on
+        # one machine, not a moment in market time, and a `SimulatedClock`
+        # jumping a day between two reads would put a day in the bucket.
+        started = time.perf_counter()
         try:
             acknowledged = await self.broker.submit_order(order)
         except OrderRejectedError as exc:
+            metrics.order_submit_seconds(self.broker.name, time.perf_counter() - started)
+            metrics.order_rejected("broker")
             transition(order, OrderStatus.REJECTED, reason=str(exc))
             log.warning(
                 "order.broker_rejected",
@@ -880,14 +892,17 @@ class OrderRouter:
             )
             return SubmitResult(order=order, decision=decision, submitted=False)
         except BrokerConnectionError as exc:
+            metrics.order_submit_seconds(self.broker.name, time.perf_counter() - started)
             return await self._resolve_indeterminate(order, decision, exc)
 
+        metrics.order_submit_seconds(self.broker.name, time.perf_counter() - started)
         working = self._adopt(order, acknowledged)
         if not working:
             # The venue answered, and its answer was no. `submitted` means "the
             # venue has this order working", not "the call returned" — a caller
             # that reads it as the latter cancels a protective stop against a
             # close that was refused.
+            metrics.order_rejected("acknowledgement")
             log.warning(
                 "order.rejected_on_acknowledgement",
                 order_id=order.id,
@@ -899,6 +914,7 @@ class OrderRouter:
             )
             return SubmitResult(order=order, decision=decision, submitted=False)
 
+        metrics.order_submitted(order.side.value, order.order_type.value)
         log.info(
             "order.submitted",
             order_id=order.id,
@@ -1025,6 +1041,7 @@ class OrderRouter:
             )
             return SubmitResult(order=order, decision=decision, submitted=working)
 
+        metrics.order_rejected("indeterminate")
         log.critical(
             "order.submit_indeterminate",
             order_id=order.id,

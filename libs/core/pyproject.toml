@@ -17,6 +17,10 @@ dependencies = [
   "websockets>=12.0",
   "pandas-market-calendars>=4.4",   # NYSE sessions, half-days, holidays
   "pyyaml>=6.0",
+  # The metric registry and the text exposition format only. Nothing in core
+  # imports the parts of this package that open a socket (CLAUDE.md §1.3) —
+  # serving the text is the API's and the worker's job.
+  "prometheus-client>=0.20",
 ]
 
 [build-system]

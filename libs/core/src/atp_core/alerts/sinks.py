@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from atp_core import metrics
 from atp_core.alerts.ports import Alert, AlertSink, Severity
 from atp_core.logging import get_logger
 
@@ -87,6 +88,11 @@ class LoggingAlertSink:
     """
 
     def send(self, alert: Alert) -> None:
+        # Counted as a failure, which is the honest label: nothing left this
+        # process and no phone rang. An unconfigured platform showing zero
+        # under both `sent` and `failed` would read as "nothing needed
+        # alerting" — the one conclusion that is never true here.
+        metrics.alert_failed("logging")
         getattr(log, _LOG_LEVEL[alert.severity])(
             "alert.logged",
             key=alert.key,
@@ -156,6 +162,7 @@ class NtfyAlertSink:
             # Swallowed on purpose — `AlertSink.send` promises not to raise, and
             # the action this describes has already happened. The URL is not
             # logged: it contains the topic, which is the capability.
+            metrics.alert_failed("ntfy")
             log.error(
                 "alert.send_failed",
                 key=alert.key,
@@ -165,6 +172,7 @@ class NtfyAlertSink:
             )
             return
 
+        metrics.alert_sent("ntfy", alert.severity)
         log.info("alert.sent", key=alert.key, severity=alert.severity.value)
 
 
@@ -228,6 +236,7 @@ class TelegramAlertSink:
             response.raise_for_status()
             body = response.json()
         except Exception as exc:
+            metrics.alert_failed("telegram")
             log.error(
                 "alert.send_failed",
                 transport="telegram",
@@ -239,6 +248,11 @@ class TelegramAlertSink:
             return
 
         if not body.get("ok", False):
+            # Counted alongside the transport failure above and not separately:
+            # the whole point of reading the body is that `ok: false` on an
+            # HTTP 200 *is* a failed delivery, and a metric that told them apart
+            # would invite somebody to alert on only one of them.
+            metrics.alert_failed("telegram")
             # `description` is Telegram's own words about the failure and
             # carries neither the token nor the chat id.
             log.error(
@@ -251,6 +265,7 @@ class TelegramAlertSink:
             )
             return
 
+        metrics.alert_sent("telegram", alert.severity)
         log.info("alert.sent", transport="telegram", key=alert.key, severity=alert.severity.value)
 
 

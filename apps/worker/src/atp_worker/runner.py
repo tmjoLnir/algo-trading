@@ -31,6 +31,7 @@ premise cannot survive.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import deque
 from dataclasses import dataclass, replace
 from decimal import Decimal
@@ -38,6 +39,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from atp_core import metrics
 from atp_core.channels import CHANNEL_ORDERS, CHANNEL_SIGNALS
 from atp_core.dashboard import SignalSummary, build_snapshot
 from atp_core.dashboard.snapshot import DEFAULT_SIGNAL_LIMIT
@@ -46,7 +48,7 @@ from atp_core.domain.enums import StopType
 from atp_core.errors import ATPError, DataGapError, ExecutionError
 from atp_core.execution.trade_updates import apply_trade_update
 from atp_core.indicators import dispatch
-from atp_core.logging import get_logger
+from atp_core.logging import correlation_id, get_logger
 from atp_core.risk.killswitch import HaltReason, HaltScope
 
 if TYPE_CHECKING:
@@ -478,32 +480,46 @@ class StrategyRunner:
         `asyncio.CancelledError` is deliberately not caught. It is a shutdown,
         not a failure, and swallowing it would make the loop unkillable.
         """
-        async with self._lock:
-            try:
-                await self._evaluate_once(portfolio)
-            except asyncio.CancelledError:
-                raise
-            except (ATPError, Exception) as exc:
-                self.stats.errors += 1
-                self.stats.consecutive_errors += 1
-                log.error(
-                    "runner.evaluation_failed",
-                    strategy=self.strategy.name,
-                    error=str(exc),
-                    consecutive=self.stats.consecutive_errors,
-                )
-                if self.stats.consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                    self.kill_switch.engage(
-                        HaltScope.STRATEGY,
-                        HaltReason.UNHANDLED_EXCEPTION,
-                        engaged_by="strategy_runner",
-                        detail=(
-                            f"{self.strategy.name} failed {self.stats.consecutive_errors} "
-                            f"evaluations in a row: {exc}"
-                        ),
-                        target=self.strategy.name,
+        # One pass is a unit of work: an id here puts the same key on every line
+        # the pass writes, from the risk engine's refusal to the router's submit
+        # to the broker adapter's retry, none of which knows a loop exists. On a
+        # busy watchlist that is the difference between reading a log and
+        # reconstructing one.
+        with correlation_id():
+            started = time.perf_counter()
+            async with self._lock:
+                try:
+                    await self._evaluate_once(portfolio)
+                except asyncio.CancelledError:
+                    raise
+                except (ATPError, Exception) as exc:
+                    self.stats.errors += 1
+                    self.stats.consecutive_errors += 1
+                    metrics.strategy_evaluated(
+                        self.strategy.name, "failed", time.perf_counter() - started
                     )
-                return
+                    log.error(
+                        "runner.evaluation_failed",
+                        strategy=self.strategy.name,
+                        error=str(exc),
+                        consecutive=self.stats.consecutive_errors,
+                    )
+                    if self.stats.consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                        self.kill_switch.engage(
+                            HaltScope.STRATEGY,
+                            HaltReason.UNHANDLED_EXCEPTION,
+                            engaged_by="strategy_runner",
+                            detail=(
+                                f"{self.strategy.name} failed {self.stats.consecutive_errors} "
+                                f"evaluations in a row: {exc}"
+                            ),
+                            target=self.strategy.name,
+                        )
+                    return
+
+            metrics.strategy_evaluated(
+                self.strategy.name, "succeeded", time.perf_counter() - started
+            )
 
         self.stats.consecutive_errors = 0
 
