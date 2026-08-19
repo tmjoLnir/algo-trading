@@ -77,3 +77,7 @@ npm-debug.log*
 .vscode/
 .idea/
 .DS_Store
+
+# Redis writes this wherever it was started from — a local `redis-server` for
+# the integration suite drops one in the repo root.
+dump.rdb
