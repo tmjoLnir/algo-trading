@@ -70,12 +70,17 @@ as the cleanup takes.
   stopped and can forge a message saying it resumed. `ALERT_TELEGRAM_TOKEN` is
   worse — it *is* the bot, it travels in the URL path, and whoever has it can
   read the chat and post as you. Both live in the bundle, never in a commit,
-  and nothing logs either, including on the failure paths — held by
-  `atp_core.alerts.sinks._describe`, which rebuilds the status line rather than
-  quoting httpx's message and scrubs the credential out of whatever remains.
-  Until #54 that was a claim rather than a mechanism: the credential is in the
-  URL, `HTTPStatusError` quotes the URL, and every 4xx printed it. Alerts carry no
-  balances or positions for the same reason (ADR 0012).
+  and nothing logs either, on any path. Two mechanisms hold that up, because it
+  was broken twice in the same place for the same reason — the credential is in
+  the URL, and everything likes to log a URL:
+  `atp_core.alerts.sinks._describe` rebuilds the status line rather than quoting
+  httpx's exception message and scrubs the credential out of whatever remains
+  (until #54, every 4xx printed it, which is exactly what a revoked credential
+  returns); and `atp_core.logging._silence_url_logging_libraries` stops httpx
+  logging the request itself, which it did at INFO on every **successful** send
+  — so at the default log level the bot token went into the log on every halt
+  and every all-clear, not just the rare failure the first fix was written for.
+  Alerts carry no balances or positions for the same reason (ADR 0012).
 - Paper and live use separate key pairs.
 - `structlog` redacts known credential keys, but do not rely on it — never pass
   a secret to a log call.

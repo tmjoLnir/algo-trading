@@ -27,6 +27,44 @@ def pytest_configure(config: pytest.Config) -> None:
         )
     os.environ.setdefault("ATP_RUN_MODE", "backtest")
     os.environ.setdefault("ATP_ALLOW_LIVE_TRADING", "false")
+    _unconfigure_alerting()
+
+
+#: Everything `Settings` reads about alerting, removed from the test session by
+#: `_unconfigure_alerting`.
+ALERT_ENV_VARS = (
+    "ALERT_NTFY_BASE_URL",
+    "ALERT_NTFY_TOPIC",
+    "ALERT_NTFY_TOKEN",
+    "ALERT_TELEGRAM_TOKEN",
+    "ALERT_TELEGRAM_CHAT_ID",
+    "ALERT_TELEGRAM_BASE_URL",
+    "ALERT_TIMEOUT_SECONDS",
+)
+
+
+def _unconfigure_alerting() -> None:
+    """Take the operator's real alert credentials out of the test session.
+
+    The same argument as the guard above, one notch quieter. `Settings` reads
+    the process environment, so on a host with alerting configured a bare
+    `Settings()` in a test does not mean *the defaults* — it means *this
+    machine*. Two things follow, and both are bad:
+
+    - Tests that assert on the unconfigured case fail with nothing wrong in the
+      code. That is how this was found: setting `ALERT_TELEGRAM_TOKEN` on a
+      machine turned four green `test_alerts.py` cases red, and it fails where
+      it is least welcome, since a host with alerting configured is a host that
+      is trading and CLAUDE.md §6 asks for `make check` before a push from it.
+    - Worse, a test that built a sink from ambient settings and sent through it
+      would put a message on somebody's actual phone, in the middle of a test
+      run, from a suite CLAUDE.md §1.7 says never touches a live endpoint.
+
+    Popped rather than defaulted, because there is no safe value: the point is
+    that no test may inherit a credential, not that it inherits a tidy one.
+    """
+    for name in ALERT_ENV_VARS:
+        os.environ.pop(name, None)
 
 
 @pytest.fixture

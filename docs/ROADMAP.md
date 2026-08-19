@@ -1054,8 +1054,12 @@ the only property that makes the screen worth reading.
   an empty book" applied to the record instead of the book. Full reasoning and
   five rejected alternatives: ADR 0010.
 - [ ] Alerting to a phone (feed loss, halt, reconciliation failure) — @claude
-  (wip #52). Built and wired; unticked because nobody has watched a
-  notification arrive on a phone, which is the entire point of the item.
+  (wip #52, #54, #55). Built, wired, and now driven end to end against the live
+  Telegram API with a real credential: a halt, its repeat, its all-clear and a
+  dead transport all behave as the *Verifiable:* line says. Still unticked, and
+  for the same reason as before — Telegram accepting a message into the
+  operator's chat is not somebody watching their phone light up, which is the
+  entire point of the item. One confirmation short.
 
   **The three named events are one event.** `HaltReason` already enumerates
   them, and all three converge on `KillSwitch.engage` — feed loss halts,
@@ -1121,9 +1125,30 @@ the only property that makes the screen worth reading.
   structlog here, so they had been passing against an empty string and proving
   nothing. They read the captured event dicts now.
 
-  What was **not** shown is the only thing that matters to the item: no
-  notification has ever been delivered to a phone, over either transport, and no
-  test suite can show that one was.
+  **The same shape of mistake was made a second time, and #55 is what found
+  it.** `_describe` guards what the sinks write; nothing guarded what `httpx`
+  writes underneath them. httpx logs `HTTP Request: POST <url> "HTTP/1.1 200
+  OK"` at INFO, the credential is in that URL, and `configure` sets the stdlib
+  root to `ATP_LOG_LEVEL` — so the bot token went into the log on every
+  **successful** alert, at the default level, in the worker, the API and every
+  operator script. Not the rare 4xx the first fix was written for: every halt
+  and every all-clear, forever.
+
+  Worth recording *why* a test file full of scrub assertions missed it, because
+  it is the mirror image of the last miss. Those tests had been fixed to read
+  structlog's captured event dicts after `caplog` turned out to capture nothing
+  from structlog — and this record is written by a library to the *stdlib*
+  stream, which the event dicts cannot see. Each fix moved the tests to the one
+  instrument that could not see the next leak. The new cases read the stdlib
+  stream directly, for both transports; reverting
+  `logging._silence_url_logging_libraries` fails three of them.
+
+  What was **not** shown remains the only thing that matters to the item: with
+  credentials configured, Telegram has now accepted every message the platform
+  sends — halt, all-clear, and every severity — into the operator's own chat,
+  but nobody has yet confirmed one rendered on a phone, and no test suite can
+  show that one did. `scripts/check_alerts.py` sends the set on demand so that
+  confirming it does not require halting anything.
 
   Not alerted, deliberately: `order.submit_indeterminate` and
   `order.position_unprotected`, both `CRITICAL` in docs/RUNBOOK.md and neither
@@ -1391,16 +1416,40 @@ the only property that makes the screen worth reading.
   unstarted and the authentication item at the top of the phase is still
   blocking: this serves the dashboard to a private network and nowhere else.
 
-*Verifiable (alerting, proposed):* with a topic configured, engaging a halt puts
-a notification on a phone that names the reason and carries no numbers from the
-book; re-engaging the same halt for the length of an outage sends exactly one
+*Verifiable (alerting, proposed):* with a transport configured, engaging a halt
+puts a notification on a phone that names the reason and carries no numbers from
+the book; re-engaging the same halt for the length of an outage sends exactly one
 more nothing; clearing it sends an all-clear; and a sink pointed at an
 unreachable host leaves the halt in effect and the process running.
-**Not shown** — the first clause needs a phone and nobody has held one. The
-third and fourth are unit-tested, and the fourth was additionally driven against
-a real 403; that is not the same as the line, and this item stays unticked until
-somebody watches their phone light up. Proposed because the item had no line of
-its own, which is the defect #45 and #46 both named.
+**Partly shown** — @claude. With real `ALERT_TELEGRAM_TOKEN` and
+`ALERT_TELEGRAM_CHAT_ID` supplied, all four clauses were driven against the live
+Telegram API rather than a mock, through the sink `build_alert_sink` builds from
+the deployment's own settings and the real `RedisKillSwitch`:
+
+- Engaging a global `data_feed_lost` halt sent one message, `ok: true`, titled
+  `Trading halted: data_feed_lost`, body naming the scope, who halted and what
+  to go and read — and no balance, position or fill price, as ADR 0012 requires.
+- Re-engaging the same halt sent **nothing**: the Redis state is the dedup, and
+  the early return in `engage` never reaches an alert.
+- Clearing it sent one `Trading resumed`, INFO, and Telegram-silent.
+- A sink pointed at a dead host logged `THE ALERT DID NOT GO OUT` and left the
+  halt engaged and the process running.
+
+Severity mapping was checked the same way: INFO delivered with
+`disable_notification: true` and both louder levels without it, which is the
+only lever Telegram gives and the whole difference between an all-clear at 02:00
+and a halt.
+
+Still **unticked**, because the one clause that defines the item is the one no
+code here can close: what was shown is that Telegram *accepted* every message
+into the operator's own chat, and the line says a notification arrives on a
+phone. That last step needs somebody to look at theirs and say so. Everything
+between the kill switch and the push service is now demonstrated rather than
+asserted; what remains is a person confirming receipt.
+
+`scripts/check_alerts.py` is what makes that repeatable without engaging a real
+halt (#55). Proposed because the item had no line of its own, which is the
+defect #45 and #46 both named.
 
 *Verifiable (metrics and tracing, proposed):* a scrape config collects from
 both processes across a trading day; the platform's state is legible from it
@@ -1526,7 +1575,8 @@ The phase still needs a line covering production readiness as a whole. The
 reason previously given for not writing one — that nothing is deployable until
 authentication lands — no longer holds, since it has. What stands in its way now
 is a shorter list than it was, and a more specific one: **backups**, which are
-unstarted; **alerting**, which is built and has never reached a phone; and
+unstarted; **alerting**, which is built, now reaches a real chat over a real
+credential, and is one person's confirmation short of reaching a phone; and
 **metrics**, which are exported and have never been collected. Two of those
 three are waiting on the same missing host, and the third is waiting on somebody
 holding a phone. A line written today would still describe a system

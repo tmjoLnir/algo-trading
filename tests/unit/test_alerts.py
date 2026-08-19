@@ -13,7 +13,10 @@ agreed with us about those would prove nothing.
 
 from __future__ import annotations
 
+import io
 import json
+import logging
+from typing import TYPE_CHECKING
 
 import httpx
 import pytest
@@ -29,6 +32,10 @@ from atp_core.alerts import (
     build_alert_sink,
 )
 from atp_core.config import Settings
+from atp_core.logging import configure
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def _alert(severity: Severity = Severity.CRITICAL) -> Alert:
@@ -43,6 +50,11 @@ def _alert(severity: Severity = Severity.CRITICAL) -> Alert:
 
 def _client(handler: object) -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(handler))  # type: ignore[arg-type]
+
+
+# The alert credentials a host may have configured are removed from the whole
+# test session by `tests/conftest.py`, so a bare `Settings()` below means the
+# documented defaults rather than whatever this machine is running.
 
 
 class TestLoggingAlertSink:
@@ -447,6 +459,105 @@ class TestFanOutAlertSink:
     def test_refuses_an_empty_fan_out(self) -> None:
         with pytest.raises(ValueError, match="at least one"):
             FanOutAlertSink([])
+
+
+class TestTheCredentialNeverReachesTheStdlibLog:
+    """The success path, which is where the credential actually leaked.
+
+    Every other scrub test in this file asserts against `capture_logs`, which
+    collects the events *this codebase* emits. That is the wrong instrument for
+    this bug and is why it survived: `httpx` logs `HTTP Request: POST <url>` at
+    INFO through the standard library, and for both transports here the URL is
+    the credential. So these read the stdlib stream instead, and they fail
+    against a `configure()` that does not silence the library.
+
+    Driven through `MockTransport` — httpx logs the request either way, and the
+    point is the log record, not the endpoint (CLAUDE.md §1.7).
+    """
+
+    @staticmethod
+    def _stdlib_log_of(send: Callable[[], None]) -> str:
+        """Whatever `send` causes to be written to the stdlib root logger."""
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(logging.NOTSET)
+        root = logging.getLogger()
+        root.addHandler(handler)
+        # NOTSET on the root would let a parent level suppress the record before
+        # the handler sees it, which would make this test pass by not looking.
+        previous = root.level
+        root.setLevel(logging.DEBUG)
+        try:
+            send()
+        finally:
+            root.setLevel(previous)
+            root.removeHandler(handler)
+        return stream.getvalue()
+
+    def test_httpx_does_not_log_the_telegram_token(self) -> None:
+        """The bot token travels in the URL path, so httpx's request line *is*
+        the credential. This is the one that was leaking on every halt."""
+        configure(level="DEBUG", fmt="json")
+        token = "111111111:AAFnotarealtokennotarealtokennotareal"
+        sink = TelegramAlertSink(
+            token,
+            "12345678",
+            client=_client(lambda request: httpx.Response(200, json={"ok": True})),
+        )
+        written = self._stdlib_log_of(lambda: sink.send(_alert()))
+        assert token not in written
+        assert "AAFsecret" not in written
+
+    def test_httpx_does_not_log_the_ntfy_topic(self) -> None:
+        """Same vector, other transport: the topic is a capability in both
+        directions — reading the alerts and forging one that says all clear."""
+        configure(level="DEBUG", fmt="json")
+        topic = "atp-e6f1c0de5b7a4d9f8c3b2a1e0d9c8b7a"
+        sink = NtfyAlertSink(
+            "https://ntfy.sh",
+            topic,
+            client=_client(lambda request: httpx.Response(200)),
+        )
+        written = self._stdlib_log_of(lambda: sink.send(_alert()))
+        assert topic not in written
+
+    def test_a_debug_log_level_does_not_reintroduce_it(self) -> None:
+        """DEBUG is what an operator raises the level to mid-incident, which is
+        also when they are most likely to be pasting output into a chat. The
+        silence has to be set on the logger itself rather than inherited, or it
+        is only ever as strong as whatever the root happens to be.
+
+        Asserting on `.level` and not `getEffectiveLevel()` on purpose: the
+        effective level walks up to the root, and under pytest the root sits at
+        WARNING anyway, so that version of this test passed with the fix
+        removed entirely.
+        """
+        configure(level="DEBUG", fmt="json")
+        assert logging.getLogger("httpx").level >= logging.WARNING
+
+    def test_the_alert_is_still_reported(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Silencing httpx must not cost the operator the record that the alert
+        went out — `alert.sent` is what they grep for, and it carries the key
+        and the severity that httpx's line never did.
+
+        Read off stdout rather than through `capture_logs`, because those are
+        two different streams: `configure` leaves structlog on its own
+        `PrintLogger`, so what an operator actually sees is this, and the
+        event list the other tests assert on would not show whether the record
+        reached anywhere at all.
+        """
+        token = "111111111:AAFnotarealtokennotarealtokennotareal"
+        configure(level="DEBUG", fmt="json")
+        sink = TelegramAlertSink(
+            token,
+            "12345678",
+            client=_client(lambda request: httpx.Response(200, json={"ok": True})),
+        )
+        sink.send(_alert())
+        written = capsys.readouterr().out
+        assert "alert.sent" in written
+        assert "halt.global.all.data_feed_lost" in written
+        assert token not in written
 
 
 class _Recorder:

@@ -232,7 +232,9 @@ the only thing between your halt notifications and anyone who guesses it, in
 *both* directions — reading them and forging one that says trading resumed. A
 Telegram bot token is worse: it *is* the bot, it travels in the URL path, and
 whoever holds it can read the chat and post as you. Hence the bundle, and hence
-nothing logs either — including on the failure paths. If the alerts matter,
+nothing logs either, on any path — neither the sinks' own failure logging nor
+the HTTP library underneath them, which used to log the URL, and therefore the
+credential, on every successful send (SECURITY.md). If the alerts matter,
 self-host ntfy and set `ALERT_NTFY_TOKEN`; then it is not a guess away.
 
 Alerts deliberately carry no numbers from the book — a reason and a scope, never
@@ -241,14 +243,40 @@ through a third party; what the numbers are is a question for the dashboard,
 which is behind authentication. Sending one to yourself to check the wiring:
 
 ```bash
+uv run python scripts/check_alerts.py --by "you"
+```
+
+It builds the sink from this host's own configuration, sends one message per
+severity through it, and exits non-zero if a transport did not take one —
+`2` if nothing is configured at all, which is the case worth catching, because
+an unalerted platform behaves exactly like an alerted one until the day it
+matters. Run it after `make secrets-install`, and again whenever the bundle
+changes: a revoked bot token and a working one are indistinguishable from
+anything except a send.
+
+**It reports delivery, not receipt.** A transport accepting a message is as far
+as any code here can see. Whether a phone lit up is the half that matters, and
+only the person holding it can confirm it — so look at the phone before
+believing the exit code.
+
+The older way was to engage a real halt and clear it:
+
+```bash
 uv run python scripts/halt.py engage --by "you" --detail "testing the alert path"
 uv run python scripts/halt.py clear  --by "you"
 ```
 
-That is a real halt, so do it outside market hours or on a host that is not
-trading. It is also the only end-to-end test of this that exists: whether a
-notification arrives on a particular phone is not something the test suite can
-answer.
+That still works and exercises one more layer — the kill switch calling the
+sink. It is also a real halt: it needs Redis, it stops trading, and it writes an
+incident into the audit trail that never happened. Prefer `check_alerts.py`
+unless you are specifically testing the halt path, and if you do use this, do it
+outside market hours or on a host that is not trading.
+
+Neither is something the test suite can do for you. `make test` never touches a
+live endpoint (CLAUDE.md §1.7), so every alert test in it proves the request the
+platform *would* have made against a transport that agrees with us about the
+answer — which is worth having, and is not evidence that a credential still
+works.
 
 With no topic configured the platform starts normally and logs what it would
 have sent (`alert.logged`). A notification must not be a dependency of trading.

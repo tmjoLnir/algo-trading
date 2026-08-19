@@ -21,6 +21,8 @@ from typing import Any
 
 import pytest
 
+from atp_core.alerts import Severity
+from atp_core.config import Settings
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
@@ -43,6 +45,7 @@ def _load(name: str) -> Any:
 
 halt = _load("halt")
 status = _load("status")
+check_alerts = _load("check_alerts")
 
 
 class TestHaltArguments:
@@ -152,3 +155,62 @@ class TestStatusArguments:
             import asyncio
 
             asyncio.run(status.main(["--timeframe", "1fortnight"]))
+
+
+class TestCheckAlertsArguments:
+    """The alert checker, minus the sending.
+
+    What it does over the wire is the one thing no test here can cover — the
+    whole reason the script exists is that a live send is the only proof, and
+    CLAUDE.md §1.7 keeps this suite off live endpoints. So what is tested is
+    what it decides before it gets there.
+    """
+
+    def test_it_demands_a_name(self) -> None:
+        """The name goes into the message. Whoever gets a `critical` at 03:00
+        should be able to see from the notification that it was a drill and who
+        to ask about it, without opening anything."""
+        with pytest.raises(SystemExit):
+            check_alerts.parse_args([])
+
+    def test_by_itself_is_enough(self) -> None:
+        assert check_alerts.parse_args(["--by", "jo"]).severity is None
+
+    def test_an_unknown_severity_is_refused(self) -> None:
+        """Rather than sending nothing and exiting 0, which would read exactly
+        like a working alert path."""
+        with pytest.raises(SystemExit):
+            check_alerts.parse_args(["--by", "jo", "--severity", "panic"])
+
+    def test_no_severity_means_all_of_them(self) -> None:
+        """The levels differ in whether they make a phone ring, and that is the
+        part of the configuration most likely to be wrong."""
+        assert check_alerts._severities(None) == list(Severity)
+
+    def test_severities_are_deduplicated_and_ordered(self) -> None:
+        """Typed in any order, sent in declaration order — so the messages land
+        in the chat in the order their levels escalate."""
+        chosen = check_alerts._severities(["critical", "info", "critical"])
+        assert chosen == [Severity.INFO, Severity.CRITICAL]
+
+    def test_it_reports_the_transports_the_factory_would_build(self) -> None:
+        settings = Settings(  # type: ignore[call-arg]
+            ALERT_NTFY_TOPIC="atp-abc123",
+            ALERT_TELEGRAM_TOKEN="123:AAF",
+            ALERT_TELEGRAM_CHAT_ID="9876",
+        )
+        assert check_alerts._configured_transports(settings) == ["ntfy", "telegram"]
+
+    def test_half_a_telegram_configuration_is_not_a_transport(self) -> None:
+        """It is not one for `build_alert_sink` either, and a checker that
+        disagreed with the factory would report a transport that cannot
+        deliver — the exact belief this script exists to correct."""
+        settings = Settings(ALERT_TELEGRAM_TOKEN="123:AAF")  # type: ignore[call-arg]
+        assert check_alerts._configured_transports(settings) == []
+
+    def test_nothing_configured_is_not_a_success(self) -> None:
+        """An unconfigured platform is the failure this script is for. Exiting
+        0 on it would confirm precisely the thing that is not true."""
+        assert check_alerts.EXIT_UNCONFIGURED != 0
+        assert check_alerts.EXIT_UNDELIVERED != 0
+        assert check_alerts.EXIT_UNCONFIGURED != check_alerts.EXIT_UNDELIVERED
