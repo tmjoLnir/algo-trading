@@ -366,11 +366,30 @@ unreachable Redis. The stack came up halted and looked alive.
 
 ## What this does not give you
 
-One Phase 6 item is unbuilt, and a host does not supply it:
+**Backups exist now and are no longer on this list**, with the boundary stated
+carefully. `scripts/backup_db.py` takes them, and — the half that matters —
+restores one into a scratch database and compares it, so "an untested backup is
+a belief" is now a command rather than an aspiration
+([BACKUPS.md](BACKUPS.md), ADR 0014). What a host does not supply, and what this
+repository cannot:
 
-- **No backups.** There is no backup and no tested restore, which means one VM
-  is one VM. Take a `pg_dump` on a cron before you care about the data, and
-  restore it somewhere once — an untested backup is a belief, not a backup.
+- **Nothing schedules it.** The cron lines are in BACKUPS.md and are two lines.
+  They are documentation until there is a machine to put them on.
+- **A dump lands on the host's own disk** unless `ATP_BACKUP_DIR` says
+  otherwise, and a dump beside the database it came from dies with it. Until
+  that variable points at something that outlives the VM, what you have is a
+  fast undo for operator error, not disaster recovery. **One VM is still one
+  VM.**
+- **Dumps are not encrypted at rest.** They carry no credentials and they carry
+  the entire trading record. The `age` key you generated for the secrets bundle
+  is already here if you are shipping them off-box.
+
+One thing to know before you need it, because it is the opposite of what the
+deployment does everywhere else: a rebuilt host comes back with an **empty**
+Redis, and an empty Redis holds no halt. The kill switch fails closed against an
+*unreachable* Redis, not an empty one — so a restored stack starts **willing to
+trade**, against a book as of the dump and a broker as of now. `halt.py engage`
+before `make deploy`, every time. BACKUPS.md sequences it.
 
 **Alerting works and is no longer on this list**, but it is not something a host
 gives you either: it is configuration plus one confirmation. Set a transport,

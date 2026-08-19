@@ -1248,7 +1248,87 @@ the only property that makes the screen worth reading.
   made from reading the code rather than from a week of trading. The gauges —
   the halt state, the per-symbol last tick — are useful from one `curl` today,
   and that is the honest extent of it.
-- [ ] Backups and a tested restore
+- [ ] Backups and a tested restore — @claude (wip #57).
+  **The tooling is built and the restore is genuinely tested. Nothing schedules
+  it, and no dump has ever left the host that made it** — so this stays
+  unticked, for the same missing machine as the item above.
+
+  `scripts/backup_db.py` is `create`, `list`, `verify`, `restore` and `prune`
+  over `pg_dump -Fc`; ADR 0014 has the argument for logical dumps over PITR, and
+  it turns on an asymmetry in the data rather than on taste. `bars` is the
+  expensive table and `scripts/backfill_bars.py` can refetch every row of it;
+  `audit_log` is tiny and exists nowhere else in the world. A mechanism whose
+  cost scales with the half Alpaca already has, to protect the half that is
+  small, is the wrong shape.
+
+  **`verify` is the item and the rest is scaffolding for it.** It restores the
+  newest dump into a scratch database, compares it against the source, drops the
+  scratch database and exits non-zero if anything disagrees. The comparison is
+  bracketed rather than exact on purpose: counts are read either side of the
+  dump, and `pg_dump`'s snapshot sits between them, so `before <= restored <=
+  after` holds on a database that is being written to while it is backed up.
+  An equality check would have been correct on a laptop and flaky at 03:00,
+  which is the only time it runs.
+
+  Two things it checks that no other test in this repository could. That `bars`
+  comes back **a hypertable** with its compression policy — a restore that loses
+  the partitioning answers every query correctly and goes on doing so until the
+  table is too big to fix (ADR 0004). And that the restore *can* fail: the
+  suite edits a manifest to claim more rows than the dump holds and requires
+  `verify` to notice, because a verification step that always passes converts
+  "we have never tested a restore" into "we test it nightly", which is worse
+  than having neither.
+
+  **What was actually driven**, against a real PostgreSQL 16 rather than in the
+  suite: a dump of the real schema built from the SQLAlchemy metadata with 504
+  rows across 10 tables; `verify` restoring it into a scratch database, matching
+  every count, reporting the Alembic revision and dropping the scratch database
+  behind it; a restore into a fresh database with `NUMERIC` values arriving back
+  as `500.12500000` rather than a float; and `--overwrite` renaming the existing
+  database aside instead of dropping it. Then the refusals, which are the half
+  that matters and the half nobody exercises: a dump with one byte flipped
+  refused on its checksum before anything was restored; a manifest claiming
+  9999 rows failing verification with the table named; a restore into a database
+  with a client connected refused; and a paper dump refused against a host
+  configured for another run mode, which is a guard only this platform's own
+  shape makes possible (ADR 0011 puts the two on separate hosts, which is
+  exactly what makes their databases look interchangeable). 39 unit tests
+  alongside, and 9 integration tests that need a real TimescaleDB.
+
+  **The TimescaleDB half was not driven here.** This environment has no
+  timescaledb extension available and no docker daemon to run the image, so the
+  `pre_restore`/`post_restore` bracket and the hypertable assertions were
+  exercised only in CI, against the same `timescale/timescaledb:2.15.2-pg16` the
+  stack runs. That is a real check and it is not the same as having watched it.
+
+  Two things found by running it that would have shipped looking plausible.
+  `pg_dump --version` **exits 1 with a bare "Try --help"** when connection flags
+  are passed alongside it, so a version check written the obvious way fails and
+  blames the database; the probe drops every connection flag now and a test pins
+  it. And TimescaleDB keeps a **background worker connected to every database it
+  lives in**, which appears in `pg_stat_activity` like any client — so the
+  "refuse if anything is connected" guard would have refused every restore
+  forever, on every database this platform uses, including on a host where
+  nothing at all was running. The guard counts `backend_type = 'client backend'`
+  and the scratch database is dropped `WITH (FORCE)`, because that same worker
+  attaches the moment `post_restore` hands the database back.
+
+  **What is missing is what a host would supply.** Nothing runs this: the cron
+  lines are two lines in docs/BACKUPS.md and are documentation until there is a
+  machine. Dumps land on the host's own disk unless `ATP_BACKUP_DIR` says
+  otherwise, and a dump beside the database it came from dies with it — so what
+  exists today is a fast undo for operator error, not disaster recovery, and
+  docs/BACKUPS.md says so in its first paragraph rather than its last. They are
+  not encrypted at rest. And the restore *procedure* has never been walked by
+  anyone but its author.
+
+  One thing found on the way and worth more than the feature: a rebuilt host
+  comes back with an **empty** Redis, and an empty Redis holds no halt. The kill
+  switch fails closed against an *unreachable* Redis, not an empty one — so a
+  restored stack starts **willing to trade**, against a book as of the dump and
+  a broker as of now. That is the opposite of the posture everything else here
+  takes, it is not something the backup tooling can fix, and it is now step 4 of
+  the restore procedure and a paragraph in docs/DEPLOYMENT.md.
 - [ ] Deployment target chosen; secrets manager — @claude (wip #50, #51).
   **The deployment *shape* is chosen and recorded. No host has been selected,
   and nothing is deployed.** ADR 0011: one always-on VM per run mode in a
@@ -1481,6 +1561,24 @@ the host ADR 0011 has specified and nobody has bought. Proposed because this
 item had no line of its own, the same defect #45 and #46 named; scoped to
 *metrics and tracing* and saying nothing about alerting or backups.
 
+*Verifiable (backups, proposed):* a scheduled backup runs unattended on the
+host across a week without anyone touching it; a dump taken by that schedule is
+restored into a scratch database and matches the source it came from, `bars`
+included as a hypertable with its compression policy; at least one dump is
+demonstrably somewhere the host's disk failing would not take with it; and the
+restore procedure has been walked end to end — stack down, database back,
+migrations applied, book reconciled against the broker, halt cleared
+deliberately — by somebody following docs/BACKUPS.md rather than by the person
+who wrote it.
+**Partly shown** — @claude. The second clause is shown and is the one this item
+is named for: `backup_db.py verify` restores and compares on demand, fails when
+the restore does not match, and is a command rather than an intention. The
+other three are not, and only the last is about this repository — the first and
+third need the host ADR 0011 specified and nobody has bought, which is the same
+blocker metrics has above. Proposed because this item had no line of its own,
+the same defect #45 and #46 named; scoped to *backups* and saying nothing about
+the schedule that would make them a disaster-recovery story rather than an undo.
+
 *Verifiable (rate limiting and audit, proposed):* a run of wrong passwords from
 one address ends in 429 with a `Retry-After`, a correct password from that
 address is refused too while the window holds, and the same password from
@@ -1557,9 +1655,9 @@ implemented and untickable through the whole of Phase 1: a phase without a line
 cannot tick anything, however much of it is built. It is scoped to *serving* on
 purpose. It says nothing about authentication, rate limiting, alerting,
 metrics, backups or a secrets manager, and it must not be read as evidence for
-any of them. (Those six were all unstarted when this was written; four have
-since been built to varying depths and only backups still has nothing at all.
-The scope of this line is unchanged either way — it is about serving.)
+any of them. (Those six were all unstarted when this was written; all six have
+since been built to varying depths, backups last. The scope of this line is
+unchanged either way — it is about serving.)
 *Proposed and ticked by the same hand, so it wants a reviewer's eye rather than
 mine.*
 
@@ -1586,9 +1684,11 @@ sleeps.
 The phase still needs a line covering production readiness as a whole. The
 reason previously given for not writing one — that nothing is deployable until
 authentication lands — no longer holds, since it has. What stands in its way now
-is a shorter list than it was, and a more specific one: **backups**, which are
-unstarted, and **metrics**, which are exported and have never been collected.
-Both are waiting on the same missing host. **Alerting** has come off this list:
+is a shorter list than it was, and a more specific one, and both of what is on
+it now wants the same thing. **Backups** are taken and a restore of one is
+demonstrable on demand, and nothing schedules them and no dump has left the host
+that wrote it. **Metrics** are exported and have never been collected. Neither
+is a missing mechanism any more; both are waiting on the same missing host. **Alerting** has come off this list:
 it reaches a phone over a real credential and is ticked above, which closes the
 one item here that was waiting on a person rather than on a machine — and it is
 the go-live checklist line most likely to be assumed rather than tested, since
