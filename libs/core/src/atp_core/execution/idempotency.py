@@ -59,11 +59,31 @@ _SEP = "\x1f"
 #: and a decision instant without being the same order; this is what separates
 #: them. `OrderRequest.purpose` defaults to the literal `"entry"` rather than to
 #: `ENTRY`, because `domain/` imports nothing from its siblings (CLAUDE.md §2).
+#:
+#: It carries a second job, and the exit values exist for it. `purpose` is now
+#: stored on the order (`Order.purpose`) and is the only record of *why* a
+#: position closed, which is what `analytics.performance` groups P&L by. So the
+#: three engine-side exits are separate values rather than one `FLATTEN`: a
+#: stop, a target and a time exit are the same order shape and completely
+#: different facts about a strategy, and collapsing them would make the most
+#: actionable attribution in the platform report a single undifferentiated
+#: "flatten" for all three.
 ENTRY = "entry"
 EXIT = "exit"
 FLATTEN = "flatten"
 MANUAL = "manual"
 STOP_LOSS = "stop_loss"
+TAKE_PROFIT = "take_profit"
+TIME_EXIT = "time_exit"
+
+#: Not a purpose — the absence of one. Orders stored before `orders.purpose`
+#: existed have no value for it, and `Order` refuses an empty string, so a
+#: restored order carries this instead. It is deliberately *not* `ENTRY`: an
+#: exit relabelled as an entry lands on the wrong side of a reconstructed round
+#: trip, which is a wrong number where this is a missing one. Nothing derives a
+#: `client_order_id` from it, because nothing submits an order whose purpose it
+#: does not know.
+UNKNOWN_PURPOSE = "unknown"
 
 
 def _digest(*parts: str) -> str:

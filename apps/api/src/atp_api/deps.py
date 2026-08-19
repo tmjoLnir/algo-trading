@@ -29,11 +29,14 @@ from atp_core.brokers import AlpacaBroker, BrokerPort, SimulatedBroker
 from atp_core.clock import Clock, SystemClock, TradingCalendar
 from atp_core.config import Settings, get_settings
 from atp_core.dashboard.ports import SnapshotStore
+from atp_core.data.ports import BarRepository
 from atp_core.domain.enums import RunMode
-from atp_core.execution.ports import PortfolioRepository
+from atp_core.execution.ports import OrderRepository, PortfolioRepository
 from atp_core.logging import get_logger
 from atp_core.persistence.audit import PostgresAuditLog
+from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.dashboard import RedisSnapshotStore
+from atp_core.persistence.orders import PostgresOrderRepository
 from atp_core.persistence.positions import PostgresPortfolioRepository
 from atp_core.risk.killswitch import KillSwitch
 
@@ -199,6 +202,25 @@ async def get_portfolio_repository(
     question with one answer.
     """
     return PostgresPortfolioRepository(session_factory)
+
+
+async def get_order_repository(
+    session_factory: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
+) -> OrderRepository:
+    """Every order that reached a venue — read here for trade reconstruction.
+
+    Read-only from this process, for the same reason as the book above: the
+    runner is the only thing that writes an order, which is what keeps "what did
+    we submit" a question with one answer.
+    """
+    return PostgresOrderRepository(session_factory)
+
+
+async def get_bar_repository(
+    session_factory: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
+) -> BarRepository:
+    """Stored bars — read here to measure MAE/MFE over a trade's holding period."""
+    return PostgresBarRepository(session_factory)
 
 
 #: One adapter for the process, keyed by nothing: `AlpacaBroker` owns an

@@ -309,6 +309,10 @@ class OrderRouter:
             limit_price=request.limit_price,
             strategy_id=request.strategy_id,
             signal_id=request.signal_id,
+            # Carried onto the order, not just consumed by the key derivation
+            # below. The key is a one-way hash, so a stored order could not
+            # answer "why did this position close?" without it.
+            purpose=request.purpose,
             client_order_id=client_order_id(
                 symbol=request.symbol,
                 side=request.side,
@@ -658,7 +662,12 @@ class OrderRouter:
         return cancelled
 
     async def flatten(
-        self, symbol: str, portfolio: Portfolio, *, decided_at: datetime | None = None
+        self,
+        symbol: str,
+        portfolio: Portfolio,
+        *,
+        decided_at: datetime | None = None,
+        purpose: str = FLATTEN,
     ) -> SubmitResult:
         """Close a position at market.
 
@@ -690,6 +699,17 @@ class OrderRouter:
         its own idempotency key. Pin it to retry a flatten whose outcome you
         could not establish: that is the one case where two calls must collapse
         into one order at the venue.
+
+        `purpose` defaults to a bare `FLATTEN` — an operator closing a position
+        — and callers that know better should say so. Every engine-side exit
+        arrives here: a triggered stop, a hit target and a time exit are all
+        "close it at market", and the caller is the only thing that knows which.
+        Left to default, all three would store as `flatten` and
+        `analytics.performance`'s exit-reason attribution would report one
+        undifferentiated bucket for the three facts it exists to separate. It is
+        also in the idempotency key, correctly: a stop and a time exit firing on
+        the same bar are two decisions, and one key for both would silently drop
+        the second.
         """
         # `.get`, not `.position()`: the latter is a `setdefault` and would
         # insert a Position into a book this is only inspecting.
@@ -706,7 +726,7 @@ class OrderRouter:
             # GTC: a DAY flatten that does not fill evaporates at the close and
             # leaves the position we were trying to be rid of open overnight.
             time_in_force=TimeInForce.GTC,
-            purpose=FLATTEN,
+            purpose=purpose,
         )
         result = await self.submit(request, portfolio)
         if result.submitted:
@@ -820,6 +840,7 @@ class OrderRouter:
             strategy_id=entry_order.strategy_id,
             signal_id=entry_order.signal_id,
             parent_order_id=entry_order.id,
+            purpose=STOP_LOSS,
             client_order_id=protective_client_order_id(
                 entry_order.client_order_id, STOP_LOSS, covered_from, covered_to
             ),

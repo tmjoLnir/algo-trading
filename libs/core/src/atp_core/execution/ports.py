@@ -70,6 +70,32 @@ class OrderRepository(Protocol):
         """
         ...
 
+    async def filled_orders(
+        self, run_mode: RunMode, *, until: datetime, strategy_id: str | None = None
+    ) -> list[Order]:
+        """Every order with at least one fill up to `until`, oldest first.
+
+        What `analytics.performance.PerformanceAnalyzer.build_trades` folds into
+        round trips. Orders that never filled are excluded: they moved no
+        quantity, so they belong to the signal record rather than to a trade.
+
+        **There is no `start`, and that is the interesting part of this
+        signature.** Round trips are matched FIFO from flat, so an exit can only
+        be paired with the entry it closes if that entry is in the same list. A
+        window starting last Monday would present every position opened before it
+        as an exit with no entry — and the tempting reading of that is a short
+        that was never opened, which inverts the sign of its P&L. So the read is
+        bounded at one end only, and a caller wanting a period filters the
+        *trades* that come out rather than the orders going in.
+
+        The cost is honest and stated rather than hidden: this grows with the
+        lifetime of the account. When it stops being affordable the fix is a
+        stored trade table — reconstruct once, keep the round trips — not a
+        truncated read, because a truncated read does not get slower, it gets
+        wrong. `docs/ANALYTICS.md` records the boundary.
+        """
+        ...
+
 
 class PortfolioRepository(Protocol):
     """Point-in-time snapshots of the book."""

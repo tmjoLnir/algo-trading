@@ -69,6 +69,18 @@ class Order:
     signal_id: str | None = None
     parent_order_id: str | None = None  # set on protective stop/target children
 
+    #: What this order is for, carried over from the `OrderRequest` that built
+    #: it. Already part of the identity — `client_order_id` is derived from it —
+    #: but it lived only inside that derivation, which made it unrecoverable
+    #: from a stored order: a hash cannot be read backwards. It is here because
+    #: it is the only thing that can say *why* a position closed, and
+    #: `analytics.performance` groups P&L by exactly that (a strategy whose
+    #: profits come from targets while its stops bleed has a stop-placement
+    #: problem, not a signal problem). The vocabulary lives in
+    #: `atp_core.execution.idempotency`; the default is the bare string because
+    #: `domain/` imports nothing from its siblings.
+    purpose: str = "entry"
+
     status: OrderStatus = OrderStatus.PENDING_RISK
     filled_qty: Decimal = Decimal(0)
     avg_fill_price: Decimal | None = None
@@ -86,6 +98,11 @@ class Order:
             raise ValueError(f"{self.order_type} requires limit_price")
         if self.order_type in (OrderType.STOP, OrderType.STOP_LIMIT) and self.stop_price is None:
             raise ValueError(f"{self.order_type} requires stop_price")
+        if not self.purpose:
+            # Same refusal `OrderRequest` makes, for the same reason: an empty
+            # purpose is an order whose identity cannot be derived, and an exit
+            # nothing can attribute.
+            raise ValueError("an order needs a purpose — it is part of its identity")
 
     @property
     def remaining_qty(self) -> Decimal:

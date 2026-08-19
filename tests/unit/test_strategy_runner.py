@@ -38,6 +38,7 @@ from atp_core.domain import (
     Timeframe,
 )
 from atp_core.errors import ExecutionError
+from atp_core.execution.idempotency import FLATTEN, STOP_LOSS, TAKE_PROFIT, TIME_EXIT
 from atp_core.execution.reconciliation import ReconciliationReport
 from atp_core.execution.router import ProtectionResult, SubmitResult
 from atp_core.risk.engine import RiskDecision
@@ -50,7 +51,9 @@ from tests.fakes import (
     FakeOrderRepository,
     FakePortfolioRepository,
     FakePublisher,
+    FakeSignalRepository,
     FakeSnapshotStore,
+    FakeStrategyRepository,
 )
 
 if TYPE_CHECKING:
@@ -154,6 +157,7 @@ class FakeRouter:
         self.calls: list[str] = []
         self.signals: list[Signal] = []
         self.flattened: list[str] = []
+        self.flatten_purposes: list[str] = []
         self.protected: list[Order] = []
         self.refuse_signals = False
         self.refuse_protection = False
@@ -215,9 +219,19 @@ class FakeRouter:
             placed=[stop], covered_qty=Decimal("10"), unprotected_qty=Decimal(0)
         )
 
-    async def flatten(self, symbol: str, portfolio: Portfolio) -> SubmitResult:
+    async def flatten(
+        self,
+        symbol: str,
+        portfolio: Portfolio,
+        *,
+        decided_at: datetime | None = None,
+        purpose: str = FLATTEN,
+    ) -> SubmitResult:
         self.calls.append("flatten")
         self.flattened.append(symbol)
+        #: What the runner said this exit was for. The whole of exit-reason
+        #: attribution rides on it reaching the order, so tests assert on it.
+        self.flatten_purposes.append(purpose)
         if self.refuse_flatten:
             return SubmitResult(
                 order=None, decision=RiskDecision.deny("kill_switch", "halted"), submitted=False
@@ -271,6 +285,8 @@ def build(
     stop_config: StopConfig | None = None,
     order_repo: FakeOrderRepository | None = None,
     portfolio_repo: FakePortfolioRepository | None = None,
+    strategy_repo: FakeStrategyRepository | None = None,
+    signal_repo: FakeSignalRepository | None = None,
     snapshot_store: FakeSnapshotStore | None = None,
     publisher: FakePublisher | None = None,
     signal_limit: int = DEFAULT_SIGNAL_LIMIT,
@@ -300,6 +316,8 @@ def build(
         run_mode=RunMode.PAPER,
         order_repo=order_repo or FakeOrderRepository(),  # type: ignore[arg-type]
         portfolio_repo=portfolio_repo or FakePortfolioRepository(),  # type: ignore[arg-type]
+        strategy_repo=strategy_repo or FakeStrategyRepository(),  # type: ignore[arg-type]
+        signal_repo=signal_repo or FakeSignalRepository(),  # type: ignore[arg-type]
         snapshot_store=snapshot_store,  # type: ignore[arg-type]
         publisher=publisher,  # type: ignore[arg-type]
         signal_limit=signal_limit,
@@ -948,3 +966,280 @@ class TestPublishing:
         message = publisher.on(CHANNEL_ORDERS)[0]
         assert not any(isinstance(v, float) for v in message.values())
         assert message["price"] == "100.125"
+
+
+class TestProtectiveExits:
+    """Which level fired, and what the resulting order says it was for.
+
+    Both halves matter and for different reasons. The take-profit half is a
+    live-vs-backtest divergence: `BacktestEngine._check_stops` has always
+    resolved a target and named `take_profit`, and this loop did not look at one
+    at all — so a strategy backtested with a target ran live without it. The
+    purpose half is what makes an exit attributable afterwards; all three
+    engine-side exits reach the venue as `router.flatten`, and without a purpose
+    they store identically.
+    """
+
+    @staticmethod
+    def _armed(
+        portfolio: Portfolio,
+        *,
+        qty: str = "10",
+        entry: str = "100",
+        stop: str | None = None,
+        target: str | None = None,
+    ) -> None:
+        position = portfolio.position(SYMBOL)
+        position.qty = Decimal(qty)
+        position.avg_entry_price = Decimal(entry)
+        position.last_price = Decimal(entry)
+        position.stop_loss_price = Decimal(stop) if stop else None
+        position.take_profit_price = Decimal(target) if target else None
+
+    @pytest.mark.asyncio
+    async def test_a_take_profit_is_acted_on(self) -> None:
+        """The divergence this closes.
+
+        The router arms a target on every position whose signal or `StopConfig`
+        carries one, and `Position.take_profit_price` survives a restart —
+        so the level existed, was persisted, and nothing looked at it.
+        """
+        runner, router, _, _, portfolio, _ = build(
+            bars=[bar(0)],
+            stop_config=StopConfig(
+                stop_type=StopType.FIXED_PCT, value=Decimal("0.02"), broker_side=False
+            ),
+        )
+        await runner.warmup(portfolio)
+        self._armed(portfolio, target="110")
+
+        close_bar(runner, bar(1, close=112.0))
+        await runner.evaluate(portfolio)
+
+        assert router.flattened == [SYMBOL]
+        assert router.flatten_purposes == [TAKE_PROFIT]
+
+    @pytest.mark.asyncio
+    async def test_a_stop_wins_when_one_bar_spans_both_levels(self) -> None:
+        """The pessimistic reading, matching the engine exactly.
+
+        The bar cannot say which came first. Assuming the target would make
+        every live report — and every backtest that agreed with it — flatter
+        than the truth.
+        """
+        runner, router, _, _, portfolio, _ = build(
+            bars=[bar(0)],
+            stop_config=StopConfig(
+                stop_type=StopType.FIXED_PCT, value=Decimal("0.02"), broker_side=False
+            ),
+        )
+        await runner.warmup(portfolio)
+        self._armed(portfolio, stop="98", target="102")
+
+        # bar() spans low−1 to high+1 around its close, so a close of 100 covers
+        # 99–101; widen it by closing at 100 with both levels inside the range.
+        spanning = Bar(
+            symbol=SYMBOL,
+            ts=bar(1).ts,
+            timeframe=Timeframe.D1,
+            open=Decimal("100"),
+            high=Decimal("103"),
+            low=Decimal("97"),
+            close=Decimal("100"),
+            volume=Decimal("1000000"),
+        )
+        close_bar(runner, spanning)
+        await runner.evaluate(portfolio)
+
+        assert router.flatten_purposes == [STOP_LOSS]
+
+    @pytest.mark.asyncio
+    async def test_a_broker_side_stop_still_leaves_the_target_to_us(self) -> None:
+        """The stop rests at the venue; the target never does.
+
+        `submit_protective_orders` arms a take-profit on the position rather
+        than sending a second order, so returning early on a broker-side config
+        would leave the position with no upside exit at all.
+        """
+        runner, router, _, _, portfolio, _ = build(
+            bars=[bar(0)],
+            stop_config=StopConfig(
+                stop_type=StopType.FIXED_PCT, value=Decimal("0.02"), broker_side=True
+            ),
+        )
+        await runner.warmup(portfolio)
+        self._armed(portfolio, stop="98", target="110")
+
+        close_bar(runner, bar(1, close=112.0))
+        await runner.evaluate(portfolio)
+
+        assert router.flatten_purposes == [TAKE_PROFIT]
+
+    @pytest.mark.asyncio
+    async def test_a_broker_side_stop_is_not_double_exited(self) -> None:
+        """It is resting at the venue and fires without us."""
+        runner, router, _, _, portfolio, _ = build(
+            bars=[bar(0)],
+            stop_config=StopConfig(
+                stop_type=StopType.FIXED_PCT, value=Decimal("0.02"), broker_side=True
+            ),
+        )
+        await runner.warmup(portfolio)
+        self._armed(portfolio, stop="98")
+
+        close_bar(runner, bar(1, close=80.0))
+        await runner.evaluate(portfolio)
+
+        assert router.flattened == []
+
+    @pytest.mark.asyncio
+    async def test_a_time_exit_is_named_as_one(self) -> None:
+        """Not `flatten`. A time exit and an operator flatten are the same order
+        and completely different facts about a strategy."""
+        runner, router, _, _, portfolio, _ = build(
+            bars=[bar(0)],
+            stop_config=StopConfig(stop_type=StopType.TIME, bars=1),
+        )
+        await runner.warmup(portfolio)
+        self._armed(portfolio)
+        portfolio.position(SYMBOL).opened_at = bar(0).ts
+
+        close_bar(runner, bar(1))
+        await runner.evaluate(portfolio)
+
+        assert router.flatten_purposes == [TIME_EXIT]
+
+    @pytest.mark.asyncio
+    async def test_a_position_with_no_target_is_left_alone(self) -> None:
+        runner, router, _, _, portfolio, _ = build(
+            bars=[bar(0)],
+            stop_config=StopConfig(
+                stop_type=StopType.FIXED_PCT, value=Decimal("0.02"), broker_side=False
+            ),
+        )
+        await runner.warmup(portfolio)
+        self._armed(portfolio, stop="98")
+
+        close_bar(runner, bar(1, close=140.0))
+        await runner.evaluate(portfolio)
+
+        assert router.flattened == []
+
+
+class TestTheDecisionRecord:
+    """Signals and the strategy row — the join that makes an order attributable.
+
+    `orders.strategy_id` and `orders.signal_id` are foreign keys, so these
+    writes are not a nice-to-have alongside the order: without them the order
+    save is refused by the database.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_strategy_row_is_written_before_anything_can_trade(self) -> None:
+        strategies = FakeStrategyRepository()
+        runner, _, _, _, portfolio, _ = build(bars=[bar(0)], strategy_repo=strategies)
+
+        await runner.warmup(portfolio)
+
+        assert strategies.ensure_calls == ["scripted"]
+        # The id is the strategy's *name*, because that is what every
+        # `Signal.strategy_id` in the platform already carries.
+        assert strategies.stored["scripted"].id == "scripted"
+
+    @pytest.mark.asyncio
+    async def test_warmup_refuses_to_start_if_the_row_cannot_be_written(self) -> None:
+        strategies = FakeStrategyRepository()
+        strategies.ensure_error = RuntimeError("database is down")
+        runner, _, _, _, portfolio, _ = build(bars=[bar(0)], strategy_repo=strategies)
+
+        with pytest.raises(RuntimeError, match="database is down"):
+            await runner.warmup(portfolio)
+
+    @pytest.mark.asyncio
+    async def test_ensuring_is_idempotent_across_session_opens(self) -> None:
+        """`warmup` re-runs at every open, and must not reset the row."""
+        strategies = FakeStrategyRepository()
+        runner, _, _, _, portfolio, _ = build(bars=[bar(0)], strategy_repo=strategies)
+
+        await runner.warmup(portfolio)
+        first = strategies.stored["scripted"]
+        await runner.warmup(portfolio)
+
+        assert strategies.ensure_calls == ["scripted", "scripted"]
+        assert strategies.stored["scripted"] is first
+
+    @pytest.mark.asyncio
+    async def test_a_submitted_signal_is_stored_as_acted_on(self) -> None:
+        signals = FakeSignalRepository()
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, _, _, _, portfolio, _ = build(strategy, bars=[bar(0)], signal_repo=signals)
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+
+        await runner.evaluate(portfolio)
+
+        ((_, outcome),) = signals.stored.values()
+        assert outcome.acted_on is True
+        assert outcome.rejected_by is None
+
+    @pytest.mark.asyncio
+    async def test_a_refused_signal_is_stored_with_the_rule_that_refused_it(self) -> None:
+        """The whole reason the refusals are kept.
+
+        From the orders table alone, a strategy whose every idea was refused is
+        indistinguishable from a strategy that had no ideas — and those two call
+        for opposite responses.
+        """
+        signals = FakeSignalRepository()
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)], signal_repo=signals)
+        router.refuse_signals = True
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+
+        await runner.evaluate(portfolio)
+
+        ((_, outcome),) = signals.stored.values()
+        assert outcome.acted_on is False
+        assert outcome.rejected_by == "a_rule"
+        assert outcome.rejection_reason == "nope"
+
+    @pytest.mark.asyncio
+    async def test_the_signal_is_stored_before_the_order_that_references_it(self) -> None:
+        """`orders.signal_id` is a foreign key. Order matters, literally."""
+        signals = FakeSignalRepository()
+        orders = FakeOrderRepository()
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, _, _, _, portfolio, _ = build(
+            strategy, bars=[bar(0)], signal_repo=signals, order_repo=orders
+        )
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+
+        await runner.evaluate(portfolio)
+
+        assert signals.save_calls  # written at all
+        assert orders.save_calls  # and the order followed
+        # The fakes record in call order within one pass, so a signal recorded
+        # after the order would leave `save_calls` empty at this point.
+        assert len(signals.stored) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_signal_write_that_fails_fails_the_evaluation(self) -> None:
+        """Unlike the publisher's, this failure must reach the caller.
+
+        Swallowing it would let the order save a step later hit a foreign-key
+        violation instead — the same outage reported as a corruption.
+        """
+        signals = FakeSignalRepository()
+        signals.save_error = RuntimeError("signals table is unreachable")
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, _, _, _, portfolio, _ = build(strategy, bars=[bar(0)], signal_repo=signals)
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+
+        await runner.evaluate(portfolio)
+
+        # `evaluate` catches and counts rather than propagating — the loop must
+        # not die — but the pass is recorded as failed rather than as clean.
+        assert runner.stats.errors == 1

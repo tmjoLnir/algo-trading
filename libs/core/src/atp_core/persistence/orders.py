@@ -28,11 +28,14 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from atp_core.domain import Fill, Order, OrderStatus, OrderType, Side, TimeInForce
+from atp_core.execution.idempotency import UNKNOWN_PURPOSE
 from atp_core.logging import get_logger
 from atp_core.persistence.db import session_scope
 from atp_core.persistence.models import FillRow, OrderRow
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from atp_core.domain import RunMode
@@ -119,6 +122,40 @@ class PostgresOrderRepository:
 
         return [self._to_order(row, fills_by_order.get(row.id, [])) for row in rows]
 
+    async def filled_orders(
+        self, run_mode: RunMode, *, until: datetime, strategy_id: str | None = None
+    ) -> list[Order]:
+        """Every order with at least one fill up to `until`, oldest first.
+
+        Filtered on the stored `filled_qty` rather than on status, because both
+        `FILLED` and `PARTIALLY_FILLED` moved quantity and so did a `CANCELLED`
+        order that filled half before the cancel landed. Selecting on status
+        would drop that last one, and a partial fill nobody accounted for is a
+        position the reconstruction believes closed when it did not.
+
+        Ordered by `created_at`, which is the decision instant rather than the
+        fill instant. That is the order the FIFO matcher wants: an entry decided
+        before an exit is the entry that exit closes, even on the rare occasion
+        the venue prints them out of sequence.
+        """
+        query = (
+            select(OrderRow)
+            .where(
+                OrderRow.run_mode == run_mode.value,
+                OrderRow.filled_qty > 0,
+                OrderRow.created_at <= until,
+            )
+            .order_by(OrderRow.created_at, OrderRow.id)
+        )
+        if strategy_id is not None:
+            query = query.where(OrderRow.strategy_id == strategy_id)
+
+        async with session_scope(self._session_factory) as session:
+            rows = (await session.execute(query)).scalars().all()
+            fills_by_order = await self._fills_for(session, [row.id for row in rows])
+
+        return [self._to_order(row, fills_by_order.get(row.id, [])) for row in rows]
+
     @staticmethod
     async def _fills_for(session: AsyncSession, order_ids: list[str]) -> dict[str, list[FillRow]]:
         if not order_ids:
@@ -144,8 +181,17 @@ class PostgresOrderRepository:
             "id": order.id,
             "client_order_id": order.client_order_id,
             "broker_order_id": order.broker_order_id,
-            "strategy_id": None,  # set once strategies are rows; FK would fail otherwise
-            "signal_id": None,
+            # Both were hardcoded `None` with a note that a strategies row would
+            # have to exist first. `PostgresStrategyRepository.ensure` and
+            # `PostgresSignalRepository.save` are that row and that signal, and
+            # the runner calls them before it saves an order — so these now
+            # carry the join that makes an order attributable to the decision
+            # behind it. A caller that skips those writes gets a foreign-key
+            # violation here, which is the intended outcome: a null was how this
+            # gap stayed invisible.
+            "strategy_id": order.strategy_id,
+            "signal_id": order.signal_id,
+            "purpose": order.purpose,
             "parent_order_id": order.parent_order_id,
             "symbol": order.symbol,
             "side": order.side.value,
@@ -184,7 +230,14 @@ class PostgresOrderRepository:
             id=row.id,
             client_order_id=row.client_order_id,
             broker_order_id=row.broker_order_id,
+            strategy_id=row.strategy_id,
+            signal_id=row.signal_id,
             parent_order_id=row.parent_order_id,
+            # Rows written before the column existed have none. `Order` refuses
+            # an empty purpose, so the fallback is the default rather than "":
+            # a historical order genuinely does not know, and the analytics
+            # layer reports that as unattributable rather than as an entry.
+            purpose=row.purpose or UNKNOWN_PURPOSE,
             created_at=row.created_at,
             submitted_at=row.submitted_at,
         )

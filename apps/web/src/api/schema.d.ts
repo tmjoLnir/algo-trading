@@ -14,6 +14,11 @@ export interface paths {
         /**
          * Get Attribution
          * @description P&L grouped by strategy | symbol | weekday | hour | exit_reason.
+         *
+         *     An unknown dimension is a 422 naming the ones that exist, rather than an
+         *     empty list. "You asked for something that does not exist" and "this period
+         *     made nothing" are different answers and only one of them should look like a
+         *     quiet period.
          */
         get: operations["get_attribution_api_v1_analytics_attribution_get"];
         put?: never;
@@ -37,6 +42,16 @@ export interface paths {
          *
          *     The most important report here. Persistent negative divergence means the
          *     backtest was wrong — overfitting, unmodelled costs, or unachievable fills.
+         *
+         *     Still a stub, and deliberately so: this is its own roadmap item (Phase 5,
+         *     "Live-vs-backtest comparison"). The half that belongs to *this* item is
+         *     built — `PerformanceAnalyzer.compare_to_backtest` computes the divergence
+         *     metric by metric — and what is missing is the other operand. There is no
+         *     stored backtest result to compare against: `backtest_runs` has no reader,
+         *     and `/backtests` is a stub too. Answering with a comparison against a
+         *     backtest run on the fly here would compare live against whatever parameters
+         *     this request happened to pass, rather than against the backtest that
+         *     approved the strategy, which is the only comparison worth making.
          */
         get: operations["live_vs_backtest_api_v1_analytics_live_vs_backtest__strategy_id__get"];
         put?: never;
@@ -57,6 +72,20 @@ export interface paths {
         /**
          * Get Performance
          * @description Full metric set over a period.
+         *
+         *     The equity curve comes from the trades' own P&L rather than from
+         *     `equity_snapshots`, and that is a deliberate narrowing worth reading. The
+         *     snapshot table is sampled per evaluation and includes marks on *open*
+         *     positions, so a curve drawn from it moves on unrealised P&L — which is the
+         *     right curve for the dashboard's chart and the wrong one for a statistic
+         *     about closed trades, because it would attribute a metric to a period the
+         *     trade had not yet resolved in. Here the curve steps only when a round trip
+         *     closes.
+         *
+         *     The consequence is stated rather than hidden: `max_drawdown` measured this
+         *     way is the drawdown of *realised* P&L, which is shallower than the drawdown
+         *     an account actually experienced. `/dashboard/equity-curve` is the series
+         *     that answers the other question.
          */
         get: operations["get_performance_api_v1_analytics_performance_get"];
         put?: never;
@@ -77,6 +106,11 @@ export interface paths {
         /**
          * Daily Report
          * @description End-of-day summary: P&L, trades, rejections, halts, feed incidents.
+         *
+         *     Still a stub: its own roadmap item (Phase 5, "Daily report"). Trades and P&L
+         *     are available from this module now, and the other three are not gathered
+         *     anywhere one query can reach — rejections live in the signals table, halts in
+         *     the kill switch's records, feed incidents only in the worker's logs.
          */
         get: operations["daily_report_api_v1_analytics_reports_daily_get"];
         put?: never;
@@ -97,6 +131,20 @@ export interface paths {
         /**
          * List Trades
          * @description Completed round trips with MAE/MFE.
+         *
+         *     Newest first — a trade list is read to see what just happened — and capped,
+         *     because this is a screen rather than an export.
+         *
+         *     Excursions are measured after the cap is applied, so a request for 50 trades
+         *     fetches bars for the symbols in those 50 rather than for every symbol in the
+         *     period.
+         *
+         *     `timeframe` says which stored series to measure the excursions against, and
+         *     it is a parameter rather than a constant because the answer changes with it:
+         *     a daily bar's high is the day's high, so MAE read from dailies is coarser
+         *     than the same trade measured on minutes. It defaults to `1d` to match what
+         *     `atp_worker.trading.build_runner` ingests; a deployment storing minute bars
+         *     should ask for them and will get a tighter number.
          */
         get: operations["list_trades_api_v1_analytics_trades_get"];
         put?: never;
@@ -1026,6 +1074,38 @@ export interface components {
             /** Unrealized Pnl */
             unrealized_pnl: string;
         };
+        /** AttributionResponse */
+        AttributionResponse: {
+            /** By */
+            by: string;
+            /**
+             * End
+             * Format: date-time
+             */
+            end: string;
+            /** Rows */
+            rows: components["schemas"]["AttributionRowView"][];
+            /**
+             * Start
+             * Format: date-time
+             */
+            start: string;
+        };
+        /** AttributionRowView */
+        AttributionRowView: {
+            /** Avg Pnl */
+            avg_pnl: string;
+            /** Contribution Pct */
+            contribution_pct: number;
+            /** Key */
+            key: string;
+            /** Net Pnl */
+            net_pnl: string;
+            /** Num Trades */
+            num_trades: number;
+            /** Win Rate */
+            win_rate: number;
+        };
         /**
          * AuditEntryView
          * @description One row, as the dashboard reads it.
@@ -1323,6 +1403,35 @@ export interface components {
             ts: string | null;
         };
         /**
+         * PerformanceResponse
+         * @description The metric set, plus what it was computed over.
+         *
+         *     `num_trades` is inside `metrics` already; `start`, `end` and `equity_points`
+         *     are here because a Sharpe over four days and a Sharpe over four months are
+         *     different claims and the response should not make a reader guess which one
+         *     they have.
+         */
+        PerformanceResponse: {
+            /**
+             * End
+             * Format: date-time
+             */
+            end: string;
+            /** Equity Points */
+            equity_points: number;
+            /** Metrics */
+            metrics: {
+                [key: string]: number;
+            };
+            /** Periods Per Year */
+            periods_per_year: number;
+            /**
+             * Start
+             * Format: date-time
+             */
+            start: string;
+        };
+        /**
          * PositionView
          * @description One holding.
          *
@@ -1540,6 +1649,75 @@ export interface components {
              */
             updated_at: string;
         };
+        /**
+         * Timeframe
+         * @enum {string}
+         */
+        Timeframe: "1m" | "5m" | "15m" | "30m" | "1h" | "4h" | "1d";
+        /**
+         * TradeView
+         * @description One completed round trip.
+         *
+         *     Every monetary field is a `Decimal` and reaches the browser as a string —
+         *     the dashboard performs no arithmetic on money, so nothing downstream ever
+         *     parses one back (docs/DASHBOARD.md).
+         */
+        TradeView: {
+            /** Entry Price */
+            entry_price: string;
+            /**
+             * Entry Ts
+             * Format: date-time
+             */
+            entry_ts: string;
+            /** Exit Price */
+            exit_price: string | null;
+            /** Exit Reason */
+            exit_reason: string;
+            /** Exit Ts */
+            exit_ts: string | null;
+            /** Fees */
+            fees: string;
+            /** Gross Pnl */
+            gross_pnl: string;
+            /** Holding Period Hours */
+            holding_period_hours: number;
+            /** Max Adverse Excursion */
+            max_adverse_excursion: string | null;
+            /** Max Favorable Excursion */
+            max_favorable_excursion: string | null;
+            /** Net Pnl */
+            net_pnl: string;
+            /** Qty */
+            qty: string;
+            /** Return Pct */
+            return_pct: string;
+            /** Side */
+            side: string;
+            /** Strategy Id */
+            strategy_id: string;
+            /** Symbol */
+            symbol: string;
+            /** Trade Id */
+            trade_id: string;
+        };
+        /** TradesResponse */
+        TradesResponse: {
+            /**
+             * End
+             * Format: date-time
+             */
+            end: string;
+            /** Excursions Omitted */
+            excursions_omitted: boolean;
+            /**
+             * Start
+             * Format: date-time
+             */
+            start: string;
+            /** Trades */
+            trades: components["schemas"]["TradeView"][];
+        };
         /** ValidationError */
         ValidationError: {
             /** Context */
@@ -1588,9 +1766,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    }[];
+                    "application/json": components["schemas"]["AttributionResponse"];
                 };
             };
             /** @description Validation Error */
@@ -1643,6 +1819,7 @@ export interface operations {
                 start?: string | null;
                 end?: string | null;
                 strategy_id?: string | null;
+                periods_per_year?: number | null;
             };
             header?: never;
             path?: never;
@@ -1656,9 +1833,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["PerformanceResponse"];
                 };
             };
             /** @description Validation Error */
@@ -1713,6 +1888,7 @@ export interface operations {
                 end?: string | null;
                 strategy_id?: string | null;
                 limit?: number;
+                timeframe?: components["schemas"]["Timeframe"];
             };
             header?: never;
             path?: never;
@@ -1726,9 +1902,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    }[];
+                    "application/json": components["schemas"]["TradesResponse"];
                 };
             };
             /** @description Validation Error */

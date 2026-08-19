@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from atp_core.data.ports import BarRepository, EventPublisher, QuoteCache
     from atp_core.execution.ports import OrderRepository, PortfolioRepository
     from atp_core.risk.killswitch import KillSwitch
+    from atp_core.strategy.ports import SignalRepository, StrategyRepository
 
 log = get_logger(__name__)
 
@@ -134,6 +135,8 @@ def build_runner(
     last_tick_at: Callable[[str], datetime | None],
     order_repo: OrderRepository,
     portfolio_repo: PortfolioRepository,
+    strategy_repo: StrategyRepository,
+    signal_repo: SignalRepository,
     snapshot_store: SnapshotStore | None = None,
     publisher: EventPublisher | None = None,
 ) -> tuple[StrategyRunner, Reconciler]:
@@ -172,6 +175,8 @@ def build_runner(
         run_mode=settings.run_mode,
         order_repo=order_repo,
         portfolio_repo=portfolio_repo,
+        strategy_repo=strategy_repo,
+        signal_repo=signal_repo,
         snapshot_store=snapshot_store,
         publisher=publisher,
         tick_interval_seconds=float(settings.engine_tick_interval_seconds),

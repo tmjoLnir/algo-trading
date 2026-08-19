@@ -120,6 +120,12 @@ class OrderRow(Base):
         UniqueConstraint("client_order_id", name="uq_orders_client_order_id"),
         Index("ix_orders_status_created", "status", "created_at"),
         Index("ix_orders_symbol_created", "symbol", "created_at"),
+        # Trade reconstruction reads every filled order for a run mode in
+        # created order, so this is the index that read walks. The existing two
+        # lead on status and symbol and neither serves it: reconstruction is not
+        # scoped to one symbol, and it wants both filled statuses rather than
+        # one.
+        Index("ix_orders_runmode_created", "run_mode", "created_at"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -130,6 +136,13 @@ class OrderRow(Base):
     strategy_id: Mapped[str | None] = mapped_column(ForeignKey("strategies.id"), nullable=True)
     signal_id: Mapped[str | None] = mapped_column(ForeignKey("signals.id"), nullable=True)
     parent_order_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    #: Why this order exists — the `purpose` vocabulary in
+    #: `atp_core.execution.idempotency`. Nullable because orders stored before
+    #: the column existed genuinely do not know theirs, and a defaulted "entry"
+    #: would label every historical exit as an entry. It is what makes an exit
+    #: attributable: `analytics.performance` reads it to answer whether a
+    #: strategy's profit comes from its targets while its stops bleed.
+    purpose: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     symbol: Mapped[str] = mapped_column(String(20))
     side: Mapped[str] = mapped_column(String(8))

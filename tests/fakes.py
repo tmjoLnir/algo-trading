@@ -30,8 +30,9 @@ if TYPE_CHECKING:
     from typing import Any
 
     from atp_core.dashboard.snapshot import LiveSnapshot
-    from atp_core.domain import Side
+    from atp_core.domain import Side, Signal
     from atp_core.execution.ports import EquityPoint
+    from atp_core.strategy.ports import SignalOutcome, StrategyRecord
 
 
 class FakeBroker:
@@ -300,6 +301,74 @@ class FakePortfolioRepository:
         if self.history_error is not None:
             raise self.history_error
         return [p for p in self.equity_points if start <= p.ts <= end]
+
+
+class FakeStrategyRepository:
+    """In-memory `StrategyRepository`.
+
+    `ensure` is counted rather than merely recorded, because the property worth
+    testing is that it is idempotent: the runner calls it at every session open,
+    and a second call must not replace the row.
+    """
+
+    def __init__(self) -> None:
+        self.stored: dict[str, StrategyRecord] = {}
+        self.ensure_calls: list[str] = []
+        #: Set by a test to stand for a database that will not take the row. The
+        #: runner must fail warmup rather than continue into an evaluation whose
+        #: every write would be refused by a foreign key.
+        self.ensure_error: Exception | None = None
+
+    async def ensure(self, record: StrategyRecord) -> None:
+        if self.ensure_error is not None:
+            raise self.ensure_error
+        self.ensure_calls.append(record.id)
+        # Matches the real adapter: an existing row keeps the values it has.
+        self.stored.setdefault(record.id, record)
+
+    async def get(self, strategy_id: str) -> StrategyRecord | None:
+        return self.stored.get(strategy_id)
+
+
+class FakeSignalRepository:
+    """In-memory `SignalRepository`, upserting on the signal's id like the real one."""
+
+    def __init__(self) -> None:
+        self.stored: dict[str, tuple[Signal, SignalOutcome]] = {}
+        self.save_calls: list[str] = []
+        #: Set by a test to stand for a write that cannot land. Unlike the
+        #: publisher's, this failure must reach the caller: the order saved a
+        #: step later carries a foreign key to this row.
+        self.save_error: Exception | None = None
+
+    async def save(self, signal: Signal, outcome: SignalOutcome) -> None:
+        if self.save_error is not None:
+            raise self.save_error
+        self.save_calls.append(signal.id)
+        self.stored[signal.id] = (signal, outcome)
+
+    async def recent(
+        self, strategy_id: str | None = None, *, limit: int = 200
+    ) -> list[tuple[Signal, SignalOutcome]]:
+        rows = [
+            pair
+            for pair in self.stored.values()
+            if strategy_id is None or pair[0].strategy_id == strategy_id
+        ]
+        rows.sort(key=lambda pair: pair[0].ts, reverse=True)
+        return rows[:limit]
+
+    async def between(
+        self, start: datetime, end: datetime, *, strategy_id: str | None = None
+    ) -> list[tuple[Signal, SignalOutcome]]:
+        rows = [
+            pair
+            for pair in self.stored.values()
+            if start <= pair[0].ts <= end
+            and (strategy_id is None or pair[0].strategy_id == strategy_id)
+        ]
+        rows.sort(key=lambda pair: pair[0].ts)
+        return rows
 
 
 class FakeSnapshotStore:
