@@ -1,6 +1,7 @@
 .DEFAULT_GOAL := help
 .PHONY: help install up up-prod deploy down logs migrate revision seed backfill \
-        secrets-check secrets-install test test-unit \
+        secrets-check secrets-install backup backup-verify backup-list backup-restore \
+        test test-unit \
         test-integration lint typecheck fmt check check-bindings gen-types build-web \
         dev-api dev-worker dev-web clean
 
@@ -96,6 +97,35 @@ secrets-install:  ## Write .env from the bundle:  make secrets-install env=paper
 	@# build command means it happens on every run of it, including the ones a
 	@# developer does on a laptop. docs/DEPLOYMENT.md sequences the two.
 	uv run python scripts/manage_secrets.py install --env "$(env)"
+
+# ── backups ─────────────────────────────────────────────────────────────────
+# ADR 0014 chose logical dumps verified by restoring them. docs/BACKUPS.md is
+# the procedure, including the part these targets cannot do for you: a dump on
+# the same disk as the database is not a backup. Set ATP_BACKUP_DIR.
+#
+# `via=compose` runs the client tools inside the db container, which is what a
+# deployment host wants — the binaries are then the server's own build, and the
+# host needs no postgres client installed.
+backup:  ## Take a database backup:  make backup [via=compose]
+	uv run python scripts/backup_db.py create $(if $(via),--exec $(via),)
+
+backup-verify:  ## Restore the newest backup into a scratch database and compare
+	@# The one that matters. Exit 1 means the backup does not restore; exit 2
+	@# means the check could not run at all. See docs/BACKUPS.md before wiring
+	@# this to anything that pages someone.
+	uv run python scripts/backup_db.py verify $(if $(via),--exec $(via),)
+
+backup-list:  ## What backups exist, with their checksums re-read
+	uv run python scripts/backup_db.py list --check
+
+backup-restore:  ## Restore a backup:  make backup-restore into=atp
+	@# Destructive, and deliberately awkward: no default target, and the stack
+	@# has to be down. `into` is named explicitly so nobody restores over a
+	@# database they did not mean to. docs/BACKUPS.md, "Restoring".
+	@test -n "$(into)" || { \
+	  echo "set into=<database>, e.g. make backup-restore into=atp"; \
+	  echo "this one replaces a database — read docs/BACKUPS.md first"; exit 1; }
+	uv run python scripts/backup_db.py restore --into "$(into)" $(if $(via),--exec $(via),)
 
 down:  ## Stop the stack
 	@# --profile prod so this also takes down web-prod, which is otherwise

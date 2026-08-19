@@ -64,6 +64,15 @@ npm-debug.log*
 /logs/
 *.log
 
+# Database dumps. Anchored, per the lesson above. A dump is the entire trading
+# record — every order, every fill and the whole audit trail — so this is not a
+# size rule like the ones above it, and `make check-tracked` deliberately does
+# NOT list these: a dump that git can see is the failure, not the fix.
+# ADR 0014, docs/BACKUPS.md.
+/backups/
+*.dump
+*.dump.json
+
 # --- editors / os ---
 .vscode/
 .idea/
