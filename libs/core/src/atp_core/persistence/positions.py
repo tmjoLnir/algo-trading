@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 
 from atp_core.domain import Portfolio, Position
-from atp_core.execution.ports import EquityPoint
+from atp_core.execution.ports import EquityPoint, StoredBook
 from atp_core.logging import get_logger
 from atp_core.persistence.db import session_scope
 from atp_core.persistence.models import EquitySnapshotRow, PositionSnapshotRow
@@ -81,7 +81,18 @@ class PostgresPortfolioRepository:
                 )
 
     async def latest(self, run_mode: RunMode) -> Portfolio | None:
-        """The newest complete snapshot, or None if there has never been one."""
+        """The newest complete snapshot, or None if there has never been one.
+
+        The portfolio alone. Its caller is a runner adopting its own last state
+        at boot, for which the age is not a question — it reconciles against the
+        broker either way. A reader that has to *say* how stale the book is
+        wants `latest_snapshot`.
+        """
+        stored = await self.latest_snapshot(run_mode)
+        return stored.portfolio if stored is not None else None
+
+    async def latest_snapshot(self, run_mode: RunMode) -> StoredBook | None:
+        """The newest complete snapshot, with the instant it was written."""
         async with session_scope(self._session_factory) as session:
             equity_row = (
                 await session.execute(
@@ -108,7 +119,10 @@ class PostgresPortfolioRepository:
         )
         for position in positions:
             portfolio.positions[position.symbol] = position
-        return portfolio
+        # `equity_row.ts` is the instant every row of this snapshot shares, which
+        # is what `_positions_at` selected on — so the age reported to a reader
+        # is the age of the whole book rather than of its newest row.
+        return StoredBook(at=equity_row.ts, portfolio=portfolio)
 
     async def equity_history(
         self, run_mode: RunMode, *, start: datetime, end: datetime

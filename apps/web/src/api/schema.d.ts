@@ -657,7 +657,23 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List Positions */
+        /**
+         * List Positions
+         * @description What the worker last recorded holding, with the age of that record.
+         *
+         *     Every derived figure — market value, unrealised P&L, leverage, the
+         *     distance-to-stop fraction — comes from `atp_core.dashboard`'s own
+         *     `position_summary` and `account_summary`, which is what the live dashboard
+         *     computes from. One expression per figure, two screens: a distance-to-stop
+         *     that disagreed between them would be a bug invisible from either.
+         *
+         *     **`open_only` is gone from this signature.** The stub took it, and it could
+         *     never have been honoured: `PortfolioRepository.snapshot` writes only open
+         *     positions, because a `Portfolio` keeps a zeroed `Position` after an exit and
+         *     storing those would be rows holding nothing. A closed position is a round
+         *     trip, and round trips are `/analytics/trades`. Accepting a parameter that
+         *     silently did nothing would be worse than not offering it.
+         */
         get: operations["list_positions_api_v1_positions_get"];
         put?: never;
         post?: never;
@@ -674,7 +690,15 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get Position */
+        /**
+         * Get Position
+         * @description One holding.
+         *
+         *     Still a stub, and deliberately: nothing consumes it. The screen shows the
+         *     whole book in one read, so this would be an endpoint built, tested and
+         *     documented with no caller — which is the shape of gap the analytics
+         *     endpoints sat in for a phase before anything read them.
+         */
         get: operations["get_position_api_v1_positions__symbol__get"];
         put?: never;
         post?: never;
@@ -1653,6 +1677,32 @@ export interface components {
              * Format: date-time
              */
             ts: string;
+        };
+        /**
+         * StoredBookView
+         * @description The book as the worker last wrote it, and how long ago that was.
+         *
+         *     `as_of` and `age_seconds` are not decoration. Every other field here
+         *     describes a moment that has already passed, and how far past it is decides
+         *     whether any of them can be acted on. A stored book rendered without its age
+         *     is the same mistake as a price without one (docs/DASHBOARD.md), with more at
+         *     stake: the reader is usually looking at this screen *because* something
+         *     stopped.
+         *
+         *     Null throughout when the worker has never written a snapshot. That is not an
+         *     empty book — "you hold nothing" and "nobody has ever said what you hold" are
+         *     different sentences and only one of them is safe to act on (ADR 0007).
+         */
+        StoredBookView: {
+            account: components["schemas"]["AccountView"] | null;
+            /** Age Seconds */
+            age_seconds: number | null;
+            /** As Of */
+            as_of: string | null;
+            /** Positions */
+            positions?: components["schemas"]["PositionView"][];
+            /** Run Mode */
+            run_mode: string;
         };
         /** StrategyCreate */
         StrategyCreate: {
@@ -2697,9 +2747,7 @@ export interface operations {
     };
     list_positions_api_v1_positions_get: {
         parameters: {
-            query?: {
-                open_only?: boolean;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -2712,18 +2760,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    }[];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["StoredBookView"];
                 };
             };
         };

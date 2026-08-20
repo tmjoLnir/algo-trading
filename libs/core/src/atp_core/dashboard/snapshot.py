@@ -219,11 +219,13 @@ def build_snapshot(
     if at.tzinfo is None:
         raise ValueError(f"snapshot instant must be tz-aware UTC (rule §1.2), got {at!r}")
 
-    positions = tuple(sorted((_position(p) for p in portfolio.open_positions), key=_by_exposure))
+    positions = tuple(
+        sorted((position_summary(p) for p in portfolio.open_positions), key=_by_exposure)
+    )
     return LiveSnapshot(
         as_of=at,
         run_mode=run_mode,
-        account=_account(portfolio),
+        account=account_summary(portfolio),
         positions=positions,
         recent_signals=tuple(recent_signals),
         working_orders=tuple(_order(o) for o in working_orders),
@@ -260,7 +262,13 @@ def _newest_quote_ts(quotes: Mapping[str, Quote] | None) -> datetime | None:
     return max(quote.ts for quote in quotes.values())
 
 
-def _account(portfolio: Portfolio) -> AccountSummary:
+def account_summary(portfolio: Portfolio) -> AccountSummary:
+    """Account-level figures from a portfolio.
+
+    Public because `/positions` computes the same figures over the *stored*
+    book. Two call sites, one expression: an account summary that disagreed
+    between two screens would be a bug nobody could see from either of them.
+    """
     open_positions = portfolio.open_positions
     return AccountSummary(
         equity=portfolio.equity,
@@ -275,7 +283,15 @@ def _account(portfolio: Portfolio) -> AccountSummary:
     )
 
 
-def _position(position: Position) -> PositionSummary:
+def position_summary(position: Position) -> PositionSummary:
+    """One holding, with every derived figure computed.
+
+    Public for the same reason as `account_summary`, and it matters more here:
+    `_distance_to_stop` below is one expression covering long and short, and its
+    own docstring says writing it per side would be two chances to get a sign
+    wrong. Writing it per *screen* would be the same mistake with the same
+    consequence — on the number that says how close a position is to closing.
+    """
     marked = position.last_price is not None
     cost_basis = (position.avg_entry_price * position.qty).copy_abs()
     return PositionSummary(
