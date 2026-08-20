@@ -4,9 +4,10 @@
  * Always visible, never behind a menu. Engaging asks for no confirmation —
  * hesitation is the expensive part. Resuming is the deliberate action and is
  * deliberately not here: `POST /risk/resume` demands the account password again
- * (ADR 0009), and until a screen exists to ask for one, clearing a halt is
- * `scripts/halt.py clear --by <name>`. `HaltBanner` says so where a halted
- * reader will actually be looking.
+ * (ADR 0009), so it asks for one from `ResumeButton`, on the halt it is
+ * clearing, inside the banner a halted reader is already looking at.
+ * `scripts/halt.py clear --by <name>` remains the path that works when the API
+ * does not.
  *
  * **A failed halt is shown, not swallowed.** This is the one control in the app
  * that acts on the book, and the failure it can hit is the one an operator is

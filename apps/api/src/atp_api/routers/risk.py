@@ -27,6 +27,23 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/risk", tags=["risk"])
 
 
+def _scope_target_error(scope: HaltScope, target: str | None, *, verb: str) -> str | None:
+    """The scope/target pairing, in one place because both ends need it.
+
+    A halt is keyed on (scope, target) and is cleared by that same pair, so the
+    two requests have to agree about which pairs exist. Written twice they would
+    drift, and the direction that drift goes is the dangerous one: a resume that
+    accepted a combination `/halt` refuses could only ever be asking to clear a
+    halt that cannot exist, and would answer "nothing was halted" — which reads
+    exactly like "trading is fine" to whoever is looking at it.
+    """
+    if scope is HaltScope.GLOBAL and target is not None:
+        return f"target is meaningless with scope 'global' — it {verb} everything"
+    if scope is not HaltScope.GLOBAL and not target:
+        return f"scope '{scope.value}' needs a target (a strategy id or symbol)"
+    return None
+
+
 class HaltRequest(BaseModel):
     """What to stop. Everything, by default.
 
@@ -52,10 +69,9 @@ class HaltRequest(BaseModel):
         target would key a halt on the literal string `None`, which halts
         nothing and reads on the banner as though it halted something.
         """
-        if self.scope is HaltScope.GLOBAL and self.target is not None:
-            raise ValueError("target is meaningless with scope 'global' — it halts everything")
-        if self.scope is not HaltScope.GLOBAL and not self.target:
-            raise ValueError(f"scope '{self.scope.value}' needs a target (a strategy id or symbol)")
+        problem = _scope_target_error(self.scope, self.target, verb="halts")
+        if problem is not None:
+            raise ValueError(problem)
         return self
 
 
@@ -86,13 +102,60 @@ class HaltEngagedView(BaseModel):
 
 
 class ResumeRequest(BaseModel):
-    """Clearing a halt, with the password that proves someone is still there."""
+    """Clearing a halt, with the password that proves someone is still there.
 
-    scope: str = "global"
+    `scope` is the domain enum and not a bare string, for the reason
+    `HaltRequest` gives and one more that is specific to this end: the handler
+    has to hand a `HaltScope` to the kill switch, so a string would be converted
+    somewhere — and converting it inside the handler turns a typo into a 500
+    with no useful body, where the enum makes it a 422 that names the three
+    scopes that exist. An operator clearing a halt is not in a position to guess
+    which of those two an error page meant.
+    """
+
+    scope: HaltScope = HaltScope.GLOBAL
     target: str | None = None
     #: Re-presented for this one act. In the body and never a query parameter:
     #: a query string is written to nginx's access log verbatim.
     password: str = Field(min_length=1, max_length=1024)
+
+    @model_validator(mode="after")
+    def _scope_and_target_agree(self) -> ResumeRequest:
+        problem = _scope_target_error(self.scope, self.target, verb="clears")
+        if problem is not None:
+            raise ValueError(problem)
+        return self
+
+
+class ResumedView(BaseModel):
+    """What this call did, and whether it did anything at all.
+
+    `was_halted` is the field to read first. `clear` is deliberately not an
+    error when nothing was engaged — an operator clearing defensively should not
+    get an exception for being early — so "resumed" and "there was nothing to
+    resume" are both successes, and only this tells them apart.
+
+    The halt fields describe **what was removed**, so they are null when
+    `was_halted` is false. They are worth returning rather than dropping: the
+    thing an operator most wants confirmed after resuming is that the halt they
+    cleared is the halt they meant, and `reason` is what says so.
+
+    Deliberately silent about what is *still* halted. Clearing the global halt
+    while a symbol halt stands leaves trading partly stopped, which matters — but
+    answering it here means a second read of the store on a path whose first
+    write has already landed, so a failed read would report failure for a resume
+    that actually happened. The banner re-reads every halt on the next poll and
+    stays up if any remain; that is the honest place for the question.
+    """
+
+    scope: str
+    target: str | None
+    was_halted: bool
+    cleared_by: str
+    reason: str | None = None
+    engaged_at: datetime | None = None
+    engaged_by: str | None = None
+    detail: str | None = None
 
 
 class FlattenAllRequest(BaseModel):
@@ -102,7 +165,14 @@ class FlattenAllRequest(BaseModel):
     password: str = Field(min_length=1, max_length=1024)
 
 
-def _require_step_up(password: str, actor: str, settings: Settings) -> None:
+async def _require_step_up(
+    password: str,
+    actor: str,
+    settings: Settings,
+    audit: AuditSink,
+    clock: Clock,
+    target: str,
+) -> None:
     """Demand the password again, for an act that cannot be taken back.
 
     This is what finally enforces docs/RISK.md's "clearing requires a named
@@ -119,12 +189,38 @@ def _require_step_up(password: str, actor: str, settings: Settings) -> None:
 
     403 rather than 401: the session is valid and stays valid. Answering 401
     would send the dashboard to a login screen, which is not what went wrong.
+
+    **A failure is recorded before it is raised.** `Action.FORBIDDEN` has always
+    described itself as covering "a read-only session attempting a write, or a
+    failed step-up (ADR 0009)", and `deps.require_write_scope` wrote the first
+    of those from the start; this end wrote nothing, so the record has been
+    claiming a coverage it did not have. The gap matters more here than there:
+    a wrong password against `/resume` or `/flatten-all` is either the operator
+    mistyping or somebody working through guesses with a stolen cookie, those
+    look identical at the moment of refusal, and `rate_limited` only ever
+    counted attempts at the *login* form. Without this row the second case
+    leaves no trace anywhere.
     """
-    if authenticate(actor, password, settings) is None:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="password required for this action",
+    if authenticate(actor, password, settings) is not None:
+        return
+
+    await audit.record(
+        AuditEntry(
+            at=clock.now(),
+            actor=actor,
+            action=Action.FORBIDDEN,
+            target=target,
+            # Named so this is distinguishable from a read-only session's
+            # refusal, which shares the verb and would otherwise be indistinct
+            # on the audit screen — one is a session in the wrong mode, the
+            # other is a credential that did not check out.
+            detail={"reason": "step_up_failed"},
         )
+    )
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="password required for this action",
+    )
 
 
 @router.get("/limits")
@@ -253,16 +349,102 @@ async def clear_kill_switch(
     payload: ResumeRequest,
     actor: CurrentUser,
     settings: Annotated[Settings, Depends(get_settings)],
-) -> dict[str, object]:
+    kill_switch: Annotated[KillSwitch, Depends(get_kill_switch)],
+    audit: Annotated[AuditSink, Depends(get_audit_sink)],
+    clock: Annotated[Clock, Depends(get_clock)],
+) -> ResumedView:
     """Resume trading. Requires a named human and is audit-logged.
 
     Deliberately asymmetric with `/halt`: stopping is reflexive, restarting is
     a decision. The password is where that asymmetry stops being a comment and
     starts being enforced — `/halt` asks for nothing at all, and a read-only
     session may call it; this one asks again and a read-only session may not.
+    That second half needs no code here: `deps.READ_ONLY_MAY_CALL` names `/halt`
+    and nothing else, so `require_write_scope` refuses this route by default.
+
+    `cleared_by` is the session's user, exactly as `engaged_by` is on the way
+    in. It is the answer to the only question anyone asks after an incident —
+    who decided it was safe to trade again — and a field the request could fill
+    in would not be an answer at all (ADR 0008).
+
+    Off the event loop for the reason `/halt` is: the switch is synchronous
+    because the risk chain consulting it is, and one Redis round trip must not
+    block every other request.
+
+    **A failure here is a 503, and it means the opposite of the one on `/halt`.**
+    Nothing was cleared, so the halt is still in force and nothing is trading —
+    the safe direction, and worth saying plainly because an operator who has
+    just been refused will otherwise be left wondering whether they are now half
+    resumed. There is no partial state to recover from: `clear` is a single
+    DELETE, so it either happened or it did not.
     """
-    _require_step_up(payload.password, actor, settings)
-    raise NotImplementedError
+    await _require_step_up(payload.password, actor, settings, audit, clock, "/api/v1/risk/resume")
+
+    try:
+        cleared = await asyncio.to_thread(
+            kill_switch.clear,
+            payload.scope,
+            actor,
+            payload.target,
+        )
+    except Exception as exc:
+        log.critical(
+            "risk.resume_failed",
+            error=str(exc),
+            actor=actor,
+            scope=payload.scope.value,
+            target=payload.target,
+            effect="the halt still stands — nothing is trading",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "trading was NOT resumed: "
+                f"{exc}. The halt is still in force and the switch fails closed, "
+                "so nothing is trading — this failed safe. Try again once the "
+                "store is reachable, and confirm with `scripts/halt.py status`."
+            ),
+        ) from exc
+
+    # After the clear, never before — the mirror of the halt row's ordering and
+    # for the inverse reason. A row claiming trading resumed when the delete did
+    # not land would have whoever reads it stop looking for the thing that is
+    # still stopping the platform.
+    #
+    # Written whether or not anything was removed. A clear that found nothing is
+    # not a no-op worth dropping: someone with the password decided the platform
+    # should be trading, and that decision is the record's business even when it
+    # turned out to be unnecessary.
+    await audit.record(
+        AuditEntry(
+            at=clock.now(),
+            actor=actor,
+            action=Action.HALT_CLEARED,
+            target=payload.target,
+            detail={
+                "scope": payload.scope.value,
+                "was_halted": cleared is not None,
+                # Who this operator overrode, when it was not themselves. An
+                # automated halt cleared by a human is the case worth being able
+                # to find afterwards: the risk layer stopped trading for a
+                # reason it had, and somebody decided that reason no longer
+                # applied.
+                "original_reason": cleared.reason.value if cleared is not None else None,
+                "originally_engaged_by": cleared.engaged_by if cleared is not None else None,
+            },
+        )
+    )
+
+    return ResumedView(
+        scope=payload.scope.value,
+        target=payload.target,
+        was_halted=cleared is not None,
+        cleared_by=actor,
+        reason=cleared.reason.value if cleared is not None else None,
+        engaged_at=cleared.engaged_at if cleared is not None else None,
+        engaged_by=cleared.engaged_by if cleared is not None else None,
+        detail=cleared.detail if cleared is not None else None,
+    )
 
 
 @router.post("/flatten-all")
@@ -270,6 +452,8 @@ async def flatten_all(
     payload: FlattenAllRequest,
     actor: CurrentUser,
     settings: Annotated[Settings, Depends(get_settings)],
+    audit: Annotated[AuditSink, Depends(get_audit_sink)],
+    clock: Annotated[Clock, Depends(get_clock)],
 ) -> dict[str, object]:
     """Liquidate everything at market.
 
@@ -281,7 +465,9 @@ async def flatten_all(
     the password shows they are the person entitled to do it. A copied session
     cookie satisfies neither on its own.
     """
-    _require_step_up(payload.password, actor, settings)
+    await _require_step_up(
+        payload.password, actor, settings, audit, clock, "/api/v1/risk/flatten-all"
+    )
     raise NotImplementedError
 
 

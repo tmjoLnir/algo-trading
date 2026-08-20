@@ -41,10 +41,20 @@ implemented, covered by tests, and writes an audit row (#70). `scripts/halt.py`
 is no longer the only operator path to the kill switch, though it remains the
 one that works when the API does not.
 
-**Clearing a halt is still command-line only.** `/risk/resume` is a stub and
-demands a step-up password no screen asks for, which leaves the asymmetry
-docs/RISK.md wants — stopping reflexive, restarting deliberate — enforced by
-what exists rather than by design.
+**Clearing a halt is a screen now too.** It was command-line only when this was
+written: `/risk/resume` was a stub demanding a step-up password no screen asked
+for, which left the asymmetry docs/RISK.md wants — stopping reflexive,
+restarting deliberate — enforced by what existed rather than by design. The
+endpoint is implemented and the halt banner carries a `Resume…` control per halt
+(#PR), so the asymmetry is now enforced where it was meant to be: the halt
+button asks nothing, the resume asks for the account password, and a read-only
+session may press one and not the other. `scripts/halt.py clear` remains the
+path that works when the API does not.
+
+**The resume control has never been rendered against a real API**, and neither
+had the halt button when this document was first written. It is covered by
+component tests against a stubbed `fetch` and by handler tests against a fake
+switch; nothing has cleared a halt in a real Redis from a real browser.
 
 Everything else on every tab is a read, and the reads are real.
 
@@ -65,10 +75,12 @@ totals understate exposure.
   cannot be written — a state that is neither "stopped" nor "trading", because
   the switch fails closed but records nothing, so trading resumes when the store
   recovers. The button renders that message rather than swallowing it.
-- No way to clear a halt from any screen. `/risk/resume` is a stub
-  (`risk.py:107`) and wants a password no screen asks for, so clearing is
-  `scripts/halt.py clear --by <name>`. The nav has seven tabs and none is Risk;
-  a resume control needs that screen, or a password prompt on this one.
+- Clearing a halt is on the halt banner (#PR), not on this tab's own controls:
+  one `Resume…` per halt, because a halt is keyed on (scope, target) and a
+  single button could only ever clear one of the halts on screen while looking
+  like it cleared the lot. The nav still has seven tabs and none is Risk, which
+  is where `/risk/status`, `/risk/limits` and `/risk/rejections` would go — all
+  three are still stubs.
 - `/dashboard/health` is stubbed (`dashboard.py:567`). Nothing calls it —
   `FeedStatus` reads `data_feed_healthy` off the aggregate instead — so it is a
   dead route rather than a missing feature.
@@ -167,25 +179,35 @@ labelled as such.
 
 ## 7. Audit — `/audit`
 
-**The screen is very nearly the finding.** The audit trail records six verbs:
+**The screen is very nearly the finding.** The audit trail records seven verbs:
 five about who was signed in — `login`, `login_failed`, `logout`,
-`rate_limited`, `forbidden` — and one about the book, `halt_engaged`, which
-arrived with the endpoint that emits it (#70). Nothing else is recorded, because
-the class docstring's rule is that a constant for an event nothing emits is a
-claim the record does not support, and the remaining handlers are still stubs.
+`rate_limited`, `forbidden` — and two about the book, `halt_engaged` (#70) and
+`halt_cleared` (#PR), each of which arrived with the endpoint that emits it.
+Nothing else is recorded, because the class docstring's rule is that a constant
+for an event nothing emits is a claim the record does not support, and the
+remaining handlers are still stubs.
 
-So the tab is a sign-in log with one trading event in it. "Who stopped trading"
-is now answerable — and only for halts engaged through the API: `scripts/halt.py`
-has no session to attribute a row to, and the automated triggers inside the risk
-layer announce themselves through alerts and logs instead. An absent row means
-"not halted *from the dashboard*", never "not halted". "Who promoted this
-strategy to live" and "which order did we send at 14:30" remain unanswerable,
-and ADR 0010's lifecycle verbs remain unwired.
+So the tab is a sign-in log with the kill switch's two events in it. "Who
+stopped trading" and "who started it again" are both answerable — and only for
+the API's own halts: `scripts/halt.py` has no session to attribute a row to, and
+the automated triggers inside the risk layer announce themselves through alerts
+and logs instead. An absent row means "not halted *from the dashboard*", never
+"not halted". "Who promoted this strategy to live" and "which order did we send
+at 14:30" remain unanswerable, and ADR 0010's lifecycle verbs remain unwired.
+
+`forbidden` also covers a failed step-up now, carrying `step_up_failed` in its
+detail (#PR). It had always claimed to — ADR 0009 says so and the constant's own
+docstring says so — but only `require_write_scope` ever wrote one, so a wrong
+password against `/resume` or `/flatten-all` left no trace at all. That was the
+gap worth closing: `rate_limited` counts attempts at the *login form*, so a
+stolen cookie being used to guess at the step-up was invisible to every part of
+the record.
 
 **Outstanding**
 
 - The order-flow and strategy-lifecycle verb families, each blocked on its own
-  handler. Clearing a halt is the nearest one: it needs `/risk/resume`.
+  handler. Clearing a halt was the nearest one and has landed; the rest wait on
+  `/orders`, `/positions/{symbol}/close` and the strategy writes.
 - The halts this log cannot see — the CLI's and the risk layer's own. Attributing
   those means giving each an identity the record can stand behind, which is a
   larger question than adding a constant.
@@ -216,21 +238,25 @@ and ADR 0010's lifecycle verbs remain unwired.
 | `/market-data/calendar` | built | **none** |
 | `/market-data/{bars,quote,search}` | **stub** | none |
 | `/risk/halt` | built (#70) | Dashboard button |
-| `/risk/{resume,flatten-all,limits,status,rejections}` | **stub** | none |
+| `/risk/resume` | built (#PR) | Halt banner |
+| `/risk/{flatten-all,limits,status,rejections}` | **stub** | none |
 
 ## Cross-cutting
 
-- **One live write path.** Of three mutations in the whole app — halt, queue a
-  backtest, log in/out — only the kill switch touches trading. It was a stub
-  when this was written and is not any more (#70); the point still standing is
-  how narrow the surface is, not that it is broken.
+- **Two live write paths, and they are the same one.** Of four mutations in the
+  whole app — halt, resume, queue a backtest, log in/out — only the kill switch
+  touches trading, and now in both directions (#70, #PR). The point still
+  standing is how narrow the surface is: nothing in the app can place an order,
+  close a position, or move a stop.
 - **Two built endpoints have no reader** (`live-vs-backtest`,
   `market-data/calendar`).
 - **Nothing here has met real data.** Every test drives fixtures or an ASGI
   transport, and so did the reading behind this document. The gap between "the
   screen renders this correctly" and "the screen agrees with what the worker
   holds" is exactly Phase 5's unshown *Verifiable:* line.
-- No roadmap tick is warranted by this document. Phase 5's dashboard item is
+- No roadmap tick is warranted by this document, and none by the resume work
+  either — it is fakes and an ASGI transport, and Phase 5's line asks for a
+  browser agreeing with a running worker. Phase 5's dashboard item is
   already unticked for the reason above, and the ticked "Redis kill switch" item
   (#32) claims only the core mechanism, which does work — it never claimed the
   HTTP endpoint or the button.

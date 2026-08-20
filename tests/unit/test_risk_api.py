@@ -19,8 +19,9 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
-from atp_api.auth import Scope, Session
+from atp_api.auth import Scope, Session, hash_password
 from atp_api.deps import get_audit_sink, get_clock, get_current_session, get_kill_switch
 from atp_api.main import create_app
 from atp_core.audit.ports import Action, AuditEntry
@@ -35,6 +36,11 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
 
 HALT = "/api/v1/risk/halt"
+RESUME = "/api/v1/risk/resume"
+
+#: The step-up password these cases present. `/resume` re-checks it against the
+#: settings, so unlike `/halt` these need settings with a real hash in them.
+PASSWORD = "a-perfectly-ordinary-password"
 
 NOW = datetime(2024, 6, 3, 14, 30, tzinfo=UTC)
 
@@ -63,6 +69,35 @@ class RecordingAuditSink:
         action: str | None = None,
     ) -> list[tuple[int, AuditEntry]]:
         return []
+
+
+def resume_settings(password: str = PASSWORD) -> Settings:
+    """`pinned_settings` plus a credential the step-up can actually check.
+
+    `api_user` matches the session the `app` fixture installs: `authenticate`
+    compares the *session's* user against the configured one, so a mismatch here
+    would make every resume a 403 for the wrong reason and quietly turn the
+    happy-path cases into duplicates of the refusal ones.
+    """
+    return Settings(
+        ATP_RUN_MODE="backtest",
+        api_user="test-operator",
+        api_secret_key=SecretStr("k" * 64),
+        api_password_hash=SecretStr(hash_password(password)),
+        _env_file=None,
+    )
+
+
+class UnclearableKillSwitch(FakeKillSwitch):
+    """A kill switch whose Redis is gone, on the way *out* of a halt.
+
+    Separate from `UnreachableKillSwitch` because the two failures mean opposite
+    things and the handlers must say so: a failed engage leaves trading about to
+    resume on its own, a failed clear leaves it stopped.
+    """
+
+    def clear(self, *args: Any, **kwargs: Any) -> Any:
+        raise ConnectionError("Error 111 connecting to redis:6379. Connection refused.")
 
 
 class UnreachableKillSwitch(FakeKillSwitch):
@@ -403,3 +438,296 @@ class TestReadOnlySessions:
         assert response.status_code == 200
         assert kill_switch.is_engaged() is True
         assert response.json()["engaged_by"] == "reader"
+
+
+class TestResuming:
+    """`POST /api/v1/risk/resume` — the deliberate half of the pair.
+
+    The theme is the mirror of the halting one above: **a resume must never
+    overstate what it achieved either**, and the ways it can mislead are the
+    reverse. Reporting "resumed" when the delete never landed leaves an operator
+    walking away from a stopped platform; reporting failure when it did land
+    leaves them re-clearing something already clear. Between those sits the case
+    with no counterpart on the way in — a clear that found nothing engaged,
+    which is a success and reads exactly like the first one unless the body
+    says otherwise.
+    """
+
+    @pytest.fixture
+    def app(self, app: FastAPI) -> FastAPI:
+        app.dependency_overrides[get_settings] = resume_settings
+        return app
+
+    @staticmethod
+    def halted(kill_switch: FakeKillSwitch) -> None:
+        """Put a halt in force the way the risk layer would have."""
+        kill_switch.engage(HaltScope.GLOBAL, HaltReason.DAILY_LOSS_LIMIT, "risk", "-3.2%")
+
+    async def test_it_resumes_trading(
+        self, client: httpx.AsyncClient, kill_switch: FakeKillSwitch
+    ) -> None:
+        self.halted(kill_switch)
+
+        response = await client.post(RESUME, json={"password": PASSWORD})
+
+        assert response.status_code == 200
+        assert kill_switch.is_engaged() is False
+        assert response.json()["was_halted"] is True
+
+    async def test_the_body_describes_the_halt_that_was_removed(
+        self, client: httpx.AsyncClient, kill_switch: FakeKillSwitch
+    ) -> None:
+        """Not an acknowledgement — the record that was overridden.
+
+        The reason is the field worth returning: an operator who cleared what
+        they thought was their own manual halt, and is told they cleared
+        `daily_loss_limit`, has just learned the risk layer stopped trading for
+        a reason of its own and that they have overruled it.
+        """
+        self.halted(kill_switch)
+
+        body = (await client.post(RESUME, json={"password": PASSWORD})).json()
+
+        assert body["reason"] == HaltReason.DAILY_LOSS_LIMIT.value
+        assert body["engaged_by"] == "risk"
+        assert body["detail"] == "-3.2%"
+        assert body["cleared_by"] == "test-operator"
+
+    async def test_clearing_nothing_is_a_success_that_says_so(
+        self, client: httpx.AsyncClient, kill_switch: FakeKillSwitch
+    ) -> None:
+        """The case with no counterpart on the halt side.
+
+        `clear` is deliberately not an error when nothing was engaged, so this
+        cannot be a 404 — but a bare 200 would read as "resumed" to a caller
+        who believed the platform was stopped, and the useful answer is that
+        whatever they were reacting to is not a halt.
+        """
+        response = await client.post(RESUME, json={"password": PASSWORD})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["was_halted"] is False
+        assert body["reason"] is None
+        assert body["engaged_by"] is None
+
+    async def test_the_resume_is_attributed_to_the_session_not_the_payload(
+        self, client: httpx.AsyncClient, kill_switch: FakeKillSwitch
+    ) -> None:
+        """The same rule the halt row follows, and it matters more here.
+
+        "Who decided it was safe to trade again" is the question the whole
+        asymmetry exists to answer (ADR 0008). A `cleared_by` the request could
+        set would let the answer be anything the caller liked.
+        """
+        self.halted(kill_switch)
+
+        body = (
+            await client.post(RESUME, json={"password": PASSWORD, "cleared_by": "somebody-else"})
+        ).json()
+
+        assert body["cleared_by"] == "test-operator"
+        assert kill_switch.clears == [(HaltScope.GLOBAL.value, "test-operator", None)]
+
+    async def test_a_narrowed_resume_clears_only_its_target(
+        self, client: httpx.AsyncClient, kill_switch: FakeKillSwitch
+    ) -> None:
+        kill_switch.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+        kill_switch.engage(HaltScope.SYMBOL, HaltReason.DATA_FEED_LOST, "worker", target="SPY")
+
+        response = await client.post(
+            RESUME, json={"password": PASSWORD, "scope": "symbol", "target": "SPY"}
+        )
+
+        assert response.status_code == 200
+        assert response.json()["was_halted"] is True
+        assert kill_switch.clears == [(HaltScope.SYMBOL.value, "test-operator", "SPY")]
+
+
+class TestTheResumeAuditRow:
+    @pytest.fixture
+    def app(self, app: FastAPI) -> FastAPI:
+        app.dependency_overrides[get_settings] = resume_settings
+        return app
+
+    async def test_resuming_is_recorded(
+        self, client: httpx.AsyncClient, kill_switch: FakeKillSwitch, audit: RecordingAuditSink
+    ) -> None:
+        """The counterpart to `halt_engaged`, and the reason the pair is needed:
+        a halt with no clear beside it is still in force."""
+        kill_switch.engage(HaltScope.GLOBAL, HaltReason.DAILY_LOSS_LIMIT, "risk", "-3.2%")
+
+        await client.post(RESUME, json={"password": PASSWORD})
+
+        (entry,) = audit.entries
+        assert entry.action == Action.HALT_CLEARED
+        assert entry.actor == "test-operator"
+        assert entry.at == NOW
+        assert entry.detail["was_halted"] is True
+        assert entry.detail["original_reason"] == HaltReason.DAILY_LOSS_LIMIT.value
+        assert entry.detail["originally_engaged_by"] == "risk"
+
+    async def test_a_clear_that_found_nothing_is_still_recorded(
+        self, client: httpx.AsyncClient, audit: RecordingAuditSink
+    ) -> None:
+        """Somebody with the password decided the platform should be trading.
+
+        That decision belongs in the record whether or not it turned out to be
+        necessary — and if nothing was halted, whatever they were reacting to
+        was somewhere else, which is worth being able to find afterwards.
+        """
+        await client.post(RESUME, json={"password": PASSWORD})
+
+        (entry,) = audit.entries
+        assert entry.action == Action.HALT_CLEARED
+        assert entry.detail["was_halted"] is False
+        assert entry.detail["original_reason"] is None
+
+    async def test_a_failed_resume_writes_no_row(
+        self, app: FastAPI, client: httpx.AsyncClient, audit: RecordingAuditSink
+    ) -> None:
+        """The mirror of `test_a_failed_halt_writes_no_row`, and worse if broken.
+
+        A row claiming trading resumed when the delete never landed has whoever
+        reads it stop looking for the thing still stopping the platform.
+        """
+        app.dependency_overrides[get_kill_switch] = UnclearableKillSwitch
+
+        await client.post(RESUME, json={"password": PASSWORD})
+
+        assert audit.entries == []
+
+    async def test_a_wrong_password_is_recorded(
+        self, client: httpx.AsyncClient, audit: RecordingAuditSink
+    ) -> None:
+        """`Action.FORBIDDEN` has always claimed to cover a failed step-up.
+
+        It did not until now — `require_write_scope` wrote its half from the
+        start and this end wrote nothing. The gap is the one that matters: a
+        wrong password here is either a typo or somebody working through guesses
+        with a stolen cookie, `rate_limited` only ever counted attempts at the
+        login form, and without this row the second case leaves no trace.
+        """
+        response = await client.post(RESUME, json={"password": "wrong"})
+
+        assert response.status_code == 403
+        (entry,) = audit.entries
+        assert entry.action == Action.FORBIDDEN
+        assert entry.actor == "test-operator"
+        assert entry.target == RESUME
+        assert entry.detail["reason"] == "step_up_failed"
+
+    async def test_a_wrong_password_does_not_resume(
+        self, client: httpx.AsyncClient, kill_switch: FakeKillSwitch
+    ) -> None:
+        kill_switch.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        await client.post(RESUME, json={"password": "wrong"})
+
+        assert kill_switch.is_engaged() is True
+        assert kill_switch.clears == []
+
+
+class TestWhenTheStoreIsGoneOnTheWayOut:
+    """The failure path, whose message is the inverse of the halting one."""
+
+    @pytest.fixture
+    def app(self, app: FastAPI) -> FastAPI:
+        app.dependency_overrides[get_settings] = resume_settings
+        app.dependency_overrides[get_kill_switch] = UnclearableKillSwitch
+        return app
+
+    async def test_it_is_a_503(self, client: httpx.AsyncClient) -> None:
+        response = await client.post(RESUME, json={"password": PASSWORD})
+
+        assert response.status_code == 503
+
+    async def test_it_says_trading_is_still_stopped(self, client: httpx.AsyncClient) -> None:
+        """The opposite reassurance to the one `/halt` gives on failure.
+
+        A failed halt leaves trading about to resume by itself and the message
+        has to raise the alarm. A failed resume leaves the halt standing, which
+        is the safe direction — and saying so plainly is what stops an operator
+        guessing they are now half resumed and re-clearing into a state nobody
+        understands.
+        """
+        detail = (await client.post(RESUME, json={"password": PASSWORD})).json()["detail"]
+
+        assert "NOT resumed" in detail
+        assert "still in force" in detail
+        assert "failed safe" in detail
+
+    async def test_it_names_the_underlying_error(self, client: httpx.AsyncClient) -> None:
+        detail = (await client.post(RESUME, json={"password": PASSWORD})).json()["detail"]
+
+        assert "Connection refused" in detail
+
+
+class TestResumeRefusals:
+    """Bad requests, refused rather than interpreted — as on the way in."""
+
+    @pytest.fixture
+    def app(self, app: FastAPI) -> FastAPI:
+        app.dependency_overrides[get_settings] = resume_settings
+        return app
+
+    async def test_an_unknown_scope_is_a_422_not_a_500(self, client: httpx.AsyncClient) -> None:
+        """`scope` is the enum for this reason.
+
+        As a bare string it reached `HaltScope(...)` inside the handler, and a
+        typo became an unhandled `ValueError` — a 500 with nothing in the body.
+        An operator clearing a halt cannot be asked to guess whether that meant
+        "you misspelled it" or "the platform is broken".
+        """
+        response = await client.post(RESUME, json={"password": PASSWORD, "scope": "globl"})
+
+        assert response.status_code == 422
+
+    async def test_a_narrowed_scope_needs_a_target(self, client: httpx.AsyncClient) -> None:
+        response = await client.post(RESUME, json={"password": PASSWORD, "scope": "symbol"})
+
+        assert response.status_code == 422
+
+    async def test_a_global_resume_refuses_a_target(self, client: httpx.AsyncClient) -> None:
+        """The same pairing `/halt` enforces, and it has to be the same.
+
+        A halt is keyed on (scope, target) and cleared by that pair. A resume
+        that accepted a combination the halt refuses could only ever be clearing
+        a halt that cannot exist — and would answer "nothing was halted", which
+        reads exactly like "trading is fine".
+        """
+        response = await client.post(
+            RESUME, json={"password": PASSWORD, "scope": "global", "target": "SPY"}
+        )
+
+        assert response.status_code == 422
+
+    async def test_a_refused_request_does_not_resume(
+        self, client: httpx.AsyncClient, kill_switch: FakeKillSwitch
+    ) -> None:
+        kill_switch.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        await client.post(RESUME, json={"password": PASSWORD, "scope": "globl"})
+
+        assert kill_switch.is_engaged() is True
+        assert kill_switch.clears == []
+
+    async def test_a_read_only_session_may_not_resume(
+        self, app: FastAPI, client: httpx.AsyncClient, kill_switch: FakeKillSwitch
+    ) -> None:
+        """Where the bend in the write-scope rule stops.
+
+        `deps.READ_ONLY_MAY_CALL` names `/halt` and nothing else, on purpose:
+        the person watching from a phone is who most needs to stop trading and
+        is the last who should be able to start it again. Nothing in the handler
+        enforces this — `require_write_scope` refuses the route by default — so
+        this pins the default rather than a line of code, which is exactly the
+        thing a later edit could remove without noticing.
+        """
+        kill_switch.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+        app.dependency_overrides[get_current_session] = lambda: Session("reader", Scope.READ)
+
+        response = await client.post(RESUME, json={"password": PASSWORD})
+
+        assert response.status_code == 403
+        assert kill_switch.is_engaged() is True

@@ -441,8 +441,10 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   control that looked live and returned a 500. Closed by #70, which is not
   ticked anywhere on purpose: it is covered by unit tests against a fake switch
   and has never engaged a halt in a real Redis from a real browser, which is the
-  demonstration this file asks for. Clearing from the UI is still not built —
-  `/risk/resume` wants a step-up password no screen asks for.
+  demonstration this file asks for. Clearing from the UI was still not built at
+  that point — `/risk/resume` was a stub wanting a step-up password no screen
+  asked for. It is built now (#PR), with the same caveat and for the same
+  reason: fakes and an ASGI transport, never a real Redis from a real browser.
 
 **Before any live order path exists.** Not after.
 
@@ -1483,11 +1485,17 @@ has met a database holding a real strategy's history.
   are still `NotImplementedError` stubs and a write behind a stub is dead code.
   They land with their handlers, which is exactly how the first of them arrived:
   `halt_engaged` was added by #70 alongside the endpoint that emits it, so
-  "who stopped trading" is answerable for halts engaged through the API. Halts
-  from `scripts/halt.py` and from the risk layer's own triggers are still absent
-  from the record, and attributing those needs an identity the record can stand
-  behind rather than another constant. The table's docstring is still the
-  optimistic document and this item is the honest one.
+  "who stopped trading" is answerable for halts engaged through the API.
+  `halt_cleared` followed the same way (#PR) — a halt with no clear beside it is
+  still in force, so the pair is what makes "when did we start again" answerable
+  at all — and the same change closed a gap the record had been claiming to
+  cover since ADR 0009: a failed step-up now writes `forbidden` with
+  `step_up_failed`, where before a wrong password on `/resume` or
+  `/flatten-all` left no trace anywhere. Halts from `scripts/halt.py` and from
+  the risk layer's own triggers are still absent from the record, and
+  attributing those needs an identity the record can stand behind rather than
+  another constant. The table's docstring is still the optimistic document and
+  this item is the honest one.
 
   Two rules the design turns on. A failed audit *write* never fails the action —
   the actions worth auditing include halting trading, and refusing to stop
@@ -2103,8 +2111,9 @@ a route added later is refused by default and it is *adding one to the exception
 list* that this notices. The exception itself is pinned separately, along with
 the halt/resume asymmetry. Step-up is checked at all three outcomes: refused by
 the schema with no password, 403 with the wrong one, past the gate with the
-right one — "past the gate" being a 500 into a stub, which is the honest
-assertion while the handler is unbuilt.
+right one. "Past the gate" was a 500 into a stub when this was written, which
+was the honest assertion while the handler was unbuilt; `/risk/resume` is
+implemented as of #PR and the assertion is now the 200 it actually answers.
 
 Then driven in a real browser through the real nginx config: the read-only badge
 renders, `/dashboard/live` returns 200, `/risk/halt` is not refused, `/orders`

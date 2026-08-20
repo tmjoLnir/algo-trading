@@ -20,10 +20,18 @@ money.
 > incident — and because it is what you fall back to when the page will not
 > load.
 >
-> **Clearing is only the command.** `clear --by <name>` resumes; there is no
-> button, deliberately — stopping is reflexive, restarting is a decision, and
-> `POST /risk/resume` demands the account password that no screen asks for yet.
-> `scripts/halt.py status` says what is halted and exits 2 when anything is.
+> **Clearing asks for the password, wherever you do it.** The halt banner now
+> carries a `Resume…` control per halt, which posts to `POST /risk/resume` and
+> demands the account password in the body — stopping stays reflexive, restarting
+> stays a decision, and a read-only session may halt but may not resume.
+> `clear --by <name>` does the same job from the shell and is what you fall back
+> to when the page will not load. `scripts/halt.py status` says what is halted
+> and exits 2 when anything is.
+>
+> **Clearing one halt is not clearing all of them.** A halt is keyed on scope
+> and target, so resuming the global halt leaves a symbol halt standing. The
+> banner is the answer to what remains: it re-reads every active halt after a
+> resume and stays up if any are left.
 >
 > Stopping the worker (`docker compose stop worker`) is **not** the same thing:
 > it leaves other processes free to trade and deliberately does not halt.

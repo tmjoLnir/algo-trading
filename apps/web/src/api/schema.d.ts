@@ -965,6 +965,24 @@ export interface paths {
          *     a decision. The password is where that asymmetry stops being a comment and
          *     starts being enforced — `/halt` asks for nothing at all, and a read-only
          *     session may call it; this one asks again and a read-only session may not.
+         *     That second half needs no code here: `deps.READ_ONLY_MAY_CALL` names `/halt`
+         *     and nothing else, so `require_write_scope` refuses this route by default.
+         *
+         *     `cleared_by` is the session's user, exactly as `engaged_by` is on the way
+         *     in. It is the answer to the only question anyone asks after an incident —
+         *     who decided it was safe to trade again — and a field the request could fill
+         *     in would not be an answer at all (ADR 0008).
+         *
+         *     Off the event loop for the reason `/halt` is: the switch is synchronous
+         *     because the risk chain consulting it is, and one Redis round trip must not
+         *     block every other request.
+         *
+         *     **A failure here is a 503, and it means the opposite of the one on `/halt`.**
+         *     Nothing was cleared, so the halt is still in force and nothing is trading —
+         *     the safe direction, and worth saying plainly because an operator who has
+         *     just been refused will otherwise be left wondering whether they are now half
+         *     resumed. There is no partial state to recover from: `clear` is a single
+         *     DELETE, so it either happened or it did not.
          */
         post: operations["clear_kill_switch_api_v1_risk_resume_post"];
         delete?: never;
@@ -1676,6 +1694,11 @@ export interface components {
          *
          *     Deliberately not `dashboard.HaltView`, which is a row in an aggregate
          *     describing the world. This answers one question about one request.
+         *
+         *     `datetime` is imported at runtime rather than behind `TYPE_CHECKING` because
+         *     FastAPI resolves these annotations when it builds the schema — one that
+         *     existed only to the type checker would import cleanly and fail on the first
+         *     request (`test_api_contract.py::test_openapi_schema_generates`).
          */
         HaltEngagedView: {
             /** Detail */
@@ -2071,17 +2094,61 @@ export interface components {
         /**
          * ResumeRequest
          * @description Clearing a halt, with the password that proves someone is still there.
+         *
+         *     `scope` is the domain enum and not a bare string, for the reason
+         *     `HaltRequest` gives and one more that is specific to this end: the handler
+         *     has to hand a `HaltScope` to the kill switch, so a string would be converted
+         *     somewhere — and converting it inside the handler turns a typo into a 500
+         *     with no useful body, where the enum makes it a 422 that names the three
+         *     scopes that exist. An operator clearing a halt is not in a position to guess
+         *     which of those two an error page meant.
          */
         ResumeRequest: {
             /** Password */
             password: string;
-            /**
-             * Scope
-             * @default global
-             */
-            scope: string;
+            /** @default global */
+            scope: components["schemas"]["HaltScope"];
             /** Target */
             target?: string | null;
+        };
+        /**
+         * ResumedView
+         * @description What this call did, and whether it did anything at all.
+         *
+         *     `was_halted` is the field to read first. `clear` is deliberately not an
+         *     error when nothing was engaged — an operator clearing defensively should not
+         *     get an exception for being early — so "resumed" and "there was nothing to
+         *     resume" are both successes, and only this tells them apart.
+         *
+         *     The halt fields describe **what was removed**, so they are null when
+         *     `was_halted` is false. They are worth returning rather than dropping: the
+         *     thing an operator most wants confirmed after resuming is that the halt they
+         *     cleared is the halt they meant, and `reason` is what says so.
+         *
+         *     Deliberately silent about what is *still* halted. Clearing the global halt
+         *     while a symbol halt stands leaves trading partly stopped, which matters — but
+         *     answering it here means a second read of the store on a path whose first
+         *     write has already landed, so a failed read would report failure for a resume
+         *     that actually happened. The banner re-reads every halt on the next poll and
+         *     stays up if any remain; that is the honest place for the question.
+         */
+        ResumedView: {
+            /** Cleared By */
+            cleared_by: string;
+            /** Detail */
+            detail?: string | null;
+            /** Engaged At */
+            engaged_at?: string | null;
+            /** Engaged By */
+            engaged_by?: string | null;
+            /** Reason */
+            reason?: string | null;
+            /** Scope */
+            scope: string;
+            /** Target */
+            target: string | null;
+            /** Was Halted */
+            was_halted: boolean;
         };
         /**
          * SessionView
@@ -3538,9 +3605,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["ResumedView"];
                 };
             };
             /** @description Validation Error */
