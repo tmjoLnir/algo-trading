@@ -79,8 +79,12 @@ totals understate exposure.
   one `Resume…` per halt, because a halt is keyed on (scope, target) and a
   single button could only ever clear one of the halts on screen while looking
   like it cleared the lot. The nav still has seven tabs and none is Risk, which
-  is where `/risk/status`, `/risk/limits` and `/risk/rejections` would go — all
-  three are still stubs.
+  is where `/risk/status`, `/risk/limits` and `/risk/rejections` would go.
+  `/status` and `/limits` are built as of #75 and **have no reader** — they join
+  `live-vs-backtest` and `market-data/calendar` in the list of endpoints with
+  nobody calling them. A Risk tab is the screen all three want, and it is a nav
+  decision rather than a wiring one, so it was left out rather than guessed at.
+  `/risk/rejections` is still a stub.
 - `/dashboard/health` is stubbed (`dashboard.py:567`). Nothing calls it —
   `FeedStatus` reads `data_feed_healthy` off the aggregate instead — so it is a
   dead route rather than a missing feature.
@@ -239,7 +243,8 @@ the record.
 | `/market-data/{bars,quote,search}` | **stub** | none |
 | `/risk/halt` | built (#70) | Dashboard button |
 | `/risk/resume` | built (#75) | Halt banner |
-| `/risk/{flatten-all,limits,status,rejections}` | **stub** | none |
+| `/risk/limits`, `/risk/status` | built (#75) | **none** |
+| `/risk/{flatten-all,rejections}` | **stub** | none |
 
 ## Cross-cutting
 
@@ -248,8 +253,10 @@ the record.
   touches trading, and now in both directions (#70, #75). The point still
   standing is how narrow the surface is: nothing in the app can place an order,
   close a position, or move a stop.
-- **Two built endpoints have no reader** (`live-vs-backtest`,
-  `market-data/calendar`).
+- **Four built endpoints have no reader** (`live-vs-backtest`,
+  `market-data/calendar`, and `risk/limits` and `risk/status` as of #75). The
+  first two have been reader-less for phases; the risk pair is new and wants a
+  Risk tab that does not exist yet.
 - **Nothing here has met real data.** Every test drives fixtures or an ASGI
   transport, and so did the reading behind this document. The gap between "the
   screen renders this correctly" and "the screen agrees with what the worker

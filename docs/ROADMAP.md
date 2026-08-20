@@ -446,6 +446,25 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   asked for. It is built now (#75), with the same caveat and for the same
   reason: fakes and an ASGI transport, never a real Redis from a real browser.
 
+  **The read half followed in the same PR.** `/risk/limits` serves the
+  configured ceilings from config alone — no store, so it answers during the
+  incident when an operator most wants to know what the limits are — and
+  `/risk/status` reports usage against each of them from the worker's published
+  book, mirroring every rule's own comparison including the boundaries the
+  rules deliberately disagree on. Neither has a screen: the Risk tab all three
+  read endpoints want does not exist, and adding one is a nav decision rather
+  than a wiring one.
+
+  One limit is reported as **structurally unobservable** rather than as a
+  number, and it is worth recording why here because the same shape blocks the
+  daily report below. `RateLimitRule` keeps its window in the worker's own
+  process and counts orders on the *attempt*, before the rules after it vote —
+  and a refused attempt is never persisted as an order, because
+  `runner._persist` walks the open-order set that a refusal never enters. Its
+  record is a **signal** instead. So a rate taken from the `orders` table would
+  read as calm during precisely the runaway the limit exists to catch, and
+  understating it is the direction that makes a breached limit look compliant.
+
 **Before any live order path exists.** Not after.
 
 *Verifiable (proposed):* a strategy that tries to breach every limit is refused

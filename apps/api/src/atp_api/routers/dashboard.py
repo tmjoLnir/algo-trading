@@ -342,7 +342,7 @@ async def _session_open_before(calendar: TradingCalendar, now: datetime) -> date
     return opens[-1] if opens else None
 
 
-async def _day_pnl(
+async def day_pnl_since_open(
     repo: PortfolioRepository,
     calendar: TradingCalendar,
     *,
@@ -362,6 +362,12 @@ async def _day_pnl(
     alternative — failing the whole response — would take the halt banner and
     the position list down with it, and those are the parts a person needs when
     something is already wrong.
+
+    Public because `/risk/status` reports the day's move against
+    `RISK_MAX_DAILY_LOSS_PCT` and has to arrive at the same number this does.
+    Two implementations of "the day's move" would eventually disagree, and the
+    screen they disagree on is the one an operator consults to decide whether
+    the platform is safe to keep running.
     """
     session_open = await _session_open_before(calendar, now)
     if session_open is None:
@@ -459,7 +465,7 @@ async def get_live_dashboard(
             data_feed_healthy=None,
         )
 
-    day_pnl, day_pnl_pct = await _day_pnl(
+    day_pnl, day_pnl_pct = await day_pnl_since_open(
         portfolio_repo,
         calendar,
         run_mode=settings.run_mode,

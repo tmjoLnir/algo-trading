@@ -9,16 +9,30 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, model_validator
 
 from atp_api.auth import authenticate
-from atp_api.deps import CurrentUser, get_audit_sink, get_clock, get_kill_switch
+from atp_api.deps import (
+    CurrentUser,
+    get_audit_sink,
+    get_calendar,
+    get_clock,
+    get_kill_switch,
+    get_portfolio_repository,
+    get_snapshot_store,
+)
+from atp_api.routers.dashboard import day_pnl_since_open
 from atp_core.audit.ports import Action, AuditEntry, AuditSink
-from atp_core.clock import Clock
-from atp_core.config import Settings, get_settings
+from atp_core.clock import Clock, TradingCalendar
+from atp_core.config import RiskLimits, Settings, get_settings
+from atp_core.dashboard import LiveSnapshot, SnapshotStore
+from atp_core.dashboard.snapshot import RATIO_PLACES
+from atp_core.domain import RunMode
+from atp_core.execution.ports import PortfolioRepository
 from atp_core.logging import get_logger
 from atp_core.risk.killswitch import HaltReason, HaltScope, KillSwitch
 
@@ -223,16 +237,419 @@ async def _require_step_up(
     )
 
 
-@router.get("/limits")
-async def get_risk_limits() -> dict[str, object]:
-    raise NotImplementedError
+class RiskLimitsView(BaseModel):
+    """The configured ceilings, as `RiskLimits` holds them.
+
+    Field-for-field with the settings object rather than reshaped, because the
+    thing an operator is checking is whether the deployment is configured the
+    way they think — and a view that renamed or rounded anything would make
+    that check answer a different question than the one asked.
+
+    The fractions are `Decimal` and serialise as strings. They are not money,
+    but they are multiplied by equity to produce the ceiling an order is
+    measured against, and a `0.1` that arrived as a binary float would move
+    that ceiling (CLAUDE.md §1.1).
+    """
+
+    max_position_pct: Decimal
+    max_gross_exposure_pct: Decimal
+    max_daily_loss_pct: Decimal
+    max_orders_per_minute: int
+    max_open_positions: int
+    max_quote_age_seconds: int
+    default_stop_loss_pct: Decimal
+    default_take_profit_pct: Decimal
 
 
-@router.get("/status")
-async def get_risk_status() -> dict[str, object]:
-    """Current usage against every limit: exposure, daily P&L, order rate,
-    open position count. What a human checks before promoting to live."""
-    raise NotImplementedError
+class LimitUsageView(BaseModel):
+    """One limit, and where the book stands against it.
+
+    `ceiling` and `current` are both `Decimal` even where the underlying limit
+    is a count, which is the one place this deviates from `AccountView`'s
+    convention of `int` for counts. The rows are heterogeneous — fractions of
+    equity, position counts, orders per minute, seconds — and a column that
+    changed type per row is one a table has to branch on to render. `unit` says
+    how to read the pair.
+    """
+
+    #: The rule that enforces it, by its own `name` — so a refusal an operator
+    #: reads on the orders screen ("refused by max_gross_exposure") names the
+    #: same string as the row that predicted it.
+    rule: str
+    unit: str
+    ceiling: Decimal
+    #: None when the figure cannot be observed from here. Never zero as a
+    #: stand-in for unknown: zero is a value a reader acts on.
+    current: Decimal | None
+    #: `current` as a fraction of `ceiling`, for a bar. None whenever `current`
+    #: is. Can exceed 1.
+    utilisation: Decimal | None
+    #: True when the rule would now refuse. Mirrors that rule's own comparison
+    #: including its boundary, which is not the same across rules.
+    at_limit: bool | None
+    #: False means this row is structurally unreadable from the API, not that
+    #: today's value happens to be missing. `note` says why.
+    observable: bool = True
+    note: str | None = None
+
+
+class RiskStatusView(BaseModel):
+    """Usage against every limit, from one book at one instant.
+
+    `book_published` is the field to read before any other. False means the
+    worker has published nothing and every `current` below is null — which is
+    ordinary (a worker that is up but not trading publishes nothing) and is not
+    the same as a compliant book.
+    """
+
+    as_of: datetime
+    #: When the worker built the book. None when there is none.
+    book_as_of: datetime | None
+    book_age_seconds: int | None
+    book_published: bool
+    equity: Decimal | None
+    limits: list[LimitUsageView]
+    #: Open positions carrying no mark. Non-empty means every exposure figure
+    #: here is a *lower bound*, which is the direction that makes a breached
+    #: limit look compliant — so it travels with the numbers rather than being
+    #: left to be inferred from the dashboard.
+    unmarked_symbols: list[str] = Field(default_factory=list)
+
+
+#: Rule name → (unit, the `RiskLimits` field holding its ceiling), in the order
+#: the chain checks them, which is the order an operator reads them in.
+#:
+#: `buying_power` and `trading_hours` are deliberately absent. Both are
+#: predicates about *one prospective order* — can this account pay for it, is
+#: the market open — rather than a standing quantity a book consumes, so
+#: neither has a "current usage" that means anything. Inventing one would put
+#: two rows on the screen that never move.
+_CEILINGS: tuple[tuple[str, str, str], ...] = (
+    ("max_position_size", "fraction_of_equity", "max_position_pct"),
+    ("max_gross_exposure", "fraction_of_equity", "max_gross_exposure_pct"),
+    ("daily_loss_limit", "fraction_of_equity", "max_daily_loss_pct"),
+    ("max_open_positions", "count", "max_open_positions"),
+    ("rate_limit", "orders_per_minute", "max_orders_per_minute"),
+    ("stale_data", "seconds", "max_quote_age_seconds"),
+)
+
+#: Why the order rate cannot be reported from here, in the response itself.
+#:
+#: `RateLimitRule` keeps its window in a `deque` in the worker's own process,
+#: and counts an order on the *attempt* — before the rules after it have voted.
+#: The API has no access to that, and the obvious substitute is worse than
+#: nothing: refused orders are never persisted (`runner._persist` walks the
+#: open-order set, which a risk refusal never enters), so their record lives in
+#: `signals` instead. Counting the `orders` table would therefore report a calm
+#: rate for precisely the runaway this limit exists to catch — a strategy
+#: looping on rejections — and understating it is the direction that makes a
+#: breached limit look compliant.
+_RATE_LIMIT_NOTE = (
+    "not observable from the API: the rule's window lives in the worker's "
+    "process and counts refused attempts, which are recorded as signals rather "
+    "than orders — a count taken from the order table would read as calm during "
+    "exactly the runaway this limit exists to catch"
+)
+
+_STALE_DATA_NOTE = (
+    "the age of the newest tick across the whole watchlist, so it is a lower "
+    "bound: StaleDataRule judges each symbol separately and one frozen symbol "
+    "does not move this number"
+)
+
+_MARKET_CLOSED_NOTE = (
+    "the market is closed, so this is expected — TradingHoursRule refuses "
+    "first, and the feed is meant to be silent"
+)
+
+
+def _limits_view(limits: RiskLimits) -> RiskLimitsView:
+    return RiskLimitsView(
+        max_position_pct=limits.max_position_pct,
+        max_gross_exposure_pct=limits.max_gross_exposure_pct,
+        max_daily_loss_pct=limits.max_daily_loss_pct,
+        max_orders_per_minute=limits.max_orders_per_minute,
+        max_open_positions=limits.max_open_positions,
+        max_quote_age_seconds=limits.max_quote_age_seconds,
+        default_stop_loss_pct=limits.default_stop_loss_pct,
+        default_take_profit_pct=limits.default_take_profit_pct,
+    )
+
+
+async def _read_book(store: SnapshotStore, run_mode: RunMode) -> LiveSnapshot | None:
+    """The worker's published book, or None if it has published nothing.
+
+    The same posture `/dashboard/live` takes, and it has to be: None is
+    ordinary, an unreadable store is not. A risk screen that rendered "nothing
+    is near a limit" because Redis blinked would be the most misleading page in
+    the application.
+    """
+    try:
+        return await store.get(run_mode)
+    except Exception as exc:
+        log.error("risk.status.book_unreadable", run_mode=run_mode.value, error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"cannot read the published book, so no limit can be reported against it: {exc}"
+            ),
+        ) from exc
+
+
+def _usage(
+    rule: str,
+    limits: RiskLimits,
+    current: Decimal | None,
+    at_limit: bool | None,
+    *,
+    note: str | None = None,
+    observable: bool = True,
+    utilisation: Decimal | None = None,
+) -> LimitUsageView:
+    """One row, with `utilisation` derived unless a caller knows better.
+
+    `daily_loss_limit` is the case that needs to know better: its `current` is
+    the day's signed change, so a profitable day is a *negative* fraction of a
+    loss allowance, and dividing would render `+1.2%` as `-40% used`.
+    """
+    unit, field = next((u, f) for r, u, f in _CEILINGS if r == rule)
+    ceiling = Decimal(str(getattr(limits, field)))
+    if utilisation is None and current is not None and ceiling != 0:
+        utilisation = (current / ceiling).quantize(RATIO_PLACES)
+    return LimitUsageView(
+        rule=rule,
+        unit=unit,
+        ceiling=ceiling,
+        current=current,
+        utilisation=utilisation,
+        at_limit=at_limit,
+        observable=observable,
+        note=note,
+    )
+
+
+def _unreadable_rows(limits: RiskLimits) -> list[LimitUsageView]:
+    """Every row, ceilings intact and every reading null.
+
+    The ceilings are still worth serving with no book: "what is the exposure
+    limit" has an answer whether or not anyone is trading, and dropping the
+    rows entirely would leave a screen that renders as though the limits
+    themselves had gone away.
+
+    `rate_limit` keeps `observable=False` here rather than joining the others
+    at null, because the two mean different things and the distinction survives
+    the book coming back: the rest are unknown *right now*, that one is unknown
+    always.
+    """
+    return [
+        _usage(
+            rule,
+            limits,
+            None,
+            None,
+            observable=rule != "rate_limit",
+            note=_RATE_LIMIT_NOTE
+            if rule == "rate_limit"
+            else "no book published — the worker has not said what it is holding",
+        )
+        for rule, _unit, _field in _CEILINGS
+    ]
+
+
+def _status_view(
+    snapshot: LiveSnapshot,
+    limits: RiskLimits,
+    *,
+    now: datetime,
+    day_pnl_pct: Decimal | None,
+    market_open: bool,
+) -> RiskStatusView:
+    """Read one published book against every limit.
+
+    Each comparison below is the matching rule's, boundary included. Where the
+    rules differ from each other they are copied as they are rather than
+    harmonised — see the endpoint docstring.
+    """
+    account = snapshot.account
+    equity = account.equity
+    unmarked = list(account.unmarked_symbols)
+    #: Every fraction-of-equity row is undefined without equity to divide by.
+    #: `MaxPositionSizeRule` and `MaxExposureRule` both refuse outright at
+    #: `equity <= 0`, so the honest reading is "unknown", not "0%".
+    priced = equity > 0
+
+    # `MaxPositionSizeRule`: the largest single holding, gross, against equity.
+    # An unmarked position contributes nothing here, which is why `unmarked`
+    # travels with the answer.
+    values = [abs(p.market_value) for p in snapshot.positions if p.market_value is not None]
+    largest = max(values) if values else Decimal(0)
+    position_pct = (largest / equity).quantize(RATIO_PLACES) if priced else None
+
+    # `MaxExposureRule`: gross, so every leg adds.
+    exposure_pct = (account.gross_exposure / equity).quantize(RATIO_PLACES) if priced else None
+
+    # `StaleDataRule`: `last_data_at` is the newest tick the worker has seen.
+    age = snapshot.last_data_at
+    quote_age = Decimal(max(0, int((now - age).total_seconds()))) if age is not None else None
+
+    open_count = Decimal(account.open_position_count)
+    exposure_note = "understated: some positions are unmarked" if unmarked else None
+
+    return RiskStatusView(
+        as_of=now,
+        book_as_of=snapshot.as_of,
+        # Clamped at zero for the reason `/dashboard/live` clamps it: a worker
+        # clock a second ahead reads as a bug in the screen rather than skew.
+        book_age_seconds=max(0, int((now - snapshot.as_of).total_seconds())),
+        book_published=True,
+        equity=equity,
+        unmarked_symbols=unmarked,
+        limits=[
+            _usage(
+                "max_position_size",
+                limits,
+                position_pct,
+                # `resulting > ceiling` in the rule: the ceiling is a value a
+                # position may hold exactly.
+                None if position_pct is None else position_pct > limits.max_position_pct,
+                note=exposure_note,
+            ),
+            _usage(
+                "max_gross_exposure",
+                limits,
+                exposure_pct,
+                None if exposure_pct is None else exposure_pct > limits.max_gross_exposure_pct,
+                note=exposure_note,
+            ),
+            _usage(
+                "daily_loss_limit",
+                limits,
+                day_pnl_pct,
+                # `change <= -max_daily_loss_pct` in the rule — at the limit
+                # blocks, and the comparison is against the negated limit
+                # because `current` here is a signed change.
+                None if day_pnl_pct is None else day_pnl_pct <= -limits.max_daily_loss_pct,
+                # A profitable day consumes none of a loss allowance. Dividing
+                # would render it as a negative percentage used.
+                utilisation=(
+                    None
+                    if day_pnl_pct is None or limits.max_daily_loss_pct == 0
+                    else (max(Decimal(0), -day_pnl_pct) / limits.max_daily_loss_pct).quantize(
+                        RATIO_PLACES
+                    )
+                ),
+                note=(
+                    None
+                    if day_pnl_pct is not None
+                    else "no equity snapshot at this session's open to measure from"
+                ),
+            ),
+            _usage(
+                "max_open_positions",
+                limits,
+                open_count,
+                # `open_count >= limit` in the rule: holding the limit means no
+                # *new* symbol may be opened, so at the limit already blocks.
+                open_count >= limits.max_open_positions,
+            ),
+            _usage("rate_limit", limits, None, None, observable=False, note=_RATE_LIMIT_NOTE),
+            _usage(
+                "stale_data",
+                limits,
+                quote_age,
+                # `age > max_quote_age_seconds` in the rule, judged the same way
+                # whether or not the market is open — because the rule is. The
+                # note carries the context instead of the verdict bending to it.
+                None if quote_age is None else quote_age > limits.max_quote_age_seconds,
+                note=(
+                    _STALE_DATA_NOTE
+                    if market_open
+                    else f"{_STALE_DATA_NOTE}; {_MARKET_CLOSED_NOTE}"
+                )
+                if quote_age is not None
+                else "the worker has seen no market data at all",
+            ),
+        ],
+    )
+
+
+@router.get("/limits", response_model=RiskLimitsView)
+async def get_risk_limits(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> RiskLimitsView:
+    """The configured ceilings. What the rules are, not where we stand.
+
+    Config only: no Redis, no Postgres, no broker. That is the point of it
+    being separate from `/status` rather than a field on it — the moment an
+    operator most wants to know what the limits are is an incident, which is
+    also when the stores are least likely to answer. This route survives all of
+    them being down.
+
+    Read by a full or a read-only session alike; there is nothing here a reader
+    should not see, and `.env` is not somewhere a person can look during an
+    incident.
+    """
+    return _limits_view(settings.risk)
+
+
+@router.get("/status", response_model=RiskStatusView)
+async def get_risk_status(
+    settings: Annotated[Settings, Depends(get_settings)],
+    clock: Annotated[Clock, Depends(get_clock)],
+    calendar: Annotated[TradingCalendar, Depends(get_calendar)],
+    store: Annotated[SnapshotStore, Depends(get_snapshot_store)],
+    portfolio_repo: Annotated[PortfolioRepository, Depends(get_portfolio_repository)],
+) -> RiskStatusView:
+    """Current usage against every limit. What a human checks before promoting
+    to live.
+
+    Read from the worker's published book, which is the same book the risk
+    engine evaluates orders against — the stored copy in Postgres is a lagging
+    record of it and would answer a slightly different question.
+
+    **No book published means every usage is null, never zero.** That is the
+    whole safety property of this endpoint. A worker that is up but not trading
+    publishes nothing, and so does one that has just started or just died; a
+    screen that rendered those as "0% of your exposure limit, 0 of 20
+    positions" would be telling an operator they are flat and compliant at the
+    exact moment nobody knows what the book contains (ADR 0007).
+
+    Every comparison mirrors its rule's own, including the boundary. The rules
+    disagree with each other about it on purpose — `MaxOpenPositionsRule`
+    refuses at `>=` because holding the limit means no new symbol may be
+    opened, while `MaxExposureRule` refuses at `>` because the ceiling is a
+    value exposure may reach — and a status screen that rounded those together
+    would tell someone they are fine while the engine refuses their next order.
+    """
+    now = clock.now()
+    limits = settings.risk
+    snapshot = await _read_book(store, settings.run_mode)
+
+    if snapshot is None:
+        return RiskStatusView(
+            as_of=now,
+            book_as_of=None,
+            book_age_seconds=None,
+            book_published=False,
+            equity=None,
+            limits=_unreadable_rows(limits),
+            unmarked_symbols=[],
+        )
+
+    _, day_pct = await day_pnl_since_open(
+        portfolio_repo,
+        calendar,
+        run_mode=settings.run_mode,
+        equity=snapshot.account.equity,
+        now=now,
+    )
+    return _status_view(
+        snapshot,
+        limits,
+        now=now,
+        day_pnl_pct=day_pct,
+        market_open=calendar.is_open(now),
+    )
 
 
 @router.post("/halt")

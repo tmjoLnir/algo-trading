@@ -914,7 +914,20 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get Risk Limits */
+        /**
+         * Get Risk Limits
+         * @description The configured ceilings. What the rules are, not where we stand.
+         *
+         *     Config only: no Redis, no Postgres, no broker. That is the point of it
+         *     being separate from `/status` rather than a field on it — the moment an
+         *     operator most wants to know what the limits are is an incident, which is
+         *     also when the stores are least likely to answer. This route survives all of
+         *     them being down.
+         *
+         *     Read by a full or a read-only session alike; there is nothing here a reader
+         *     should not see, and `.env` is not somewhere a person can look during an
+         *     incident.
+         */
         get: operations["get_risk_limits_api_v1_risk_limits_get"];
         put?: never;
         post?: never;
@@ -1000,8 +1013,26 @@ export interface paths {
         };
         /**
          * Get Risk Status
-         * @description Current usage against every limit: exposure, daily P&L, order rate,
-         *     open position count. What a human checks before promoting to live.
+         * @description Current usage against every limit. What a human checks before promoting
+         *     to live.
+         *
+         *     Read from the worker's published book, which is the same book the risk
+         *     engine evaluates orders against — the stored copy in Postgres is a lagging
+         *     record of it and would answer a slightly different question.
+         *
+         *     **No book published means every usage is null, never zero.** That is the
+         *     whole safety property of this endpoint. A worker that is up but not trading
+         *     publishes nothing, and so does one that has just started or just died; a
+         *     screen that rendered those as "0% of your exposure limit, 0 of 20
+         *     positions" would be telling an operator they are flat and compliant at the
+         *     exact moment nobody knows what the book contains (ADR 0007).
+         *
+         *     Every comparison mirrors its rule's own, including the boundary. The rules
+         *     disagree with each other about it on purpose — `MaxOpenPositionsRule`
+         *     refuses at `>=` because holding the limit means no new symbol may be
+         *     opened, while `MaxExposureRule` refuses at `>` because the ceiling is a
+         *     value exposure may reach — and a status screen that rounded those together
+         *     would tell someone they are fine while the engine refuses their next order.
          */
         get: operations["get_risk_status_api_v1_risk_status_get"];
         put?: never;
@@ -1770,6 +1801,38 @@ export interface components {
             target: string | null;
         };
         /**
+         * LimitUsageView
+         * @description One limit, and where the book stands against it.
+         *
+         *     `ceiling` and `current` are both `Decimal` even where the underlying limit
+         *     is a count, which is the one place this deviates from `AccountView`'s
+         *     convention of `int` for counts. The rows are heterogeneous — fractions of
+         *     equity, position counts, orders per minute, seconds — and a column that
+         *     changed type per row is one a table has to branch on to render. `unit` says
+         *     how to read the pair.
+         */
+        LimitUsageView: {
+            /** At Limit */
+            at_limit: boolean | null;
+            /** Ceiling */
+            ceiling: string;
+            /** Current */
+            current: string | null;
+            /** Note */
+            note?: string | null;
+            /**
+             * Observable
+             * @default true
+             */
+            observable: boolean;
+            /** Rule */
+            rule: string;
+            /** Unit */
+            unit: string;
+            /** Utilisation */
+            utilisation: string | null;
+        };
+        /**
          * LiveDashboard
          * @description One screen, assembled from two sources — see the module docstring.
          */
@@ -2149,6 +2212,66 @@ export interface components {
             target: string | null;
             /** Was Halted */
             was_halted: boolean;
+        };
+        /**
+         * RiskLimitsView
+         * @description The configured ceilings, as `RiskLimits` holds them.
+         *
+         *     Field-for-field with the settings object rather than reshaped, because the
+         *     thing an operator is checking is whether the deployment is configured the
+         *     way they think — and a view that renamed or rounded anything would make
+         *     that check answer a different question than the one asked.
+         *
+         *     The fractions are `Decimal` and serialise as strings. They are not money,
+         *     but they are multiplied by equity to produce the ceiling an order is
+         *     measured against, and a `0.1` that arrived as a binary float would move
+         *     that ceiling (CLAUDE.md §1.1).
+         */
+        RiskLimitsView: {
+            /** Default Stop Loss Pct */
+            default_stop_loss_pct: string;
+            /** Default Take Profit Pct */
+            default_take_profit_pct: string;
+            /** Max Daily Loss Pct */
+            max_daily_loss_pct: string;
+            /** Max Gross Exposure Pct */
+            max_gross_exposure_pct: string;
+            /** Max Open Positions */
+            max_open_positions: number;
+            /** Max Orders Per Minute */
+            max_orders_per_minute: number;
+            /** Max Position Pct */
+            max_position_pct: string;
+            /** Max Quote Age Seconds */
+            max_quote_age_seconds: number;
+        };
+        /**
+         * RiskStatusView
+         * @description Usage against every limit, from one book at one instant.
+         *
+         *     `book_published` is the field to read before any other. False means the
+         *     worker has published nothing and every `current` below is null — which is
+         *     ordinary (a worker that is up but not trading publishes nothing) and is not
+         *     the same as a compliant book.
+         */
+        RiskStatusView: {
+            /**
+             * As Of
+             * Format: date-time
+             */
+            as_of: string;
+            /** Book Age Seconds */
+            book_age_seconds: number | null;
+            /** Book As Of */
+            book_as_of: string | null;
+            /** Book Published */
+            book_published: boolean;
+            /** Equity */
+            equity: string | null;
+            /** Limits */
+            limits: components["schemas"]["LimitUsageView"][];
+            /** Unmarked Symbols */
+            unmarked_symbols?: string[];
         };
         /**
          * SessionView
@@ -3546,9 +3669,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["RiskLimitsView"];
                 };
             };
         };
@@ -3634,9 +3755,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["RiskStatusView"];
                 };
             };
         };

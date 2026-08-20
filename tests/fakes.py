@@ -391,7 +391,7 @@ class FakePortfolioRepository:
     ) -> list[EquityPoint]:
         """Whatever a test seeded, filtered to the window.
 
-        The filtering is real rather than a pass-through: `dashboard._day_pnl`
+        The filtering is real rather than a pass-through: `dashboard.day_pnl_since_open`
         takes the *first* point in the range as the day's anchor, so a fake that
         ignored `start` would hand back a point from before the session opened
         and make the assertion pass for the wrong reason.
