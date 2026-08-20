@@ -46,7 +46,7 @@ written: `/risk/resume` was a stub demanding a step-up password no screen asked
 for, which left the asymmetry docs/RISK.md wants — stopping reflexive,
 restarting deliberate — enforced by what existed rather than by design. The
 endpoint is implemented and the halt banner carries a `Resume…` control per halt
-(#PR), so the asymmetry is now enforced where it was meant to be: the halt
+(#75), so the asymmetry is now enforced where it was meant to be: the halt
 button asks nothing, the resume asks for the account password, and a read-only
 session may press one and not the other. `scripts/halt.py clear` remains the
 path that works when the API does not.
@@ -75,7 +75,7 @@ totals understate exposure.
   cannot be written — a state that is neither "stopped" nor "trading", because
   the switch fails closed but records nothing, so trading resumes when the store
   recovers. The button renders that message rather than swallowing it.
-- Clearing a halt is on the halt banner (#PR), not on this tab's own controls:
+- Clearing a halt is on the halt banner (#75), not on this tab's own controls:
   one `Resume…` per halt, because a halt is keyed on (scope, target) and a
   single button could only ever clear one of the halts on screen while looking
   like it cleared the lot. The nav still has seven tabs and none is Risk, which
@@ -182,7 +182,7 @@ labelled as such.
 **The screen is very nearly the finding.** The audit trail records seven verbs:
 five about who was signed in — `login`, `login_failed`, `logout`,
 `rate_limited`, `forbidden` — and two about the book, `halt_engaged` (#70) and
-`halt_cleared` (#PR), each of which arrived with the endpoint that emits it.
+`halt_cleared` (#75), each of which arrived with the endpoint that emits it.
 Nothing else is recorded, because the class docstring's rule is that a constant
 for an event nothing emits is a claim the record does not support, and the
 remaining handlers are still stubs.
@@ -196,7 +196,7 @@ and logs instead. An absent row means "not halted *from the dashboard*", never
 at 14:30" remain unanswerable, and ADR 0010's lifecycle verbs remain unwired.
 
 `forbidden` also covers a failed step-up now, carrying `step_up_failed` in its
-detail (#PR). It had always claimed to — ADR 0009 says so and the constant's own
+detail (#75). It had always claimed to — ADR 0009 says so and the constant's own
 docstring says so — but only `require_write_scope` ever wrote one, so a wrong
 password against `/resume` or `/flatten-all` left no trace at all. That was the
 gap worth closing: `rate_limited` counts attempts at the *login form*, so a
@@ -238,14 +238,14 @@ the record.
 | `/market-data/calendar` | built | **none** |
 | `/market-data/{bars,quote,search}` | **stub** | none |
 | `/risk/halt` | built (#70) | Dashboard button |
-| `/risk/resume` | built (#PR) | Halt banner |
+| `/risk/resume` | built (#75) | Halt banner |
 | `/risk/{flatten-all,limits,status,rejections}` | **stub** | none |
 
 ## Cross-cutting
 
 - **Two live write paths, and they are the same one.** Of four mutations in the
   whole app — halt, resume, queue a backtest, log in/out — only the kill switch
-  touches trading, and now in both directions (#70, #PR). The point still
+  touches trading, and now in both directions (#70, #75). The point still
   standing is how narrow the surface is: nothing in the app can place an order,
   close a position, or move a stop.
 - **Two built endpoints have no reader** (`live-vs-backtest`,
