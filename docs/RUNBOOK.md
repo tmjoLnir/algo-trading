@@ -204,6 +204,29 @@ compose ps` distinguishes them — a climbing restart count is a crash loop, not
 recovery. Read `logs api` for the traceback; a `Settings` validation error at
 startup is the usual cause on a machine where `.env` was edited.
 
+### Before you sign in: "Cannot reach the API"
+
+The same fault, one screen earlier. With no session yet, the dashboard shows
+
+> Cannot reach the API. This is not a sign-in problem — the server did not
+> answer. It will retry on its own.
+
+in place of the login form. That substitution is deliberate: a password box in
+front of a server that cannot check a password invites the operator to read an
+outage as their own typing. The `/healthz` and `/readyz` ladder above applies
+unchanged — both are open without a session, so they answer from the same
+browser showing this screen.
+
+**It clears itself.** The screen re-asks every five seconds and renders the login
+form as soon as the API answers, so a stack that is merely still starting needs
+no reload. It did not always, and the sentence on screen was the giveaway: the
+session probe was configured never to retry, so the first refused connection —
+the seconds between the dev server accepting requests and the API being ready to
+answer, which `make up` produces on every cold start — stuck until the tab was
+refocused or reloaded, under a message promising it would retry on its own. If
+this screen persists for more than a few seconds, the API genuinely is not
+answering: work the table above.
+
 ## Worker crash-looping
 
 1. Halt (the API is independent of the worker).
