@@ -68,3 +68,14 @@ export type TradesResponse = Schemas['TradesResponse']
 export type PerformanceResponse = Schemas['PerformanceResponse']
 export type AttributionRowView = Schemas['AttributionRowView']
 export type AttributionResponse = Schemas['AttributionResponse']
+
+/**
+ * The order history (`/orders`).
+ *
+ * `OrderHistoryView` is not `OrderView`: the latter is the *working* order the
+ * worker published in the live book, and this one is read from the order table
+ * and has to describe a finished order too — including the ones that never
+ * filled, which is what the screen exists for.
+ */
+export type OrderHistoryView = Schemas['OrderHistoryView']
+export type OrdersResponse = Schemas['OrdersResponse']

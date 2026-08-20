@@ -495,3 +495,157 @@ class TestEquityHistory:
         assert point.cash == Decimal("1234.56789")
         assert point.gross_exposure == Decimal("1000")
         assert point.equity == Decimal("2234.56789")
+
+
+class TestTheHistoryRead:
+    """`recent_orders` — the display read behind `GET /api/v1/orders`.
+
+    Its shape is the opposite of `filled_orders` in two ways that only a real
+    database can confirm: it comes back newest-first, and it is bounded. Both
+    are safe here and would be bugs there, so both are worth pinning against the
+    SQL rather than against a fake that was written to agree with it.
+    """
+
+    async def _store(
+        self,
+        orders: PostgresOrderRepository,
+        client_order_id: str,
+        *,
+        created_at: datetime,
+        status: OrderStatus = OrderStatus.FILLED,
+        symbol: str = "SPY",
+        strategy_id: str | None = None,
+        reject_reason: str | None = None,
+        run_mode: RunMode = RunMode.PAPER,
+    ) -> Order:
+        order = Order(
+            symbol=symbol,
+            side=Side.BUY,
+            qty=Decimal("10"),
+            order_type=OrderType.MARKET,
+            time_in_force=TimeInForce.DAY,
+            client_order_id=client_order_id,
+            created_at=created_at,
+            strategy_id=strategy_id,
+        )
+        order.status = status
+        order.reject_reason = reject_reason
+        await orders.save(order, run_mode=run_mode)
+        return order
+
+    @pytest.mark.asyncio
+    async def test_newest_first(self, orders: PostgresOrderRepository) -> None:
+        """The reverse of `filled_orders`, which FIFO matching needs oldest-first.
+
+        Nothing here is matched against anything — this is a list a person reads
+        from the top, and the top is what just happened.
+        """
+        await self._store(orders, "atp-old", created_at=T0)
+        await self._store(orders, "atp-mid", created_at=T0 + timedelta(hours=1))
+        await self._store(orders, "atp-new", created_at=T0 + timedelta(hours=2))
+
+        rows = await orders.recent_orders(RunMode.PAPER)
+
+        assert [o.client_order_id for o in rows] == ["atp-new", "atp-mid", "atp-old"]
+
+    @pytest.mark.asyncio
+    async def test_an_order_that_never_filled_comes_back(
+        self, orders: PostgresOrderRepository
+    ) -> None:
+        """The row this read exists for.
+
+        `filled_orders` selects on `filled_qty > 0` and so cannot return this
+        one; the book never held it and no round trip contains it. If it is
+        absent here it is absent everywhere, and a strategy refused every
+        morning looks exactly like a strategy that never placed an order.
+        """
+        await self._store(
+            orders,
+            "atp-refused",
+            created_at=T0,
+            status=OrderStatus.REJECTED_RISK,
+            reject_reason="MaxPositionSize: 500 exceeds the 100 limit",
+        )
+
+        rows = await orders.recent_orders(RunMode.PAPER)
+
+        assert [o.client_order_id for o in rows] == ["atp-refused"]
+        assert rows[0].reject_reason == "MaxPositionSize: 500 exceeds the 100 limit"
+        assert await orders.filled_orders(RunMode.PAPER, until=T0 + timedelta(days=1)) == []
+
+    @pytest.mark.asyncio
+    async def test_the_limit_keeps_the_newest_rather_than_the_first(
+        self, orders: PostgresOrderRepository
+    ) -> None:
+        """A truncation that kept the oldest rows would be a screen showing the
+        account's first week forever."""
+        for i in range(5):
+            await self._store(orders, f"atp-{i}", created_at=T0 + timedelta(hours=i))
+
+        rows = await orders.recent_orders(RunMode.PAPER, limit=2)
+
+        assert [o.client_order_id for o in rows] == ["atp-4", "atp-3"]
+
+    @pytest.mark.asyncio
+    async def test_paper_and_live_do_not_share_a_screen(
+        self, orders: PostgresOrderRepository
+    ) -> None:
+        await self._store(orders, "atp-paper", created_at=T0, run_mode=RunMode.PAPER)
+        await self._store(orders, "atp-live", created_at=T0, run_mode=RunMode.LIVE)
+
+        rows = await orders.recent_orders(RunMode.PAPER)
+
+        assert [o.client_order_id for o in rows] == ["atp-paper"]
+
+    @pytest.mark.asyncio
+    async def test_the_filters_compose(self, orders: PostgresOrderRepository) -> None:
+        await self._store(
+            orders, "atp-hit", created_at=T0, status=OrderStatus.REJECTED, strategy_id=None
+        )
+        await self._store(orders, "atp-wrong-status", created_at=T0, status=OrderStatus.FILLED)
+        await self._store(
+            orders,
+            "atp-wrong-symbol",
+            created_at=T0,
+            status=OrderStatus.REJECTED,
+            symbol="AAPL",
+        )
+        await self._store(
+            orders,
+            "atp-too-old",
+            created_at=T0 - timedelta(days=2),
+            status=OrderStatus.REJECTED,
+        )
+
+        rows = await orders.recent_orders(
+            RunMode.PAPER,
+            status=OrderStatus.REJECTED,
+            symbol="SPY",
+            since=T0 - timedelta(hours=1),
+        )
+
+        assert [o.client_order_id for o in rows] == ["atp-hit"]
+
+    @pytest.mark.asyncio
+    async def test_a_symbol_filter_is_uppercased(self, orders: PostgresOrderRepository) -> None:
+        """A symbol is always an uppercase ticker (CLAUDE.md §4), and an empty
+        table reads as "no such orders" rather than as "no such spelling"."""
+        await self._store(orders, "atp-1", created_at=T0, symbol="SPY")
+
+        rows = await orders.recent_orders(RunMode.PAPER, symbol="spy")
+
+        assert [o.client_order_id for o in rows] == ["atp-1"]
+
+    @pytest.mark.asyncio
+    async def test_fills_travel_with_the_row(self, orders: PostgresOrderRepository) -> None:
+        """The screen shows a filled quantity and an average price, and both are
+        rebuilt from the stored prints rather than trusted from a column."""
+        order = an_order(client_order_id="atp-filled")
+        order.apply_fill(a_fill(order, "40", "100.25", venue_fill_id="exec-a"))
+        order.apply_fill(a_fill(order, "60", "100.75", venue_fill_id="exec-b"))
+        await orders.save(order, run_mode=RunMode.PAPER)
+
+        row = (await orders.recent_orders(RunMode.PAPER))[0]
+
+        assert row.filled_qty == Decimal("100")
+        assert row.avg_fill_price == Decimal("100.55")

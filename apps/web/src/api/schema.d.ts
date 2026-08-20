@@ -584,7 +584,21 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List Orders */
+        /**
+         * List Orders
+         * @description The order table, newest first.
+         *
+         *     Read straight from storage rather than from the worker's published book, and
+         *     that is the right source here even though ADR 0007 says the opposite for the
+         *     live screen. That ADR is about a quantity still moving: two processes
+         *     computing "what do we hold" at two instants disagree. A stored order is a
+         *     record of something that already happened, and reading it in this process
+         *     cannot disagree with anything the runner is doing — the same reasoning
+         *     `analytics.py` gives for reconstructing round trips here (ADR 0015).
+         *
+         *     Scoped to the configured run mode. The response says which, because paper
+         *     and live orders share a table.
+         */
         get: operations["list_orders_api_v1_orders_get"];
         put?: never;
         /**
@@ -1388,6 +1402,65 @@ export interface components {
             /** Timezone */
             timezone: string;
         };
+        /**
+         * OrderHistoryView
+         * @description One order, as the history screen reads it.
+         *
+         *     Deliberately **not** `dashboard.OrderView`, which is the same noun from a
+         *     different source: that one is built from the book the worker published and
+         *     describes an order still working. This is read from the order table and has
+         *     to describe a finished one — which needs the three fields that one has no
+         *     use for and would be null on every row it serves.
+         *
+         *     `reject_reason` is the field this whole endpoint is for. `purpose` is the
+         *     second: it says whether an order was an entry, a stop or a target, and it is
+         *     the only thing that can distinguish two exits that agree on everything else.
+         *
+         *     Every monetary field is a `Decimal` and reaches the browser as a string
+         *     (docs/DASHBOARD.md).
+         */
+        OrderHistoryView: {
+            /** Avg Fill Price */
+            avg_fill_price: string | null;
+            /** Broker Order Id */
+            broker_order_id: string | null;
+            /** Client Order Id */
+            client_order_id: string;
+            /** Created At */
+            created_at: string | null;
+            /** Filled At */
+            filled_at: string | null;
+            /** Filled Qty */
+            filled_qty: string;
+            /** Id */
+            id: string;
+            /** Limit Price */
+            limit_price: string | null;
+            /** Order Type */
+            order_type: string;
+            /** Purpose */
+            purpose: string | null;
+            /** Qty */
+            qty: string;
+            /** Reject Reason */
+            reject_reason: string | null;
+            /** Side */
+            side: string;
+            /** Signal Id */
+            signal_id: string | null;
+            /** Status */
+            status: string;
+            /** Stop Price */
+            stop_price: string | null;
+            /** Strategy Id */
+            strategy_id: string | null;
+            /** Submitted At */
+            submitted_at: string | null;
+            /** Symbol */
+            symbol: string;
+            /** Time In Force */
+            time_in_force: string;
+        };
         /** OrderView */
         OrderView: {
             /** Avg Fill Price */
@@ -1416,6 +1489,15 @@ export interface components {
             symbol: string;
             /** Ts */
             ts: string | null;
+        };
+        /** OrdersResponse */
+        OrdersResponse: {
+            /** Limit Reached */
+            limit_reached: boolean;
+            /** Orders */
+            orders: components["schemas"]["OrderHistoryView"][];
+            /** Run Mode */
+            run_mode: string;
         };
         /**
          * PerformanceResponse
@@ -2498,9 +2580,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    }[];
+                    "application/json": components["schemas"]["OrdersResponse"];
                 };
             };
             /** @description Validation Error */

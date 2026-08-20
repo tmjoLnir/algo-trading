@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from datetime import datetime
     from decimal import Decimal
 
-    from atp_core.domain import Order, Portfolio, RunMode
+    from atp_core.domain import Order, OrderStatus, Portfolio, RunMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +93,46 @@ class OrderRepository(Protocol):
         stored trade table — reconstruct once, keep the round trips — not a
         truncated read, because a truncated read does not get slower, it gets
         wrong. `docs/ANALYTICS.md` records the boundary.
+        """
+        ...
+
+    async def recent_orders(
+        self,
+        run_mode: RunMode,
+        *,
+        status: OrderStatus | None = None,
+        symbol: str | None = None,
+        strategy_id: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[Order]:
+        """Orders for display, **newest first**, bounded by `limit`.
+
+        Two things here contradict the method above, and both are deliberate.
+
+        **The ordering is reversed.** `filled_orders` is oldest-first because
+        the FIFO matcher pairs an exit with the entry it closes and cannot do
+        that out of sequence. Nothing here is matched against anything: this is
+        a list a person reads from the top, and the top is what just happened.
+
+        **It is bounded, and that is safe here in a way it is not there.** The
+        port's own warning — a truncated read does not get slower, it gets
+        wrong — is about reconstruction, where a missing entry becomes an exit
+        with no entry and inverts the sign of a P&L. Dropping the oldest rows
+        from a *display* loses rows off the bottom of a screen and changes no
+        number on it. The two reads want opposite things and get them.
+
+        **Orders that never filled are included**, which is the point of having
+        this at all. `filled_orders` excludes them because they moved no
+        quantity, and the consequence is that a rejection — ours or the venue's
+        — appears in no other read in the platform: not in the book, not in a
+        round trip, not on the equity curve. An order refused every morning for
+        a month is, from everywhere else, indistinguishable from an order never
+        placed.
+
+        Scoped by run mode for the same reason as `open_orders`: paper and live
+        share a table, and a screen mixing them is worse than one showing
+        neither.
         """
         ...
 
