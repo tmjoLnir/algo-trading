@@ -217,9 +217,20 @@ outage as their own typing. The `/healthz` and `/readyz` ladder above applies
 unchanged — both are open without a session, so they answer from the same
 browser showing this screen.
 
-**It clears itself.** The screen re-asks every five seconds and renders the login
-form as soon as the API answers, so a stack that is merely still starting needs
-no reload. It did not always, and the sentence on screen was the giveaway: the
+**First, check the API is not crash-looping.** `docker compose ps api` — a
+climbing restart count means it is exiting at startup, and then no amount of
+waiting helps because there is nothing to reach. `docker compose logs api` has
+the reason. The one that produced this symptom in the past was a `Settings`
+validation error: an empty `ALPACA_API_KEY` in `paper` or `live` mode refused to
+validate, and since the API builds its app at import it could not start at all.
+That is fixed — a missing broker credential is now a CRITICAL log line
+(`startup.no_broker_credentials`) and a broker that will not build, not a
+process that will not run — but any *other* `Settings` error still exits the
+same way, and `.env` is where to look.
+
+**Otherwise it clears itself.** The screen re-asks every five seconds and renders
+the login form as soon as the API answers, so a stack that is merely still
+starting needs no reload. It did not always, and the sentence on screen was the giveaway: the
 session probe was configured never to retry, so the first refused connection —
 the seconds between the dev server accepting requests and the API being ready to
 answer, which `make up` produces on every cold start — stuck until the tab was

@@ -207,6 +207,57 @@ jobs:
             exit 1
           fi
 
+      # The hop the browser actually makes, which nothing above exercises: the
+      # steps before this reach the API on its own published port and the dev
+      # server at `/`, so a dashboard whose every API call fails would pass all
+      # of them. Both bugs this job has missed in this area were on this hop —
+      # the run-mode banner reading `/` and getting index.html, and the API not
+      # starting at all.
+      #
+      # 401 is the expected answer and a healthy one: nobody is signed in, and
+      # it is what puts the sign-in form on screen. A 000 (refused), a 500 (the
+      # dev proxy could not reach the API) or an HTML body all mean the
+      # dashboard would be showing "Cannot reach the API".
+      - name: The API answers on the dev server's own origin
+        run: |
+          code=$(curl -s -o body.txt -w '%{http_code}' http://localhost:5173/api/v1/auth/me)
+          type=$(curl -s -o /dev/null -w '%{content_type}' http://localhost:5173/api/v1/auth/me)
+          echo "/api/v1/auth/me -> $code ($type)"; cat body.txt; echo
+          [ "$code" = "401" ] || { echo "::error::the login gate does not reach the API through the dev server"; exit 1; }
+          case "$type" in application/json*) ;; *) echo "::error::not JSON -- something in front answered instead of the API"; exit 1;; esac
+          rm -f body.txt
+
+      # The regression that produced "Cannot reach the API" for an operator:
+      # `Settings` refused to validate without ALPACA_API_KEY outside backtest
+      # mode, and since `atp_api.main` builds `app` at import, the API could not
+      # start — it crash-looped behind `restart: unless-stopped` with /healthz
+      # and /readyz down alongside it.
+      #
+      # Everything above runs in `backtest`, because that is what .env.example
+      # ships and it is the one mode exempt from that check, so CI could not see
+      # it. `.env.example` tells the operator to move to `paper` next, which is
+      # exactly when it bites. No credentials are set here on purpose: not being
+      # able to trade is correct, and not being able to *boot* is the bug.
+      - name: The API still serves in a run mode it has no credentials for
+        run: |
+          sed -i 's/^ATP_RUN_MODE=.*/ATP_RUN_MODE=paper/' .env
+          docker compose up -d --force-recreate api
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/healthz | grep -q '"ok"'; then
+              echo "api healthy in paper mode after ~${i}s"
+              code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5173/api/v1/auth/me)
+              [ "$code" = "401" ] || { echo "::error::login gate answers $code in paper mode"; exit 1; }
+              echo "login gate: 401"
+              sed -i 's/^ATP_RUN_MODE=.*/ATP_RUN_MODE=backtest/' .env
+              docker compose up -d --force-recreate api
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the API does not start in paper mode without broker credentials"
+          docker compose logs --tail=40 api
+          exit 1
+
       # ── the built dashboard ────────────────────────────────────────────
       # `make up` runs the dev server, deliberately and permanently — it is the
       # right thing for the loop developers spend the day in. Which leaves the
@@ -258,6 +309,15 @@ jobs:
           curl -fsS http://localhost:8080/healthz | grep -q '"ok"' \
             || { echo "::error::/healthz does not reach the API through nginx"; exit 1; }
           echo "healthz via the proxy: ok"
+
+      - name: The API answers under /api through nginx
+        # `/healthz` above proves the proxy works, but it is its own `location =`
+        # block. `location /api/` is what every request the dashboard makes goes
+        # through, and it was covered by nothing.
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/api/v1/auth/me)
+          [ "$code" = "401" ] || { echo "::error::/api/ does not reach the API through nginx (got $code)"; exit 1; }
+          echo "/api/v1/auth/me via nginx: 401"
 
       - name: A client-side route survives a hard refresh
         # /positions has no file behind it; without the SPA fallback a reload on

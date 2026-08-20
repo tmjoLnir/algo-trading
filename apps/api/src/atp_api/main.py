@@ -89,6 +89,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             fix="set METRICS_TOKEN in .env, or in the SOPS bundle (docs/DEPLOYMENT.md)",
         )
 
+    if not settings.broker_configured:
+        # The API serves everything else regardless — this is not fatal and is
+        # deliberately no longer allowed to be. It used to be: `Settings`
+        # refused to validate without ALPACA_API_KEY outside backtest mode, and
+        # since `app = create_app()` runs at import, the process could not start
+        # at all. The operator's only symptom was the dashboard saying it could
+        # not reach the API, forever, with /healthz and /readyz dead alongside
+        # it — so the two probes written to tell "API down" from "dependency
+        # down" both reported the first, about a missing credential.
+        #
+        # CRITICAL rather than WARNING: in paper or live mode this platform
+        # cannot place an order, which is most of what it is for.
+        log.critical(
+            "startup.no_broker_credentials",
+            run_mode=settings.run_mode.value,
+            msg=(
+                "ALPACA_API_KEY is unset and this run mode trades against Alpaca — "
+                "no order can be placed; the dashboard and the rest of the API still serve"
+            ),
+            fix="set ALPACA_API_KEY and ALPACA_API_SECRET in .env, or ATP_RUN_MODE=backtest",
+        )
+
     # Fail closed, and say so here rather than at the login screen. With no hash
     # configured there is no password that works — not "any password works" —
     # so the API is safe but unusable, and the difference between those two is

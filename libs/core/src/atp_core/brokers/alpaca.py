@@ -56,6 +56,7 @@ from atp_core.errors import (
     BrokerConnectionError,
     BrokerError,
     InsufficientFundsError,
+    MissingBrokerCredentialsError,
     OrderRejectedError,
 )
 from atp_core.logging import get_logger
@@ -217,6 +218,22 @@ class AlpacaBroker:
     ) -> None:
         if settings.run_mode is RunMode.BACKTEST:
             raise ValueError("AlpacaBroker cannot serve a backtest; use SimulatedBroker")
+        if not settings.alpaca_api_key.get_secret_value():
+            # Here rather than in `Settings`, which is where this lived and
+            # could not stay: refusing during settings validation made an
+            # unbuildable *broker* into an unimportable *process* (see
+            # `Settings._guard_live_trading`). This is the one place that
+            # genuinely cannot proceed without the key, and both callers —
+            # `atp_api.deps` and the worker — come through it.
+            #
+            # The key is never quoted, here or in any other message: naming the
+            # variable is what an operator needs, and the value is the one thing
+            # that must not reach a log (CLAUDE.md §1.6).
+            raise MissingBrokerCredentialsError(
+                f"ALPACA_API_KEY is not set, and run_mode={settings.run_mode.value} trades "
+                "against Alpaca. Set ALPACA_API_KEY and ALPACA_API_SECRET in .env, or use "
+                "ATP_RUN_MODE=backtest, which needs no credentials."
+            )
         self._settings = settings
         self._base_url = settings.broker_base_url
         self._is_live = settings.is_live
