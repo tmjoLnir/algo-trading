@@ -23,6 +23,7 @@ not run. bcrypt's own API is four lines of the same thing, so this uses it and
 
 from __future__ import annotations
 
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -48,6 +49,29 @@ ALGORITHM = "HS256"
 #: passwords sharing a prefix hash identically — so this refuses at the same
 #: boundary rather than trimming on the caller's behalf.
 MAX_PASSWORD_BYTES = 72
+
+#: The shape of a bcrypt hash: `$2<variant>$<cost>$<22-char salt><31-char digest>`,
+#: the last 53 characters drawn from bcrypt's own base64 alphabet.
+_BCRYPT_HASH = re.compile(r"^\$2[abxy]\$\d{2}\$[./A-Za-z0-9]{53}$")
+
+
+def looks_like_bcrypt_hash(hashed: str) -> bool:
+    """Whether `hashed` is structurally a bcrypt hash — not whether it verifies.
+
+    Exists for one failure that is otherwise silent. `API_PASSWORD_HASH` reaches
+    this process through `.env`, and Docker Compose interpolates `$NAME` in that
+    file: a hash pasted unquoted has its `$` and the salt's leading letters
+    eaten as an unset variable, arriving here shortened. `verify_password`
+    refuses it correctly — every login fails — and the startup check for an
+    *unset* hash stays quiet, because a truncated hash is not an empty one.
+
+    Structure only, deliberately. Anything stronger would have to hash to find
+    out, and this runs at startup on a value that is allowed to be absent.
+
+    See `scripts/hash_password.py`, which prints the line single-quoted so this
+    never fires, and `.env.example` for the operator-facing version.
+    """
+    return bool(_BCRYPT_HASH.match(hashed))
 
 
 class Scope(StrEnum):
