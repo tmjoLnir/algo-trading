@@ -29,13 +29,14 @@ up: .env  ## Start the full stack
 	@echo "web  → http://localhost:5173"
 	@echo "worker → market-data ingestion + scheduled jobs"
 	@echo "         it places no orders yet; set WORKER_SYMBOLS to give it a watchlist"
+	@echo "queue  → runs the backtests the dashboard queues"
 
 up-prod: .env check-bindings  ## Start the stack with the BUILT dashboard behind nginx
 	@# `web` is the dev server and stays that way; this starts `web-prod`
 	@# instead, which is the bundle `npm run build` produces served by nginx
 	@# with /api and /ws proxied onto the same origin. Services are named
 	@# explicitly so the dev server does not come up alongside it on 5173.
-	docker compose --profile prod up -d --build db redis api worker web-prod
+	docker compose --profile prod up -d --build db redis api worker queue web-prod
 	@# Asked of compose rather than recomputed here. ATP_WEB_BIND_ADDR is
 	@# usually set in .env, which compose reads for interpolation and make does
 	@# not — so a message assembled from make's own environment would confidently

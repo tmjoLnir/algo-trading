@@ -13,6 +13,11 @@ dependencies = [
   "asyncpg>=0.29",
   "alembic>=1.13",
   "redis>=5.0",
+  # The job queue's producer side (`persistence/jobs.py`). Here rather than in
+  # apps/worker alone because the API enqueues and the worker consumes — two
+  # applications, and apps/* may not import each other (CLAUDE.md §2). Nothing
+  # in domain/, strategy/, risk/ or backtest/ imports it; the adapter does.
+  "arq>=0.26",
   "httpx>=0.27",
   "websockets>=12.0",
   "pandas-market-calendars>=4.4",   # NYSE sessions, half-days, holidays

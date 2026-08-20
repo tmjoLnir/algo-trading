@@ -31,25 +31,37 @@ you have found a design problem — the difference belongs behind a port.
 ┌─────────────┐   HTTP/WS   ┌──────────────┐
 │  apps/web   │◀───────────▶│  apps/api    │  stateless, horizontally scalable
 │  React      │             │  FastAPI     │  reads state, publishes intents
-└─────────────┘             └──────┬───────┘
-                                   │ Redis pub/sub
-                            ┌──────┴────────┐
-                            │ apps/worker   │  singleton (leader-elected)
-                            │ ingestor      │  ONE market-data connection
-                            │ runners       │  one per active strategy
-                            │ scheduler     │  reconcile, backfill, reports
-                            └──────┬────────┘
-                                   │
-                     ┌─────────────┴──────────────┐
-                     │  Postgres/TimescaleDB      │  bars, orders, fills, audit
-                     │  Redis                     │  quotes, pub/sub, kill switch
-                     └────────────────────────────┘
+└─────────────┘             └──┬────────┬──┘
+                               │        │ arq (Redis)
+              Redis pub/sub    │        └──────────────┐
+                        ┌──────┴────────┐      ┌───────┴────────────┐
+                        │ apps/worker   │      │ apps/worker.queue  │
+                        │ singleton     │      │ arq worker         │
+                        │ ingestor      │      │ one job at a time  │
+                        │ runners       │      │ backtests          │
+                        │ scheduler     │      │                    │
+                        └──────┬────────┘      └───────┬────────────┘
+                               │                       │
+                     ┌─────────┴───────────────────────┴──────┐
+                     │  Postgres/TimescaleDB                  │  bars, orders,
+                     │  Redis                                 │  fills, audit,
+                     └────────────────────────────────────────┘  backtest runs
 ```
 
 **Why the API never places orders directly.** It publishes an intent; the worker
 consumes it and routes it through the same `OrderRouter` a strategy uses. Two
 submission paths would mean two places to enforce risk, and the second one is
 always the one that gets forgotten. One path, one audit trail.
+
+**Why the queue worker is a *third* process** rather than a responsibility of
+the second. A backtest is minutes of solid synchronous Python — a calculator, not
+I/O — and run inside `apps/worker` it would hold that process's event loop for
+its whole duration: no ticks consumed, no bars stored, and `StalenessMonitor`
+eventually halting trading because the feed looked dead. It is not dead; the
+process is busy. Nothing a person asks for on demand may be able to stop the
+thing managing open positions. That is the same argument that separates the API
+from the worker, applied one level down; ADR 0016 has the rest, including why the
+job runs in a thread even alone in its own process.
 
 **Why the worker is a singleton.** Two ingestors would double-write bars and
 burn the broker's connection limit. Two runners of the same strategy would

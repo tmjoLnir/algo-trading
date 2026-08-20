@@ -40,11 +40,13 @@ from atp_api.ws import manager as ws_manager
 from atp_api.ws import redis_bridge
 from atp_api.ws import router as ws_router
 from atp_core.alerts import build_alert_sink
+from atp_core.clock import SystemClock
 from atp_core.config import get_settings
 from atp_core.logging import configure as configure_logging
 from atp_core.logging import get_logger
 from atp_core.metrics import build_info
 from atp_core.persistence.db import create_engine, create_session_factory
+from atp_core.persistence.jobs import ArqBacktestQueue
 from atp_core.persistence.redis_client import close_redis, create_redis, create_sync_redis
 from atp_core.risk.killswitch import RedisKillSwitch
 
@@ -120,6 +122,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # is exactly the case where the notification matters to whoever else is
     # watching.
     app.state.kill_switch = RedisKillSwitch(sync_redis, alerts=build_alert_sink(settings))
+    # The backtest queue's producer side. Constructed here and not in a
+    # dependency, because it owns an arq connection pool and a pool built per
+    # request is a pool abandoned per request. Constructing it connects to
+    # nothing — the pool opens on the first enqueue — so this keeps the property
+    # every other resource here has: a Redis that is down delays no startup.
+    app.state.backtest_queue = ArqBacktestQueue(redis, settings.redis_url, SystemClock())
 
     # Live push. Started here rather than on the first socket so that the
     # subscription exists before any client does — a bridge brought up by the
@@ -134,6 +142,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         bridge.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await bridge
+        # Before the shared Redis client: this holds a pool of its own and
+        # releasing it after the client it shares a server with would be the
+        # wrong order to read, even though neither depends on the other.
+        await app.state.backtest_queue.aclose()
         await close_redis(redis)
         sync_redis.close()
         await engine.dispose()

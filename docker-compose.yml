@@ -145,6 +145,46 @@ services:
       - ./apps/worker:/app/apps/worker
     restart: unless-stopped
 
+  queue:
+    # The arq worker: backtests the API queued. A THIRD process, and the split
+    # from `worker` above is the same reasoning that split `worker` from `api`,
+    # one level down.
+    #
+    # A backtest is minutes of solid synchronous Python. Run inside `worker` it
+    # would hold that process's event loop for the whole run — no ticks
+    # consumed, no bars stored, and `StalenessMonitor` eventually halting
+    # trading because the feed looked dead. It is not dead; the process is busy
+    # being a calculator. Nothing that a person asks for on demand may be able
+    # to stop the thing that manages open positions.
+    #
+    # Same image as `worker` — same code, same dependencies, different entry
+    # point. Building a second image for one command would mean two images to
+    # keep in step.
+    build:
+      context: .
+      dockerfile: infra/docker/worker.Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+asyncpg://atp:atp@db:5432/atp
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    volumes:
+      - ./libs:/app/libs
+      - ./apps/worker:/app/apps/worker
+    # No ports and no `expose`. This process serves nothing: it reads a queue and
+    # writes rows. It places no orders either — the engine's broker is simulated
+    # and lives inside the run — so nothing here reaches a venue.
+    command: python -m atp_worker.queue
+    # As the others. A restart is also how an interrupted run gets cleaned up:
+    # `queue.on_startup` sweeps rows left at `running` by the process that died,
+    # so a worker coming back is what turns a run stuck forever into a run that
+    # says it was interrupted.
+    restart: unless-stopped
+
   web:
     # The Vite dev server, with HMR and the source bind-mounted. This is what
     # `make up` runs and it stays that way: a production image has to be

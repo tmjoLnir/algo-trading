@@ -310,7 +310,13 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List Backtests */
+        /**
+         * List Backtests
+         * @description Runs newest first, optionally for one strategy.
+         *
+         *     Progress is attached only to the runs that are in flight, so a page of
+         *     finished runs costs no Redis round trips.
+         */
         get: operations["list_backtests_api_v1_backtests_get"];
         put?: never;
         /**
@@ -319,6 +325,18 @@ export interface paths {
          *
          *     Validate data coverage BEFORE queueing — telling the user up front that
          *     history is missing beats a job that fails four minutes in.
+         *
+         *     **The row is written before the job is enqueued**, and the order is the whole
+         *     of the failure design. A row with no job is a run that shows up as queued and
+         *     never progresses: visible, and re-queueable. A job with no row is a worker
+         *     that wakes up, cannot find what it was asked to do, and has nowhere to write
+         *     the failure. So if the enqueue fails, this answers 503 and the row is left
+         *     marked failed rather than sitting queued forever behind a job that does not
+         *     exist.
+         *
+         *     202, not 201. Nothing has been created that the caller asked for — the result
+         *     does not exist yet — and the `Location`-shaped answer is the run id in the
+         *     body, which the client polls.
          */
         post: operations["run_backtest_api_v1_backtests_post"];
         delete?: never;
@@ -334,8 +352,6 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
-        put?: never;
         /**
          * Compare Backtests
          * @description Metrics side by side.
@@ -343,8 +359,34 @@ export interface paths {
          *     Beware: comparing many variants and picking the best is how overfitting
          *     happens. The winner of a 200-way parameter sweep is usually the luckiest
          *     parameter set, not the best one. See docs/BACKTESTING.md.
+         *
+         *     That warning is in the response as well as in this docstring, because the
+         *     docstring is read by whoever writes the client and the response is read by
+         *     whoever is about to promote a strategy. `MAX_COMPARE` is the same argument
+         *     expressed as a limit: this endpoint compares a handful of deliberate variants
+         *     and is deliberately useless for sweeping.
+         *
+         *     Only finished runs are compared. A queued or failed run has no metrics, and
+         *     including it as a column of nulls would put a run that produced no answer
+         *     beside runs that did, in a table read to pick a winner.
+         *
+         *     **A GET, where the skeleton specified `POST /compare`**, and the reason is
+         *     ADR 0009 rather than taste. `require_write_scope` decides from the method, so
+         *     as a POST this would be refused with 403 to exactly the reader it is for —
+         *     somebody watching the book who wants to know which of two backtests did
+         *     better. That ADR's whole argument is that authorisation is about the *act*,
+         *     and this handler performs none: it reads rows and pivots them. The
+         *     alternative was a third entry in `deps.READ_ONLY_MAY_CALL`, whose one
+         *     existing entry is there for a domain rule about halting — widening it for a
+         *     read expressed with the wrong verb would be weakening a guardrail to
+         *     accommodate a method choice.
+         *
+         *     `run_ids` is therefore a repeated query parameter: `?run_ids=a&run_ids=b`.
+         *     `MAX_COMPARE` keeps that comfortably short.
          */
-        post: operations["compare_backtests_api_v1_backtests_compare_post"];
+        get: operations["compare_backtests_api_v1_backtests_compare_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -358,7 +400,15 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get Backtest */
+        /**
+         * Get Backtest
+         * @description One run, with its live progress if it is still going.
+         *
+         *     Deliberately does **not** carry the equity curve or the trades. Those are
+         *     their own endpoints because they are large — a five-year daily curve is 1,250
+         *     points and a minute run is hundreds of thousands — and this is the response a
+         *     client polls every few seconds while a run is in flight.
+         */
         get: operations["get_backtest_api_v1_backtests__run_id__get"];
         put?: never;
         post?: never;
@@ -375,7 +425,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get Backtest Equity Curve */
+        /**
+         * Get Backtest Equity Curve
+         * @description The run's equity curve, as timestamp/decimal-string pairs.
+         */
         get: operations["get_backtest_equity_curve_api_v1_backtests__run_id__equity_curve_get"];
         put?: never;
         post?: never;
@@ -396,6 +449,12 @@ export interface paths {
          * Get Backtest Trades
          * @description Every simulated trade. Inspecting individual trades is how you catch a
          *     backtest that is "profitable" because of one impossible fill.
+         *
+         *     A run with no trades stored answers with an empty list rather than a 404, and
+         *     the distinction the *status* carries is what tells them apart: a `done` run
+         *     with no trades took none, which is a result, and a `queued` one has not
+         *     produced any yet. Both are honest empties; a 404 would say the run does not
+         *     exist.
          */
         get: operations["get_backtest_trades_api_v1_backtests__run_id__trades_get"];
         put?: never;
@@ -1253,7 +1312,61 @@ export interface components {
                 [key: string]: unknown;
             };
         };
-        /** BacktestOut */
+        /**
+         * BacktestComparisonResponse
+         * @description Metrics side by side, with the reason not to trust the winner.
+         */
+        BacktestComparisonResponse: {
+            /** Metrics */
+            metrics: {
+                [key: string]: {
+                    [key: string]: number | null;
+                };
+            };
+            /** Overfitting Warning */
+            overfitting_warning: string;
+            /** Runs */
+            runs: components["schemas"]["BacktestOut"][];
+        };
+        /**
+         * BacktestEquityCurveResponse
+         * @description The equity curve as `[iso timestamp, decimal string]` pairs.
+         *
+         *     Money as strings, so the curve a chart receives is the one the engine
+         *     computed. `toChartNumber` is the single place the front end is allowed to
+         *     make one a float, for geometry (docs/DASHBOARD.md).
+         */
+        BacktestEquityCurveResponse: {
+            /** Points */
+            points: string[][];
+            /** Run Id */
+            run_id: string;
+        };
+        /** BacktestListResponse */
+        BacktestListResponse: {
+            /** Limit Reached */
+            limit_reached: boolean;
+            /** Runs */
+            runs: components["schemas"]["BacktestOut"][];
+        };
+        /**
+         * BacktestOut
+         * @description One run.
+         *
+         *     Three timestamps rather than one, and the reason is what a queue does to a
+         *     request: `queued_at` is when it was asked for, `started_at` is null until a
+         *     worker picked it up, `finished_at` is when it stopped either way. A single
+         *     `started_at` — which is all this table used to have — would have made every
+         *     run's duration include its queue wait.
+         *
+         *     `metrics` is a bag of JSON floats and is **not** money. These are statistics
+         *     over a return series (a Sharpe, a drawdown fraction, an expectancy in
+         *     account currency), and the dashboard renders them through `src/lib/stats.ts`
+         *     rather than the decimal formatter, which would claim a precision the numbers
+         *     do not carry. A null value inside it is a metric that was infinite or
+         *     undefined — `profit_factor` with no losing trade — and means "not available",
+         *     never zero.
+         */
         BacktestOut: {
             /** Error */
             error?: string | null;
@@ -1263,19 +1376,50 @@ export interface components {
             id: string;
             /** Metrics */
             metrics?: {
-                [key: string]: number;
+                [key: string]: number | null;
             } | null;
+            progress?: components["schemas"]["BacktestProgressView"] | null;
             /**
-             * Started At
+             * Queued At
              * Format: date-time
              */
-            started_at: string;
+            queued_at: string;
+            spec: components["schemas"]["BacktestSpecView"];
+            /** Started At */
+            started_at?: string | null;
             /** Status */
             status: string;
             /** Strategy Id */
             strategy_id: string;
+            /** Warnings */
+            warnings?: string[];
         };
-        /** BacktestRequest */
+        /**
+         * BacktestProgressView
+         * @description How far a running job has got. Absent unless it is running and reported.
+         */
+        BacktestProgressView: {
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Bars Done */
+            bars_done: number;
+            /** Bars Total */
+            bars_total: number;
+            /** Fraction */
+            fraction: number;
+        };
+        /**
+         * BacktestRequest
+         * @description What a caller may ask for.
+         *
+         *     `cost_model` has no zero default and that is deliberate — docs/BACKTESTING.md
+         *     is unambiguous that a zero-cost result is not evidence about a strategy, and
+         *     a default that flattered every run would make the honest choice the one you
+         *     had to remember.
+         */
         BacktestRequest: {
             /**
              * Cost Model
@@ -1287,6 +1431,15 @@ export interface components {
              * Format: date-time
              */
             end: string;
+            /** Params */
+            params?: {
+                [key: string]: unknown;
+            };
+            /**
+             * Qty
+             * @default 100
+             */
+            qty: number | string;
             /**
              * Start
              * Format: date-time
@@ -1306,6 +1459,60 @@ export interface components {
              * @default 1d
              */
             timeframe: string;
+        };
+        /**
+         * BacktestSpecView
+         * @description The request, echoed back on every run.
+         *
+         *     On the run rather than only in the request's own response, because a result
+         *     read a week later has to say what it was a result *of*. Every monetary value
+         *     is a string, as everywhere else (docs/DASHBOARD.md).
+         */
+        BacktestSpecView: {
+            /** Cost Model */
+            cost_model: string;
+            /**
+             * End
+             * Format: date-time
+             */
+            end: string;
+            /** Params */
+            params?: {
+                [key: string]: unknown;
+            };
+            /** Qty */
+            qty: string;
+            /**
+             * Start
+             * Format: date-time
+             */
+            start: string;
+            /** Starting Cash */
+            starting_cash: string;
+            /** Strategy Id */
+            strategy_id: string;
+            /** Symbols */
+            symbols: string[];
+            /** Timeframe */
+            timeframe: string;
+        };
+        /**
+         * BacktestTradesResponse
+         * @description Every simulated trade in one run.
+         *
+         *     The rows are the same shape as `/analytics/trades` because they come from the
+         *     same fold — `PerformanceAnalyzer.build_trades`, over the engine's own orders.
+         *     That is what makes a backtested trade and a live one comparable, and it is
+         *     why the engine sets `Order.purpose`: without it every exit here would read
+         *     `signal`, stop-outs included.
+         */
+        BacktestTradesResponse: {
+            /** Run Id */
+            run_id: string;
+            /** Trades */
+            trades: {
+                [key: string]: unknown;
+            }[];
         };
         /**
          * EquityCurveView
@@ -2335,7 +2542,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["BacktestOut"][];
+                    "application/json": components["schemas"]["BacktestListResponse"];
                 };
             };
             /** @description Validation Error */
@@ -2382,18 +2589,16 @@ export interface operations {
             };
         };
     };
-    compare_backtests_api_v1_backtests_compare_post: {
+    compare_backtests_api_v1_backtests_compare_get: {
         parameters: {
-            query?: never;
+            query: {
+                run_ids: string[];
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
-        requestBody: {
-            content: {
-                "application/json": string[];
-            };
-        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {
@@ -2401,9 +2606,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["BacktestComparisonResponse"];
                 };
             };
             /** @description Validation Error */
@@ -2465,9 +2668,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["BacktestEquityCurveResponse"];
                 };
             };
             /** @description Validation Error */
@@ -2498,9 +2699,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    }[];
+                    "application/json": components["schemas"]["BacktestTradesResponse"];
                 };
             };
             /** @description Validation Error */

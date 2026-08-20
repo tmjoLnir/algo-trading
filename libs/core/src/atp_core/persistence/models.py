@@ -224,16 +224,46 @@ class EquitySnapshotRow(Base):
 
 
 class BacktestRunRow(Base):
+    """One queued backtest, from the request to the result.
+
+    Three timestamps, because a queue puts real time between being asked and
+    starting (migration `d7a1c9f4b208`). `queued_at` is when somebody asked,
+    `started_at` is when a worker picked it up — **null while it waits** — and
+    `finished_at` is when it stopped either way. Stamping `started_at` at enqueue
+    time, which is what this table's original shape forced, would make every
+    run's reported duration include however long the queue was backed up.
+
+    `metrics`, `equity_curve` and `trades` are written together or not at all: a
+    `done` row whose metrics landed and whose curve did not would claim a result
+    it cannot show.
+    """
+
     __tablename__ = "backtest_runs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    #: The registered strategy name, which is also its `strategies.id` — see
+    #: `StrategyRecord`, where the same identity choice is explained. The foreign
+    #: key means a backtest cannot name a strategy no worker has ever registered,
+    #: which is a real constraint on this endpoint rather than a formality.
     strategy_id: Mapped[str] = mapped_column(ForeignKey("strategies.id"))
+    #: The whole request, as `BacktestRunSpec` serialises it. Stored rather than
+    #: normalised into columns because it is evidence: a result whose parameters
+    #: nobody recorded cannot be compared with anything, and the set of
+    #: parameters a backtest takes will grow.
     config: Mapped[JsonDict] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(20))  # queued|running|done|failed
     metrics: Mapped[JsonDict | None] = mapped_column(JSON, nullable=True)
     equity_curve: Mapped[JsonList | None] = mapped_column(JSON, nullable=True)
+    #: The reconstructed round trips, from the same fold the live analytics use
+    #: (`PerformanceAnalyzer.build_trades`). Stored rather than recomputed on
+    #: read, unlike the live trades, and the difference is that those are folded
+    #: from orders this database holds while a backtest's orders exist only
+    #: inside the run that produced them.
+    trades: Mapped[JsonList | None] = mapped_column(JSON, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    #: Null until a worker claims it. A queued run has not started.
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 

@@ -43,6 +43,7 @@ from atp_core.domain import (
     TimeInForce,
 )
 from atp_core.errors import BacktestError, DataGapError, LookaheadError
+from atp_core.execution.idempotency import ENTRY, EXIT, STOP_LOSS, TAKE_PROFIT
 from atp_core.execution.matching import intended_price
 from atp_core.indicators import dispatch
 from atp_core.logging import get_logger
@@ -56,6 +57,12 @@ if TYPE_CHECKING:
     from atp_core.strategy.base import Strategy
 
 log = get_logger(__name__)
+
+#: Bars between progress reports. A multi-year minute-bar run walks hundreds of
+#: thousands of bars, and a report on each would spend more on round trips than
+#: on the backtest; at 500 a daily run over five years reports twice and a minute
+#: run over a year reports ~200 times, which is a smooth enough bar.
+PROGRESS_EVERY = 500
 
 #: A regular US equity session, in seconds. Used only to annualise: a minute
 #: backtest has ~390 bars a day, and annualising it at 252 would understate its
@@ -80,6 +87,26 @@ class PositionSizer(Protocol):
     """
 
     def __call__(self, signal: Signal, portfolio: Portfolio, price: Decimal) -> Decimal: ...
+
+
+class ProgressCallback(Protocol):
+    """Told how far through the timeline the run is, as it goes.
+
+    Called with (bars completed, bars total) and expected to be cheap and
+    non-raising: it is invoked from inside the event loop over every bar, and a
+    callback that blocked on a socket would make the run's duration a property of
+    the network. `BacktestEngine` calls it every `PROGRESS_EVERY` bars for the
+    same reason — a multi-year minute-bar run has hundreds of thousands of bars,
+    and one round trip each would cost more than the backtest.
+
+    An exception raised here is **not** caught. A progress reporter that fails is
+    a bug in the caller, and swallowing it would hide the reason the bar on the
+    screen stopped moving. Callers that cannot guarantee delivery — which is all
+    of them, since the store is a network hop away — swallow their own errors at
+    the point where they know what failure means (`BacktestQueue.report`).
+    """
+
+    def __call__(self, bars_done: int, bars_total: int) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,12 +338,19 @@ class BacktestEngine:
         cost_model: CostModel,
         risk_engine: RiskEngine,
         position_sizer: PositionSizer | None = None,
+        on_progress: ProgressCallback | None = None,
     ) -> None:
         self.strategy = strategy
         self.config = config
         self.cost_model = cost_model
         self.risk_engine = risk_engine
         self.position_sizer = position_sizer
+        #: Called as the timeline advances, if a caller supplied one. A callback
+        #: rather than anything this class does itself: reporting progress means
+        #: writing somewhere, and core writes nowhere (CLAUDE.md §1.3). The CLI
+        #: passes none and is unaffected; the queue worker passes one that
+        #: publishes to Redis.
+        self.on_progress = on_progress
 
         self._portfolio = Portfolio(cash=config.starting_cash, starting_equity=config.starting_cash)
         self._pending: list[Order] = []
@@ -383,8 +417,10 @@ class BacktestEngine:
         timeline = sorted({bar.ts for series in bars.values() for bar in series})
 
         seen: dict[str, int] = dict.fromkeys(bars, 0)
+        total = len(timeline)
+        self._report_progress(0, total)
 
-        for ts in timeline:
+        for done, ts in enumerate(timeline, start=1):
             # 1. The clock stands at the bar's CLOSE: `Bar.ts` is its open, and
             #    a decision taken on a completed bar is taken once it has ended.
             clock.set(ts + step)
@@ -431,6 +467,16 @@ class BacktestEngine:
                 for signal in signals:
                     self._handle_signal(signal, bar, result)  # 6, 7
 
+            # After the bar is fully resolved, so a reported count is a count of
+            # bars whose decisions have been taken rather than started.
+            if done % PROGRESS_EVERY == 0:
+                self._report_progress(done, total)
+
+        # Unconditionally, so the last report is always the whole timeline
+        # rather than whatever the last multiple of PROGRESS_EVERY happened to
+        # be. A bar that stops at 96% on a finished run is a support question.
+        self._report_progress(total, total)
+
         self.strategy.on_stop()
         result.metrics = self._metrics(result, len(timeline)).to_dict()
 
@@ -443,6 +489,11 @@ class BacktestEngine:
             total_return=str(result.total_return),
         )
         return result
+
+    def _report_progress(self, done: int, total: int) -> None:
+        """Tell the caller how far along we are, if it asked to be told."""
+        if self.on_progress is not None:
+            self.on_progress(done, total)
 
     def _metrics(self, result: BacktestResult, bars: int) -> PerformanceMetrics:
         """Fold the run's own bookkeeping into the shared metric set.
@@ -509,10 +560,10 @@ class BacktestEngine:
             # routinely worse than the trigger — especially on the gaps where
             # stops matter most.
             intended = stop
-            reason = "stop_loss"
+            reason = STOP_LOSS
         else:
             intended = target
-            reason = "take_profit"
+            reason = TAKE_PROFIT
         assert intended is not None
 
         side = Side.SELL if long else Side.BUY
@@ -526,6 +577,12 @@ class BacktestEngine:
             strategy_id=self.strategy.name,
             created_at=bar.ts,
             status=OrderStatus.SUBMITTED,
+            # Which level fired, carried on the order. Without it every exit
+            # this engine produces defaults to `entry`, and the trade
+            # reconstruction that reads it reports a stop-out as an exit "by
+            # signal" — a wrong label rather than a missing one, on the number
+            # that decides whether a strategy's stops are misplaced.
+            purpose=reason,
         )
         # A gap through the level fills at the open, not at the level: the
         # market never traded at the stop price on this bar.
@@ -682,6 +739,7 @@ class BacktestEngine:
                 )
             side = Side.SELL if position.is_long else Side.BUY
             qty = abs(position.qty)
+            purpose = EXIT
         elif signal.action in (SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT):
             if self.position_sizer is None:
                 raise BacktestError(
@@ -690,6 +748,7 @@ class BacktestEngine:
                 )
             side = Side.BUY if signal.action is SignalAction.ENTER_LONG else Side.SELL
             qty = self.position_sizer(signal, self._portfolio, bar.close)
+            purpose = ENTRY
         else:
             raise BacktestError(f"{signal.action} is not modelled by the backtest engine")
 
@@ -705,6 +764,9 @@ class BacktestEngine:
             strategy_id=signal.strategy_id,
             signal_id=signal.id,
             created_at=bar.ts,
+            # An exit by signal, told apart from an exit by a level. Both close a
+            # position and only this distinguishes them afterwards.
+            purpose=purpose,
         )
 
         decision = self.risk_engine.validate(order, self._portfolio)
