@@ -29,7 +29,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/analytics/live-vs-backtest/{strategy_id}": {
+    "/api/v1/analytics/live-vs-backtest/{run_id}": {
         parameters: {
             query?: never;
             header?: never;
@@ -41,19 +41,43 @@ export interface paths {
          * @description Is live performing as the backtest promised?
          *
          *     The most important report here. Persistent negative divergence means the
-         *     backtest was wrong — overfitting, unmodelled costs, or unachievable fills.
+         *     backtest was wrong — overfitting, unmodelled costs, or a strategy whose
+         *     backtested fills were unachievable.
          *
-         *     Still a stub, and deliberately so: this is its own roadmap item (Phase 5,
-         *     "Live-vs-backtest comparison"). The half that belongs to *this* item is
-         *     built — `PerformanceAnalyzer.compare_to_backtest` computes the divergence
-         *     metric by metric — and what is missing is the other operand. There is no
-         *     stored backtest result to compare against: `backtest_runs` has no reader,
-         *     and `/backtests` is a stub too. Answering with a comparison against a
-         *     backtest run on the fly here would compare live against whatever parameters
-         *     this request happened to pass, rather than against the backtest that
-         *     approved the strategy, which is the only comparison worth making.
+         *     **Keyed on a backtest run, not on a strategy**, and that is the substance of
+         *     this endpoint rather than a URL detail. A strategy accumulates any number of
+         *     stored runs over different windows, cost models and share counts; comparing
+         *     live against an arbitrary one — the newest, say — reports a divergence
+         *     against a backtest nobody used to approve anything. So the caller names the
+         *     run, and the *strategy is read off it* rather than passed alongside: the two
+         *     halves of this comparison cannot be about different strategies, because only
+         *     one of them was ever specified.
+         *
+         *     What that does not do is verify that the named run is the one that justified
+         *     the promotion. Nothing in the platform records which backtest a promotion was
+         *     granted against — that is the audit trail's lifecycle verbs (ADR 0010), and
+         *     it is still not built. Until it is, this endpoint answers "how does live
+         *     compare to *this* run", and choosing an unrepresentative run produces an
+         *     answer that is arithmetically correct and worthless. Naming it here because
+         *     the response cannot detect it.
+         *
+         *     Running a backtest inside this request remains the wrong answer for the
+         *     reason it always was: it would compare live against whatever parameters this
+         *     request happened to pass, which is a comparison with no authority behind it.
+         *
+         *     **The live window is open at the start by default**, unlike every other
+         *     endpoint on this router. The others describe a period a reader chose and a
+         *     30-day default is the period an operator asks about without thinking; this
+         *     one asks whether a strategy has held up, and the honest denominator for that
+         *     is its whole live record. A default that silently compared the last 30 days
+         *     of a three-month paper run against a five-year backtest would answer a
+         *     different question in a way nobody would notice.
+         *
+         *     Only a finished run can be compared. A queued or failed one has no metrics,
+         *     and comparing against a column of nulls would report every live metric as an
+         *     unexplained divergence.
          */
-        get: operations["live_vs_backtest_api_v1_analytics_live_vs_backtest__strategy_id__get"];
+        get: operations["live_vs_backtest_api_v1_analytics_live_vs_backtest__run_id__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1089,12 +1113,12 @@ export interface paths {
          *     a minimum paper-trading period, `ATP_ALLOW_LIVE_TRADING=true`, and an audit
          *     entry naming a human. See docs/SAFETY.md.
          *
-         *     Still a stub, and the two missing preconditions are the reason rather than
-         *     the effort: `backtest_runs` has no reader, so "a completed backtest on
-         *     record" cannot be checked, and the audit trail's lifecycle verbs are unwired
-         *     (ADR 0010), so the entry naming a human cannot be written. An endpoint that
-         *     promoted while silently skipping both would be this ratchet with its pawl
-         *     removed.
+         *     Still a stub, and now for one missing precondition rather than two.
+         *     "A completed backtest on record" became checkable when `backtest_runs` got a
+         *     reader (ADR 0016). The audit trail's lifecycle verbs are still unwired (ADR
+         *     0010), so the entry naming a human cannot be written — and an endpoint that
+         *     promoted a strategy to live while silently skipping the record of who did it
+         *     would be this ratchet with its pawl removed.
          */
         post: operations["promote_strategy_api_v1_strategies__strategy_id__promote_post"];
         delete?: never;
@@ -1461,6 +1485,43 @@ export interface components {
             timeframe: string;
         };
         /**
+         * BacktestSideView
+         * @description The stored run, as the thing being compared against.
+         *
+         *     Carries the spec, not just the metrics, and that is the whole argument of
+         *     this endpoint: a divergence is only meaningful against a backtest somebody
+         *     can identify. Cost model, share count, timeframe and symbols are what make
+         *     two runs of the same strategy different results, so they travel with the
+         *     numbers rather than being one more request away.
+         */
+        BacktestSideView: {
+            /** Cost Model */
+            cost_model: string;
+            /** Finished At */
+            finished_at: string | null;
+            /** Metrics */
+            metrics: {
+                [key: string]: number | null;
+            };
+            /** Periods Per Year */
+            periods_per_year: number;
+            /** Qty */
+            qty: string;
+            /** Run Id */
+            run_id: string;
+            /** Starting Cash */
+            starting_cash: string;
+            /** Status */
+            status: string;
+            /** Symbols */
+            symbols: string[];
+            /** Timeframe */
+            timeframe: string;
+            /** Warnings */
+            warnings: string[];
+            window: components["schemas"]["ComparisonWindowView"];
+        };
+        /**
          * BacktestSpecView
          * @description The request, echoed back on every run.
          *
@@ -1513,6 +1574,24 @@ export interface components {
             trades: {
                 [key: string]: unknown;
             }[];
+        };
+        /**
+         * ComparisonWindowView
+         * @description What a set of metrics was measured over.
+         *
+         *     On both sides of the comparison, because a Sharpe over four days and a
+         *     Sharpe over four years are different claims and a divergence between them is
+         *     a third thing again. `days` is served rather than left to the client: it is
+         *     the number the length warning is computed from, and a reader checking that
+         *     warning should not have to subtract two timestamps to see whether they agree.
+         */
+        ComparisonWindowView: {
+            /** Days */
+            days: number | null;
+            /** End */
+            end: string | null;
+            /** Start */
+            start: string | null;
         };
         /**
          * EquityCurveView
@@ -1640,6 +1719,62 @@ export interface components {
             symbols?: string[];
             /** Working Orders */
             working_orders?: components["schemas"]["OrderView"][];
+        };
+        /**
+         * LiveSideView
+         * @description The live record, computed exactly as `/analytics/performance` computes it.
+         *
+         *     Same reconstruction, same realised-P&L curve, same metric functions — so the
+         *     numbers here are the numbers that screen shows for this strategy over this
+         *     window, and a reader can check one against the other. A second
+         *     implementation would make the two disagree and neither would be wrong.
+         */
+        LiveSideView: {
+            /** Equity Points */
+            equity_points: number;
+            /** Metrics */
+            metrics: {
+                [key: string]: number;
+            };
+            /** Num Trades */
+            num_trades: number;
+            /** Periods Per Year */
+            periods_per_year: number;
+            /**
+             * Requested End
+             * Format: date-time
+             */
+            requested_end: string;
+            /** Requested Start */
+            requested_start: string | null;
+            /** Strategy Id */
+            strategy_id: string;
+            /** Symbols */
+            symbols: string[];
+            window: components["schemas"]["ComparisonWindowView"];
+        };
+        /**
+         * LiveVsBacktestResponse
+         * @description The most important report this platform produces.
+         *
+         *     Persistent negative divergence means the backtest was wrong — overfitting,
+         *     unmodelled costs, or fills that were never achievable. It is also the report
+         *     most easily read into saying something it does not, which is why two thirds
+         *     of this response is context rather than numbers.
+         */
+        LiveVsBacktestResponse: {
+            backtest: components["schemas"]["BacktestSideView"];
+            /** Comparability */
+            comparability: {
+                [key: string]: string;
+            };
+            /** Divergence */
+            divergence: {
+                [key: string]: number | null;
+            };
+            live: components["schemas"]["LiveSideView"];
+            /** Warnings */
+            warnings: string[];
         };
         /** LoginRequest */
         LoginRequest: {
@@ -2264,12 +2399,16 @@ export interface operations {
             };
         };
     };
-    live_vs_backtest_api_v1_analytics_live_vs_backtest__strategy_id__get: {
+    live_vs_backtest_api_v1_analytics_live_vs_backtest__run_id__get: {
         parameters: {
-            query?: never;
+            query?: {
+                start?: string | null;
+                end?: string | null;
+                periods_per_year?: number | null;
+            };
             header?: never;
             path: {
-                strategy_id: string;
+                run_id: string;
             };
             cookie?: never;
         };
@@ -2281,9 +2420,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["LiveVsBacktestResponse"];
                 };
             };
             /** @description Validation Error */

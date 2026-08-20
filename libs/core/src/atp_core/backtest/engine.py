@@ -25,9 +25,9 @@ from typing import TYPE_CHECKING, Protocol
 import numpy as np
 
 from atp_core.backtest.metrics import (
-    TRADING_DAYS_PER_YEAR,
     PerformanceMetrics,
     compute_all,
+    periods_per_year_for,
 )
 from atp_core.clock import SimulatedClock
 from atp_core.domain import (
@@ -63,18 +63,6 @@ log = get_logger(__name__)
 #: on the backtest; at 500 a daily run over five years reports twice and a minute
 #: run over a year reports ~200 times, which is a smooth enough bar.
 PROGRESS_EVERY = 500
-
-#: A regular US equity session, in seconds. Used only to annualise: a minute
-#: backtest has ~390 bars a day, and annualising it at 252 would understate its
-#: volatility by a factor of twenty.
-_SESSION_SECONDS = 390 * 60
-
-
-def _periods_per_year(timeframe: Timeframe) -> int:
-    """Bars per year, for annualising a return series of this timeframe."""
-    if timeframe is Timeframe.D1:
-        return TRADING_DAYS_PER_YEAR
-    return TRADING_DAYS_PER_YEAR * (_SESSION_SECONDS // timeframe.seconds)
 
 
 class PositionSizer(Protocol):
@@ -506,7 +494,7 @@ class BacktestEngine:
         return compute_all(
             list(result.equity_curve),
             self._trade_pnls,
-            periods_per_year=_periods_per_year(self.config.timeframe),
+            periods_per_year=periods_per_year_for(self.config.timeframe),
             avg_holding_period_hours=(
                 sum(self._holding_hours) / len(self._holding_hours) if self._holding_hours else 0.0
             ),

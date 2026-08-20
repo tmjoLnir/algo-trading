@@ -474,8 +474,10 @@ class PerformanceAnalyzer:
         }
 
     def compare_to_backtest(
-        self, live: PerformanceMetrics, backtest: PerformanceMetrics
-    ) -> dict[str, float]:
+        self,
+        live: PerformanceMetrics | Mapping[str, float | int | None],
+        backtest: PerformanceMetrics | Mapping[str, float | int | None],
+    ) -> dict[str, float | None]:
         """Live vs backtest, metric by metric.
 
         Large negative divergence usually means one of: overfitting, unmodelled
@@ -492,9 +494,138 @@ class PerformanceAnalyzer:
         `num_trades`. A live run that took a third as many trades as its
         backtest has not underperformed; it has been refused, and that shows up
         here before anyone starts blaming the signal.
+
+        **Either side may be a plain mapping, and a value in one may be None.**
+        That is not defensive typing; it is the shape a *stored* backtest
+        actually has. `backtest.runner.jsonable` nulls every non-finite metric on
+        the way into the `backtest_runs` row, because `Infinity` is not legal
+        JSON — and an infinite `profit_factor` means no losing trade, which is
+        precisely the run somebody wants to hold a live record up against. Read
+        back as a `PerformanceMetrics` those nulls would have to be guessed into
+        floats; subtracted raw they would raise. Both are worse than reporting
+        the one honest answer, which is that this metric has no comparison.
+
+        A None divergence therefore means **not available**, never zero — the
+        same convention the metric column itself carries. A metric absent from
+        one side entirely gets the same treatment, so a metric set that grows a
+        field does not make every older stored run uncomparable.
         """
-        theirs = backtest.to_dict()
-        return {name: float(value) - float(theirs[name]) for name, value in live.to_dict().items()}
+        mine = live.to_dict() if isinstance(live, PerformanceMetrics) else dict(live)
+        theirs = backtest.to_dict() if isinstance(backtest, PerformanceMetrics) else dict(backtest)
+        return {
+            name: _difference(mine.get(name), theirs.get(name)) for name in mine.keys() | theirs
+        }
+
+
+#: Live trades below which the live half of a comparison is too small a sample
+#: to conclude anything from. docs/BACKTESTING.md's own threshold, and the same
+#: one `backtest.runner.suspicious` applies to a backtest — deliberately, because
+#: "thirty trades" is a fact about statistics rather than about which side of the
+#: comparison you are on.
+MIN_COMPARABLE_TRADES = 30
+
+#: How far two windows may differ in length before their window-basis metrics
+#: stop being worth subtracting. A live month against a backtested five years
+#: produces a `total_return` divergence of almost exactly minus the backtest's
+#: return, whatever the strategy did.
+WINDOW_LENGTH_TOLERANCE = 0.5
+
+
+def comparability_warnings(
+    *,
+    live_periods_per_year: int,
+    backtest_periods_per_year: int,
+    live_days: float | None,
+    backtest_days: float,
+    live_trades: int,
+    live_symbols: Sequence[str],
+    backtest_symbols: Sequence[str],
+) -> list[str]:
+    """Reasons a divergence in this comparison is not what it looks like.
+
+    Computed here and returned with the numbers, for the reason
+    `backtest.runner.suspicious` gives for doing the same to a backtest: a number
+    a human has already read is a number they have already believed. A
+    divergence table is read by somebody deciding whether to keep a strategy
+    running with real money, and the failure mode is not that they distrust a
+    real divergence — it is that they act on an artefact.
+
+    Not a refusal, and deliberately not a filter. Every metric is still
+    subtracted and returned; these sentences say which of the answers to weigh.
+    `METRIC_BASIS` is the other half — it says which metrics each sentence
+    reaches.
+    """
+    notes: list[str] = []
+
+    if live_trades == 0:
+        notes.append(
+            "no live round trips closed in this window, so every live metric is "
+            "the value of an empty series rather than a measurement. The "
+            "divergence below is the backtest's own numbers, negated"
+        )
+    elif live_trades < MIN_COMPARABLE_TRADES:
+        notes.append(
+            f"only {live_trades} live round trips — under about "
+            f"{MIN_COMPARABLE_TRADES} the statistics mean very little "
+            "(docs/BACKTESTING.md 'Reading the result')"
+        )
+
+    if live_periods_per_year != backtest_periods_per_year:
+        notes.append(
+            f"the two sides are annualised on different bases — live at "
+            f"{live_periods_per_year} periods a year, the backtest at "
+            f"{backtest_periods_per_year}. The live curve steps once per closed "
+            f"trade and the backtest's once per bar, so every annualised metric "
+            f"(see the comparability of each) differs partly for that reason "
+            f"alone. Pin `periods_per_year` to compare them on one basis"
+        )
+
+    if live_days is not None and live_days > 0 and backtest_days > 0:
+        shorter, longer = sorted((live_days, backtest_days))
+        if shorter / longer < WINDOW_LENGTH_TOLERANCE:
+            notes.append(
+                f"the windows are different lengths — {live_days:.1f} days live "
+                f"against {backtest_days:.1f} backtested. Every window-basis "
+                f"metric scales with that and is not a like-for-like difference"
+            )
+
+    live_only = sorted(set(live_symbols) - set(backtest_symbols))
+    if live_only:
+        notes.append(
+            f"live traded {', '.join(live_only)}, which this backtest never "
+            f"covered. Their P&L is in the live metrics and has no counterpart "
+            f"in the backtest's"
+        )
+
+    backtest_only = sorted(set(backtest_symbols) - set(live_symbols))
+    if backtest_only and live_trades:
+        notes.append(
+            f"the backtest covered {', '.join(backtest_only)} and live has "
+            f"closed no round trip in them. A strategy that is not trading a "
+            f"symbol it was approved on is a refusal or a data gap, not "
+            f"underperformance — check `/analytics/attribution` and the signals "
+            f"table before reading the trade count below"
+        )
+
+    notes.append(
+        "the backtest sized every entry at a flat share count and live sizing is "
+        "risk-based (docs/RISK.md 'Position sizing'), so the money-denominated "
+        "metrics — expectancy, the win and loss sizes, turnover, total return — "
+        "are partly a difference between two sizing rules"
+    )
+    return notes
+
+
+def _difference(live: float | int | None, backtest: float | int | None) -> float | None:
+    """`live - backtest`, or None when either side does not have the number.
+
+    Not zero. A zero divergence is the strongest possible claim this report can
+    make — the strategy performed exactly as promised on this metric — and it is
+    the last thing a missing value should be rendered as.
+    """
+    if live is None or backtest is None:
+        return None
+    return float(live) - float(backtest)
 
 
 def infer_periods_per_year(equity_curve: Sequence[tuple[datetime, Decimal]]) -> int:

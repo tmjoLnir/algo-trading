@@ -24,17 +24,40 @@ perfect strategy.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
 import numpy as np
 
+from atp_core.domain import Timeframe
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
 TRADING_DAYS_PER_YEAR = 252
+
+#: A regular US equity session, in seconds — 09:30 to 16:00.
+SESSION_SECONDS = 390 * 60
+
+
+def periods_per_year_for(timeframe: Timeframe) -> int:
+    """Bars per year, for annualising a return series sampled at this timeframe.
+
+    Lives here rather than in the engine that used to own it because two callers
+    now need the same answer and they must not drift: the engine annualises a
+    backtest with it, and `/analytics/live-vs-backtest` reports it so a reader
+    can see *which* basis each side of a divergence was scaled by. A Sharpe
+    annualised at 252 beside one annualised at 252x390 differ by a factor of
+    twenty for reasons that have nothing to do with the strategy.
+
+    A minute backtest has ~390 bars a day, so annualising it at 252 would
+    understate its volatility by about that factor.
+    """
+    if timeframe is Timeframe.D1:
+        return TRADING_DAYS_PER_YEAR
+    return TRADING_DAYS_PER_YEAR * (SESSION_SECONDS // timeframe.seconds)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +84,58 @@ class PerformanceMetrics:
 
     def to_dict(self) -> dict[str, float | int]:
         return asdict(self)
+
+
+#: A metric that is a statistic over the trades themselves, with no time basis
+#: and no dependence on how long the run was. Two runs of different lengths over
+#: different windows can be compared on these directly.
+BASIS_PER_TRADE = "per_trade"
+
+#: A metric that has been scaled by `periods_per_year`. Comparable between two
+#: runs only when both were annualised on the same basis — and a backtest over
+#: minute bars and a live curve sampled per closed trade are not.
+BASIS_ANNUALISED = "annualised"
+
+#: A metric that is a property of the equity curve over its own window: how far
+#: it fell, how long it was in the market, how much it turned over. A one-month
+#: live window and a five-year backtest do not produce comparable values even
+#: when the strategy behaved identically in both.
+BASIS_WINDOW = "window"
+
+#: Metric name → what a difference between two runs of it actually means.
+#:
+#: Declared here, beside the metric set it describes, because the alternative is
+#: each reader deciding for themselves which rows of a divergence table to
+#: believe. `/analytics/live-vs-backtest` subtracts all nineteen and this is what
+#: stops five of them being read as performance when they are measurement: a
+#: Sharpe divergence between series annualised on different bases says almost
+#: nothing about the strategy, and looks exactly like one that says everything.
+METRIC_BASIS: dict[str, str] = {
+    "total_return": BASIS_WINDOW,
+    "cagr": BASIS_ANNUALISED,
+    "sharpe": BASIS_ANNUALISED,
+    "sortino": BASIS_ANNUALISED,
+    "calmar": BASIS_ANNUALISED,
+    "max_drawdown": BASIS_WINDOW,
+    "max_drawdown_duration_days": BASIS_WINDOW,
+    "volatility": BASIS_ANNUALISED,
+    "win_rate": BASIS_PER_TRADE,
+    "profit_factor": BASIS_PER_TRADE,
+    "expectancy": BASIS_PER_TRADE,
+    "avg_win": BASIS_PER_TRADE,
+    "avg_loss": BASIS_PER_TRADE,
+    "largest_win": BASIS_PER_TRADE,
+    "largest_loss": BASIS_PER_TRADE,
+    "num_trades": BASIS_WINDOW,
+    "avg_holding_period_hours": BASIS_PER_TRADE,
+    "exposure_pct": BASIS_WINDOW,
+    "turnover": BASIS_WINDOW,
+}
+
+# Every field classified, and the check is here rather than in a test because a
+# metric added without a basis would otherwise reach a comparison table as an
+# unlabelled row — which is the exact failure this mapping exists to prevent.
+assert METRIC_BASIS.keys() == {f.name for f in fields(PerformanceMetrics)}
 
 
 def returns_from_equity(equity: np.ndarray) -> np.ndarray:

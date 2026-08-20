@@ -30,13 +30,22 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
-from atp_api.deps import get_bar_repository, get_clock, get_order_repository
+from atp_api.deps import (
+    get_backtest_repository,
+    get_bar_repository,
+    get_clock,
+    get_order_repository,
+)
 from atp_core.analytics.performance import (
     ATTRIBUTION_DIMENSIONS,
     PerformanceAnalyzer,
     TradeRecord,
+    comparability_warnings,
     infer_periods_per_year,
 )
+from atp_core.backtest.metrics import METRIC_BASIS, periods_per_year_for
+from atp_core.backtest.ports import STATUS_DONE, BacktestRunRepository
+from atp_core.backtest.runner import suspicious
 from atp_core.clock import Clock
 from atp_core.config import Settings, get_settings
 from atp_core.data.ports import BarRepository
@@ -52,6 +61,10 @@ router = APIRouter(prefix="/analytics", tags=["analytics"])
 #: an operator asks about without thinking, and long enough that a paper week
 #: fits inside it whole.
 DEFAULT_LOOKBACK_DAYS = 30
+
+#: Seconds in a day, for expressing a window's length in the unit a reader
+#: compares two windows in.
+SECONDS_PER_DAY = 24 * 60 * 60
 
 #: Bars are fetched per symbol to measure excursions, so a request covering many
 #: symbols is many queries. Capped, and the response says when the cap bound —
@@ -134,6 +147,105 @@ class AttributionResponse(BaseModel):
     rows: list[AttributionRowView]
     start: datetime
     end: datetime
+
+
+class ComparisonWindowView(BaseModel):
+    """What a set of metrics was measured over.
+
+    On both sides of the comparison, because a Sharpe over four days and a
+    Sharpe over four years are different claims and a divergence between them is
+    a third thing again. `days` is served rather than left to the client: it is
+    the number the length warning is computed from, and a reader checking that
+    warning should not have to subtract two timestamps to see whether they agree.
+    """
+
+    start: datetime | None
+    end: datetime | None
+    days: float | None
+
+
+class BacktestSideView(BaseModel):
+    """The stored run, as the thing being compared against.
+
+    Carries the spec, not just the metrics, and that is the whole argument of
+    this endpoint: a divergence is only meaningful against a backtest somebody
+    can identify. Cost model, share count, timeframe and symbols are what make
+    two runs of the same strategy different results, so they travel with the
+    numbers rather than being one more request away.
+    """
+
+    run_id: str
+    status: str
+    metrics: dict[str, float | None]
+    window: ComparisonWindowView
+    symbols: list[str]
+    timeframe: str
+    cost_model: str
+    qty: str
+    starting_cash: str
+    finished_at: datetime | None
+    #: What `compute_all` annualised this run's ratios by, derived from the
+    #: run's own timeframe exactly as the engine derived it.
+    periods_per_year: int
+    #: `backtest.runner.suspicious` on the stored metrics — the same sentences
+    #: `/backtests` attaches to this run. Repeated here rather than referenced,
+    #: because a divergence against a backtest with nine trades in it is a
+    #: statement about the backtest, and the reader of this response is not
+    #: necessarily the person who read that one.
+    warnings: list[str]
+
+
+class LiveSideView(BaseModel):
+    """The live record, computed exactly as `/analytics/performance` computes it.
+
+    Same reconstruction, same realised-P&L curve, same metric functions — so the
+    numbers here are the numbers that screen shows for this strategy over this
+    window, and a reader can check one against the other. A second
+    implementation would make the two disagree and neither would be wrong.
+    """
+
+    strategy_id: str
+    metrics: dict[str, float | int]
+    #: The range the trades actually cover: first close to last close. Null on
+    #: both ends when nothing closed, which is a different fact from a window
+    #: that was asked for and found empty — `requested_start`/`requested_end`
+    #: carry that one.
+    window: ComparisonWindowView
+    requested_start: datetime | None
+    requested_end: datetime
+    num_trades: int
+    #: Symbols with at least one closed round trip. What the symbol warnings are
+    #: computed from, and worth reading beside the backtest's list: a strategy
+    #: trading names it was not approved on is a finding in itself.
+    symbols: list[str]
+    equity_points: int
+    periods_per_year: int
+
+
+class LiveVsBacktestResponse(BaseModel):
+    """The most important report this platform produces.
+
+    Persistent negative divergence means the backtest was wrong — overfitting,
+    unmodelled costs, or fills that were never achievable. It is also the report
+    most easily read into saying something it does not, which is why two thirds
+    of this response is context rather than numbers.
+    """
+
+    live: LiveSideView
+    backtest: BacktestSideView
+    #: metric name → `live - backtest`. Null where either side does not have the
+    #: number, which means **not available** and never zero: a stored run nulls
+    #: its non-finite metrics, and an infinite `profit_factor` is exactly the
+    #: kind of run somebody holds a live record up against.
+    divergence: dict[str, float | None]
+    #: metric name → `per_trade` | `annualised` | `window`. How far the row
+    #: above it can be trusted when the two sides were measured differently,
+    #: from `backtest.metrics.METRIC_BASIS`.
+    comparability: dict[str, str]
+    #: Reasons a divergence here is not what it looks like. Server-side, on the
+    #: same principle as a backtest's own warnings: a number a human has already
+    #: read is a number they have already believed.
+    warnings: list[str]
 
 
 def _window(start: date | None, end: date | None, now: datetime) -> tuple[datetime, datetime]:
@@ -404,34 +516,198 @@ async def get_attribution(
     )
 
 
-@router.get("/live-vs-backtest/{strategy_id}")
-async def live_vs_backtest(strategy_id: str) -> dict[str, object]:
+def _open_window(
+    start: date | None, end: date | None, now: datetime
+) -> tuple[datetime | None, datetime]:
+    """Like `_window`, but a missing start means *the whole record* rather than 30 days.
+
+    Only `/analytics/live-vs-backtest` uses this, and the divergence between the
+    two is deliberate. The other endpoints on this router describe a period the
+    reader chose, and a month is the period an operator asks about without
+    thinking. This one asks whether a strategy has held up against what it
+    promised, and truncating that to the last 30 days of a longer paper run would
+    answer a narrower question in a way the response could not distinguish from
+    the broader one.
+
+    The end is still inclusive-through-the-day and still defaults to today, for
+    the reasons `_window` gives.
+    """
+    resolved_end = end or now.astimezone(UTC).date()
+    if start is not None and start > resolved_end:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"start {start} is after end {resolved_end}",
+        )
+    return (
+        datetime.combine(start, time.min, tzinfo=UTC) if start is not None else None,
+        datetime.combine(resolved_end, time.max, tzinfo=UTC),
+    )
+
+
+def _span(start: datetime, end: datetime) -> ComparisonWindowView:
+    """A window and its length in days."""
+    return ComparisonWindowView(
+        start=start, end=end, days=(end - start).total_seconds() / SECONDS_PER_DAY
+    )
+
+
+def _covered_window(trades: list[TradeRecord]) -> ComparisonWindowView:
+    """What the live record actually spans: first entry to last exit.
+
+    The *entry* at the start rather than the first exit, because that is when
+    the account first had a position on. A strategy that opened on day one and
+    closed nothing until day forty has a forty-day live record, and measuring
+    exit-to-exit would call it zero — which would then suppress the window-length
+    warning on exactly the comparison that most needs it.
+
+    Empty on both ends when nothing closed. That is a different fact from a
+    window that was asked for and came back empty, and `requested_start` /
+    `requested_end` carry that one.
+    """
+    if not trades:
+        return ComparisonWindowView(start=None, end=None, days=None)
+    first = min(t.entry_ts for t in trades)
+    # `exit_ts` is not None: the caller filtered on it.
+    last = max(t.exit_ts for t in trades if t.exit_ts is not None)
+    return _span(first, last)
+
+
+@router.get("/live-vs-backtest/{run_id}", response_model=LiveVsBacktestResponse)
+async def live_vs_backtest(
+    run_id: str,
+    runs: Annotated[BacktestRunRepository, Depends(get_backtest_repository)],
+    order_repo: Annotated[OrderRepository, Depends(get_order_repository)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    clock: Annotated[Clock, Depends(get_clock)],
+    start: date | None = None,
+    end: date | None = None,
+    periods_per_year: Annotated[int | None, Query(ge=1)] = None,
+) -> LiveVsBacktestResponse:
     """Is live performing as the backtest promised?
 
     The most important report here. Persistent negative divergence means the
-    backtest was wrong — overfitting, unmodelled costs, or unachievable fills.
+    backtest was wrong — overfitting, unmodelled costs, or a strategy whose
+    backtested fills were unachievable.
 
-    Still a stub, and still its own roadmap item (Phase 5, "Live-vs-backtest
-    comparison") — but the reason has changed and is worth restating, because the
-    old one no longer holds. `PerformanceAnalyzer.compare_to_backtest` computes
-    the divergence metric by metric and always did; what was missing was the
-    other operand, and `backtest_runs` now has a reader and a writer (ADR 0016),
-    so a stored backtest exists to compare against.
+    **Keyed on a backtest run, not on a strategy**, and that is the substance of
+    this endpoint rather than a URL detail. A strategy accumulates any number of
+    stored runs over different windows, cost models and share counts; comparing
+    live against an arbitrary one — the newest, say — reports a divergence
+    against a backtest nobody used to approve anything. So the caller names the
+    run, and the *strategy is read off it* rather than passed alongside: the two
+    halves of this comparison cannot be about different strategies, because only
+    one of them was ever specified.
 
-    What is left is the *choice of which one*, which is the whole substance of
-    this endpoint. A strategy can have any number of stored runs over different
-    windows, cost models and share counts, and comparing live against an
-    arbitrary one — the newest, say — would report a divergence against a
-    backtest nobody used to approve anything. Answering it properly means the
-    promotion ratchet recording which run justified the promotion, and that is
-    blocked on the audit trail's lifecycle verbs (ADR 0010) rather than on this
-    module.
+    What that does not do is verify that the named run is the one that justified
+    the promotion. Nothing in the platform records which backtest a promotion was
+    granted against — that is the audit trail's lifecycle verbs (ADR 0010), and
+    it is still not built. Until it is, this endpoint answers "how does live
+    compare to *this* run", and choosing an unrepresentative run produces an
+    answer that is arithmetically correct and worthless. Naming it here because
+    the response cannot detect it.
 
     Running a backtest inside this request remains the wrong answer for the
     reason it always was: it would compare live against whatever parameters this
-    request happened to pass.
+    request happened to pass, which is a comparison with no authority behind it.
+
+    **The live window is open at the start by default**, unlike every other
+    endpoint on this router. The others describe a period a reader chose and a
+    30-day default is the period an operator asks about without thinking; this
+    one asks whether a strategy has held up, and the honest denominator for that
+    is its whole live record. A default that silently compared the last 30 days
+    of a three-month paper run against a five-year backtest would answer a
+    different question in a way nobody would notice.
+
+    Only a finished run can be compared. A queued or failed one has no metrics,
+    and comparing against a column of nulls would report every live metric as an
+    unexplained divergence.
     """
-    raise NotImplementedError
+    run = await runs.get(run_id)
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"no backtest run {run_id!r}"
+        )
+    if run.status != STATUS_DONE or not run.metrics:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"backtest run {run_id!r} is {run.status!r} and has no metrics to "
+                "compare against. Only a completed run has a result."
+            ),
+        )
+
+    window_start, window_end = _open_window(start, end, clock.now())
+    strategy_id = run.spec.strategy_id
+    trades = [
+        trade
+        for trade in await _reconstruct(
+            order_repo, settings, end=window_end, strategy_id=strategy_id
+        )
+        if trade.exit_ts is not None
+        and trade.exit_ts <= window_end
+        and (window_start is None or trade.exit_ts >= window_start)
+    ]
+
+    # Anchored at the first entry when nothing was pinned, because that is when
+    # this live record begins. Anchoring at the requested start instead would
+    # date the curve to a request rather than to the account, and anchoring at
+    # the first *exit* would give the curve's first two points one timestamp —
+    # which `infer_periods_per_year` reads as a zero gap.
+    live_window = _covered_window(trades)
+    curve = _realised_curve(trades, window_start or live_window.start or window_end)
+    analyzer = PerformanceAnalyzer()
+    live_metrics = analyzer.metrics(trades, curve, periods_per_year=periods_per_year)
+    live_basis = periods_per_year if periods_per_year is not None else infer_periods_per_year(curve)
+    backtest_basis = periods_per_year_for(Timeframe(run.spec.timeframe))
+
+    backtest_window = _span(run.spec.start, run.spec.end)
+    live_symbols = sorted({trade.symbol for trade in trades})
+
+    log.info(
+        "analytics.live_vs_backtest",
+        run_id=run_id,
+        strategy=strategy_id,
+        live_trades=len(trades),
+        backtest_trades=run.metrics.get("num_trades"),
+    )
+    return LiveVsBacktestResponse(
+        live=LiveSideView(
+            strategy_id=strategy_id,
+            metrics=live_metrics.to_dict(),
+            window=live_window,
+            requested_start=window_start,
+            requested_end=window_end,
+            num_trades=len(trades),
+            symbols=live_symbols,
+            equity_points=len(curve),
+            periods_per_year=live_basis,
+        ),
+        backtest=BacktestSideView(
+            run_id=run.id,
+            status=run.status,
+            metrics=dict(run.metrics),
+            window=backtest_window,
+            symbols=list(run.spec.symbols),
+            timeframe=run.spec.timeframe,
+            cost_model=run.spec.cost_model,
+            qty=run.spec.qty,
+            starting_cash=run.spec.starting_cash,
+            finished_at=run.finished_at,
+            periods_per_year=backtest_basis,
+            warnings=suspicious(run.metrics),
+        ),
+        divergence=analyzer.compare_to_backtest(live_metrics, run.metrics),
+        comparability=dict(METRIC_BASIS),
+        warnings=comparability_warnings(
+            live_periods_per_year=live_basis,
+            backtest_periods_per_year=backtest_basis,
+            live_days=live_window.days,
+            backtest_days=backtest_window.days or 0.0,
+            live_trades=len(trades),
+            live_symbols=live_symbols,
+            backtest_symbols=run.spec.symbols,
+        ),
+    )
 
 
 @router.get("/reports/daily")

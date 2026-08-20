@@ -32,9 +32,16 @@ from atp_core.analytics.performance import (
     UNATTRIBUTED,
     UNKNOWN_EXIT,
     PerformanceAnalyzer,
+    comparability_warnings,
     infer_periods_per_year,
 )
-from atp_core.backtest.metrics import TRADING_DAYS_PER_YEAR, compute_all
+from atp_core.backtest.metrics import (
+    METRIC_BASIS,
+    TRADING_DAYS_PER_YEAR,
+    PerformanceMetrics,
+    compute_all,
+    periods_per_year_for,
+)
 from atp_core.domain import Bar, Fill, Order, Side, Timeframe
 from atp_core.execution.idempotency import (
     ENTRY,
@@ -893,3 +900,188 @@ class TestTheInvariantThatMattersMost:
 def _open_cost(orders: list[Order]) -> Decimal:
     """An upper bound on the cash tied up in whatever is still open."""
     return sum((fill.qty * fill.price for placed in orders for fill in placed.fills), Decimal(0))
+
+
+class TestComparingAgainstAStoredRun:
+    """The other operand is a JSON column, not a `PerformanceMetrics`.
+
+    Everything here is about that seam. `backtest.runner.jsonable` nulls every
+    non-finite metric on the way into the `backtest_runs` row because
+    `Infinity` is not legal JSON, so the mapping that comes back out has holes
+    in it — and the run most likely to have one is the run somebody most wants
+    to compare against.
+    """
+
+    def test_a_stored_mapping_compares_the_same_as_a_metric_set(
+        self, analyzer: PerformanceAnalyzer
+    ) -> None:
+        live = compute_all([(at(0), Decimal("100")), (at(24), Decimal("110"))], [Decimal("10")])
+        backtest = compute_all([(at(0), Decimal("100")), (at(24), Decimal("130"))], [Decimal("30")])
+
+        # `nan_ok`, because a metric that is infinite on both sides subtracts to
+        # nan and nan does not equal itself. That is the same nan by both routes,
+        # which is what this asserts.
+        assert analyzer.compare_to_backtest(live, backtest.to_dict()) == pytest.approx(
+            analyzer.compare_to_backtest(live, backtest), nan_ok=True
+        )
+
+    def test_a_null_on_either_side_is_a_null_divergence(
+        self, analyzer: PerformanceAnalyzer
+    ) -> None:
+        """Not zero, and the distinction is the whole reason this is nullable.
+
+        Zero is the strongest claim the report can make — live matched the
+        backtest exactly on this metric — and it is the last thing an absent
+        number should render as.
+        """
+        live = compute_all([(at(0), Decimal("100"))], [Decimal("1")])
+
+        divergence = analyzer.compare_to_backtest(live, {**live.to_dict(), "profit_factor": None})
+
+        assert divergence["profit_factor"] is None
+        assert divergence["win_rate"] == 0.0
+
+    def test_a_metric_missing_from_one_side_does_not_retire_the_others(
+        self, analyzer: PerformanceAnalyzer
+    ) -> None:
+        """A run stored before the metric set grew a field is still comparable.
+
+        On every field it does have. Otherwise adding one metric would make
+        every backtest on record uncomparable at once.
+        """
+        live = compute_all([(at(0), Decimal("100"))], [Decimal("1")])
+        stored = {k: v for k, v in live.to_dict().items() if k != "turnover"}
+
+        divergence = analyzer.compare_to_backtest(live, stored)
+
+        assert divergence["turnover"] is None
+        assert divergence["num_trades"] == 0.0
+
+    def test_an_infinite_live_metric_is_not_silently_dropped(
+        self, analyzer: PerformanceAnalyzer
+    ) -> None:
+        """Infinity is a value, not an absence.
+
+        The live half is computed in this process and never went through JSON,
+        so it can legitimately hold one — `profit_factor` with no losing trade.
+        Subtracting a finite backtest from it is infinite, which is the honest
+        answer and is distinguishable from None.
+        """
+        live = compute_all([(at(0), Decimal("100"))], [Decimal("1")])
+        assert live.profit_factor == float("inf")
+
+        divergence = analyzer.compare_to_backtest(live, {**live.to_dict(), "profit_factor": 1.5})
+
+        assert divergence["profit_factor"] == float("inf")
+
+
+class TestComparabilityWarnings:
+    """What stops a divergence table being read as more than it is.
+
+    Every one of these is a case where the arithmetic is correct and the
+    conclusion a reader would draw from it is wrong.
+    """
+
+    def _warn(self, **overrides: object) -> list[str]:
+        kwargs: dict[str, object] = {
+            "live_periods_per_year": TRADING_DAYS_PER_YEAR,
+            "backtest_periods_per_year": TRADING_DAYS_PER_YEAR,
+            "live_days": 100.0,
+            "backtest_days": 100.0,
+            "live_trades": 50,
+            "live_symbols": ["SPY"],
+            "backtest_symbols": ["SPY"],
+        }
+        kwargs.update(overrides)
+        return comparability_warnings(**kwargs)  # type: ignore[arg-type]
+
+    def test_two_comparable_runs_still_get_the_sizing_caveat(self) -> None:
+        """The one that is always true for these runs.
+
+        A backtest sizes every entry at a flat share count; live sizing is
+        risk-based. The money-denominated metrics differ for that reason before
+        the strategy has done anything.
+        """
+        notes = self._warn()
+        assert len(notes) == 1
+        assert "sizing" in notes[0]
+
+    def test_an_empty_live_half_is_named_before_anything_else(self) -> None:
+        """Because every other sentence is about a measurement that was made.
+
+        With no closed trades the divergence column is the backtest's own
+        metrics negated, which reads as catastrophic underperformance rather
+        than as no data.
+        """
+        assert "no live round trips" in self._warn(live_trades=0)[0]
+
+    def test_a_thin_live_sample_is_named_but_not_as_an_empty_one(self) -> None:
+        notes = self._warn(live_trades=7)
+        assert any("only 7 live round trips" in n for n in notes)
+        assert not any("no live round trips" in n for n in notes)
+
+    def test_different_annualisation_bases_are_named_with_both_numbers(self) -> None:
+        """The divergence that is measurement rather than performance.
+
+        A reader who cannot see both numbers has no way to tell a Sharpe gap
+        caused by the strategy from one caused by the sampling.
+        """
+        notes = self._warn(live_periods_per_year=168, backtest_periods_per_year=98280)
+        assert any("168" in n and "98280" in n for n in notes)
+
+    def test_windows_of_similar_length_are_not_warned_about(self) -> None:
+        """The threshold has to admit the ordinary case or it is noise.
+
+        A paper run that has been going most of the backtest's length is the
+        comparison this endpoint is for.
+        """
+        assert not any("different lengths" in n for n in self._warn(live_days=60.0))
+
+    def test_a_live_window_a_fraction_of_the_backtest_is(self) -> None:
+        assert any("different lengths" in n for n in self._warn(live_days=10.0))
+
+    def test_a_symbol_live_traded_that_was_never_backtested_is_named(self) -> None:
+        notes = self._warn(live_symbols=["SPY", "TSLA"])
+        assert any("TSLA" in n and "never covered" in n for n in notes)
+
+    def test_a_backtested_symbol_live_has_not_touched_is_named(self) -> None:
+        """A refusal or a data gap, not underperformance — and the trade count
+        below it looks identical either way."""
+        notes = self._warn(backtest_symbols=["SPY", "QQQ"])
+        assert any("QQQ" in n for n in notes)
+
+    def test_it_is_not_named_when_nothing_traded_at_all(self) -> None:
+        """The empty-half sentence already says it, and better.
+
+        Listing every backtested symbol as untraded on a strategy that has
+        closed nothing is a longer way of saying "no data" and buries the
+        sentence that says it plainly.
+        """
+        notes = self._warn(live_trades=0, live_symbols=[], backtest_symbols=["SPY", "QQQ"])
+        assert not any("QQQ" in n for n in notes)
+
+
+class TestTheAnnualisationBasis:
+    def test_a_daily_series_is_a_trading_year(self) -> None:
+        assert periods_per_year_for(Timeframe.D1) == TRADING_DAYS_PER_YEAR
+
+    def test_a_minute_series_is_a_trading_year_of_sessions(self) -> None:
+        """252 x 390. Annualising minute bars at 252 understates volatility by
+        about twenty times, which turns a mediocre Sharpe into a spectacular
+        one."""
+        assert periods_per_year_for(Timeframe.M1) == TRADING_DAYS_PER_YEAR * 390
+
+    def test_the_engine_and_the_comparison_read_one_function(self) -> None:
+        """Not a tautology: these were two copies until the comparison needed one.
+
+        A backtest annualised by the engine's copy and reported by the
+        endpoint's would differ by whichever drifted, and the difference would
+        surface as a Sharpe divergence nobody could source.
+        """
+        from atp_core.backtest import engine
+
+        assert engine.periods_per_year_for is periods_per_year_for
+
+    def test_every_metric_has_a_basis(self) -> None:
+        """An unlabelled row in a divergence table is what the label prevents."""
+        assert set(METRIC_BASIS) == set(PerformanceMetrics.__dataclass_fields__)

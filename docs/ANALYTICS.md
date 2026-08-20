@@ -146,6 +146,88 @@ Named rather than handled, because nothing here trades one. The first day has no
 prior close and is **absent** rather than zero; absence says the series started
 there, zero would claim the account was flat.
 
+## Live against the backtest
+
+`GET /analytics/live-vs-backtest/{run_id}` — the most important report here, and
+the one most easily read into saying something it does not.
+
+**It is keyed on a backtest run, not on a strategy.** A strategy accumulates any
+number of stored runs over different windows, cost models and share counts, and
+comparing live against an arbitrary one — the newest, say — reports a divergence
+against a backtest nobody used to approve anything. So the caller names the run,
+and the strategy is *read off it* rather than passed alongside: the two halves of
+the comparison cannot be about different strategies, because only one of them was
+ever specified. Running a backtest inside the request would be worse again — it
+would compare live against whatever parameters that request happened to pass.
+
+**What it still cannot do** is verify that the named run is the one the promotion
+was granted against. Nothing in the platform records that; it is the audit
+trail's lifecycle verbs (ADR 0010) and is not built. Naming an unrepresentative
+run produces an answer that is arithmetically correct and worthless, and the
+response cannot detect it.
+
+**The live window is open at the start by default**, unlike every other endpoint
+on this router. The others describe a period a reader chose, and a month is the
+period an operator asks about without thinking. This one asks whether a strategy
+has held up, and the denominator for that is its whole live record — a default
+that compared the last 30 days of a three-month paper run against a five-year
+backtest would answer a narrower question in a way nothing in the response
+distinguished from the broader one.
+
+### Why two thirds of the response is context
+
+The arithmetic is one subtraction per metric. Everything else is there because
+the two sides are rarely measuring the same thing, and every one of these
+differences produces a divergence that is correct and misleading:
+
+- **The annualisation bases differ.** The engine annualises a backtest by its bar
+  spacing — 252 for dailies, 252×390 for minutes (`metrics.periods_per_year_for`,
+  which the engine and this endpoint now share so they cannot drift). The live
+  side is inferred from a curve that steps once per *closed trade*, which for a
+  six-trade paper month is around 20. Every annualised ratio differs by that
+  factor before the strategy has done anything, and a live Sharpe that reads
+  *better* than the backtest is the usual result. Pass `periods_per_year` to put
+  both on one basis; the warning names both numbers and disappears when they
+  agree.
+- **The windows are different lengths.** `total_return`, `max_drawdown`,
+  `num_trades` and `turnover` all scale with the window. A live month against a
+  backtested five years gives a `total_return` divergence of very nearly minus
+  the backtest's return, whatever the strategy did.
+- **The sizing rules differ.** A backtest sizes every entry at a flat share count
+  (`spec.qty`, a placeholder that says so); live sizing is risk-based
+  (docs/RISK.md). The money-denominated metrics are partly a difference between
+  two sizing rules.
+- **The symbol sets can differ.** Live trades are **not** filtered to the run's
+  symbols, deliberately. Dropping them would tidy the numbers and hide a strategy
+  trading names it was never approved on — which is a finding, not noise. The
+  warning names them instead. The reverse case matters too: a backtested symbol
+  live has never touched is a refusal or a data gap, and from the trade count
+  alone it is indistinguishable from underperformance.
+
+So each metric carries a `comparability` of `per_trade`, `annualised` or
+`window` (`backtest.metrics.METRIC_BASIS`), saying which of the above reaches it.
+The per-trade statistics — win rate, profit factor, expectancy, the win and loss
+sizes — are the ones two runs of different shapes can be compared on directly,
+and they are where a real divergence shows up first.
+
+The warnings are computed server-side for the same reason `suspicious` attaches
+a backtest's own to it: a number a human has already read is a number they have
+already believed.
+
+### Nulls
+
+A divergence is `null` where either side does not have the number, and that means
+**not available**, never zero. Zero is the strongest claim this report can make —
+live matched the backtest exactly on this metric — and it is the last thing an
+absent value should render as.
+
+Absences are routine rather than exotic. `backtest.runner.jsonable` nulls every
+non-finite metric on the way into the row because `Infinity` is not legal JSON,
+and an infinite `profit_factor` means the backtest had no losing trade — which is
+precisely the run somebody wants to hold a live record up against. A metric
+missing from a run stored before the metric set grew a field gets the same
+treatment, so adding one metric does not retire every backtest on record.
+
 ## The read, and what it costs
 
 Reconstruction reads **every filled order in the account's history** up to the
@@ -199,7 +281,7 @@ know which is which.
 | `GET /analytics/performance` | the full metric set over a period |
 | `GET /analytics/trades` | completed round trips, newest first, with MAE/MFE |
 | `GET /analytics/attribution` | P&L grouped by one dimension |
-| `GET /analytics/live-vs-backtest/{id}` | **not built** — see below |
+| `GET /analytics/live-vs-backtest/{run_id}` | live against one stored backtest run, metric by metric |
 | `GET /analytics/reports/daily` | **not built** — see below |
 
 Every monetary value crosses the wire as a **string** and nothing downstream
@@ -258,14 +340,13 @@ day is its session day.
 
 Stated here rather than left to be discovered:
 
-- **Live-vs-backtest comparison.** Half of it exists:
-  `PerformanceAnalyzer.compare_to_backtest` computes the divergence metric by
-  metric, live minus backtest. What is missing is the other operand — there is
-  no stored backtest result to compare against, because `backtest_runs` has no
-  reader and `/backtests` is a stub. Running a backtest on the fly inside the
-  request would compare live against whatever parameters that request happened
-  to pass, rather than against the backtest that approved the strategy, which is
-  the only comparison worth making.
+- **A screen for the live-vs-backtest comparison.** The endpoint is built; the
+  `/analytics` page does not call it. It wants a run picker rather than a date
+  range — the choice this comparison turns on is *which backtest*, not which
+  month — and that is a different shape from the three panels that page is. The
+  divergence table also has to render `comparability` beside every row and the
+  warnings above them, or the screen reintroduces exactly the misreading the
+  response is built to prevent.
 - **The daily report.** Trades and P&L are available from this module now. The
   other three things the report wants are not gathered anywhere one query can
   reach: rejections are in `signals`, halts are in the kill switch's records,

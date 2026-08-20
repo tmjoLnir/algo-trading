@@ -21,10 +21,12 @@
  *   This is the same gap the Strategies tab exists to show, met from the other
  *   side.
  *
- * What this screen makes possible elsewhere, now that a backtest can be stored:
- * `/analytics/live-vs-backtest` has a second operand, and the promotion ratchet
- * can begin to ask for "a completed backtest on record". Neither is built here —
- * both are their own roadmap items.
+ * What this screen made possible elsewhere, now that a backtest can be stored:
+ * `/analytics/live-vs-backtest` got its second operand and is now an endpoint —
+ * keyed on a run id, because which backtest a live record is judged against is
+ * the whole substance of that comparison. It has no screen yet, and the run
+ * picker it wants is this page's list. The promotion ratchet can also begin to
+ * ask for "a completed backtest on record". Both are their own roadmap items.
  */
 
 import { useState } from 'react'
