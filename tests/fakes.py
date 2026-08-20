@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from atp_core.dashboard.snapshot import LiveSnapshot
     from atp_core.domain import Side, Signal
     from atp_core.execution.ports import EquityPoint
-    from atp_core.strategy.ports import SignalOutcome, StrategyRecord
+    from atp_core.strategy.ports import SignalOutcome, StoredStrategy, StrategyRecord
 
 
 class FakeBroker:
@@ -362,6 +362,10 @@ class FakeStrategyRepository:
 
     def __init__(self) -> None:
         self.stored: dict[str, StrategyRecord] = {}
+        #: Seeded by a test to stand for the whole `strategies` table, which is
+        #: what a reader sees. Distinct from `stored`, which holds the thinner
+        #: record a worker writes.
+        self.rows: list[StoredStrategy] = []
         self.ensure_calls: list[str] = []
         #: Set by a test to stand for a database that will not take the row. The
         #: runner must fail warmup rather than continue into an evaluation whose
@@ -377,6 +381,18 @@ class FakeStrategyRepository:
 
     async def get(self, strategy_id: str) -> StrategyRecord | None:
         return self.stored.get(strategy_id)
+
+    async def list_all(self, *, state: str | None = None) -> list[StoredStrategy]:
+        """Whatever a test seeded in `rows`, filtered and ordered as the real
+        adapter orders it — newest first by `created_at`.
+
+        Seeded separately from `stored` because the two hold different types on
+        purpose: `ensure` writes the thin `StrategyRecord` a worker knows, and
+        this returns the whole row a reader needs.
+        """
+        matched = [row for row in self.rows if state is None or row.state == state]
+        matched.sort(key=lambda r: (r.created_at, r.id), reverse=True)
+        return matched
 
 
 class FakeSignalRepository:

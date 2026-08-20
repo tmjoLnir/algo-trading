@@ -898,7 +898,28 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List Strategies */
+        /**
+         * List Strategies
+         * @description Stored strategies, and the registered classes beside them.
+         *
+         *     One response rather than two endpoints, because the useful fact is the
+         *     *difference*: a class in the registry with no row has never been loaded by a
+         *     worker, and with `WORKER_STRATEGY` empty by default that is the ordinary
+         *     state of a fresh install. Making a client fetch both and diff them would
+         *     leave every client computing the same thing, and a screen that showed only
+         *     the table would answer "nothing is running" with an empty list that looks
+         *     identical to "nothing is written".
+         *
+         *     `state` filters the stored half only. The registry has no state — a class is
+         *     not draft or active, it is just compiled — so a filtered request still
+         *     reports every available class, and `never_run` is still computed against the
+         *     unfiltered table rather than against the filtered view. Otherwise filtering
+         *     to `paused` would report every active strategy as never run.
+         *
+         *     Unscoped by run mode: `strategies` has no such column, because a strategy is
+         *     the same strategy whichever mode runs it. Its *orders* are separable, and
+         *     that is where the distinction belongs.
+         */
         get: operations["list_strategies_api_v1_strategies_get"];
         put?: never;
         /**
@@ -924,8 +945,13 @@ export interface paths {
         };
         /**
          * List Available Strategy Classes
-         * @description Registered strategy classes with their params JSON Schema — the frontend
-         *     renders its configuration form from this.
+         * @description Registered strategy classes with their params JSON Schema.
+         *
+         *     Still a stub, and now for a reason rather than by omission: the list above
+         *     already carries this, marked with whether each class has ever run. A second
+         *     endpoint serving the same registry would be a second thing to keep in step
+         *     with it, and nothing calls this one. It is the frontend's configuration-form
+         *     source, and there is no form — that lands with `POST /strategies`.
          */
         get: operations["list_available_strategy_classes_api_v1_strategies_available_get"];
         put?: never;
@@ -943,7 +969,14 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get Strategy */
+        /**
+         * Get Strategy
+         * @description One strategy.
+         *
+         *     Still a stub: nothing consumes it. The screen reads every strategy in one
+         *     request — this table has one row per strategy that has ever booted — so a
+         *     per-id endpoint would be built, tested and documented with no caller.
+         */
         get: operations["get_strategy_api_v1_strategies__strategy_id__get"];
         put?: never;
         post?: never;
@@ -996,6 +1029,13 @@ export interface paths {
          *     Promotion to `live` additionally requires: a completed backtest on record,
          *     a minimum paper-trading period, `ATP_ALLOW_LIVE_TRADING=true`, and an audit
          *     entry naming a human. See docs/SAFETY.md.
+         *
+         *     Still a stub, and the two missing preconditions are the reason rather than
+         *     the effort: `backtest_runs` has no reader, so "a completed backtest on
+         *     record" cannot be checked, and the audit trail's lifecycle verbs are unwired
+         *     (ADR 0010), so the entry naming a human cannot be written. An endpoint that
+         *     promoted while silently skipping both would be this ratchet with its pawl
+         *     removed.
          */
         post: operations["promote_strategy_api_v1_strategies__strategy_id__promote_post"];
         delete?: never;
@@ -1188,6 +1228,30 @@ export interface components {
             entries?: components["schemas"]["AuditEntryView"][];
             /** Next Before Id */
             next_before_id?: number | null;
+        };
+        /**
+         * AvailableStrategyView
+         * @description A strategy class the code knows about.
+         *
+         *     From the registry rather than the database, so this is what *could* run
+         *     rather than what has. `has_run` is the join between the two and is the
+         *     reason both are in one response: separately they are two lists a reader has
+         *     to diff by eye, and the answer they want — "is the thing I wrote being
+         *     picked up?" — is exactly that diff.
+         */
+        AvailableStrategyView: {
+            /** Class Name */
+            class_name: string;
+            /** Description */
+            description: string;
+            /** Has Run */
+            has_run: boolean;
+            /** Name */
+            name: string;
+            /** Params Schema */
+            params_schema?: {
+                [key: string]: unknown;
+            };
         };
         /** BacktestOut */
         BacktestOut: {
@@ -1703,6 +1767,72 @@ export interface components {
             positions?: components["schemas"]["PositionView"][];
             /** Run Mode */
             run_mode: string;
+        };
+        /**
+         * StoredStrategyView
+         * @description One `strategies` row, as a reader should see it.
+         *
+         *     Two fields carry a health warning, and the response says so rather than
+         *     leaving each client to discover it:
+         *
+         *     `state` is **not** "is it running now". `ensure` writes `"active"` when it
+         *     creates a row and never touches it again, so a strategy no worker has loaded
+         *     for a month still reads `active`. It is the configured lifecycle state, and
+         *     today nothing but a first boot ever sets it.
+         *
+         *     `last_started_at` is the `updated_at` column, renamed to what it actually
+         *     means. The same asymmetry: an existing row has only its timestamp bumped, at
+         *     every worker boot. Serving it as `updated_at` would invite every reader to
+         *     conclude somebody edited the strategy this morning.
+         */
+        StoredStrategyView: {
+            /** Class Name */
+            class_name: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Description */
+            description: string;
+            /** Id */
+            id: string;
+            /** Kind */
+            kind: string;
+            /**
+             * Last Started At
+             * Format: date-time
+             */
+            last_started_at: string;
+            /** Name */
+            name: string;
+            /** Params */
+            params?: {
+                [key: string]: unknown;
+            };
+            /** Risk Config */
+            risk_config?: {
+                [key: string]: unknown;
+            };
+            /** Ruleset */
+            ruleset: {
+                [key: string]: unknown;
+            } | null;
+            /** State */
+            state: string;
+            /** Timeframe */
+            timeframe: string;
+            /** Universe */
+            universe?: string[];
+        };
+        /** StrategiesResponse */
+        StrategiesResponse: {
+            /** Available */
+            available: components["schemas"]["AvailableStrategyView"][];
+            /** Never Run */
+            never_run?: string[];
+            /** Strategies */
+            strategies: components["schemas"]["StoredStrategyView"][];
         };
         /** StrategyCreate */
         StrategyCreate: {
@@ -3065,7 +3195,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["StrategyOut"][];
+                    "application/json": components["schemas"]["StrategiesResponse"];
                 };
             };
             /** @description Validation Error */

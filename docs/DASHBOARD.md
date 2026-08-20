@@ -300,6 +300,54 @@ orders — rule §1.5 again — so `POST /positions/{symbol}/close` and
 screen reads the whole book in one request, and an endpoint built, tested and
 documented with no caller is the gap the analytics endpoints sat in for a phase.
 
+## The strategies page
+
+`/strategies`, over `GET /api/v1/strategies` — the rows a worker has written,
+and the strategy classes the code registers, in one response.
+
+**The gap between those two lists is why the page exists.** A class is
+registered at import time; a `strategies` row is written by the runner at its
+first session open. `WORKER_STRATEGY` is empty by default, so a platform with
+strategies in it and nothing running is the ordinary state of a fresh install —
+and no screen could say so. "I wrote a strategy and nothing is happening" had no
+answer anywhere in this UI. The response carries `never_run` computed
+server-side, because every client would otherwise diff the two lists identically
+and the diff *is* the answer.
+
+Two labels here are deliberately not the column names behind them, because the
+columns mean less than they say:
+
+- **`state` is not "is it running now".** `StrategyRepository.ensure` writes
+  `active` when it creates a row and never touches it again, so a strategy no
+  worker has loaded for a month still reads `active`. The screen shows it as the
+  configured state and puts the liveness question on the timestamp instead.
+- **`updated_at` is not "last edited".** The same asymmetry — a later boot bumps
+  only the timestamp — so the API serves it as `last_started_at` and the column
+  header reads "a worker last started this". Under its own name it would invite
+  every reader to conclude somebody edited the strategy this morning.
+
+One trap worth recording because it was nearly shipped: **the registry is
+populated by an import side effect.** `@register` runs when a strategy module is
+imported, so a process that has never imported one has an empty registry — and
+would report, with total confidence, that this platform has no strategies. The
+worker and the backtest script already import `atp_core.strategy.examples` for
+exactly this reason; the API had never needed to, because nothing here read the
+registry until this endpoint.
+
+A filtered request still reports every available class, and `never_run` is still
+computed against the **unfiltered** table. Otherwise filtering to `paused` would
+report every active strategy as one nothing has ever loaded.
+
+**Only the read is built**, and here the reason is sharper than elsewhere.
+Create, edit, promote and pause are the promotion ratchet — draft → backtest →
+paper → live — and half its preconditions cannot be checked yet: `backtest_runs`
+has no reader, so "a completed backtest on record" is unanswerable, and the
+audit trail's lifecycle verbs are unwired (ADR 0010), so the entry naming a human
+cannot be written. An endpoint that promoted while silently skipping both would
+be the ratchet with its pawl removed, which is worse than no endpoint.
+`GET /strategies/{id}` and `GET /strategies/available` also stay stubs: the list
+above already carries both, and nothing calls either.
+
 ## Serving it
 
 Two ways, and they resolve the API identically on purpose.
@@ -429,14 +477,13 @@ remaining Phase 6 items are the difference — see docs/SAFETY.md.
 
 Stated here rather than left to be discovered:
 
-- **Two of the seven tabs are still stubs.** Strategies and Backtests render
-  "not yet implemented", and the reason is not the front end in either:
-  `apps/api/src/atp_api/routers/strategies.py` and `backtests.py` raise
-  `NotImplementedError` in every handler. Strategies needs a reader on
-  `PostgresStrategyRepository`, which has only `ensure` and `get`. Backtests is
-  furthest out: it additionally needs a worker task to run a queued backtest and
-  a reader for `backtest_runs`, which has neither — and until it does,
-  `/analytics/live-vs-backtest` has no second operand either.
+- **One of the seven tabs is still a stub.** Backtests renders "not yet
+  implemented", and the reason is not the front end: `POST /backtests` needs a
+  worker task to run a queued backtest, and every read needs a reader for
+  `backtest_runs`, which has none. It is the last one and the largest, and it
+  blocks more than itself — `/analytics/live-vs-backtest` has no second operand
+  until a backtest can be stored, and the promotion ratchet on the strategies
+  page cannot require "a completed backtest on record" until one exists.
 - **No screen places an order.** The three tabs that are built are all reads.
   Every write handler across `orders.py` and `positions.py` is still a stub,
   because they place things and there is one path from an intent to a venue
