@@ -555,11 +555,18 @@ remaining Phase 6 items are the difference — see docs/SAFETY.md.
 Stated here rather than left to be discovered:
 
 - **All seven tabs are built.** Backtests was the last and the largest; it is
-  above. What it unblocked elsewhere is not built with it and is still listed
-  here: `/analytics/live-vs-backtest` now has a second operand and remains a stub
-  (its own roadmap item, its own semantics), and the promotion ratchet on the
-  strategies page could now check "a completed backtest on record" and still
-  cannot write the audit entry naming a human (ADR 0010).
+  above. What it unblocked elsewhere is still being built separately:
+  `/analytics/live-vs-backtest` is now an endpoint and has no screen — it wants a
+  *run picker* rather than a date range, because the choice it turns on is which
+  backtest, which is a different shape from the three date-ranged panels the
+  analytics page is (docs/ANALYTICS.md). The promotion ratchet on the strategies
+  page could now check "a completed backtest on record" and still cannot write
+  the audit entry naming a human (ADR 0010).
+- **A divergence table needs its labels to be worth rendering.** Whenever the
+  comparison does get a screen: the response carries a `comparability` per metric
+  and warnings above them, and a table that dropped either would reintroduce
+  exactly the misreading they exist to prevent — most often a live Sharpe that
+  looks better than the backtest because the two were annualised differently.
 - **Strategy parameters cannot be edited per run.** The backtests form queues a
   run with the strategy's configured parameters. Building the editor means
   rendering a form from a JSON Schema, and one that silently dropped the fields it

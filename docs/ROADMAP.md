@@ -1241,19 +1241,68 @@ wording if it is not the demonstration you want.
   asks of the numbers.
 
 - [ ] Live-vs-backtest comparison.
-  Half exists as of #58: `PerformanceAnalyzer.compare_to_backtest` computes the
-  divergence metric by metric, live minus backtest, and is tested.
+  Built as of #PRNUM: `GET /analytics/live-vs-backtest/{run_id}` serves the live
+  metric set, the stored backtest's, the divergence between them, and the reasons
+  not to read that divergence as performance.
 
-  **The reason it is still a stub changed with #67 and is worth restating**, since
-  the old one no longer holds: the other operand exists now — `backtest_runs` has
-  a reader and a writer, and `/backtests` can store a completed run. What is
-  missing is the *choice of which run*. A strategy can have any number of stored
-  runs over different windows, cost models and share counts, and comparing live
-  against an arbitrary one — the newest, say — reports a divergence against a
-  backtest nobody used to approve anything. Answering it properly needs the
-  promotion ratchet to record which run justified the promotion, which is blocked
-  on the audit trail's lifecycle verbs (ADR 0010). Running a backtest inside the
-  request remains wrong for the reason it always was.
+  **The blocker recorded here was the *choice of which run*, and it is answered
+  by making the caller name it.** The path takes a backtest run id, and the
+  strategy is read off that run's spec rather than passed alongside — so the two
+  halves cannot be about different strategies, because only one of them is ever
+  specified. Nothing is guessed, and the alternative that was actually wrong
+  (comparing against the newest run, or running a backtest inside the request)
+  is not reachable from this shape.
+
+  What that does **not** answer is whether the named run is the one the promotion
+  was granted against. That still needs the ratchet to record it, and it is still
+  blocked on the audit trail's lifecycle verbs (ADR 0010). The endpoint cannot
+  detect an unrepresentative run, so it says so in its own docstring and in
+  docs/ANALYTICS.md rather than implying an authority it does not have.
+
+  **Three things found by building it:**
+
+  - **`compare_to_backtest` raised on the runs most worth comparing.** It did
+    `float(theirs[name])`, and a stored run's metrics come back from a JSON
+    column with every non-finite value nulled by `runner.jsonable` — `Infinity`
+    is not legal JSON. An infinite `profit_factor` means the backtest had no
+    losing trade, which is exactly the result somebody holds a live record up
+    against. Now either side may be a mapping and either may have a hole in it;
+    the divergence is `None` there, meaning *not available* and never zero.
+  - **The two sides annualise on different bases, and the artefact flatters
+    live.** The engine scales a backtest by its bar spacing (252 for dailies,
+    252×390 for minutes); the live curve steps once per closed trade, which for a
+    paper month infers to around 20. Every annualised ratio differs by that
+    factor before the strategy has done anything, and the usual result is a live
+    Sharpe that reads *better* than the backtest — a divergence a reader acts on
+    in the wrong direction. The engine's `_periods_per_year` was private and is
+    now `metrics.periods_per_year_for`, read by both, so the number the endpoint
+    reports is the number the engine used rather than a second copy of the idea.
+    Each metric carries a `comparability` of `per_trade` / `annualised` /
+    `window` saying which of these reaches it.
+  - **Filtering live trades to the run's symbols was the tempting version and is
+    wrong.** It would tidy the numbers and hide a strategy trading names it was
+    never approved on, which is a finding rather than noise. Both directions are
+    warned about instead: the reverse — a backtested symbol live has never
+    touched — is a refusal or a data gap, and from the trade count alone it is
+    indistinguishable from underperformance.
+
+  Unticked. 18 unit tests on the endpoint and 14 on the core it added, and
+  `make check` is green — but every run in them is a fixture. Nothing has yet
+  compared a real paper record against a real backfilled backtest, which is what
+  the line below asks for. No screen calls it yet either (docs/ANALYTICS.md
+  'Not built yet').
+
+*Verifiable (live-vs-backtest, proposed):* with a strategy that has traded paper
+for a fortnight and a completed backtest of the same strategy on record, the
+endpoint answers for that run id, and: the live half's `num_trades` and
+`total_return` match what `/analytics/performance` reports for the same strategy
+over the same window, to the digit; the backtest half's metrics match what
+`/backtests/{run_id}` serves for that run; and asking again with
+`periods_per_year` pinned to the backtest's own basis moves every annualised
+metric and no per-trade one, with the annualisation warning gone from the
+response. Proposed because the numbers being *arithmetically* right is what the
+unit tests already hold, and the thing that would actually be wrong in
+production is the two halves describing different periods or different runs.
 - [ ] Daily report.
   Trades and P&L are available from `analytics/` as of #58. The other three
   things the report wants are not gathered anywhere one query can reach:

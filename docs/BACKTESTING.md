@@ -177,11 +177,27 @@ reading a comparison table is the person about to promote something.
 ## Then paper trade it
 
 A passed backtest earns a paper deployment, not a live one. Four weeks minimum,
-then compare with `GET /api/v1/analytics/live-vs-backtest/{id}`. Divergence
+then compare with `GET /api/v1/analytics/live-vs-backtest/{run_id}`. Divergence
 there is the cheapest lesson this platform can teach you.
 
-That endpoint is still a stub, and what was blocking it is now gone: it needed a
-*stored* backtest to compare against, and until `POST /backtests` existed there
-was none. Running one inside the request would compare live against whatever
-parameters that request passed rather than against the backtest that approved the
-strategy, which is the only comparison worth making.
+**The `{run_id}` is a backtest run, not a strategy**, and that is the substance
+of the endpoint rather than a URL detail. A strategy accumulates any number of
+stored runs over different windows, cost models and share counts; comparing live
+against an arbitrary one — the newest, say — reports a divergence against a
+backtest nobody used to approve anything. So you name the run, and the strategy
+is read off it: the two halves cannot be about different strategies, because only
+one of them was ever specified. Running a backtest inside the request would be
+worse still — it would compare live against whatever parameters that request
+happened to pass.
+
+What the endpoint cannot do is check that the run you named is the one the
+promotion was granted against. Nothing records that yet (ADR 0010's lifecycle
+verbs), so choosing an unrepresentative run gives an answer that is
+arithmetically correct and worthless. Note the run id in the promotion checklist
+and compare against that one.
+
+Read the warnings before the numbers. `docs/ANALYTICS.md` has the full argument;
+the short version is that a live paper month and a backtested five years are
+measured over different windows, annualised on different bases and sized by
+different rules, and several rows of the divergence table move for those reasons
+before the strategy has done anything.
