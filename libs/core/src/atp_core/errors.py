@@ -15,6 +15,17 @@ class ATPError(Exception):
 class ConfigError(ATPError): ...
 
 
+class MissingBrokerCredentialsError(ConfigError):
+    """A live/paper broker adapter was asked for without an API key.
+
+    Raised where the credential is actually needed — building the adapter —
+    rather than where configuration is *read*. `Settings` used to refuse to
+    validate at all in this case, which meant the API and the worker could not
+    import, so a missing key presented as a process that would not start rather
+    than as a broker that could not be built. See `Settings.broker_configured`.
+    """
+
+
 # ── market data ─────────────────────────────────────────────────────────────
 class DataError(ATPError): ...
 

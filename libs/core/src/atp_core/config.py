@@ -230,8 +230,24 @@ class Settings(BaseSettings):
                 "ATP_RUN_MODE=live requires ATP_ALLOW_LIVE_TRADING=true. "
                 "Read docs/SAFETY.md before setting it."
             )
-        if self.run_mode is not RunMode.BACKTEST and not self.alpaca_api_key.get_secret_value():
-            raise ValueError(f"run_mode={self.run_mode} needs ALPACA_API_KEY")
+        # A missing ALPACA_API_KEY is deliberately NOT raised here, and used to
+        # be. It is a real misconfiguration — `broker_configured` below reports
+        # it, `AlpacaBroker` refuses to build without it, and the worker will
+        # not trade — but it is not a reason this process cannot exist.
+        #
+        # Raising made it one. `Settings()` is called at import by
+        # `atp_api.main` (`app = create_app()`), so an empty key in `paper` mode
+        # meant the API could not be imported: uvicorn exited 1, compose's
+        # `restart: unless-stopped` restarted it forever, and every request was
+        # refused. What that looks like from a browser is the dashboard's
+        # "Cannot reach the API", permanently, with nothing on screen or in the
+        # probes connecting it to a credential — because /healthz and /readyz
+        # were dead too, and they are what an operator is told to check.
+        #
+        # It is the same rule `main.lifespan` already applies to Postgres and
+        # Redis, and states in as many words: an API that refused to boot
+        # without a dependency could not serve /healthz to say so. Nothing here
+        # can reach a venue, so nothing is less safe for booting.
         return self
 
     @property
@@ -247,6 +263,19 @@ class Settings(BaseSettings):
     @property
     def is_live(self) -> bool:
         return self.run_mode is RunMode.LIVE and self.allow_live_trading
+
+    @property
+    def broker_configured(self) -> bool:
+        """Whether a real broker adapter can be built for this run mode.
+
+        `backtest` needs no credential — `SimulatedBroker` is the venue — so it
+        is configured by definition. Every other mode reaches Alpaca and needs a
+        key. Reported at startup and consulted by the worker's trading locks;
+        the adapter itself is what enforces it (`MissingBrokerCredentialsError`).
+        """
+        if self.run_mode is RunMode.BACKTEST:
+            return True
+        return bool(self.alpaca_api_key.get_secret_value())
 
     @property
     def cors_origin_list(self) -> list[str]:

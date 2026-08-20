@@ -104,6 +104,17 @@ def decide(settings: Settings, symbols: list[str]) -> TradingDecision:
             blocked=True,
         )
 
+    if not settings.broker_configured:
+        return TradingDecision(
+            enabled=False,
+            reason=(
+                f"WORKER_STRATEGY={settings.worker_strategy} is set but ALPACA_API_KEY is "
+                f"empty, and ATP_RUN_MODE={settings.run_mode.value} trades against Alpaca; "
+                "there is no venue to send an order to"
+            ),
+            blocked=True,
+        )
+
     if settings.is_live and not settings.worker_allow_live_orders:
         return TradingDecision(
             enabled=False,

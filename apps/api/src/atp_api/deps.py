@@ -32,6 +32,7 @@ from atp_core.config import Settings, get_settings
 from atp_core.dashboard.ports import SnapshotStore
 from atp_core.data.ports import BarRepository
 from atp_core.domain.enums import RunMode
+from atp_core.errors import MissingBrokerCredentialsError
 from atp_core.execution.ports import OrderRepository, PortfolioRepository
 from atp_core.logging import get_logger
 from atp_core.persistence.audit import PostgresAuditLog
@@ -331,7 +332,21 @@ async def get_broker(settings: Annotated[Settings, Depends(get_settings)]) -> Br
     """
     global _broker_instance
     if _broker_instance is None:
-        _broker_instance = _build_broker(settings)
+        try:
+            _broker_instance = _build_broker(settings)
+        except MissingBrokerCredentialsError as exc:
+            # 503 and not a 500: the API is fine and this deployment has no
+            # venue configured, which is a fact about configuration rather than
+            # a bug. Every other endpoint keeps working — the book, the halts,
+            # the audit trail and the login screen do not need a broker — so
+            # refusing only the requests that actually reach for one is the
+            # same shape as `_from_state` above.
+            #
+            # `str(exc)` is safe to hand back: the message names the variable
+            # and never its value (`AlpacaBroker.__init__`).
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+            ) from exc
     return _broker_instance
 
 

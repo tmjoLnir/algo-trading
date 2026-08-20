@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import re
+from typing import TYPE_CHECKING
 
 import httpx
 import pytest
@@ -21,6 +22,10 @@ from atp_api.auth import Scope, Session
 from atp_api.deps import READ_ONLY_MAY_CALL, SAFE_METHODS, get_current_session
 from atp_api.main import create_app
 from atp_api.ws import websocket_endpoint
+from atp_core.config import get_settings
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 @pytest.fixture(scope="module")
@@ -299,3 +304,74 @@ async def test_a_full_session_is_refused_nowhere_on_scope() -> None:
             f"{method} {path} refused a FULL session with 403 — scope is not the "
             f"reason anything should be refused here"
         )
+
+
+class TestTheApiBootsWithoutABroker:
+    """The API must be constructible in a run mode it has no credentials for.
+
+    This is the regression, and it presented as a networking problem. `Settings`
+    refused to validate when `ATP_RUN_MODE` was `paper` or `live` with an empty
+    `ALPACA_API_KEY`; `atp_api.main` calls `Settings()` at import to build
+    `app`, so the module could not be imported, uvicorn exited 1, and compose's
+    `restart: unless-stopped` restarted it forever. Every request was refused at
+    the socket, so the dashboard sat on "Cannot reach the API" — and `/healthz`
+    and `/readyz`, the two probes whose whole job is to separate "the API is
+    down" from "something behind it is down", were down with it.
+
+    `.env.example` ships `ATP_RUN_MODE=backtest`, the one mode exempt from that
+    check, which is why CI never saw this and why it reached an operator: the
+    documented next step is to move to `paper`.
+
+    Nothing here asserts that trading is possible without a key — it is not, and
+    `test_config_guards.py` holds that line at the adapter.
+    """
+
+    @staticmethod
+    def _paper_without_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Paper mode, no key — and no ambient key to accidentally supply one.
+
+        Clearing the environment is load-bearing exactly as it is in
+        `test_config_guards.py`: this repo's CI exports real Alpaca keys for the
+        live-feed checks, and they would satisfy the old guard and pass this
+        test without exercising it.
+        """
+        for name in ("ALPACA_API_KEY", "ALPACA_API_SECRET"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("ATP_RUN_MODE", "paper")
+        get_settings.cache_clear()
+
+    @pytest.fixture(autouse=True)
+    def _restore_settings_cache(self) -> Iterator[None]:
+        """The settings singleton is process-wide; leaving a paper-mode one
+        cached would hand it to every test that ran after this class."""
+        yield
+        get_settings.cache_clear()
+
+    def test_it_builds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._paper_without_credentials(monkeypatch)
+
+        app = create_app()
+
+        assert app.openapi()["info"]["title"].startswith("ATP")
+
+    @pytest.mark.anyio
+    async def test_the_login_gate_answers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The symptom, stated as the assertion that would have caught it.
+
+        A 401 is what puts the sign-in form on screen. Anything else — including
+        the connection refused this used to produce — is the dashboard saying it
+        cannot reach the API.
+        """
+        self._paper_without_credentials(monkeypatch)
+        app = create_app()
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            gate = await client.get("/api/v1/auth/me")
+            health = await client.get("/healthz")
+            context = await client.get("/api/v1/auth/context")
+
+        assert gate.status_code == 401
+        assert health.status_code == 200
+        # The run-mode banner the login screen renders before anyone signs in.
+        assert context.json() == {"run_mode": "paper"}

@@ -207,3 +207,39 @@ class TestDefaults:
             Settings(alpaca_api_key=SecretStr("k"), alpaca_api_secret=SecretStr("s")).run_mode
             is RunMode.PAPER
         )
+
+
+class TestAVenueThatIsNotConfigured:
+    """A worker told to trade against Alpaca with no key to reach it.
+
+    This used to be unreachable as a *decision*, because `Settings` refused to
+    validate at all without a key and the worker died at import — a crash loop
+    rather than a worker saying what was wrong. It is now an ordinary blocked
+    intention, which is the same shape as every other lock in this file.
+    """
+
+    @staticmethod
+    def _uncredentialled(**kwargs: object) -> Settings:
+        base: dict[str, object] = {"ATP_RUN_MODE": "paper", "worker_strategy": "sma_crossover"}
+        base.update(kwargs)
+        return Settings(**base)  # type: ignore[arg-type]
+
+    def test_a_strategy_without_a_key_does_not_trade(self) -> None:
+        decision = trading.decide(self._uncredentialled(), SYMBOLS)
+
+        assert decision.enabled is False
+        assert "ALPACA_API_KEY" in decision.reason
+
+    def test_it_is_a_blocked_intention_not_a_choice(self) -> None:
+        """WORKER_STRATEGY is set, so somebody meant this to trade. That is the
+        distinction `blocked` carries, and it is what gets it logged loudly
+        rather than as a note about an unconfigured worker."""
+        assert trading.decide(self._uncredentialled(), SYMBOLS).blocked is True
+
+    def test_backtest_mode_is_not_blocked_by_a_missing_key(self) -> None:
+        """It is blocked for having no venue, which is a different sentence and
+        must not be replaced by the credential one."""
+        decision = trading.decide(self._uncredentialled(ATP_RUN_MODE="backtest"), SYMBOLS)
+
+        assert decision.enabled is False
+        assert "ALPACA_API_KEY" not in decision.reason

@@ -18,8 +18,10 @@ from __future__ import annotations
 import pytest
 from pydantic import SecretStr
 
+from atp_core.brokers import AlpacaBroker
 from atp_core.config import Settings
 from atp_core.domain.enums import RunMode
+from atp_core.errors import MissingBrokerCredentialsError
 
 #: The environment variables `Settings` reads that any test here could be
 #: fooled by. Cleared per test — see `_settings_read_only_their_inputs`.
@@ -125,15 +127,52 @@ def test_the_environment_still_selects_the_mode() -> None:
 
 
 def test_a_non_backtest_mode_demands_credentials() -> None:
-    """Paper still talks to a real venue, so it still needs a key.
+    """Paper still talks to a real venue, so it still needs a key — and this
+    file's rule holds: the refusal MOVED, it was not relaxed.
+
+    `Settings` used to raise here. That made an unbuildable *broker* into an
+    unimportable *process*: `atp_api.main` calls `Settings()` at import time
+    (`app = create_app()`), so an empty key in paper mode meant uvicorn exited 1
+    and compose restarted it forever. What the operator saw was the dashboard
+    reporting it could not reach the API, permanently — with `/healthz` and
+    `/readyz`, the two probes written to tell "the API is down" apart from "a
+    dependency is down", dead alongside the API that was supposed to answer
+    them. A missing credential is not a reason the process cannot exist.
+
+    So `Settings` loads, and the key is demanded by the thing that genuinely
+    cannot work without one. Nothing gained permission to trade: no adapter can
+    be built, so there is no path to a venue. That is the guarantee, and it is
+    asserted below rather than assumed.
 
     The autouse fixture has already cleared the ambient credentials, which is
     load-bearing here: a machine with real Alpaca keys exported — this repo's
     own CI, which runs the live-feed checks — would otherwise satisfy the
     guard from the environment and pass this test without exercising it.
     """
-    with pytest.raises(ValueError, match="ALPACA_API_KEY"):
-        Settings(ATP_RUN_MODE="paper")
+    settings = Settings(ATP_RUN_MODE="paper")
+
+    # It loads — the API can boot and say what is wrong — and it knows it is
+    # not configured rather than pretending otherwise.
+    assert settings.run_mode is RunMode.PAPER
+    assert settings.broker_configured is False
+
+    # And nothing can reach Alpaca, which is the half that must never relax.
+    with pytest.raises(MissingBrokerCredentialsError, match="ALPACA_API_KEY"):
+        AlpacaBroker(settings)
+
+
+def test_backtest_needs_no_credential_and_says_so() -> None:
+    """The one mode with no venue behind it. `SimulatedBroker` is the venue, so
+    "configured" is true by definition rather than by a key being present."""
+    assert Settings(ATP_RUN_MODE="backtest").broker_configured is True
+
+
+def test_a_configured_mode_reports_configured() -> None:
+    """The negative above is only meaningful against this."""
+    configured = Settings(
+        ATP_RUN_MODE="paper", alpaca_api_key=SecretStr("k"), alpaca_api_secret=SecretStr("s")
+    )
+    assert configured.broker_configured is True
 
 
 def test_paper_and_live_use_different_urls() -> None:
