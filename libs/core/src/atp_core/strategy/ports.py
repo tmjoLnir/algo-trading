@@ -72,6 +72,47 @@ class StrategyRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class StoredStrategy:
+    """A `strategies` row in full, for something that reads them.
+
+    Deliberately a second type rather than a wider `StrategyRecord`. That one is
+    what a *running worker* knows and writes, and its docstring explains why it
+    must stay thin: writing the rest from a worker means inventing values for
+    fields nothing running has an opinion about. This one is the other
+    direction — everything the row holds, for a reader that is not going to
+    write any of it back.
+
+    Two fields mean something narrower than their names suggest, and a reader
+    that assumes otherwise will be wrong in a way nothing corrects:
+
+    - **`state` is not "is it running now".** `ensure` writes `"active"` when it
+      creates a row and never touches it again, so a strategy no worker has
+      loaded for a month still reads `active`. It is the configured lifecycle
+      state, which today nothing but a first boot ever sets.
+    - **`updated_at` is not "last edited".** The same asymmetry: an existing row
+      has only its timestamp bumped, at every worker boot. So it answers "when
+      did a worker last start this?", which is the more useful question of the
+      two and is not the one the column name asks.
+    """
+
+    id: str
+    name: str
+    description: str
+    kind: str  # "coded" | "ruleset"
+    class_name: str | None
+    params: dict[str, object]
+    #: The declarative spec, for a `ruleset` strategy. None for a coded one,
+    #: where the logic is in Python and this row cannot describe it.
+    ruleset: dict[str, object] | None
+    state: str
+    universe: tuple[str, ...]
+    timeframe: str
+    risk_config: dict[str, object]
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class SignalOutcome:
     """What became of a signal, recorded alongside it.
 
@@ -113,6 +154,27 @@ class StrategyRepository(Protocol):
 
     async def get(self, strategy_id: str) -> StrategyRecord | None:
         """The stored identity, or None if this strategy has no row yet."""
+        ...
+
+    async def list_all(self, *, state: str | None = None) -> list[StoredStrategy]:
+        """Every stored strategy, newest first, optionally filtered by state.
+
+        Returns `StoredStrategy` rather than `StrategyRecord`, and the two types
+        are the read/write split rather than duplication: a worker writes the
+        thin one because it only knows the thin one, and a screen needs the
+        whole row including the two fields whose names mislead (see
+        `StoredStrategy`).
+
+        Unscoped by run mode, unlike the order and snapshot reads — `strategies`
+        has no `run_mode` column, because a strategy is the same strategy
+        whichever mode is running it. Its *orders* are separable and that is
+        where the distinction belongs.
+
+        Unbounded, and that is defensible here in a way it would not be for
+        orders: this table has one row per strategy that has ever booted, which
+        is a number an operator can name. A limit would be guarding against a
+        scale this table cannot reach.
+        """
         ...
 
 

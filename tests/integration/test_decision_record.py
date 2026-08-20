@@ -181,6 +181,79 @@ class TestTheStrategyRow:
         assert await strategies.get("never_registered") is None
 
 
+class TestListingStrategies:
+    """`list_all` — the read behind `GET /api/v1/strategies`.
+
+    A different shape from `get`: it returns the whole row rather than the thin
+    record a worker writes, and the two fields that matter most on a screen are
+    exactly the two `ensure` treats asymmetrically.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_whole_row_comes_back(self, repos: tuple) -> None:
+        """`StrategyRecord` is deliberately thin because a worker writes it;
+        `StoredStrategy` is what a reader needs."""
+        strategies, _, _ = repos
+        await strategies.ensure(a_record())
+
+        rows = await strategies.list_all()
+
+        assert len(rows) == 1
+        assert rows[0].id == STRATEGY
+        assert rows[0].universe == ("SPY", "QQQ")
+        assert rows[0].params == {"fast": 20, "slow": 50}
+        # Written by `ensure` on a first boot, and never touched again.
+        assert rows[0].state == "active"
+
+    @pytest.mark.asyncio
+    async def test_a_second_boot_moves_only_the_timestamp(
+        self, clean_decision_tables: str, repos: tuple
+    ) -> None:
+        """What `last_started_at` on the screen actually reports.
+
+        A restart does not edit the row — only its `updated_at` moves — which is
+        why the API serves that column under a name that says so rather than one
+        that invites "somebody changed this today".
+
+        The second boot needs its own repository because the clock is injected
+        at construction: reusing the fixture's would stamp the same instant
+        twice and prove nothing.
+        """
+        strategies, _, _ = repos
+        await strategies.ensure(a_record())
+        first = (await strategies.list_all())[0]
+
+        engine = create_engine(clean_decision_tables)
+        try:
+            tomorrow = PostgresStrategyRepository(
+                create_session_factory(engine), SimulatedClock(T0 + timedelta(days=1))
+            )
+            await tomorrow.ensure(a_record())
+        finally:
+            await engine.dispose()
+
+        second = (await strategies.list_all())[0]
+        assert second.created_at == first.created_at
+        assert second.updated_at > first.updated_at
+        assert second.params == first.params
+
+    @pytest.mark.asyncio
+    async def test_the_state_filter_narrows_the_list(self, repos: tuple) -> None:
+        strategies, _, _ = repos
+        await strategies.ensure(a_record("one"))
+        await strategies.ensure(a_record("two"))
+
+        assert len(await strategies.list_all(state="active")) == 2
+        assert await strategies.list_all(state="paused") == []
+
+    @pytest.mark.asyncio
+    async def test_nothing_stored_is_an_empty_list(self, repos: tuple) -> None:
+        """A worker that has never booted has written no rows — the default
+        posture of this platform rather than a fault."""
+        strategies, _, _ = repos
+        assert await strategies.list_all() == []
+
+
 class TestTheSignalRecord:
     @pytest.mark.asyncio
     async def test_a_decision_round_trips(self, repos: tuple) -> None:

@@ -38,7 +38,9 @@ from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.dashboard import RedisSnapshotStore
 from atp_core.persistence.orders import PostgresOrderRepository
 from atp_core.persistence.positions import PostgresPortfolioRepository
+from atp_core.persistence.strategies import PostgresStrategyRepository
 from atp_core.risk.killswitch import KillSwitch
+from atp_core.strategy.ports import StrategyRepository
 
 #: `Redis` and the SQLAlchemy session types are imported at RUNTIME, not behind
 #: `if TYPE_CHECKING`. FastAPI resolves a dependency's annotations when it wires
@@ -214,6 +216,26 @@ async def get_order_repository(
     we submit" a question with one answer.
     """
     return PostgresOrderRepository(session_factory)
+
+
+async def get_strategy_repository(
+    session_factory: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
+    clock: Annotated[Clock, Depends(get_clock)],
+) -> StrategyRepository:
+    """The `strategies` table — read here to say which strategies exist.
+
+    Read-only from this process, like the book and the orders above. The runner
+    writes a row at every session open (`ensure`), and it is the only thing that
+    does: a strategy row edited from here while a worker held a different view
+    of it would be two answers to "what is this strategy", which is the problem
+    ADR 0007 solves for the book.
+
+    Takes the clock because the adapter stamps rows with it (rule §1.2). Nothing
+    this process calls writes, so it goes unused on every read — but a
+    constructor that quietly read the wall clock instead would be wrong the
+    moment anything here did write.
+    """
+    return PostgresStrategyRepository(session_factory, clock)
 
 
 async def get_bar_repository(

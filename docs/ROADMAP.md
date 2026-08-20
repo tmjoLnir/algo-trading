@@ -1131,6 +1131,46 @@ wording if it is not the demonstration you want.
   every book in all of them is a fixture. Nothing here has yet shown a real
   worker's book outliving the worker, which is what the line below asks for.
 
+- [ ] Strategy listing endpoint and screen — @claude.
+  `GET /api/v1/strategies` and the `/strategies` tab. Fourth of the five stub
+  tabs, after `/analytics` (#63), `/orders` (#64) and `/positions` (#65), and the
+  same posture: the reads are built and the writes are left alone.
+
+  **What it answers that nothing else could.** A strategy class is registered at
+  import time; a `strategies` row is written by the runner at its first session
+  open. Those two sets can differ, and with `WORKER_STRATEGY` empty by default
+  the ordinary state of a fresh install is a platform with strategies in it and
+  nothing running. No screen could say so — "I wrote a strategy and nothing is
+  happening" had no answer anywhere in this UI. The endpoint returns both halves
+  and the difference, because every client would otherwise compute that diff
+  identically and the diff is the whole answer.
+
+  `StrategyRepository` gained `list_all`, returning a new `StoredStrategy`
+  rather than the existing `StrategyRecord`. That is the read/write split rather
+  than duplication: `StrategyRecord`'s own docstring explains why it stays thin —
+  a booting worker must not invent values for fields it is not an authority on —
+  and a reader needs the whole row.
+
+  Two columns are served under names that say what they record, because their
+  own names do not. `state` is not "is it running now": `ensure` writes `active`
+  once and never revisits it, so a strategy nothing has loaded for a month still
+  reads active. `updated_at` is not "last edited": a later boot bumps only the
+  timestamp, so it is served as `last_started_at`. Both are the same asymmetry
+  in `ensure`, seen from the reading side for the first time.
+
+  **A trap this nearly shipped into.** `@register` runs at import time, so a
+  process that has never imported a strategy module has an empty registry — and
+  this endpoint would have reported, with total confidence, that the platform has
+  no strategies. The worker and the backtest CLI already import
+  `atp_core.strategy.examples` for exactly this reason; the API never had to,
+  because nothing here read the registry until now. A unit test asserts the
+  registry is populated in this process rather than trusting the import to stay.
+
+  Unticked. Four new integration tests against a real PostgreSQL in CI, 11 API
+  and 13 web — but every row in all of them is a fixture, and the property this
+  screen exists for is about a *real* worker having or not having booted a
+  strategy.
+
 - [ ] Live-vs-backtest comparison.
   Half exists as of #58: `PerformanceAnalyzer.compare_to_backtest` computes the
   divergence metric by metric, live minus backtest, and is tested. The endpoint
@@ -1159,6 +1199,17 @@ requirement #7 asks for; the analytics items above will want their own, and
 "the dashboard renders" is deliberately not enough — the line asks for
 agreement between what the worker believes and what the screen says, which is
 the only property that makes the screen worth reading.
+
+*Verifiable (strategy listing, proposed):* on a clean stack with
+`WORKER_STRATEGY` unset, the `/strategies` tab lists `sma_crossover` as a class
+that exists and has never run, and the stored table is empty. Set
+`WORKER_STRATEGY=sma_crossover`, restart the worker, and the same screen moves it
+across: a row appears with the universe and parameters the worker was configured
+with, and "a worker last started this" matches the runner's own session-open log
+line. Restart again and only that timestamp moves.
+**Not yet shown** — @claude. Proposed because no line above distinguishes a
+strategy that exists from one that has run, which is the single thing this
+screen is for.
 
 *Verifiable (stored book, proposed):* with a worker trading paper, stop the
 worker. The dashboard correctly reports no book published; the `/positions` tab

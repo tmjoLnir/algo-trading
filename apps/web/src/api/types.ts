@@ -87,3 +87,11 @@ export type OrdersResponse = Schemas['OrdersResponse']
  * `atp_core.dashboard` expressions; what differs is the source and the age.
  */
 export type StoredBookView = Schemas['StoredBookView']
+
+/**
+ * Strategies (`/strategies`) — the stored rows and the registered classes in
+ * one response, because the useful fact is the difference between them.
+ */
+export type StoredStrategyView = Schemas['StoredStrategyView']
+export type AvailableStrategyView = Schemas['AvailableStrategyView']
+export type StrategiesResponse = Schemas['StrategiesResponse']

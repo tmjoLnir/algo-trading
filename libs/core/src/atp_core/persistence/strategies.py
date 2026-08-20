@@ -26,7 +26,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from atp_core.logging import get_logger
 from atp_core.persistence.db import session_scope
 from atp_core.persistence.models import StrategyRow
-from atp_core.strategy.ports import StrategyRecord
+from atp_core.strategy.ports import StoredStrategy, StrategyRecord
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -85,6 +85,48 @@ class PostgresStrategyRepository:
                 await session.execute(select(StrategyRow).where(StrategyRow.id == strategy_id))
             ).scalar_one_or_none()
         return None if row is None else _to_record(row)
+
+    async def list_all(self, *, state: str | None = None) -> list[StoredStrategy]:
+        """Every stored strategy, newest first.
+
+        Ordered by `created_at` descending with the id as a tie-break, so the
+        list is stable: two strategies a worker registered in the same
+        microsecond on first boot would otherwise swap places between reads.
+
+        `created_at` rather than `updated_at`, even though the latter is the
+        livelier column. `updated_at` moves on every worker boot, so ordering by
+        it would reshuffle the whole screen each morning — the reader's mental
+        map of a short list is worth more than putting the most recently booted
+        strategy on top, and the timestamp is a column they can read.
+        """
+        query = select(StrategyRow)
+        if state is not None:
+            query = query.where(StrategyRow.state == state)
+        query = query.order_by(StrategyRow.created_at.desc(), StrategyRow.id.desc())
+
+        async with session_scope(self._session_factory) as session:
+            rows = (await session.execute(query)).scalars().all()
+        return [_to_stored(row) for row in rows]
+
+
+def _to_stored(row: StrategyRow) -> StoredStrategy:
+    """The whole row. See `StoredStrategy` for what `state` and `updated_at`
+    actually mean, both of which are narrower than their names."""
+    return StoredStrategy(
+        id=row.id,
+        name=row.name,
+        description=row.description or "",
+        kind=row.kind,
+        class_name=row.class_name,
+        params=dict(row.params or {}),
+        ruleset=dict(row.ruleset) if row.ruleset else None,
+        state=row.state,
+        universe=tuple(row.universe or ()),
+        timeframe=row.timeframe,
+        risk_config=dict(row.risk_config or {}),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
 
 
 def _to_record(row: StrategyRow) -> StrategyRecord:
