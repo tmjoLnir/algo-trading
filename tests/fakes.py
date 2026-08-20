@@ -252,6 +252,10 @@ class FakeOrderRepository:
         self.save_calls: list[str] = []
         #: Seeded by a test to stand for what a previous process stored.
         self.restorable: list[Order] = []
+        #: Seeded by a test to stand for the order table's whole history —
+        #: rejections included, which is what `recent_orders` exists to surface
+        #: and what `restorable` (non-terminal only) deliberately excludes.
+        self.history: list[Order] = []
 
     async def save(self, order: Order, *, run_mode: object) -> None:
         self.save_calls.append(order.client_order_id)
@@ -259,6 +263,35 @@ class FakeOrderRepository:
 
     async def open_orders(self, run_mode: object) -> list[Order]:
         return list(self.restorable)
+
+    async def recent_orders(
+        self,
+        run_mode: object,
+        *,
+        status: OrderStatus | None = None,
+        symbol: str | None = None,
+        strategy_id: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[Order]:
+        """The display read, over whatever `history` a test seeded.
+
+        Filters and sorts here rather than returning the list untouched, so a
+        test asserting on the *screen* is asserting against the same shape the
+        real repository produces — newest first, bounded, filters composed.
+        """
+        matched = [
+            order
+            for order in self.history
+            if (status is None or order.status is status)
+            and (symbol is None or order.symbol == symbol.upper())
+            and (strategy_id is None or order.strategy_id == strategy_id)
+            and (since is None or (order.created_at is not None and order.created_at >= since))
+        ]
+        matched.sort(
+            key=lambda o: (o.created_at or datetime.min.replace(tzinfo=UTC), o.id), reverse=True
+        )
+        return matched[:limit]
 
 
 class FakePortfolioRepository:

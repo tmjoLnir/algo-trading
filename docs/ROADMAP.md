@@ -1020,7 +1020,7 @@ wording if it is not the demonstration you want.
   first boot wrote. Each was verified by mutation — restoring the hardcoded
   `None` fails the first two, and a naive upsert fails the third.
 
-  **These endpoints have a screen now.** `/analytics` in the dashboard renders
+  **These endpoints have a screen now** (#63). `/analytics` in the dashboard renders
   all three — the metric set, the attribution breakdown with its dimension
   selector, and the closed-trade list with MAE/MFE — and it is a front-end
   change only: no handler, model or query was touched to put it there.
@@ -1053,6 +1053,42 @@ wording if it is not the demonstration you want.
   real database on fixtures. What has **not** been shown is any of it against a
   database holding a real strategy's history, which is what the proposed line
   asks for and what the paper week produces.
+- [ ] Order history endpoint and screen — @claude.
+  **An item this phase was missing.** Phase 5 tracked the live dashboard and the
+  analytics endpoints; the nav has seven tabs and nothing here covered the other
+  five. Added rather than folded into "React dashboard", which is about the live
+  book and has its own *Verifiable:* line.
+
+  `GET /api/v1/orders` and the `/orders` tab. The endpoint was one of four
+  routers whose every handler raised `NotImplementedError`; this builds the read
+  and leaves the writes alone, because a write places something and there is
+  exactly one path from an intent to a venue (rule §1.5, ADR 0005) — which is
+  also the path carrying the audit events ADR 0010 is waiting on. That ADR's
+  statement that the order-flow handlers are stubs is unchanged: a read is not
+  one of the verbs it names, and it decided against recording every request.
+
+  `OrderRepository` gained `recent_orders`, and its shape is the opposite of
+  `filled_orders` in two ways that are worth a reviewer's eye because the port's
+  own docstring warns against both. It is **newest-first**, where the other is
+  oldest-first so FIFO matching can pair an exit with its entry. It is
+  **bounded**, where the other refuses a limit because a truncated read of a
+  reconstruction does not get slower, it gets wrong. Neither applies to a
+  display: nothing here is matched against anything, and dropping the oldest
+  rows loses rows off the bottom of a screen rather than inverting the sign of a
+  P&L.
+
+  What it is for: **an order that was refused appears in no other read in this
+  platform.** It moved no quantity, so `filled_orders` excludes it, no round
+  trip contains it, the book never held it and the equity curve never moved for
+  it. A strategy refused every morning for a month was, from the dashboard and
+  from analytics alike, indistinguishable from one that never placed an order.
+
+  Unticked. The SQL is covered by seven integration tests against a real
+  PostgreSQL in CI, and the handler and screen by 12 API and 15 web tests — but
+  every row in all of them is a fixture. Nothing here has yet displayed an order
+  a *worker* placed and a real risk rule refused, which is what the line below
+  asks for.
+
 - [ ] Live-vs-backtest comparison.
   Half exists as of #58: `PerformanceAnalyzer.compare_to_backtest` computes the
   divergence metric by metric, live minus backtest, and is tested. The endpoint
@@ -1081,6 +1117,16 @@ requirement #7 asks for; the analytics items above will want their own, and
 "the dashboard renders" is deliberately not enough — the line asks for
 agreement between what the worker believes and what the screen says, which is
 the only property that makes the screen worth reading.
+
+*Verifiable (order history, proposed):* with a worker trading paper and a risk
+limit tightened enough to refuse something, the `/orders` tab shows that refusal
+— the right symbol, the rule that refused it, and the reason in words — beside
+the orders that did reach the venue, and the same order is absent from
+`/analytics/trades` and from the book. That absence is the point: it is what
+makes this screen the only place the refusal can be seen.
+**Not yet shown** — @claude. Proposed because neither line above reaches it: one
+is about the live book, the other about reconstruction, and a refused order is
+in neither by construction.
 
 *Verifiable (analytics, proposed):* after a paper week, `/analytics/trades`
 reconstructs every round trip the worker actually took — the count and the

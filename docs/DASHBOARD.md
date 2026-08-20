@@ -207,6 +207,49 @@ Two rules from this document reach it unchanged, and one is new:
   entry's UTC hour while every timestamp on the screen is local, and an
   unlabelled `14` invites a comparison between two clocks.
 
+## The orders page
+
+`/orders`, over `GET /api/v1/orders` — the order table, newest first, with
+filters for status, symbol, strategy and a start date.
+
+**It exists for the orders that never filled.** The dashboard's working-orders
+panel shows what is live at the venue right now, and `/analytics` shows round
+trips that completed. An order that was *refused* is in neither, and in nothing
+else either: it moved no quantity, so `filled_orders` excludes it by design, no
+reconstructed trade contains it, the book never held it and the equity curve
+never moved for it. Before this screen, a strategy whose every order was refused
+looked — from every other view in this platform — exactly like a strategy that
+never placed one. Those two call for opposite responses.
+
+That is also why the two refusals are worded apart rather than both saying
+"rejected". `rejected_risk` is our own engine declining to send an order, which
+is a limit doing its job. `rejected` is the venue declining one we sent, which is
+a problem with the account or the instrument. One bucket for both would hide
+which happened.
+
+Three things it refuses to do:
+
+- **A refusal with no recorded reason says so**, rather than rendering the dash
+  that means "nothing refused this order". The dash and the missing reason are
+  different facts and the second one is alarming; collapsing them into one glyph
+  states the opposite of the truth. Same family as the rule for signals — show
+  `reason` on every one, refused ones included.
+- **A partial fill is shown as a proportion**, filled against asked, not left to
+  the status word. `cancelled` covers an order that never traded and one that
+  filled 90% before the cancel landed, and those are different positions.
+- **A full page says it is full.** A list that stops at exactly the row limit
+  looks identical to a list that ended, and only one of them means "this is
+  everything".
+
+The page names the run mode the rows belong to, because paper and live orders
+share a table.
+
+**Only the read is built.** `POST /orders`, `DELETE /orders/{id}` and
+`/orders/cancel-all` are still stubs, and deliberately: they place things, and
+there is exactly one path from an intent to a venue (rule §1.5, ADR 0005). That
+path also carries the audit writes ADR 0010 is waiting on. A read needs none of
+it.
+
 ## Serving it
 
 Two ways, and they resolve the API identically on purpose.
@@ -336,15 +379,16 @@ remaining Phase 6 items are the difference — see docs/SAFETY.md.
 
 Stated here rather than left to be discovered:
 
-- **Four of the seven tabs are still stubs.** Strategies, Backtests, Positions
-  and Orders render "not yet implemented", and the reason is not the front end
-  in any of the four: `apps/api/src/atp_api/routers/` has `strategies.py`,
-  `backtests.py`, `positions.py` and `orders.py` raising `NotImplementedError`
-  in every handler. Analytics went first because it was the only one whose
-  server side was already built. Positions and Orders are the next two within
-  reach — the live book already carries both, and `PostgresOrderRepository`
-  already reads order history — while Backtests additionally needs a worker task
-  and a reader for `backtest_runs`.
+- **Three of the seven tabs are still stubs.** Strategies, Backtests and
+  Positions render "not yet implemented", and the reason is not the front end in
+  any of the three: `apps/api/src/atp_api/routers/` has `strategies.py`,
+  `backtests.py` and `positions.py` raising `NotImplementedError` in every
+  handler. Positions is the next within reach — the live book already carries
+  the positions themselves, so a read-only screen needs little, while its
+  *actions* (close a position, move a stop) are order flow and belong with the
+  write path. Strategies needs a reader on `PostgresStrategyRepository`, which
+  has only `ensure` and `get`. Backtests is furthest out: it additionally needs
+  a worker task and a reader for `backtest_runs`.
 - **The signal feed on *this screen* does not survive a restart**, though the
   signals themselves now do. The feed is still a bounded in-memory ring on the
   strategy runner, so a deploy empties what the dashboard shows;

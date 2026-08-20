@@ -156,6 +156,53 @@ class PostgresOrderRepository:
 
         return [self._to_order(row, fills_by_order.get(row.id, [])) for row in rows]
 
+    async def recent_orders(
+        self,
+        run_mode: RunMode,
+        *,
+        status: OrderStatus | None = None,
+        symbol: str | None = None,
+        strategy_id: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[Order]:
+        """Orders for display, newest first — see the port for why it is bounded.
+
+        Ordered by `created_at` descending with the id as a tie-break, so a page
+        is stable: two orders decided in the same microsecond would otherwise
+        swap places between two reads of the same data, and the row a person is
+        looking at would move under them.
+
+        `created_at` rather than `filled_at` or `submitted_at`, because those are
+        null on exactly the orders this read exists to surface. Sorting on either
+        would drop every rejection to the bottom of the list, or off the end of
+        it — a screen that hides refusals is the failure this is here to prevent.
+
+        The filters compose, and every one of them is applied in SQL rather than
+        after the limit: filtering the page would return the last hundred orders
+        that happen to be rejections, which is a different question from the
+        last hundred rejections and reads identically.
+        """
+        query = select(OrderRow).where(OrderRow.run_mode == run_mode.value)
+        if status is not None:
+            query = query.where(OrderRow.status == status.value)
+        if symbol is not None:
+            # Uppercase because a symbol is always an uppercase ticker
+            # (CLAUDE.md §4) and a filter typed in lower case finding nothing
+            # reads as "no such orders" rather than as "no such spelling".
+            query = query.where(OrderRow.symbol == symbol.upper())
+        if strategy_id is not None:
+            query = query.where(OrderRow.strategy_id == strategy_id)
+        if since is not None:
+            query = query.where(OrderRow.created_at >= since)
+        query = query.order_by(OrderRow.created_at.desc(), OrderRow.id.desc()).limit(limit)
+
+        async with session_scope(self._session_factory) as session:
+            rows = (await session.execute(query)).scalars().all()
+            fills_by_order = await self._fills_for(session, [row.id for row in rows])
+
+        return [self._to_order(row, fills_by_order.get(row.id, [])) for row in rows]
+
     @staticmethod
     async def _fills_for(session: AsyncSession, order_ids: list[str]) -> dict[str, list[FillRow]]:
         if not order_ids:
