@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MemoryRouter } from 'react-router-dom'
 import App from '../App'
+import { UNREACHABLE_RETRY_MS } from '../api/session'
 
 /**
  * What the app does before anyone is signed in.
@@ -291,5 +292,125 @@ describe('a refusal is not a logout', () => {
     renderApp()
 
     expect(await screen.findByRole('button', { name: /sign in/i })).toBeTruthy()
+  })
+})
+
+describe('an API that was not there yet', () => {
+  /**
+   * The gap between the dev server accepting requests and the API answering
+   * them, which `make up` produces on every cold start: `web` depends on `api`
+   * without waiting for it to be healthy, so the browser can load the dashboard
+   * and have its very first `/auth/me` refused at the socket.
+   *
+   * These render with the app's REAL retry rule. The helper above deliberately
+   * stubs it out to keep the other tests fast, and that is precisely why it
+   * could not see this: with `retry: false` forced globally, "retries" and
+   * "gives up instantly" look identical. `retryDelay: 0` is the only thing
+   * changed, so what is under test — whether it retries at all — is untouched.
+   */
+  function renderWithRealRetries() {
+    const queryClient = createQueryClient()
+    queryClient.setDefaultOptions({
+      queries: { ...queryClient.getDefaultOptions().queries, retryDelay: 0 },
+      mutations: { retry: false },
+    })
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <App />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+  }
+
+  /** A stub whose answers can change mid-test, as a restarting API's do. */
+  function mutableApi(routes: Record<string, { status: number; body?: unknown }>) {
+    const state = { routes, fail: false }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (state.fail) throw new TypeError('Failed to fetch')
+        const url = new URL(String(input), 'http://test').pathname
+        const route = state.routes[url] ?? { status: 404, body: { detail: 'not stubbed' } }
+        return {
+          ok: route.status < 400,
+          status: route.status,
+          statusText: 'stub',
+          json: async () => route.body ?? {},
+        } as Response
+      }),
+    )
+    return state
+  }
+
+  it('reaches the sign-in form when the first attempt is refused at the socket', async () => {
+    // One failure, then the API is up — the ordinary cold start. Before this
+    // was fixed the single failure was terminal and the operator was told the
+    // API could not be reached by a stack that was, by then, running.
+    let attempt = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        attempt += 1
+        if (attempt === 1) throw new TypeError('Failed to fetch')
+        return {
+          ok: false,
+          status: 401,
+          statusText: 'stub',
+          json: async () => ({ detail: 'not authenticated' }),
+        } as Response
+      }),
+    )
+
+    renderWithRealRetries()
+
+    expect(await screen.findByRole('button', { name: /sign in/i })).toBeTruthy()
+    expect(screen.queryByText(/cannot reach the api/i)).toBeNull()
+  })
+
+  it('recovers on its own once the API answers, with nobody touching the page', async () => {
+    // The promise the screen makes — "It will retry on its own" — asserted as
+    // behaviour. Nothing here refocuses the tab, reloads, or clicks: recovery
+    // has to come from the page itself or the sentence is not true.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      const api = mutableApi({
+        '/api/v1/auth/me': { status: 401, body: { detail: 'not authenticated' } },
+      })
+      api.fail = true
+
+      renderWithRealRetries()
+      expect(await screen.findByText(/cannot reach the api/i)).toBeTruthy()
+
+      // The API comes back. No interaction of any kind follows.
+      api.fail = false
+      await vi.advanceTimersByTimeAsync(UNREACHABLE_RETRY_MS + 500)
+
+      expect(await screen.findByRole('button', { name: /sign in/i })).toBeTruthy()
+      expect(screen.queryByText(/cannot reach the api/i)).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('stops polling once it has an answer', async () => {
+    // The other half of the rule. Recovery must not turn into a request every
+    // five seconds, forever, for every operator with the dashboard open.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      const fetchMock = stubApi({
+        '/api/v1/auth/me': { status: 401, body: { detail: 'not authenticated' } },
+        '/api/v1/auth/context': { status: 200, body: { run_mode: 'paper' } },
+      })
+      renderWithRealRetries()
+      await screen.findByRole('button', { name: /sign in/i })
+
+      const settled = fetchMock.mock.calls.length
+      await vi.advanceTimersByTimeAsync(UNREACHABLE_RETRY_MS * 4)
+
+      expect(fetchMock.mock.calls.length).toBe(settled)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

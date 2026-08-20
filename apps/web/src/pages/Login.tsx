@@ -23,7 +23,13 @@ function RunMode() {
   const { data } = useQuery({
     queryKey: ['pre-session-context'],
     queryFn: () => apiGet<PreSessionContext>('/api/v1/auth/context'),
-    retry: false,
+    // Inherits the client's retry rule rather than refusing to retry at all.
+    // A single blip here does not fail loudly — it renders NOTHING, because an
+    // unknown mode falls through to `return null` below — so the cost of not
+    // retrying is the one banner docs/DASHBOARD.md calls the most important
+    // pixel on the screen silently missing for the life of the page.
+    // `staleTime: Infinity` stays: once the mode is known it does not change
+    // under a page that is still loading.
     staleTime: Infinity,
   })
   if (!data?.run_mode) return null

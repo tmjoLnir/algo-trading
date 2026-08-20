@@ -15,6 +15,15 @@ import type { WhoAmI } from './types'
 export const SESSION_KEY = ['session'] as const
 
 /**
+ * How often to re-ask while the API is unreachable.
+ *
+ * Short enough that an operator who has just started the stack sees the login
+ * screen appear by itself rather than reaching for a reload, long enough that a
+ * dashboard left open against a dead API is not hammering it.
+ */
+export const UNREACHABLE_RETRY_MS = 5_000
+
+/**
  * The current session, or null when there is none.
  *
  * A 401 is an *answer*, not a failure: it means "nobody is logged in", which is
@@ -33,11 +42,33 @@ export function useSession() {
         throw error
       }
     },
-    // No retry: a 401 is settled, and retrying it three times only delays the
-    // login screen. `staleTime: 0` because the alternative is a cached "yes"
-    // outliving the session it describes.
-    retry: false,
+    // `retry` is deliberately NOT set here, and used to be `false`.
+    //
+    // The intent behind that was right and the reach was wrong: a 401 is
+    // settled, and retrying it delays the login screen for nothing. But the
+    // client's own default already refuses exactly that and retries everything
+    // else twice (`queryClient.ts`), so `false` here bought nothing for the 401
+    // and turned every *other* failure into a permanent one — including the
+    // connection refused that `make up` produces for the few seconds between
+    // the dev server accepting requests and the API being ready to answer them.
+    // One unlucky first paint and the gate below is stuck on "cannot reach the
+    // API" for the life of the page.
+    //
+    // `staleTime: 0` because the alternative is a cached "yes" outliving the
+    // session it describes.
     staleTime: 0,
+    // What makes "it will retry on its own" true.
+    //
+    // Retries cover a blip that resolves inside a couple of seconds; they do
+    // nothing for an API that comes back a minute later, and until this existed
+    // nothing did. The screen recovered only if the operator happened to
+    // refocus the tab or reload — so an API that fixed itself left a dashboard
+    // that did not, saying it would.
+    //
+    // Only while the answer is an error: polling a settled session every five
+    // seconds would be a request per operator per five seconds, forever, to
+    // re-learn something `staleTime: 0` already refreshes on demand.
+    refetchInterval: (query) => (query.state.error ? UNREACHABLE_RETRY_MS : false),
   })
 
   return {
