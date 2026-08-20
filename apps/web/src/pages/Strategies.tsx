@@ -26,10 +26,18 @@
  * stored backtest to require, and the audit trail's lifecycle verbs are unwired
  * (ADR 0010). A promote button that skipped the checks it could not perform
  * would be the ratchet with its pawl removed.
+ *
+ * **The risk limits live here too**, at the top, rather than on a Risk tab of
+ * their own. `docs/ROADMAP.md` describes `/risk/status` as "what a human checks
+ * before promoting to live", and this is the screen that promotion decision is
+ * made on — so "has this ever run" and "how much of the exposure ceiling is
+ * already spent" belong in one view rather than one nav click apart. The nav
+ * stays at seven tabs.
  */
 
 import { useState } from 'react'
 import { ApiError } from '@/api/client'
+import RiskLimitsPanel from '@/components/RiskLimitsPanel'
 import { STRATEGY_STATES, useStrategies } from '@/hooks/useStrategies'
 import { UNKNOWN, formatDateTime } from '@/lib/money'
 import type { AvailableStrategyView, StoredStrategyView } from '@/api/types'
@@ -178,21 +186,38 @@ export default function Strategies() {
   const available = query.data?.available ?? []
   const neverRun = query.data?.never_run ?? []
 
-  if (query.isLoading) return <p className="p-8 text-sm text-slate-400">Loading…</p>
+  // The risk panel is rendered on every branch below, including the two that
+  // give up on the strategy list. The limits are a separate request against a
+  // separate store, and a strategies query that failed says nothing about
+  // whether the book can be read — blanking the whole page for it would hide a
+  // working answer behind an unrelated failure.
+  if (query.isLoading) {
+    return (
+      <div className="space-y-4">
+        <RiskLimitsPanel />
+        <p className="p-8 text-sm text-slate-400">Loading…</p>
+      </div>
+    )
+  }
 
   if (query.error) {
     return (
-      <p className="p-8 text-sm text-amber-400">
-        Could not load the strategies.
-        <span className="mt-1 block text-xs text-amber-200/70">
-          {query.error instanceof ApiError ? query.error.detail : String(query.error)}
-        </span>
-      </p>
+      <div className="space-y-4">
+        <RiskLimitsPanel />
+        <p className="p-8 text-sm text-amber-400">
+          Could not load the strategies.
+          <span className="mt-1 block text-xs text-amber-200/70">
+            {query.error instanceof ApiError ? query.error.detail : String(query.error)}
+          </span>
+        </p>
+      </div>
     )
   }
 
   return (
     <div className="space-y-4">
+      <RiskLimitsPanel />
+
       {neverRun.length > 0 ? (
         // The answer to "I wrote a strategy and nothing is happening", which
         // no other screen in this UI could give.

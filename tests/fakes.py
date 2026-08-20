@@ -224,6 +224,11 @@ class FakeKillSwitch:
         #: One 4-tuple per *call*, including calls that found a halt already in
         #: force. Kept as a tuple because tests index it positionally.
         self.engagements: list[tuple[str, str, str, str]] = []
+        #: One 3-tuple per `clear` call — (scope, cleared_by, target). Separate
+        #: from `engagements` because the property tests care about here is who
+        #: the *resume* was attributed to, which is the session's user and never
+        #: a field the request supplied.
+        self.clears: list[tuple[str, str, str | None]] = []
         #: What `active_halts` reports. Seeded by a test that needs the halt
         #: banner to have something to render; the engagement list above is a
         #: record of calls rather than of state, and the two are separate
@@ -268,9 +273,17 @@ class FakeKillSwitch:
         self._records[key] = record
         return record
 
-    def clear(self, scope: object, cleared_by: str, target: str | None = None) -> None:
+    def clear(self, scope: object, cleared_by: str, target: str | None = None) -> HaltRecord | None:
+        """Removes and returns the halt in force, mirroring `RedisKillSwitch`.
+
+        Returning `None` when nothing was engaged is the half that carries
+        weight: `/risk/resume` reports "nothing was halted" from exactly that,
+        and a fake that handed back a record either way would let the endpoint
+        pass a test it fails against Redis.
+        """
+        self.clears.append((str(scope), cleared_by, target))
         self.engaged = False
-        self._records.pop((str(scope), target), None)
+        return self._records.pop((str(scope), target), None)
 
     def active_halts(self) -> list[object]:
         return list(self.halts)
@@ -378,7 +391,7 @@ class FakePortfolioRepository:
     ) -> list[EquityPoint]:
         """Whatever a test seeded, filtered to the window.
 
-        The filtering is real rather than a pass-through: `dashboard._day_pnl`
+        The filtering is real rather than a pass-through: `dashboard.day_pnl_since_open`
         takes the *first* point in the range as the day's anchor, so a fake that
         ignored `start` would hand back a point from before the session opened
         and make the assertion pass for the wrong reason.

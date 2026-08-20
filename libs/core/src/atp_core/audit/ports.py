@@ -101,6 +101,24 @@ class Action:
     #: themselves through alerts and `risk.killswitch.engaged` instead. So an
     #: absent row means "not halted *from the dashboard*", never "not halted".
     HALT_ENGAGED = "halt_engaged"
+    #: Trading resumed from the API. The counterpart to `HALT_ENGAGED`, and the
+    #: reason the pair is worth having: a halt with no clear beside it is still
+    #: in force, so "when did we start trading again" is answerable only if the
+    #: resume is recorded too. Written *after* the switch is cleared, for the
+    #: inverse of the reason the halt row is — an entry claiming trading resumed
+    #: when it did not would have someone stop looking for the thing still
+    #: stopping it.
+    #:
+    #: Recorded even when the clear removed nothing. That case is not a
+    #: no-op worth dropping: someone with the password decided the platform
+    #: should be trading, and if it was not halted then whatever they were
+    #: reacting to was somewhere else. `detail["was_halted"]` tells the two
+    #: apart.
+    #:
+    #: Carries the same blind spot as `HALT_ENGAGED` and inherits it from the
+    #: same place: `scripts/halt.py clear` writes no row, so an absent entry
+    #: means "not resumed *from the dashboard*", never "still halted".
+    HALT_CLEARED = "halt_cleared"
 
 
 class AuditSink(Protocol):

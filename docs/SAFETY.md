@@ -163,10 +163,17 @@ because otherwise the guess that happens to be right is the one that gets
 through. `/risk/halt` is never rate limited, whatever is added later.
 
 The audit trail lives in `audit_log` and is on the dashboard's **Audit** page.
-It records signing in and out, failed attempts, lockouts, and actions refused to
-a read-only session. It does **not** yet record order flow or kill-switch
-changes: those handlers are stubs, and a write behind a stub is dead code. Both
-halves: ADR 0010.
+It records signing in and out, failed attempts, lockouts, actions refused to a
+read-only session, and both halves of the kill switch — `halt_engaged` and
+`halt_cleared` — for halts engaged and cleared **through the API**. A failed
+step-up is recorded too, as `forbidden` with `step_up_failed`: a wrong password
+against `/resume` is either a typo or somebody working through guesses with a
+stolen cookie, and the rate limiter only ever counted attempts at the login
+form. It does **not** yet record order flow or strategy-lifecycle changes: those
+handlers are stubs, and a write behind a stub is dead code. Nor does it see
+halts from `scripts/halt.py` or from the risk layer's own triggers, which have
+no session to attribute a row to — so an absent row means "not done from the
+dashboard", never "not done". Both halves: ADR 0010.
 
 **Still missing, and still Phase 6:** sessions cannot be revoked before they
 expire. Do not read "the API authenticates, authorises and records" as "this is

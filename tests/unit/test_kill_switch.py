@@ -174,6 +174,49 @@ class TestEngageAndClear:
         ks, _ = switch()
         ks.clear(HaltScope.GLOBAL, cleared_by="alice")
 
+    def test_clearing_returns_the_halt_it_removed(self) -> None:
+        """The record, not an acknowledgement.
+
+        `/risk/resume` reports what was cleared from this, and the fields that
+        matter are the *original* halt's: an operator who has just resumed wants
+        to see the reason they overrode, and if it names the risk layer rather
+        than themselves they have just cancelled a decision a machine made.
+        """
+        ks, _ = switch()
+        engaged = ks.engage(HaltScope.GLOBAL, HaltReason.DAILY_LOSS_LIMIT, "risk", detail="-3.2%")
+
+        cleared = ks.clear(HaltScope.GLOBAL, cleared_by="alice")
+
+        assert cleared == engaged
+        assert cleared is not None
+        assert cleared.engaged_by == "risk", "the clearer is not the engager"
+        assert cleared.reason is HaltReason.DAILY_LOSS_LIMIT
+
+    def test_clearing_nothing_returns_none(self) -> None:
+        """The half that carries the weight.
+
+        "Resumed trading" and "there was nothing to resume" are both successes
+        and read completely differently on a screen, and this is the only thing
+        that separates them — `clear` refuses to treat the second as an error,
+        so a caller cannot learn it from an exception.
+        """
+        ks, _ = switch()
+
+        assert ks.clear(HaltScope.GLOBAL, cleared_by="alice") is None
+
+    def test_clearing_a_target_that_is_not_halted_returns_none(self) -> None:
+        """Keyed on the pair, so a near miss is a miss.
+
+        Clearing SPY while QQQ is the halted one resumes nothing, and has to say
+        so: an operator told "resumed" here would walk away from a symbol that
+        is still stopped.
+        """
+        ks, _ = switch()
+        ks.engage(HaltScope.SYMBOL, HaltReason.DATA_FEED_LOST, "worker", target="QQQ")
+
+        assert ks.clear(HaltScope.SYMBOL, cleared_by="alice", target="SPY") is None
+        assert ks.is_engaged("any", "QQQ"), "the halt that was not named must stand"
+
 
 class TestActiveHalts:
     def test_lists_every_scope(self) -> None:

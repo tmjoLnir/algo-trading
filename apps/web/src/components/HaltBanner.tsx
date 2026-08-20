@@ -19,6 +19,7 @@
 
 import { formatDateTime } from '@/lib/money'
 import { useLiveDashboard } from '@/hooks/useLiveDashboard'
+import ResumeButton from '@/components/ResumeButton'
 import type { HaltView } from '@/api/types'
 
 const SCOPE_LABEL: Record<string, string> = {
@@ -50,11 +51,12 @@ export default function HaltBanner() {
           <span className="ml-auto text-xs text-rose-400/80">
             by {halt.engaged_by} at {formatDateTime(halt.engaged_at)}
           </span>
+          <ResumeButton halt={halt} />
         </div>
       ))}
       <p className="px-4 pb-2 text-xs text-rose-400/70">
-        Clearing a halt is deliberate and needs a named human — see docs/RUNBOOK.md. Reconcile
-        before you clear.
+        Clearing a halt is deliberate and needs the account password — see docs/RUNBOOK.md.
+        Reconcile before you clear.
       </p>
     </div>
   )

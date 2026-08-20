@@ -76,8 +76,20 @@ class KillSwitch(Protocol):
         """Halt immediately. Idempotent — re-engaging an active halt is fine."""
         ...
 
-    def clear(self, scope: HaltScope, cleared_by: str, target: str | None = None) -> None:
-        """Resume. Requires a named human; always audit-logged."""
+    def clear(
+        self, scope: HaltScope, cleared_by: str, target: str | None = None
+    ) -> HaltRecord | None:
+        """Resume. Requires a named human; always audit-logged.
+
+        Returns the halt this call removed, or `None` if nothing was engaged for
+        this scope and target. Symmetric with `engage` returning the record in
+        force, and for the same reason: there is no other race-free way for a
+        caller to tell "I resumed trading" from "there was nothing to resume".
+        Reading `active_halts` first would be two round trips with a gap in the
+        middle, and the answer it gave could be wrong by the time the delete
+        lands — which is the difference between an operator being told they
+        restarted the platform and being told they did not.
+        """
         ...
 
     def active_halts(self) -> list[HaltRecord]:
@@ -229,13 +241,19 @@ class RedisKillSwitch:
         self._alert_engaged(record)
         return record
 
-    def clear(self, scope: HaltScope, cleared_by: str, target: str | None = None) -> None:
+    def clear(
+        self, scope: HaltScope, cleared_by: str, target: str | None = None
+    ) -> HaltRecord | None:
         """Resume. Requires a named human; always audit-logged.
 
         The asymmetry with `engage` is the point: stopping should be reflexive,
         restarting should not. An empty `cleared_by` is refused because "who
         decided it was safe to trade again" is the one question anyone asks
         afterwards, and an automated caller passing "" would answer it "nobody".
+
+        Returns the halt that was removed, or `None` when there was nothing to
+        remove — see `KillSwitch.clear` for why the caller has to be told which
+        of the two happened.
         """
         if not cleared_by.strip():
             raise ValueError(
@@ -243,26 +261,33 @@ class RedisKillSwitch:
             )
 
         key = self._key(scope, target)
-        record = _sync(self._client.get(key))
+        raw = _sync(self._client.get(key))
         removed = bool(self._client.delete(key))
+        record = _decode(raw) if raw is not None else None
         log.critical(
             "risk.killswitch.cleared",
             scope=scope.value,
             target=target,
             cleared_by=cleared_by,
             was_engaged=removed,
-            original=_decode(record).engaged_by if record is not None else None,
+            original=record.engaged_by if record is not None else None,
         )
         if removed:
             metrics.halt_cleared(scope)
             self._announce(
                 "cleared",
-                _decode(record) if record is not None else None,
+                record,
                 scope=scope,
                 target=target,
                 actor=cleared_by,
             )
             self._alert_cleared(scope, target, cleared_by)
+            return record
+        # `removed` is the authority, not `raw`. The two disagree when the key
+        # expired or another caller cleared it between the GET and the DELETE,
+        # and in that window this call did not resume anything — returning the
+        # record anyway would credit this operator with someone else's decision.
+        return None
 
     def _alert_engaged(self, record: HaltRecord) -> None:
         """Tell a human trading stopped. Reached only by a *new* halt.

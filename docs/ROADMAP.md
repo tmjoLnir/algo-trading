@@ -441,8 +441,32 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   control that looked live and returned a 500. Closed by #70, which is not
   ticked anywhere on purpose: it is covered by unit tests against a fake switch
   and has never engaged a halt in a real Redis from a real browser, which is the
-  demonstration this file asks for. Clearing from the UI is still not built —
-  `/risk/resume` wants a step-up password no screen asks for.
+  demonstration this file asks for. Clearing from the UI was still not built at
+  that point — `/risk/resume` was a stub wanting a step-up password no screen
+  asked for. It is built now (#75), with the same caveat and for the same
+  reason: fakes and an ASGI transport, never a real Redis from a real browser.
+
+  **The read half followed in the same PR.** `/risk/limits` serves the
+  configured ceilings from config alone — no store, so it answers during the
+  incident when an operator most wants to know what the limits are — and
+  `/risk/status` reports usage against each of them from the worker's published
+  book, mirroring every rule's own comparison including the boundaries the
+  rules deliberately disagree on. Both are read by a panel on the **Strategies**
+  tab rather than by a Risk tab of their own: `/status` is what a person checks
+  before promoting a strategy, so it belongs on the screen that decision is made
+  on, and the nav stays at seven tabs. `/limits` is fetched only when `/status`
+  has failed, which is the case it exists for — it touches no store, so the
+  ceilings still render when the book cannot be read.
+
+  One limit is reported as **structurally unobservable** rather than as a
+  number, and it is worth recording why here because the same shape blocks the
+  daily report below. `RateLimitRule` keeps its window in the worker's own
+  process and counts orders on the *attempt*, before the rules after it vote —
+  and a refused attempt is never persisted as an order, because
+  `runner._persist` walks the open-order set that a refusal never enters. Its
+  record is a **signal** instead. So a rate taken from the `orders` table would
+  read as calm during precisely the runaway the limit exists to catch, and
+  understating it is the direction that makes a breached limit look compliant.
 
 **Before any live order path exists.** Not after.
 
@@ -1483,11 +1507,17 @@ has met a database holding a real strategy's history.
   are still `NotImplementedError` stubs and a write behind a stub is dead code.
   They land with their handlers, which is exactly how the first of them arrived:
   `halt_engaged` was added by #70 alongside the endpoint that emits it, so
-  "who stopped trading" is answerable for halts engaged through the API. Halts
-  from `scripts/halt.py` and from the risk layer's own triggers are still absent
-  from the record, and attributing those needs an identity the record can stand
-  behind rather than another constant. The table's docstring is still the
-  optimistic document and this item is the honest one.
+  "who stopped trading" is answerable for halts engaged through the API.
+  `halt_cleared` followed the same way (#75) — a halt with no clear beside it is
+  still in force, so the pair is what makes "when did we start again" answerable
+  at all — and the same change closed a gap the record had been claiming to
+  cover since ADR 0009: a failed step-up now writes `forbidden` with
+  `step_up_failed`, where before a wrong password on `/resume` or
+  `/flatten-all` left no trace anywhere. Halts from `scripts/halt.py` and from
+  the risk layer's own triggers are still absent from the record, and
+  attributing those needs an identity the record can stand behind rather than
+  another constant. The table's docstring is still the optimistic document and
+  this item is the honest one.
 
   Two rules the design turns on. A failed audit *write* never fails the action —
   the actions worth auditing include halting trading, and refusing to stop
@@ -2103,8 +2133,9 @@ a route added later is refused by default and it is *adding one to the exception
 list* that this notices. The exception itself is pinned separately, along with
 the halt/resume asymmetry. Step-up is checked at all three outcomes: refused by
 the schema with no password, 403 with the wrong one, past the gate with the
-right one — "past the gate" being a 500 into a stub, which is the honest
-assertion while the handler is unbuilt.
+right one. "Past the gate" was a 500 into a stub when this was written, which
+was the honest assertion while the handler was unbuilt; `/risk/resume` is
+implemented as of #75 and the assertion is now the 200 it actually answers.
 
 Then driven in a real browser through the real nginx config: the read-only badge
 renders, `/dashboard/live` returns 200, `/risk/halt` is not refused, `/orders`

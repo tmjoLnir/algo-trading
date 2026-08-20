@@ -31,9 +31,11 @@ from atp_api.auth import (
     signing_key,
     verify_password,
 )
-from atp_api.deps import get_current_session
+from atp_api.deps import get_audit_sink, get_clock, get_current_session, get_kill_switch
 from atp_api.main import create_app
+from atp_core.clock import SimulatedClock
 from atp_core.config import Settings, get_settings
+from tests.fakes import FakeKillSwitch
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=UTC)
 PASSWORD = "a-perfectly-ordinary-password"
@@ -247,6 +249,23 @@ class TestScopes:
         assert session.scope is Scope.READ
 
 
+class _DiscardingAuditSink:
+    """An `AuditSink` that keeps nothing.
+
+    These cases are about the gate, not the record — `test_risk_api.py` owns
+    what gets written. This exists so the routes have a sink at all.
+    """
+
+    def __call__(self) -> _DiscardingAuditSink:
+        return self
+
+    async def record(self, entry: object) -> None:
+        return None
+
+    async def recent(self, *args: object, **kwargs: object) -> list[object]:
+        return []
+
+
 class TestStepUp:
     """Re-presenting the password for the two acts that cannot be undone."""
 
@@ -255,6 +274,15 @@ class TestStepUp:
         app = create_app()
         app.dependency_overrides[get_settings] = lambda: settings
         app.dependency_overrides[get_current_session] = lambda: Session("operator", Scope.FULL)
+        # The switch, the clock and the sink are fakes rather than absent, and
+        # they have to be here even though nothing below asserts on them.
+        # FastAPI resolves a route's dependencies before it reports a body
+        # violation, so an app with no Redis behind it answers 503 to *every*
+        # request on these routes — including the malformed ones — and a test
+        # that meant to pin the gate would be pinning the missing store.
+        app.dependency_overrides[get_kill_switch] = lambda: FakeKillSwitch()
+        app.dependency_overrides[get_clock] = lambda: SimulatedClock(NOW)
+        app.dependency_overrides[get_audit_sink] = _DiscardingAuditSink()
         return httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
             base_url="http://test",
@@ -275,15 +303,15 @@ class TestStepUp:
     async def test_resume_with_the_right_password_passes_the_gate(self) -> None:
         """A valid session and the password get through to the handler.
 
-        The handler is still a stub, so "through" is a 500 rather than a 200 —
-        which is the honest assertion to make here. A test expecting 200 would
-        be testing an implementation that does not exist yet.
+        This asserted `!= 403` against a stub that answered 500, because a test
+        expecting 200 would have been testing an implementation that did not
+        exist. It does now, so the assertion is the real one.
         """
         async with self.client(settings_for()) as client:
             response = await client.post(
                 "/api/v1/risk/resume", json={"scope": "global", "password": PASSWORD}
             )
-        assert response.status_code != 403
+        assert response.status_code == 200
 
     async def test_flatten_all_needs_the_password_as_well_as_the_phrase(self) -> None:
         """Both proofs, not either.
