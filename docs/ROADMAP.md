@@ -1240,8 +1240,8 @@ wording if it is not the demonstration you want.
   phase's *Verifiable:* line asks of a screen and what the proposed line below
   asks of the numbers.
 
-- [ ] Live-vs-backtest comparison.
-  Built as of #PRNUM: `GET /analytics/live-vs-backtest/{run_id}` serves the live
+- [ ] Live-vs-backtest comparison — @claude.
+  Built as of #68: `GET /analytics/live-vs-backtest/{run_id}` serves the live
   metric set, the stored backtest's, the divergence between them, and the reasons
   not to read that divergence as performance.
 
