@@ -8,19 +8,31 @@ during the incident.
 **HALT.** Diagnose second — a halt costs missed opportunity; hesitation costs
 money.
 
-> **The dashboard button does not exist yet.** It is Phase 5, and
-> `POST /api/v1/risk/halt` still raises `NotImplementedError`. Until both land,
-> the halt is a command:
+> **Two ways, and either is fine.** `HALT TRADING` on the dashboard, top right,
+> which asks nothing further and stops everything; or the command, which is the
+> one that still works when the dashboard does not:
 >
 > ```bash
 > uv run python scripts/halt.py engage --by "<your name>" --detail "why"
 > ```
 >
-> Run it before you need it once, so the first time is not during an incident.
-> `scripts/halt.py status` says what is halted and exits 2 when anything is;
-> `clear --by <name>` resumes. Stopping the worker
-> (`docker compose stop worker`) is **not** the same thing: it leaves other
-> processes free to trade and deliberately does not halt.
+> Run the command once before you need it, so the first time is not during an
+> incident — and because it is what you fall back to when the page will not
+> load.
+>
+> **Clearing is only the command.** `clear --by <name>` resumes; there is no
+> button, deliberately — stopping is reflexive, restarting is a decision, and
+> `POST /risk/resume` demands the account password that no screen asks for yet.
+> `scripts/halt.py status` says what is halted and exits 2 when anything is.
+>
+> Stopping the worker (`docker compose stop worker`) is **not** the same thing:
+> it leaves other processes free to trade and deliberately does not halt.
+>
+> If the button reports that the halt was **not recorded**, believe it and read
+> the message: the switch fails closed, so nothing is trading while the store is
+> unreachable, but nothing was written either — trading resumes on its own when
+> the store recovers. Halt again once it is back, or stop the worker meanwhile,
+> and confirm with `scripts/halt.py status`.
 >
 > `scripts/status.py` is the read-only companion — halts, quote freshness, the
 > latest stored bars, and the venue's account, positions and working orders.

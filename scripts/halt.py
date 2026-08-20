@@ -5,11 +5,23 @@
     uv run python scripts/halt.py status
     uv run python scripts/halt.py clear --by jo
 
-This is docs/SAFETY.md's layer 6 with a handle on it. Until the dashboard
-exists (Phase 5) and `POST /api/v1/risk/halt` stops raising
-`NotImplementedError`, this is the *only* operator path to the kill switch —
-docs/FIRST_PAPER_RUN.md says to have it ready before placing an order rather
-than after.
+This is docs/SAFETY.md's layer 6 with a handle on it. The dashboard's
+`HALT TRADING` button now engages the same switch through
+`POST /api/v1/risk/halt`, so this is no longer the only way to *stop* — but it
+is still the one that works when the API or the page does not, which is a state
+worth being able to act from. docs/FIRST_PAPER_RUN.md says to have it ready
+before placing an order rather than after.
+
+**Clearing is still only here.** `POST /api/v1/risk/resume` remains a stub and
+demands a step-up password no screen asks for yet, so `clear --by <name>` is the
+sole path back to trading. That asymmetry is the intended one (docs/RISK.md) —
+it is just enforced by what exists rather than by design, for now.
+
+Nothing this script does reaches the audit log. It has no session to attribute a
+row to, and inventing one would put a name in an append-only record that nothing
+authenticated. The halt is recorded by `risk.killswitch.engaged` in the logs and
+by the alert the switch sends; only halts engaged through the API appear on the
+audit tab.
 
 Deliberately thin. Every decision lives in `RedisKillSwitch`: the idempotence
 that keeps the original halt record, the refusal to clear without a named

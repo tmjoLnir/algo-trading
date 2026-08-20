@@ -878,7 +878,27 @@ export interface paths {
          * @description STOP TRADING. Takes effect immediately for all processes.
          *
          *     No confirmation step by design — hesitation is the expensive part. Clearing
-         *     it is the deliberate action (see below).
+         *     it is the deliberate action (see below), and a read-only session may still
+         *     call this one: `deps.READ_ONLY_MAY_CALL` names it, because the person
+         *     watching the book from a phone is exactly who most needs to stop it.
+         *
+         *     `engaged_by` is the session's user and never a field the caller supplies.
+         *     An actor a request can name is not an audit trail (`deps.get_current_user`).
+         *
+         *     Off the event loop, because the switch is synchronous — it has to be, since
+         *     the risk chain that consults it is — and this handler must not block every
+         *     other request on one Redis round trip. The dashboard's halt read does the
+         *     same for the same reason.
+         *
+         *     **A failure here is a 503 that says trading did not stay stopped**, which is
+         *     the opposite of what an operator would assume from a red error on a halt
+         *     button. `RedisKillSwitch.engage` deliberately does not swallow its
+         *     exceptions, and the reason the message has to be explicit is the interaction
+         *     with `is_engaged`, which fails *closed*: while Redis is unreachable nothing
+         *     trades, so the moment of the failure is genuinely safe. But nothing was
+         *     written, so trading resumes the instant Redis comes back. Reporting only
+         *     "could not halt" would leave a reader to guess which of those two states
+         *     they are in.
          */
         post: operations["engage_kill_switch_api_v1_risk_halt_post"];
         delete?: never;
@@ -1644,26 +1664,70 @@ export interface components {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
         };
-        /** HaltRequest */
+        /**
+         * HaltEngagedView
+         * @description The halt that is now in force — not necessarily the one just requested.
+         *
+         *     `engage` is idempotent and returns the *original* record when a halt is
+         *     already active, so these fields can name an earlier person and an earlier
+         *     time. That is the answer, not a bug in it: if `engaged_by` is not you, your
+         *     request changed nothing because trading was already stopped, and the record
+         *     of who stopped it first is the one worth keeping.
+         *
+         *     Deliberately not `dashboard.HaltView`, which is a row in an aggregate
+         *     describing the world. This answers one question about one request.
+         */
+        HaltEngagedView: {
+            /** Detail */
+            detail: string;
+            /**
+             * Engaged At
+             * Format: date-time
+             */
+            engaged_at: string;
+            /** Engaged By */
+            engaged_by: string;
+            /** Reason */
+            reason: string;
+            /** Scope */
+            scope: string;
+            /** Target */
+            target: string | null;
+        };
+        /**
+         * HaltReason
+         * @enum {string}
+         */
+        HaltReason: "manual" | "daily_loss_limit" | "reconciliation_mismatch" | "data_feed_lost" | "broker_unreachable" | "rate_limit_storm" | "unhandled_exception";
+        /**
+         * HaltRequest
+         * @description What to stop. Everything, by default.
+         *
+         *     `scope` and `reason` are the domain enums rather than bare strings, so an
+         *     unrecognised value is a 422 naming the ones that exist instead of a halt
+         *     recorded under a reason nothing will ever query for.
+         *
+         *     The defaults are the point of the whole endpoint: a client that knows only
+         *     "stop" sends `{}` and stops everything.
+         */
         HaltRequest: {
             /**
              * Detail
              * @default
              */
             detail: string;
-            /**
-             * Reason
-             * @default manual
-             */
-            reason: string;
-            /**
-             * Scope
-             * @default global
-             */
-            scope: string;
+            /** @default manual */
+            reason: components["schemas"]["HaltReason"];
+            /** @default global */
+            scope: components["schemas"]["HaltScope"];
             /** Target */
             target?: string | null;
         };
+        /**
+         * HaltScope
+         * @enum {string}
+         */
+        HaltScope: "global" | "strategy" | "symbol";
         /** HaltView */
         HaltView: {
             /** Detail */
@@ -3386,9 +3450,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["HaltEngagedView"];
                 };
             };
             /** @description Validation Error */
