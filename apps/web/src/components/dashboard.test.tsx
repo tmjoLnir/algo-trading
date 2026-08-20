@@ -162,9 +162,31 @@ describe('PositionsTable', () => {
   })
 
   it('says a position has no stop rather than implying it is safe', () => {
-    render(<PositionsTable positions={[{ ...POSITION, distance_to_stop_pct: null }]} />)
+    render(
+      <PositionsTable
+        positions={[{ ...POSITION, stop_loss_price: null, distance_to_stop_pct: null }]}
+      />,
+    )
 
     expect(screen.getByText('no stop')).toBeDefined()
+  })
+
+  it('does not call a position with a stop it cannot price "no stop"', () => {
+    // `distance_to_stop_pct` is null for two different reasons. Nothing
+    // protecting the position is one; a stop that exists beside a position
+    // nothing has priced is the other, and it is the more alarming of the two.
+    // Rendering the second as the first put the words "no stop" in the same row
+    // as a stop price — a contradiction on its face.
+    render(
+      <PositionsTable
+        positions={[
+          { ...POSITION, last_price: null, stop_loss_price: '90.00', distance_to_stop_pct: null },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText('stop set, unmarked')).toBeDefined()
+    expect(screen.queryByText('no stop')).toBeNull()
   })
 
   it('renders an unmarked position without inventing a value', () => {

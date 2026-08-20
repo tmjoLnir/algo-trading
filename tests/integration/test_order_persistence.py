@@ -347,6 +347,56 @@ class TestBookSnapshots:
         assert restored.cash == Decimal("9999")
 
     @pytest.mark.asyncio
+    async def test_the_stored_book_carries_the_instant_it_was_written(
+        self, book: PostgresPortfolioRepository
+    ) -> None:
+        """What `/positions` reports as the book's age.
+
+        The timestamp is the whole reason `latest_snapshot` exists beside
+        `latest`: a book read from a table can be hours old, and one served
+        without its age is a possibly-stale book presented as the current one.
+        """
+        await book.snapshot(self.a_portfolio(), at=T0, run_mode=RunMode.PAPER)
+        later = self.a_portfolio()
+        later.cash = Decimal("9999")
+        await book.snapshot(later, at=T0 + timedelta(minutes=1), run_mode=RunMode.PAPER)
+
+        stored = await book.latest_snapshot(RunMode.PAPER)
+
+        assert stored is not None
+        assert stored.at == T0 + timedelta(minutes=1)
+        assert stored.portfolio.cash == Decimal("9999")
+
+    @pytest.mark.asyncio
+    async def test_the_instant_is_the_whole_book_rather_than_its_newest_row(
+        self, book: PostgresPortfolioRepository
+    ) -> None:
+        """Every row of one snapshot shares a timestamp, so the age reported to
+        a reader is the age of the book and not of whichever row is freshest."""
+        portfolio = self.a_portfolio()
+        portfolio.positions["QQQ"] = Position(
+            symbol="QQQ",
+            qty=Decimal("50"),
+            avg_entry_price=Decimal("400"),
+            last_price=Decimal("400"),
+        )
+        await book.snapshot(portfolio, at=T0, run_mode=RunMode.PAPER)
+
+        stored = await book.latest_snapshot(RunMode.PAPER)
+
+        assert stored is not None
+        assert stored.at == T0
+        assert set(stored.portfolio.positions) == {"SPY", "QQQ"}
+
+    @pytest.mark.asyncio
+    async def test_nothing_stored_reads_as_none_with_no_instant(
+        self, book: PostgresPortfolioRepository
+    ) -> None:
+        """A first-ever boot. Distinct from an empty book that was written —
+        which has an instant and an account, and no rows."""
+        assert await book.latest_snapshot(RunMode.PAPER) is None
+
+    @pytest.mark.asyncio
     async def test_a_read_never_mixes_two_snapshots(
         self, book: PostgresPortfolioRepository
     ) -> None:

@@ -44,6 +44,22 @@ class EquityPoint:
     gross_exposure: Decimal
 
 
+@dataclass(frozen=True, slots=True)
+class StoredBook:
+    """A stored snapshot, and the instant the worker wrote it.
+
+    The timestamp is the reason this type exists rather than a bare `Portfolio`.
+    A book read from storage can be arbitrarily old — the worker may have
+    stopped an hour ago — and a book presented without its age is the failure
+    ADR 0007 exists to prevent, moved from a cache to a table. `latest` returns
+    the portfolio alone because its caller is a runner adopting its own last
+    state at boot, for which "when" is not a question. Any *reader* needs both.
+    """
+
+    at: datetime
+    portfolio: Portfolio
+
+
 class OrderRepository(Protocol):
     """Durable record of every order that reached, or tried to reach, a venue."""
 
@@ -156,6 +172,21 @@ class PortfolioRepository(Protocol):
         mean is "the read failed" — a failure raises, because a runner that
         silently adopted after a database outage would be doing exactly the
         thing this repository exists to stop.
+        """
+        ...
+
+    async def latest_snapshot(self, run_mode: RunMode) -> StoredBook | None:
+        """`latest`, with the instant it was written.
+
+        Two methods rather than one because they have different callers and only
+        one of them can act on the age. The runner calls `latest` at boot to
+        adopt its own last state, and how old that state is does not change what
+        it does — it reconciles against the broker either way. A *screen* reading
+        the same rows must say how old they are or it is presenting a possibly
+        stale book as the current one.
+
+        None means nothing was ever written, exactly as in `latest`. A failure
+        still raises.
         """
         ...
 

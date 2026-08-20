@@ -250,6 +250,56 @@ there is exactly one path from an intent to a venue (rule §1.5, ADR 0005). That
 path also carries the audit writes ADR 0010 is waiting on. A read needs none of
 it.
 
+## The positions page
+
+`/positions`, over `GET /api/v1/positions` — the book the worker last *wrote to
+Postgres*, with the age of that record.
+
+**The dashboard shows the same book from a different place, and the difference
+is the whole point.** The dashboard reads what the worker published to Redis;
+when the worker stops there is nothing to read, and it correctly reports no book
+at all. The same book is written to the snapshot tables at every evaluation, and
+that copy outlives the process. So this screen answers "what am I holding?" at
+the moment the live one cannot — which is usually the moment somebody is asking.
+
+That is **not** the recomputation ADR 0007 refuses. Nothing here adds a position
+up from orders and quotes; it is the worker's own computation, read back from
+the table the worker wrote it to. What it *is* is possibly old, and that changes
+what the screen owes the reader:
+
+- **The age leads.** It is the first thing on the page, not a footnote, and past
+  ten minutes — several missed evaluations — the whole header becomes a warning
+  telling the reader to treat the figures as history rather than as their
+  current exposure. A stored book rendered as though it were current would be
+  ADR 0007's failure moved from a cache to a table.
+- **Two ages, not one**, for the same reason the dashboard shows two: a tab that
+  refreshed a second ago against a worker that stopped an hour ago is fresh by
+  one measure and useless by the other.
+- **No live quotes.** The dashboard overlays socket ticks beside the mark. Here
+  every figure is as of one past instant, and a live price beside a P&L computed
+  hours ago would put two instants in one row.
+- **Never written is not empty.** A worker that has never traded has stored
+  nothing, and that reads as itself rather than as "you hold nothing" — the same
+  distinction the live endpoint makes.
+
+Every derived figure — market value, unrealised P&L, leverage, the
+distance-to-stop fraction — comes from `atp_core.dashboard`'s own
+`position_summary` and `account_summary`, the functions the live book is built
+from, and the rows are the same `PositionView` rendered by the same
+`PositionsTable`. One expression per figure, two screens: a distance-to-stop
+that disagreed between them would be a bug invisible from either.
+
+Day P&L is **absent** rather than zero. It is this equity against the session's
+first recorded one, which is a question about the equity history rather than
+about one snapshot, and the dashboard is where it is answered.
+
+**Only the read is built.** Closing a position and moving a stop both place
+orders — rule §1.5 again — so `POST /positions/{symbol}/close` and
+`PATCH /positions/{symbol}/stop` are still stubs. So is
+`GET /positions/{symbol}`, for a different reason: nothing consumes it. The
+screen reads the whole book in one request, and an endpoint built, tested and
+documented with no caller is the gap the analytics endpoints sat in for a phase.
+
 ## Serving it
 
 Two ways, and they resolve the API identically on purpose.
@@ -379,16 +429,19 @@ remaining Phase 6 items are the difference — see docs/SAFETY.md.
 
 Stated here rather than left to be discovered:
 
-- **Three of the seven tabs are still stubs.** Strategies, Backtests and
-  Positions render "not yet implemented", and the reason is not the front end in
-  any of the three: `apps/api/src/atp_api/routers/` has `strategies.py`,
-  `backtests.py` and `positions.py` raising `NotImplementedError` in every
-  handler. Positions is the next within reach — the live book already carries
-  the positions themselves, so a read-only screen needs little, while its
-  *actions* (close a position, move a stop) are order flow and belong with the
-  write path. Strategies needs a reader on `PostgresStrategyRepository`, which
-  has only `ensure` and `get`. Backtests is furthest out: it additionally needs
-  a worker task and a reader for `backtest_runs`.
+- **Two of the seven tabs are still stubs.** Strategies and Backtests render
+  "not yet implemented", and the reason is not the front end in either:
+  `apps/api/src/atp_api/routers/strategies.py` and `backtests.py` raise
+  `NotImplementedError` in every handler. Strategies needs a reader on
+  `PostgresStrategyRepository`, which has only `ensure` and `get`. Backtests is
+  furthest out: it additionally needs a worker task to run a queued backtest and
+  a reader for `backtest_runs`, which has neither — and until it does,
+  `/analytics/live-vs-backtest` has no second operand either.
+- **No screen places an order.** The three tabs that are built are all reads.
+  Every write handler across `orders.py` and `positions.py` is still a stub,
+  because they place things and there is one path from an intent to a venue
+  (rule §1.5, ADR 0005) — the path that also carries the audit events ADR 0010
+  is waiting on. The kill switch remains the only acting control in this UI.
 - **The signal feed on *this screen* does not survive a restart**, though the
   signals themselves now do. The feed is still a bounded in-memory ring on the
   strategy runner, so a deploy empties what the dashboard shows;

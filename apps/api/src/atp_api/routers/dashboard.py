@@ -56,7 +56,7 @@ from atp_api.deps import (
 )
 from atp_core.clock import Clock, TradingCalendar
 from atp_core.config import Settings, get_settings
-from atp_core.dashboard import LiveSnapshot, SnapshotStore
+from atp_core.dashboard import AccountSummary, LiveSnapshot, SnapshotStore
 from atp_core.dashboard.curve import (
     RESOLUTIONS,
     default_resolution_for,
@@ -382,10 +382,18 @@ async def _day_pnl(
     return day_pnl, pct
 
 
-def _account_view(
-    snapshot: LiveSnapshot, day_pnl: Decimal | None, day_pnl_pct: Decimal | None
+def account_view(
+    account: AccountSummary, day_pnl: Decimal | None, day_pnl_pct: Decimal | None
 ) -> AccountView:
-    account = snapshot.account
+    """`AccountSummary` as the wire model.
+
+    Takes the summary rather than the whole snapshot, so `/positions` can build
+    the same account block from the *stored* book. Day P&L stays a parameter
+    because it is not a property of any single book — it is this equity against
+    the session's first recorded one — and the two callers answer it
+    differently: the live screen computes it, the stored one passes None rather
+    than a zero a reader would act on.
+    """
     return AccountView(
         equity=account.equity,
         cash=account.cash,
@@ -466,7 +474,7 @@ async def get_live_dashboard(
         # dashboard rather than the clock skew it is.
         book_age_seconds=max(0, int((now - snapshot.as_of).total_seconds())),
         strategy=snapshot.strategy,
-        account=_account_view(snapshot, day_pnl, day_pnl_pct),
+        account=account_view(snapshot.account, day_pnl, day_pnl_pct),
         positions=[
             PositionView.model_validate(p, from_attributes=True) for p in snapshot.positions
         ],

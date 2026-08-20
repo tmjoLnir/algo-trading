@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 from atp_core.brokers.ports import AccountSnapshot
 from atp_core.domain import Fill, Order, OrderStatus, OrderType, Portfolio, Position
 from atp_core.errors import BrokerConnectionError, OrderRejectedError
+from atp_core.execution.ports import StoredBook
 
 if TYPE_CHECKING:
     from typing import Any
@@ -304,6 +305,9 @@ class FakePortfolioRepository:
     def __init__(self) -> None:
         self.snapshots: list[tuple[datetime, Portfolio]] = []
         self.stored: Portfolio | None = None
+        #: When `stored` was written. Seeded by a test that cares how stale the
+        #: book it is serving looks.
+        self.stored_at: datetime = datetime(2026, 1, 1, tzinfo=UTC)
         #: Seeded by a test to stand for the `equity_snapshots` history the day
         #: anchor and the dashboard's chart are both read from.
         self.equity_points: list[EquityPoint] = []
@@ -320,6 +324,18 @@ class FakePortfolioRepository:
 
     async def latest(self, run_mode: object) -> Portfolio | None:
         return self.stored
+
+    async def latest_snapshot(self, run_mode: object) -> StoredBook | None:
+        """`stored`, stamped with `stored_at`.
+
+        The timestamp is seeded separately so a test can age the book
+        deliberately — a stored book's age is the whole point of the read, and
+        a fake that always returned "just now" could not exercise the case that
+        matters, which is a worker that stopped hours ago.
+        """
+        if self.stored is None:
+            return None
+        return StoredBook(at=self.stored_at, portfolio=self.stored)
 
     async def equity_history(
         self, run_mode: object, *, start: datetime, end: datetime

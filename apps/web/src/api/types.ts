@@ -79,3 +79,11 @@ export type AttributionResponse = Schemas['AttributionResponse']
  */
 export type OrderHistoryView = Schemas['OrderHistoryView']
 export type OrdersResponse = Schemas['OrdersResponse']
+
+/**
+ * The stored book (`/positions`) — the copy the worker wrote to Postgres, as
+ * opposed to the one it published to Redis for `/dashboard/live`. Same
+ * `PositionView` rows, because both are built from the same
+ * `atp_core.dashboard` expressions; what differs is the source and the age.
+ */
+export type StoredBookView = Schemas['StoredBookView']

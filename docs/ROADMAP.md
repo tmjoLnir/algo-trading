@@ -1089,6 +1089,48 @@ wording if it is not the demonstration you want.
   a *worker* placed and a real risk rule refused, which is what the line below
   asks for.
 
+- [ ] Stored-book positions endpoint and screen — @claude.
+  `GET /api/v1/positions` and the `/positions` tab. Third of the five stub tabs,
+  after `/analytics` (#63) and `/orders` (#64), and the same posture: the read is
+  built and the writes are left alone.
+
+  **The decision worth reviewing is the source.** The dashboard reads the book
+  the worker publishes to Redis; when the worker stops, there is nothing to read
+  and `/dashboard/live` correctly reports no book. The same book is written to
+  `equity_snapshots` and `position_snapshots` at every evaluation, and that copy
+  survives the process — so this screen answers "what am I holding?" at the
+  moment the live one cannot, which is the moment it is asked.
+
+  That is not the recomputation ADR 0007 refuses, and the distinction is the
+  argument: nothing here adds a position up from orders and quotes. It is the
+  worker's own computation, read back from the table the worker wrote it to. The
+  cost is that the answer can be arbitrarily old, so `PortfolioRepository` gained
+  `latest_snapshot`, which returns the book *with the instant it was written*.
+  `latest` stays as it was and now delegates to it: its caller is a runner
+  adopting its own last state at boot, for which the age is not a question.
+
+  The age is therefore the first thing on the screen rather than a footnote, and
+  past ten minutes — several missed evaluations — the header becomes a warning.
+  A stored book rendered as though it were current would be ADR 0007's failure
+  moved from a cache to a table, by the screen built to avoid it.
+
+  Two pieces of reuse rather than reimplementation, and the second found a bug.
+  `atp_core.dashboard`'s `position_summary` and `account_summary` were made
+  public and are now the single source of every derived figure on both screens —
+  `_distance_to_stop`'s own docstring says writing it per side would be two
+  chances to get a sign wrong, and writing it per *screen* is the same mistake.
+  Reusing `PositionsTable` then surfaced a defect in it: `distance_to_stop_pct`
+  is null both when there is no stop and when there is a stop but no mark, and
+  the component rendered both as "no stop" — putting those words in the same row
+  as a stop price. The second case is the more alarming of the two and now says
+  so. A web test asserted the old behaviour and was corrected rather than
+  deleted.
+
+  Unticked. The stored-book path has three new integration tests against a real
+  PostgreSQL in CI and the endpoint and screen have 10 API and 11 web tests, but
+  every book in all of them is a fixture. Nothing here has yet shown a real
+  worker's book outliving the worker, which is what the line below asks for.
+
 - [ ] Live-vs-backtest comparison.
   Half exists as of #58: `PerformanceAnalyzer.compare_to_backtest` computes the
   divergence metric by metric, live minus backtest, and is tested. The endpoint
@@ -1117,6 +1159,16 @@ requirement #7 asks for; the analytics items above will want their own, and
 "the dashboard renders" is deliberately not enough — the line asks for
 agreement between what the worker believes and what the screen says, which is
 the only property that makes the screen worth reading.
+
+*Verifiable (stored book, proposed):* with a worker trading paper, stop the
+worker. The dashboard correctly reports no book published; the `/positions` tab
+still shows the positions, cash and equity the worker's own log reports for its
+final evaluation, and the age on it advances past the staleness threshold and
+turns the header into a warning. Restart the worker and the two screens agree
+again.
+**Not yet shown** — @claude. Proposed because this phase's line is about a
+browser agreeing with a *running* worker, and the property this screen exists
+for is what happens when there is not one.
 
 *Verifiable (order history, proposed):* with a worker trading paper and a risk
 limit tightened enough to refuse something, the `/orders` tab shows that refusal

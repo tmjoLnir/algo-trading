@@ -36,10 +36,28 @@ interface Props {
   quotes?: Record<string, LiveQuote>
 }
 
-/** Where a position sits between its entry and its stop, as a bar. */
-function StopGauge({ fraction }: { fraction: string | null }) {
+/**
+ * Where a position sits between its entry and its stop, as a bar.
+ *
+ * `distance_to_stop_pct` is null for two different reasons and they must not
+ * read the same. **No stop** means nothing is protecting this position. **No
+ * mark** means a stop exists and we cannot say how close price is to it,
+ * because nothing has priced the position — which is a row showing a stop price
+ * beside the words "no stop", i.e. a contradiction on its face. The second is
+ * the more alarming of the two and used to be rendered as the first.
+ */
+function StopGauge({ fraction, hasStop }: { fraction: string | null; hasStop: boolean }) {
   if (fraction === null) {
-    return <span className="text-xs text-slate-600">no stop</span>
+    return hasStop ? (
+      <span
+        className="text-xs text-amber-400/80"
+        title="A stop is set, but nothing has priced this position, so how close price is to it cannot be computed."
+      >
+        stop set, unmarked
+      </span>
+    ) : (
+      <span className="text-xs text-slate-600">no stop</span>
+    )
   }
   const value = Number(fraction) // geometry only — never a displayed figure
   const through = value < 0
@@ -154,7 +172,10 @@ export default function PositionsTable({ positions, quotes = {} }: Props) {
                       )}
                     </td>
                     <td className="px-3 py-2 text-left">
-                      <StopGauge fraction={position.distance_to_stop_pct} />
+                      <StopGauge
+                        fraction={position.distance_to_stop_pct}
+                        hasStop={position.stop_loss_price !== null}
+                      />
                     </td>
                     <td className="px-3 py-2 text-right tabular-nums text-slate-400">
                       {formatMoney(position.stop_loss_price)}
