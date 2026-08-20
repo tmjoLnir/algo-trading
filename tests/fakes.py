@@ -30,6 +30,7 @@ from atp_core.execution.ports import StoredBook
 if TYPE_CHECKING:
     from typing import Any
 
+    from atp_core.backtest.ports import BacktestProgress, StoredBacktestRun
     from atp_core.dashboard.snapshot import LiveSnapshot
     from atp_core.domain import Side, Signal
     from atp_core.execution.ports import EquityPoint
@@ -478,3 +479,141 @@ class FakePublisher:
 
     def on(self, channel: str) -> list[dict[str, Any]]:
         return [m for c, m in self.published if c == channel]
+
+
+class FakeBacktestRunRepository:
+    """In-memory `BacktestRunRepository`.
+
+    Mirrors the real adapter's one non-obvious behaviour: **every transition is
+    conditional on the run still being in flight.** `mark_running`, `finish` and
+    `fail` are no-ops against a run that is already `done` or `failed`, because
+    arq can redeliver a job whose worker died and the second delivery must not
+    overwrite a conclusion that has already been reached. A fake that let the
+    last writer win would pass tests the Postgres adapter fails.
+    """
+
+    def __init__(self) -> None:
+        self.runs: dict[str, StoredBacktestRun] = {}
+        #: Set by a test to stand for a database that refuses the insert — a
+        #: foreign key rejecting a strategy no worker has ever registered is the
+        #: realistic case, and the endpoint has to answer something better than
+        #: a constraint name.
+        self.create_error: Exception | None = None
+        #: Ids passed to `fail`, in order. The enqueue-failure path is the one
+        #: worth asserting on: a run nothing will execute must not be left
+        #: claiming to be queued.
+        self.failed: list[str] = []
+
+    async def create(self, run: StoredBacktestRun) -> None:
+        if self.create_error is not None:
+            raise self.create_error
+        if run.id in self.runs:
+            raise ValueError(f"duplicate backtest run id {run.id}")
+        self.runs[run.id] = run
+
+    def _in_flight(self, run_id: str) -> StoredBacktestRun | None:
+        run = self.runs.get(run_id)
+        return run if run is not None and run.is_in_flight else None
+
+    async def mark_running(self, run_id: str, *, at: datetime) -> None:
+        run = self._in_flight(run_id)
+        if run is not None:
+            self.runs[run_id] = replace(run, status="running", started_at=at, error=None)
+
+    async def finish(
+        self,
+        run_id: str,
+        *,
+        at: datetime,
+        metrics: dict[str, float],
+        equity_curve: list[list[str]],
+        trades: list[dict[str, object]],
+    ) -> None:
+        run = self._in_flight(run_id)
+        if run is not None:
+            self.runs[run_id] = replace(
+                run,
+                status="done",
+                metrics=metrics,
+                equity_curve=equity_curve,
+                trades=trades,
+                error=None,
+                finished_at=at,
+            )
+
+    async def fail(self, run_id: str, *, at: datetime, error: str) -> None:
+        run = self._in_flight(run_id)
+        if run is None:
+            return
+        self.failed.append(run_id)
+        # Results cleared, like the real adapter: a partial curve under a failed
+        # status is a chart of part of what somebody asked about, which is worse
+        # than no chart because it renders.
+        self.runs[run_id] = replace(
+            run,
+            status="failed",
+            error=error,
+            metrics=None,
+            equity_curve=None,
+            trades=None,
+            finished_at=at,
+        )
+
+    async def get(self, run_id: str) -> StoredBacktestRun | None:
+        return self.runs.get(run_id)
+
+    async def list_runs(
+        self, *, strategy_id: str | None = None, limit: int = 50
+    ) -> list[StoredBacktestRun]:
+        matched = [
+            run
+            for run in self.runs.values()
+            if strategy_id is None or run.spec.strategy_id == strategy_id
+        ]
+        matched.sort(key=lambda r: (r.queued_at, r.id), reverse=True)
+        return matched[:limit]
+
+    async def stale_running(self, *, older_than: datetime) -> list[str]:
+        return [
+            run.id
+            for run in self.runs.values()
+            if run.status == "running"
+            and run.started_at is not None
+            and run.started_at < older_than
+        ]
+
+
+class FakeBacktestQueue:
+    """In-memory `BacktestQueue`.
+
+    Two behaviours worth mirroring exactly, because tests turn on both:
+
+    - **`enqueue` is idempotent on the run id.** The real one derives arq's job
+      id from it, so a retried request cannot queue the same run twice. A fake
+      that appended twice would let a duplicate-submission bug pass.
+    - **`report` never raises.** Progress is a nicety and the real adapter
+      swallows a store that is unreachable; `report_error` here is what a test
+      sets to prove a run still completes when nothing can be published.
+    """
+
+    def __init__(self, *, enqueue_error: Exception | None = None) -> None:
+        self.enqueued: list[str] = []
+        self.enqueue_error = enqueue_error
+        self.progress_by_run: dict[str, BacktestProgress] = {}
+        self.reports: list[BacktestProgress] = []
+        self.report_error: Exception | None = None
+
+    async def enqueue(self, run_id: str) -> None:
+        if self.enqueue_error is not None:
+            raise self.enqueue_error
+        if run_id not in self.enqueued:
+            self.enqueued.append(run_id)
+
+    async def report(self, progress: BacktestProgress) -> None:
+        if self.report_error is not None:
+            return  # swallowed, exactly as the real adapter swallows it
+        self.reports.append(progress)
+        self.progress_by_run[progress.run_id] = progress
+
+    async def progress(self, run_id: str) -> BacktestProgress | None:
+        return self.progress_by_run.get(run_id)

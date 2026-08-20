@@ -340,13 +340,90 @@ report every active strategy as one nothing has ever loaded.
 
 **Only the read is built**, and here the reason is sharper than elsewhere.
 Create, edit, promote and pause are the promotion ratchet — draft → backtest →
-paper → live — and half its preconditions cannot be checked yet: `backtest_runs`
-has no reader, so "a completed backtest on record" is unanswerable, and the
-audit trail's lifecycle verbs are unwired (ADR 0010), so the entry naming a human
-cannot be written. An endpoint that promoted while silently skipping both would
+paper → live. One of its two missing preconditions is now available and the other
+is not: `backtest_runs` has a reader as of the backtests page, so "a completed
+backtest on record" is answerable, but the audit trail's lifecycle verbs are still
+unwired (ADR 0010), so the entry naming a human cannot be written. An endpoint that promoted while silently skipping both would
 be the ratchet with its pawl removed, which is worse than no endpoint.
 `GET /strategies/{id}` and `GET /strategies/available` also stay stubs: the list
 above already carries both, and nothing calls either.
+
+## The backtests page
+
+`/backtests`, over `POST /api/v1/backtests` and its four reads — the last of the
+seven tabs, and **the only screen in this app that starts work**. Everything else
+either reads something already computed or halts trading.
+
+It is also the only screen with a form, and most of that form's design is about
+staying out of the way of the server's validation:
+
+- **Money is typed as text.** `<input type="number">` hands back a JavaScript
+  number, and a starting cash that had been through IEEE 754 would propagate into
+  every figure the run reports. The API takes a decimal string.
+- **The dates are sent with an explicit `Z`.** A date input yields a bare
+  `YYYY-MM-DD`, and the API refuses a naive datetime at the boundary rather than
+  assuming a zone (rule §1.2).
+- **The server's refusal is shown verbatim.** The important one is missing
+  history: the API answers 400 with the exact `scripts/backfill_bars.py` command
+  that fixes it, and paraphrasing the one actionable message on this screen would
+  turn it into a dead end. Duplicating the server's rules here would give two
+  answers to one question, and the client's is the one that drifts.
+- **The zero-cost option is labelled with what it costs you.** docs/BACKTESTING.md
+  is unambiguous that a zero-cost result is not evidence about a strategy, so it
+  reads as that rather than as the quicker choice — and a run that used it is
+  flagged on its row, because it invalidates everything else on it.
+
+**It can only offer strategies a worker has actually run**, and that is the
+strategies page's gap met from the other side. `backtest_runs.strategy_id` is a
+foreign key onto `strategies`, a table the runner writes at its first session
+open — so a class that exists in the code and has never been loaded cannot be
+backtested. Offering it would produce a 409 for a choice this screen invited. The
+never-run names are listed outside the picker instead, with what to do about them.
+
+**A run has four states and each renders as itself.** A queued one says it is
+waiting rather than showing an elapsed time counted from a timestamp nobody
+wrote — `started_at` is genuinely null until a worker claims it. A running one
+shows a bar built from the server's own `fraction`, with the bar counts beside it,
+because a percentage alone cannot tell a slow run from one whose range turned out
+to hold forty bars; a running run that has not reported yet says so rather than
+showing 0%, which reads as stalled. A failed one shows its reason in words. A done
+one shows its headline figures.
+
+**This screen polls only while something is in flight.** Every other tab either
+polls on a fixed cadence or not at all; a backtest changes state within seconds
+and then never again, so the interval is derived from the data — once every run is
+terminal the timer stops entirely and a tab left open makes no requests. Same
+principle as not polling a hidden tab, on a different axis: do not ask a question
+whose answer cannot have changed.
+
+**The caveats are above the numbers, not below them.** A run's `warnings` come
+from the server — too few trades, an implausible Sharpe, in docs/BACKTESTING.md's
+own words — because a number a reader has already seen is a number they have
+already believed.
+
+The metric set goes through `src/lib/stats.ts`, not `money.ts`, including the five
+metrics denominated in account currency. `compute_all` computes those in float
+space, so the precision is gone before serialisation and formatting them with the
+ledger formatter would claim a precision the response does not carry; the panel
+says so in as many words. Everything on a *trade* — price, quantity, fee, P&L — is
+a decimal string and goes through `money.ts` untouched. The equity curve's single
+float conversion is `toChartNumber`, for geometry.
+
+**The trade table is what makes the page worth opening.**
+docs/BACKTESTING.md's pre-belief checklist asks for individual trades to be
+inspected for impossible fills, and nothing else in this platform can answer it —
+a metric set cannot show you the one fill that made the number. Exit reasons come
+from the order that closed each position, so a stop-out and a signal exit are told
+apart; that required the backtest engine to start setting `Order.purpose`, which
+it never had (ADR 0016).
+
+**Comparison marks no winner**, deliberately. Highlighting the best value per row
+would be this screen making exactly the choice its own overfitting warning asks a
+reader not to make on those numbers alone. It is a GET, so a read-only session can
+use it: comparing performs no act (ADR 0009).
+
+**A read-only session cannot queue a run**, and is told so rather than finding out
+from a 403. Occupying the shared queue for minutes is an act.
 
 ## Serving it
 
@@ -477,13 +554,16 @@ remaining Phase 6 items are the difference — see docs/SAFETY.md.
 
 Stated here rather than left to be discovered:
 
-- **One of the seven tabs is still a stub.** Backtests renders "not yet
-  implemented", and the reason is not the front end: `POST /backtests` needs a
-  worker task to run a queued backtest, and every read needs a reader for
-  `backtest_runs`, which has none. It is the last one and the largest, and it
-  blocks more than itself — `/analytics/live-vs-backtest` has no second operand
-  until a backtest can be stored, and the promotion ratchet on the strategies
-  page cannot require "a completed backtest on record" until one exists.
+- **All seven tabs are built.** Backtests was the last and the largest; it is
+  above. What it unblocked elsewhere is not built with it and is still listed
+  here: `/analytics/live-vs-backtest` now has a second operand and remains a stub
+  (its own roadmap item, its own semantics), and the promotion ratchet on the
+  strategies page could now check "a completed backtest on record" and still
+  cannot write the audit entry naming a human (ADR 0010).
+- **Strategy parameters cannot be edited per run.** The backtests form queues a
+  run with the strategy's configured parameters. Building the editor means
+  rendering a form from a JSON Schema, and one that silently dropped the fields it
+  could not render would report a result for parameters nobody chose.
 - **No screen places an order.** The three tabs that are built are all reads.
   Every write handler across `orders.py` and `positions.py` is still a stub,
   because they place things and there is one path from an intent to a venue

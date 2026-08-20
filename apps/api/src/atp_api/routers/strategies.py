@@ -10,10 +10,11 @@ a live account.
 pausing are the ratchet itself: promotion to `live` additionally requires a
 completed backtest on record, a minimum paper-trading period,
 `ATP_ALLOW_LIVE_TRADING=true` and an audit entry naming a human
-(docs/SAFETY.md). Half of those preconditions cannot be checked yet —
-`backtest_runs` has no reader, and the audit trail's order-flow and lifecycle
-verbs are unwired (ADR 0010). A promote endpoint that skipped the checks it
-could not perform would be the ratchet with its pawl removed, which is worse
+(docs/SAFETY.md). One of those preconditions became checkable with the backtest
+queue — `backtest_runs` has a reader now (ADR 0016) — and the other has not: the
+audit trail's order-flow and lifecycle verbs are still unwired (ADR 0010), so the
+entry naming a human cannot be written. A promote endpoint that skipped the check
+it could not perform would be the ratchet with its pawl removed, which is worse
 than no endpoint at all.
 
 **What the reads answer, that nothing else does.** Two questions, and the second
@@ -264,12 +265,12 @@ async def promote_strategy(strategy_id: str, target_state: str, confirmed_by: st
     a minimum paper-trading period, `ATP_ALLOW_LIVE_TRADING=true`, and an audit
     entry naming a human. See docs/SAFETY.md.
 
-    Still a stub, and the two missing preconditions are the reason rather than
-    the effort: `backtest_runs` has no reader, so "a completed backtest on
-    record" cannot be checked, and the audit trail's lifecycle verbs are unwired
-    (ADR 0010), so the entry naming a human cannot be written. An endpoint that
-    promoted while silently skipping both would be this ratchet with its pawl
-    removed.
+    Still a stub, and now for one missing precondition rather than two.
+    "A completed backtest on record" became checkable when `backtest_runs` got a
+    reader (ADR 0016). The audit trail's lifecycle verbs are still unwired (ADR
+    0010), so the entry naming a human cannot be written — and an endpoint that
+    promoted a strategy to live while silently skipping the record of who did it
+    would be this ratchet with its pawl removed.
     """
     raise NotImplementedError
 

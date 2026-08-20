@@ -18,8 +18,10 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 
+from atp_core.analytics.performance import PerformanceAnalyzer
 from atp_core.backtest.costs import ZeroCostModel
 from atp_core.backtest.engine import (
+    PROGRESS_EVERY,
     BacktestConfig,
     BacktestContext,
     BacktestEngine,
@@ -37,6 +39,7 @@ from atp_core.domain import (
     Timeframe,
 )
 from atp_core.errors import DataGapError, LookaheadError
+from atp_core.execution.idempotency import ENTRY, EXIT, STOP_LOSS, TAKE_PROFIT
 from atp_core.risk.engine import RiskDecision
 from atp_core.strategy.base import Strategy
 
@@ -520,3 +523,142 @@ class TestMetricsReconcile:
         lands at 102,000 once the exit fills at 130. Without the mark-to-close
         the curve would step only on fills and this drawdown would vanish."""
         assert self.result().metrics["max_drawdown"] == pytest.approx((102_000 - 104_000) / 104_000)
+
+
+class TestOrderPurpose:
+    """Every order the engine creates says what it is for.
+
+    It did not, until the queued path needed it. `Order.purpose` defaults to
+    `"entry"`, and `PerformanceAnalyzer.build_trades` reads it to label how a
+    round trip ended — so with the default left in place every exit this engine
+    produced reconstructed as an exit "by signal", stop-outs and targets
+    included. That is a **wrong** label rather than a missing one, on the field
+    that decides whether a strategy's stops are misplaced, which is exactly what
+    `UNKNOWN_EXIT`'s own comment in `analytics.performance` says is worse.
+
+    A live-vs-backtest divergence, in the same family as the take-profit one
+    recorded against `StrategyRunner` in #58: the live loop set `purpose` and the
+    engine never did, so the two produced trade tables that disagreed about why
+    positions closed.
+    """
+
+    def test_an_entry_and_a_signal_exit_are_told_apart(self) -> None:
+        strategy = ScriptedStrategy({2: SignalAction.ENTER_LONG, 5: SignalAction.EXIT})
+        result = engine(strategy).run({"TEST": ramp(12)})
+
+        purposes = [order.purpose for order in result.orders]
+
+        assert purposes == [ENTRY, EXIT]
+
+    def test_a_triggered_stop_says_it_was_a_stop(self) -> None:
+        """The row this whole change is for. A stop-out and a signal exit are two
+        different facts about a trade, and only `purpose` separates them."""
+        strategy = ScriptedStrategy({1: SignalAction.ENTER_LONG}, stop_loss=Decimal("101.5"))
+        # Falling prices, so the stop is taken out rather than the position
+        # simply being held to the end of the run.
+        bars = [bar(i, open_=110 - i, high=111 - i, low=108 - i, close=109 - i) for i in range(12)]
+
+        result = engine(strategy).run({"TEST": bars})
+        exits = [order.purpose for order in result.orders if order.purpose != ENTRY]
+
+        assert exits == [STOP_LOSS]
+
+    def test_a_hit_target_says_it_was_a_target(self) -> None:
+        strategy = ScriptedStrategy({1: SignalAction.ENTER_LONG}, take_profit=Decimal("105"))
+
+        result = engine(strategy).run({"TEST": ramp(12)})
+        exits = [order.purpose for order in result.orders if order.purpose != ENTRY]
+
+        assert exits == [TAKE_PROFIT]
+
+    def test_the_reconstruction_reads_them_back(self) -> None:
+        """End to end, because the value of `purpose` is entirely in what reads it.
+
+        Same fold the live analytics use, so a backtested trade and a live one are
+        the same shape — which is the precondition for comparing them at all.
+        """
+        strategy = ScriptedStrategy({2: SignalAction.ENTER_LONG}, stop_loss=Decimal("101.5"))
+        bars = [bar(i, open_=110 - i, high=111 - i, low=108 - i, close=109 - i) for i in range(12)]
+
+        result = engine(strategy).run({"TEST": bars})
+        trades = PerformanceAnalyzer().build_trades(result.orders)
+
+        assert [trade.exit_reason for trade in trades] == ["stop_loss"]
+
+
+class TestProgressReporting:
+    """The engine tells a caller how far it has got, if asked.
+
+    A callback rather than anything the engine does itself: reporting means
+    writing somewhere, and core writes nowhere (CLAUDE.md §1.3). The CLI passes
+    none and is unaffected.
+    """
+
+    def test_no_callback_is_the_default_and_changes_nothing(self) -> None:
+        strategy = ScriptedStrategy({2: SignalAction.ENTER_LONG})
+
+        result = engine(strategy).run({"TEST": ramp(10)})
+
+        assert len(result.equity_curve) == 10
+
+    def test_the_first_and_last_reports_are_zero_and_the_whole_timeline(self) -> None:
+        """Both unconditional, and each for its own reason.
+
+        The first, so a run whose bars are still being walked shows 0 rather than
+        nothing at all. The last, so a finished run reports the *whole* timeline
+        rather than whatever the final multiple of `PROGRESS_EVERY` happened to
+        be — a bar stuck at 96% on a completed run is a support question.
+        """
+        seen: list[tuple[int, int]] = []
+        bars = ramp(10)
+
+        eng = engine(ScriptedStrategy({}))
+        eng.on_progress = lambda done, total: seen.append((done, total))
+        eng.run({"TEST": bars})
+
+        assert seen[0] == (0, 10)
+        assert seen[-1] == (10, 10)
+
+    def test_a_short_run_reports_only_those_two(self) -> None:
+        """`PROGRESS_EVERY` is 500, so a ten-bar run hits no interval report at
+        all — which is the case that would show nothing without them."""
+        assert PROGRESS_EVERY > 10
+        seen: list[tuple[int, int]] = []
+
+        eng = engine(ScriptedStrategy({}))
+        eng.on_progress = lambda done, total: seen.append((done, total))
+        eng.run({"TEST": ramp(10)})
+
+        assert seen == [(0, 10), (10, 10)]
+
+    def test_a_report_lands_on_the_interval(self) -> None:
+        """With enough bars to cross `PROGRESS_EVERY` once, the middle report
+        appears — so the bar moves during a long run rather than jumping from 0
+        to done."""
+        count = PROGRESS_EVERY + 5
+        seen: list[tuple[int, int]] = []
+
+        eng = engine(ScriptedStrategy({}))
+        eng.on_progress = lambda done, total: seen.append((done, total))
+        eng.run({"TEST": ramp(count)})
+
+        assert (PROGRESS_EVERY, count) in seen
+        assert seen[-1] == (count, count)
+
+    def test_a_raising_callback_is_not_swallowed(self) -> None:
+        """Deliberately not caught here.
+
+        A progress reporter that fails is a bug in the caller, and swallowing it
+        would hide the reason the bar stopped moving. The adapter that *can* fail
+        for ordinary reasons — a Redis hop — swallows its own errors, where
+        "failed" has a known meaning (`BacktestQueue.report`).
+        """
+        eng = engine(ScriptedStrategy({}))
+
+        def boom(done: int, total: int) -> None:
+            raise RuntimeError("reporter is broken")
+
+        eng.on_progress = boom
+
+        with pytest.raises(RuntimeError, match="reporter is broken"):
+            eng.run({"TEST": ramp(5)})

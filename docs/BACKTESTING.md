@@ -89,15 +89,41 @@ uv run python scripts/run_backtest.py \
   --strategy sma_crossover --symbols SPY,QQQ \
   --start 2020-01-01 --end 2024-12-31 --timeframe 1d \
   --qty 100 --out results.json
-
-# API (queued to the worker) — not wired yet
-POST /api/v1/backtests
 ```
+
+Or from the dashboard's **Backtests** tab, over `POST /api/v1/backtests`. Both
+assemble the engine through the same function (`atp_core.backtest.runner
+.build_engine`), so the same parameters produce the same result either way — two
+call sites wiring their own engines would eventually disagree, and a dashboard
+reporting a different Sharpe from the terminal is worse than either being wrong.
+
+The API route is **queued, not inline**: the request records a row, hands the job
+to arq, and answers `202` with a run id. A separate process executes it — the
+`queue` container, one run at a time. Why it is a third process rather than part
+of the trading worker, and every other decision behind the queue, is ADR 0016.
+The short version: a backtest is minutes of solid synchronous Python, and running
+one inside the process that manages open positions would stall the market-data
+stream until the staleness watchdog halted trading.
+
+A queued run moves `queued → running → done | failed`, and the row says which. It
+carries three timestamps, because a queue puts real time between being asked and
+starting: `queued_at`, `started_at` (null while it waits), `finished_at`. While it
+runs it publishes bar counts, which is what the progress bar on the screen reads.
+
+There is no cancel. arq cannot interrupt a job that is already executing, and an
+endpoint reporting a cancellation the worker went on ignoring would be worse than
+no endpoint; a bounded job timeout is what stops a mistaken run holding the queue.
+
+A run left behind by a worker that was killed is marked **interrupted** the next
+time one starts, rather than sitting at `running` forever — the worst outcome this
+path can produce, and the one nothing else would ever correct.
 
 Bars come from the database, not the vendor: a backtest has to be reproducible,
 and re-fetching means today's answer can differ from yesterday's because the
-vendor restated something. Run `scripts/backfill_bars.py` first — the CLI names
-the exact command if the range is empty.
+vendor restated something. Run `scripts/backfill_bars.py` first — both the CLI and
+the API name the exact command if the range is empty. The API checks coverage
+*before* queueing, because a run that dies four minutes in for want of history is
+a worse answer than a refusal.
 
 `--qty` is a placeholder. It sizes every entry at the same share count, so the
 reported return is a property of that number as much as of the strategy; real
@@ -127,12 +153,35 @@ fill timing first, then data alignment. It is almost never a discovery.
 - [ ] Walk-forward, not one in-sample fit
 - [ ] Trial count known and disclosed
 - [ ] Individual trades inspected — no impossible fills
+      (`GET /api/v1/backtests/{id}/trades`, or open the run on the Backtests tab)
 - [ ] Equity curve is not one lucky trade with noise around it
 - [ ] Results survive ±20% parameter perturbation
 - [ ] Data checked for gaps and unadjusted splits
+
+## Comparing runs
+
+`GET /api/v1/backtests/compare?run_ids=a&run_ids=b` puts metric sets side by
+side, and the Backtests tab does it from checkboxes. Two things about it are
+deliberate and both are about the *Overfitting* section above:
+
+- It is capped at a handful of runs. That is the argument expressed as a limit
+  rather than as advice — an endpoint that cheerfully ranked fifty runs would be
+  tooling for the mistake.
+- It marks no winner. Highlighting the best value in each row would be the
+  interface making the choice that section asks you not to make on these numbers
+  alone.
+
+Every comparison carries the warning in its own response, because the person
+reading a comparison table is the person about to promote something.
 
 ## Then paper trade it
 
 A passed backtest earns a paper deployment, not a live one. Four weeks minimum,
 then compare with `GET /api/v1/analytics/live-vs-backtest/{id}`. Divergence
 there is the cheapest lesson this platform can teach you.
+
+That endpoint is still a stub, and what was blocking it is now gone: it needed a
+*stored* backtest to compare against, and until `POST /backtests` existed there
+was none. Running one inside the request would compare live against whatever
+parameters that request passed rather than against the backtest that approved the
+strategy, which is the only comparison worth making.

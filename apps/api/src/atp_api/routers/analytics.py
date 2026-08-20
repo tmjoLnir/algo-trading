@@ -411,15 +411,25 @@ async def live_vs_backtest(strategy_id: str) -> dict[str, object]:
     The most important report here. Persistent negative divergence means the
     backtest was wrong — overfitting, unmodelled costs, or unachievable fills.
 
-    Still a stub, and deliberately so: this is its own roadmap item (Phase 5,
-    "Live-vs-backtest comparison"). The half that belongs to *this* item is
-    built — `PerformanceAnalyzer.compare_to_backtest` computes the divergence
-    metric by metric — and what is missing is the other operand. There is no
-    stored backtest result to compare against: `backtest_runs` has no reader,
-    and `/backtests` is a stub too. Answering with a comparison against a
-    backtest run on the fly here would compare live against whatever parameters
-    this request happened to pass, rather than against the backtest that
-    approved the strategy, which is the only comparison worth making.
+    Still a stub, and still its own roadmap item (Phase 5, "Live-vs-backtest
+    comparison") — but the reason has changed and is worth restating, because the
+    old one no longer holds. `PerformanceAnalyzer.compare_to_backtest` computes
+    the divergence metric by metric and always did; what was missing was the
+    other operand, and `backtest_runs` now has a reader and a writer (ADR 0016),
+    so a stored backtest exists to compare against.
+
+    What is left is the *choice of which one*, which is the whole substance of
+    this endpoint. A strategy can have any number of stored runs over different
+    windows, cost models and share counts, and comparing live against an
+    arbitrary one — the newest, say — would report a divergence against a
+    backtest nobody used to approve anything. Answering it properly means the
+    promotion ratchet recording which run justified the promotion, and that is
+    blocked on the audit trail's lifecycle verbs (ADR 0010) rather than on this
+    module.
+
+    Running a backtest inside this request remains the wrong answer for the
+    reason it always was: it would compare live against whatever parameters this
+    request happened to pass.
     """
     raise NotImplementedError
 

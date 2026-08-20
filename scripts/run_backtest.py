@@ -31,8 +31,8 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
-from atp_core.backtest.costs import ZeroCostModel, alpaca_equities_default
-from atp_core.backtest.engine import BacktestConfig, BacktestEngine, FixedQtySizer
+from atp_core.backtest.ports import BacktestRunSpec
+from atp_core.backtest.runner import build_engine, jsonable
 from atp_core.config import get_settings
 from atp_core.domain import Timeframe
 from atp_core.errors import ATPError
@@ -40,7 +40,6 @@ from atp_core.logging import configure as configure_logging
 from atp_core.logging import get_logger
 from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.db import create_engine, create_session_factory
-from atp_core.risk.engine import RiskEngine
 from atp_core.strategy import examples as _examples  # noqa: F401 — populates the registry
 from atp_core.strategy import registry
 
@@ -151,21 +150,6 @@ def _print_report(
             print(f"  ... and {len(result.warnings) - 10} more")
 
 
-def _jsonable(value: object) -> object:
-    """Infinity is a legitimate metric value and not legal JSON.
-
-    `json.dumps` would emit a bare `Infinity`, which most parsers reject — so a
-    file written here would fail to load in exactly the tools meant to read it.
-    """
-    if isinstance(value, float) and (math.isinf(value) or math.isnan(value)):
-        return None
-    if isinstance(value, dict):
-        return {k: _jsonable(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_jsonable(v) for v in value]
-    return value
-
-
 async def _load_bars(
     database_url: str, symbols: list[str], timeframe: Timeframe, start: datetime, end: datetime
 ) -> dict[str, list[Bar]]:
@@ -262,20 +246,27 @@ async def main(argv: list[str] | None = None) -> int:
         bars=sum(len(s) for s in bars.values()),
     )
 
-    engine = BacktestEngine(
-        strategy=strategy,
-        config=BacktestConfig(
-            symbols=symbols,
+    # Assembled by `atp_core.backtest.runner`, which is also what the queued
+    # path uses. Two call sites that wired their own engines would eventually
+    # disagree about how one is built, and the symptom would be the dashboard
+    # reporting a different Sharpe from this terminal for the same parameters.
+    #
+    # Every `ConfigError` that function raises is unreachable from here — the
+    # argument handling above has already rejected each of those conditions with
+    # a message naming the flag, which is the better error for a CLI.
+    engine = build_engine(
+        BacktestRunSpec(
+            strategy_id=args.strategy,
+            symbols=tuple(symbols),
             start=start,
             end=end,
-            timeframe=timeframe,
-            starting_cash=Decimal(str(args.cash)),
+            timeframe=timeframe.value,
+            starting_cash=str(Decimal(str(args.cash))),
+            cost_model="zero" if args.zero_cost else "alpaca_equities",
+            params=params,
+            qty=str(args.qty),
         ),
-        cost_model=ZeroCostModel() if args.zero_cost else alpaca_equities_default(),
-        # An explicit empty chain: `default_rules()` raises until Phase 3, and
-        # an unguarded engine should be something a caller asked for in writing.
-        risk_engine=RiskEngine(settings.risk, rules=[]),
-        position_sizer=FixedQtySizer(Decimal(args.qty)),
+        limits=settings.risk,
     )
 
     try:
@@ -301,7 +292,7 @@ async def main(argv: list[str] | None = None) -> int:
         report = result.to_report()
         report["equity_curve"] = [[ts.isoformat(), str(eq)] for ts, eq in result.equity_curve]
         with Path(args.out).open("w", encoding="utf-8") as handle:
-            json.dump(_jsonable(report), handle, indent=2, allow_nan=False)
+            json.dump(jsonable(report), handle, indent=2, allow_nan=False)
         print(f"\nFull results written to {args.out}")
 
     return 0

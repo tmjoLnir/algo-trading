@@ -99,6 +99,18 @@ services:
       DATABASE_URL: postgresql+asyncpg://atp:${ATP_DB_PASSWORD}@db:5432/atp
     logging: *log_rotation
 
+  queue:
+    # The arq worker. Same three corrections as `worker` above and for the same
+    # reasons: no source bind-mounted over the image, the real database password,
+    # rotated logs. Its entry point is a `command` in the base file rather than
+    # the image's CMD — the image starts `atp_worker.main` — so that stays, which
+    # is why there is no `command: !reset` here.
+    restart: unless-stopped
+    volumes: !reset []
+    environment:
+      DATABASE_URL: postgresql+asyncpg://atp:${ATP_DB_PASSWORD}@db:5432/atp
+    logging: *log_rotation
+
   web:
     # The Vite dev server, moved behind a profile so it cannot come up here.
     # Not deleted — there is no way to delete a service in an overlay, and a

@@ -25,6 +25,7 @@ from atp_api.auth import COOKIE_NAME, Session, read_session_token
 from atp_api.ratelimit import AlwaysAllows, RateLimiter, RedisRateLimiter
 from atp_core.audit.ports import Action, AuditEntry, AuditSink
 from atp_core.backtest.costs import alpaca_equities_default
+from atp_core.backtest.ports import BacktestQueue, BacktestRunRepository
 from atp_core.brokers import AlpacaBroker, BrokerPort, SimulatedBroker
 from atp_core.clock import Clock, SystemClock, TradingCalendar
 from atp_core.config import Settings, get_settings
@@ -34,6 +35,7 @@ from atp_core.domain.enums import RunMode
 from atp_core.execution.ports import OrderRepository, PortfolioRepository
 from atp_core.logging import get_logger
 from atp_core.persistence.audit import PostgresAuditLog
+from atp_core.persistence.backtests import PostgresBacktestRunRepository
 from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.dashboard import RedisSnapshotStore
 from atp_core.persistence.orders import PostgresOrderRepository
@@ -238,10 +240,55 @@ async def get_strategy_repository(
     return PostgresStrategyRepository(session_factory, clock)
 
 
+async def get_backtest_repository(
+    session_factory: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
+) -> BacktestRunRepository:
+    """The `backtest_runs` table.
+
+    The one repository in this file the API both reads and **writes**, and the
+    exception is narrow enough to state exactly: it writes `create`, and nothing
+    else. A request for a backtest is a fact this process is the authority on —
+    somebody asked, at this instant — and every transition after it is written by
+    the process that knows it, which is the queue worker.
+
+    That is not the two-writer problem ADR 0007 refuses. Those are disjoint
+    columns at disjoint times, not two processes computing the same number. The
+    alternative would be this handler waiting for a worker to acknowledge a job,
+    which is a synchronous call into a queue whose whole purpose is that nothing
+    waits on it.
+    """
+    return PostgresBacktestRunRepository(session_factory)
+
+
+async def get_backtest_queue(request: Request) -> BacktestQueue:
+    """Where a queued backtest goes, and where its progress is read from.
+
+    Read off `app.state`, not built here, and this is the rule at the top of this
+    module rather than a preference: the adapter owns an arq connection pool, and
+    a pool built in a dependency has nowhere to be closed. Per-request it would be
+    worse than untidy — every `POST /backtests` would open a pool and abandon it,
+    leaving the connections for the server to time out.
+
+    `lifespan` constructs it and closes it. Constructing does **not** connect:
+    `ArqBacktestQueue` opens its pool on the first `enqueue`, so a Redis that is
+    down still lets the API boot and answer `/healthz` — the property the whole
+    lifespan is written around — and every request that only reads costs no arq
+    connection at all.
+    """
+    queue: BacktestQueue = _from_state(request, "backtest_queue", "the job queue")
+    return queue
+
+
 async def get_bar_repository(
     session_factory: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
 ) -> BarRepository:
-    """Stored bars — read here to measure MAE/MFE over a trade's holding period."""
+    """Stored bars.
+
+    Two readers now: the analytics layer measures MAE/MFE over a trade's holding
+    period, and `POST /backtests` checks that the history a run needs exists
+    before queueing it — because the alternative is a job that fails four minutes
+    in, from a different process.
+    """
     return PostgresBarRepository(session_factory)
 
 

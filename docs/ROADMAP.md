@@ -253,10 +253,12 @@ that yet, so it stays **not shown**.
   pre-trade rule refuses anything: orders are routed through `RiskEngine`, but
   the chain is empty. Both are Phase 3, which the build order puts after this.
 
-  `POST /api/v1/backtests` and its worker task are still stubs. They are not
-  Phase 2 items and the dashboard that would consume them is Phase 5; the CLI
-  is what docs/BACKTESTING.md 'Running one' documents as the way to run one,
-  and it works.
+  `POST /api/v1/backtests` and its worker task are built as of Phase 5's
+  backtests tab (#67), which is where they belonged — they were never Phase 2
+  items, and the dashboard that consumes them is that phase. Both paths now
+  assemble the engine through `atp_core.backtest.runner.build_engine`, so a
+  queued run and this CLI cannot report different numbers for the same
+  parameters.
 
 *Verifiable:* a hand-computed 20-bar fixture matches the engine exactly.
 **Shown** — @claude (#25). `TestAgainstKnownFixture` in
@@ -1171,14 +1173,87 @@ wording if it is not the demonstration you want.
   screen exists for is about a *real* worker having or not having booted a
   strategy.
 
+- [ ] Backtest queue, endpoints and screen — @claude.
+  **An item this phase was missing**, added in the PR that built it. `POST
+  /api/v1/backtests` with the full arq queue behind it, the four reads, and the
+  `/backtests` tab — the last of the seven and the largest. Phase 5 tracked the
+  live dashboard and the analytics endpoints; the five stub tabs were added one
+  per PR as each landed (#63, #64, #65, #66) and this is the fifth.
+
+  **A third process, and that is the decision to review** (ADR 0016). A backtest
+  is minutes of solid synchronous Python. Run inside `apps/worker` it would hold
+  that process's event loop for the whole run — no ticks consumed, no bars
+  stored, and `StalenessMonitor` eventually halting trading because the feed
+  looked dead. It is not dead; the process is busy being a calculator. So
+  `apps/worker/queue.py` runs in its own container, one job at a time, and the
+  engine runs in a thread even there so arq can keep answering its own health
+  check.
+
+  Four decisions worth a reviewer's eye, because in each case the easier version
+  is the one that produces a state nobody can act on:
+
+  - **The row is written before the job is enqueued.** A row with no job is a run
+    that shows as queued and never progresses — visible and re-queueable. A job
+    with no row is a worker that cannot find what it was asked to do and has
+    nowhere to write the failure. If the enqueue then fails, the run is marked
+    failed and the request answers 503, because "queued" when nothing accepted it
+    is the one status a reader cannot act on.
+  - **A queued run has not started.** `backtest_runs.started_at` was `NOT NULL`,
+    so the only value the API could have written was the current time — making
+    every run's reported duration include its queue wait. Migration
+    `d7a1c9f4b208` adds `queued_at` and makes `started_at` nullable.
+  - **One attempt, plus a startup sweep.** A backtest is deterministic over
+    stored bars, so a retry spends the same minutes to reach the same failure —
+    arq's default of five would do it four more times. What that leaves uncovered
+    is a worker killed mid-run: no retry is coming and the row says `running`
+    forever, which the stub's own docstring named as the worst outcome for a user.
+    The queue worker sweeps those at startup and records them as *interrupted*
+    rather than *failed*, because the run did not fail — the process running it
+    stopped existing.
+  - **`GET /backtests/compare`, where the skeleton specified a POST.** ADR 0009's
+    reason: the scope gate keys off the method, so as a POST a pure read would be
+    refused to exactly the read-only session it is for. The alternative was
+    widening `deps.READ_ONLY_MAY_CALL`, whose one entry is there for a domain rule
+    about halting.
+
+  **Two things found by building it**, both live-vs-backtest divergences:
+
+  - **The engine never set `Order.purpose`.** It defaults to `"entry"`, and the
+    trade reconstruction this reuses — the same `build_trades` the live analytics
+    use, so a backtested trade and a live one are comparable — reads it to label
+    an exit. Every exit the engine produced therefore reconstructed as an exit "by
+    signal", stop-outs and targets included: a *wrong* label rather than a missing
+    one, on the field that decides whether a strategy's stops are misplaced. Same
+    family as the take-profit divergence recorded against `StrategyRunner` in #58.
+  - **The queue worker had an empty strategy registry.** `@register` runs at
+    import time, and nothing in the queue process imported `strategy.examples` —
+    so it would have failed *every* queued run with "unknown strategy" while the
+    API, which does import them, accepted the request at the door. The least
+    debuggable shape this failure has. Caught by a unit test that drives a real
+    engine through the task rather than a fake one.
+
+  Unticked. 24 unit tests on the queued task and the sweep, 38 on the endpoints,
+  9 more on the engine's two new behaviours, 20 web tests, and 14 integration
+  tests against a real PostgreSQL in CI — but every run in all of them is a
+  fixture or a synthetic series. Nothing here has yet queued a backtest over real
+  backfilled history from a browser and read the result, which is what this
+  phase's *Verifiable:* line asks of a screen and what the proposed line below
+  asks of the numbers.
+
 - [ ] Live-vs-backtest comparison.
   Half exists as of #58: `PerformanceAnalyzer.compare_to_backtest` computes the
-  divergence metric by metric, live minus backtest, and is tested. The endpoint
-  stays a stub because the *other operand* does not exist — `backtest_runs` has
-  no reader and `/backtests` is a stub, so there is no stored backtest to
-  compare against. Running one inside the request would compare live against
-  whatever parameters that request passed rather than against the backtest that
-  approved the strategy, which is the only comparison worth making.
+  divergence metric by metric, live minus backtest, and is tested.
+
+  **The reason it is still a stub changed with #67 and is worth restating**, since
+  the old one no longer holds: the other operand exists now — `backtest_runs` has
+  a reader and a writer, and `/backtests` can store a completed run. What is
+  missing is the *choice of which run*. A strategy can have any number of stored
+  runs over different windows, cost models and share counts, and comparing live
+  against an arbitrary one — the newest, say — reports a divergence against a
+  backtest nobody used to approve anything. Answering it properly needs the
+  promotion ratchet to record which run justified the promotion, which is blocked
+  on the audit trail's lifecycle verbs (ADR 0010). Running a backtest inside the
+  request remains wrong for the reason it always was.
 - [ ] Daily report.
   Trades and P&L are available from `analytics/` as of #58. The other three
   things the report wants are not gathered anywhere one query can reach:

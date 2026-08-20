@@ -199,6 +199,50 @@ startup is the usual cause on a machine where `.env` was edited.
 3. Positions are safe if broker-side stops are in place — verify.
 4. Fix, then restart. `warmup()` will reconcile and adopt open positions.
 
+## A backtest is stuck, or the queue is not running
+
+**Nothing here touches trading.** Backtests run in the `queue` container, which
+places no orders — its broker is simulated and lives inside the run. A dead queue
+worker means research is stalled, not that the book is at risk, so this is never a
+reason to halt.
+
+*Symptom: a run sits at `queued` and nothing picks it up.*
+
+1. `docker compose ps queue` — is it running? `docker compose logs queue --tail=100`.
+2. It logs `queue.ready` on startup with the queue name. No such line means it
+   never got past `on_startup`; the usual cause is Redis.
+3. `docker compose restart queue`. The job is still on the queue — arq holds it in
+   Redis — so a restart picks it up rather than losing it.
+
+*Symptom: a run sits at `running` and never finishes.*
+
+1. If the worker is alive and the run is legitimately long, leave it. A multi-year
+   minute-bar run is minutes; the job times out after an hour.
+2. If the worker was restarted or killed mid-run, that row is orphaned: the job is
+   gone from Redis and no retry is coming. **A worker starting is what corrects
+   it** — `queue.on_startup` sweeps rows left `running` past twice the job timeout
+   and marks them *interrupted*, with a message saying to queue it again. So
+   `docker compose restart queue` is the fix, and the row will say what happened
+   rather than staying stuck.
+3. There is deliberately no cancel. arq cannot interrupt a job already executing
+   (ADR 0016), so a run you no longer want is waited out or the container is
+   restarted — which orphans the row, which the sweep then labels.
+
+*Symptom: every run fails immediately with "unknown strategy".*
+
+The queue worker's strategy registry is populated by an import side effect, and
+the API's is populated separately — so a request the API accepts can be refused
+by the worker. `atp_worker.queue` imports `atp_core.strategy.examples` for exactly
+this reason; if a strategy module stopped being imported there, this is the
+symptom, and `tests/unit/test_backtest_queue.py` is what should have caught it.
+
+*Symptom: a run fails naming `backfill_bars.py`.*
+
+Not a fault. The history it needs is not stored, and the message is the command
+that fixes it. The API checks coverage before queueing, so seeing this from the
+worker means the bars were there at request time and are not now — a restored
+database, or a symbol whose bars were deleted.
+
 ## Broker unreachable
 
 1. Auto-halts. Confirm.

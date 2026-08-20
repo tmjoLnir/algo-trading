@@ -126,24 +126,29 @@ class TestFormatting:
 
 
 class TestJsonSafety:
+    """The CLI's `--out` file and the `backtest_runs.metrics` column are the same
+    serialisation problem, so they share one function — `atp_core.backtest.runner
+    .jsonable`, which the CLI imports. These exercise it through the CLI's own
+    namespace, which is where a reader of this file expects to find it."""
+
     def test_infinity_becomes_null(self) -> None:
         """Infinity is a real metric value and not legal JSON. `json.dumps`
         would emit a bare `Infinity`, which most parsers reject — so the file
         would fail to load in exactly the tools meant to read it."""
-        cleaned = cli._jsonable({"profit_factor": float("inf"), "sharpe": 0.5})
+        cleaned = cli.jsonable({"profit_factor": float("inf"), "sharpe": 0.5})
         assert cleaned == {"profit_factor": None, "sharpe": 0.5}
         assert json.dumps(cleaned, allow_nan=False)
 
     def test_nan_becomes_null(self) -> None:
-        assert cli._jsonable({"x": math.nan}) == {"x": None}
+        assert cli.jsonable({"x": math.nan}) == {"x": None}
 
     def test_nested_structures_are_cleaned(self) -> None:
-        cleaned = cli._jsonable({"a": [{"b": float("-inf")}], "c": "ok"})
+        cleaned = cli.jsonable({"a": [{"b": float("-inf")}], "c": "ok"})
         assert cleaned == {"a": [{"b": None}], "c": "ok"}
 
     def test_ordinary_values_pass_through_untouched(self) -> None:
         payload = {"s": "SPY", "n": 3, "f": 1.5, "l": [1, 2]}
-        assert cli._jsonable(payload) == payload
+        assert cli.jsonable(payload) == payload
 
 
 class TestHeadlineSet:
