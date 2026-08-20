@@ -1411,6 +1411,19 @@ has met a database holding a real strategy's history.
   banner silently never rendered. A stub matching paths by suffix made `'/'`
   match every request in the suite. Both the endpoint and the stub are fixed.
 
+  A third, found the same way, after the fact: the `API_PASSWORD_HASH` line
+  `scripts/hash_password.py` printed **could not be pasted into `.env`**.
+  Compose interpolates `$NAME` in that file and a bcrypt hash is
+  `$2b$12$<salt><digest>`, so the salt was read as an unset variable — compose
+  said `The "hnn" variable is not set` and handed the container a hash with a
+  bite out of it. Non-empty, so the startup check for an unset hash stayed
+  quiet; not a hash, so every login was refused, with nothing anywhere joining
+  the two. Four salts in five start with a letter and hit it. The script now
+  prints the line single-quoted (not `$$`-escaped — `Settings` reads the same
+  file and does not interpolate, so `$$` fixes compose by breaking everything
+  outside it), and a hash that arrives malformed is now `CRITICAL` at startup
+  rather than silent.
+
   **Not** ready for a public address, and this item should not be read as
   saying so: no rate limit on the login endpoint, no revocation before a
   session expires, no TLS of our own, no secrets manager. The items below are

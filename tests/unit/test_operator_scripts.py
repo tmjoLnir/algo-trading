@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 
+from atp_api.auth import looks_like_bcrypt_hash, verify_password
 from atp_core.alerts import Severity
 from atp_core.config import Settings
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
@@ -292,3 +293,86 @@ class TestHashPasswordDependencies:
 
         assert message.startswith("A dependency is not installed")
         assert "uv sync --all-packages" in message
+
+
+class TestHashPasswordOutput:
+    """The line the operator pastes, and the two things that read it.
+
+    `.env` has two readers that disagree about `$`. Docker Compose interpolates
+    `$NAME` in it; `Settings`, through pydantic-settings, does not interpolate
+    at all. A bcrypt hash is `$2b$12$<salt><digest>`, so the naive line
+
+        API_PASSWORD_HASH=$2b$12$hnn.KpQ8...
+
+    makes compose warn `The "hnn" variable is not set` and hand the API
+    container `$2b$12.KpQ8...` — a hash with its salt bitten off. Non-empty, so
+    the startup check for an unset hash stays quiet; not a hash, so every login
+    is refused. Roughly four salts in five start with a letter and trigger it.
+
+    The usual `$$` escaping is not the fix: it satisfies compose and breaks the
+    other reader. Single quotes satisfy both, and that is what these pin — the
+    quotes being present, and the quoted line still meaning the hash when read
+    back by `Settings`.
+    """
+
+    @staticmethod
+    def _emitted_line(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> str:
+        """Run the script's `main` with the prompts answered, return its line."""
+        script = _load("hash_password")
+        monkeypatch.setattr(script.getpass, "getpass", lambda _prompt: "operator-password")
+
+        assert script.main() == 0
+
+        lines = [
+            line for line in capsys.readouterr().out.splitlines() if "API_PASSWORD_HASH=" in line
+        ]
+        assert len(lines) == 1, "exactly one pasteable line, or an operator has to choose"
+        return lines[0]
+
+    def test_the_line_is_single_quoted(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        line = self._emitted_line(monkeypatch, capsys)
+
+        value = line.partition("=")[2]
+        assert value.startswith("'") and value.endswith("'"), (
+            f"unquoted, so Docker Compose will eat the salt: {line[:24]}..."
+        )
+        # Single, not double: compose interpolates inside double quotes too, so
+        # they look like protection and are not.
+        assert not value.startswith('"')
+
+    def test_the_hash_is_emitted_whole(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Quoting must not have become escaping. `$$` would satisfy compose and
+        leave `Settings` with a hash that never verifies."""
+        value = self._emitted_line(monkeypatch, capsys).partition("=")[2].strip("'")
+
+        assert "$$" not in value
+        assert looks_like_bcrypt_hash(value)
+        assert verify_password("operator-password", value)
+
+    def test_the_pasted_line_reads_back_as_the_hash(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        """End to end through the reader we can drive in a unit test.
+
+        Paste the line into a `.env` exactly as printed and load it the way the
+        API does. The quotes must be stripped as syntax rather than carried into
+        the value — a hash wrapped in literal quote characters is as dead as a
+        truncated one.
+
+        Compose is the other reader and needs a daemon, so it is not driven
+        here; its behaviour is captured in `test_auth.py` as the mangled value
+        `docker compose config` actually produced.
+        """
+        env = tmp_path / ".env"
+        env.write_text(self._emitted_line(monkeypatch, capsys) + "\n", encoding="utf-8")
+
+        settings = Settings(_env_file=env)  # type: ignore[call-arg]
+
+        assert verify_password("operator-password", settings.api_password_hash.get_secret_value())

@@ -19,6 +19,27 @@ CLAUDE.md §1.6 is about. Only the hash is written to stdout.
 
 A bcrypt hash is not a credential you can log in with, but it is one an attacker
 can grind offline, so treat the resulting `.env` line as a secret too.
+
+**The line is printed single-quoted, and the quotes are load-bearing.** A bcrypt
+hash is `$2b$12$<salt><digest>`, and Docker Compose interpolates `$NAME` in the
+`.env` it reads from the project directory. Pasted bare, the `$` and the salt's
+leading letters are read as a variable nobody set: compose warns
+
+    WARN[0000] The "hnn" variable is not set. Defaulting to a blank string.
+
+(the name is whatever your salt happens to start with) and then substitutes a
+blank string for it, so the API container receives a *truncated* hash. It is
+still non-empty, so the startup check for an unset one stays quiet, and every
+login is refused for a reason nothing on screen names. Roughly four hashes in
+five hit this — the trigger is a salt beginning with a letter — which makes the
+one in five that works look like proof the paste was fine.
+
+Single quotes and not `$$`-escaping, which is the usual advice and is wrong
+here: `.env` has a second reader. `Settings` loads the same file through
+pydantic-settings, which does no interpolation at all and would carry the
+doubled `$`s through verbatim — fixing compose by breaking every command that
+runs outside it. Single quotes suppress interpolation in compose and are
+stripped by both readers, so one line is correct for both.
 """
 
 from __future__ import annotations
@@ -93,7 +114,13 @@ def main() -> int:
     print()
     print("Put this in .env (and keep it out of anything you commit):")
     print()
-    print(f"API_PASSWORD_HASH={hashed}")
+    # Single-quoted, and copy the quotes with it. See the module docstring: a
+    # bare paste is silently truncated by Docker Compose's interpolation of
+    # `.env`, which costs an operator a login that fails for no stated reason.
+    print(f"API_PASSWORD_HASH='{hashed}'")
+    print()
+    print("Keep the quotes. They stop Docker Compose reading the hash's `$salt`")
+    print("as a variable and substituting a blank string into your password.")
     print()
     print("Set API_USER too if the account should not be called 'operator', and")
     print("set API_SECRET_KEY (openssl rand -hex 32) so sessions survive a restart.")

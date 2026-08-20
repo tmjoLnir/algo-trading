@@ -26,6 +26,7 @@ from atp_api.auth import (
     authenticate,
     create_session_token,
     hash_password,
+    looks_like_bcrypt_hash,
     read_session_token,
     signing_key,
     verify_password,
@@ -310,3 +311,59 @@ class TestStepUp:
             for operation in spec["paths"][path].values():
                 names = {p["name"] for p in operation.get("parameters", [])}
                 assert "password" not in names, f"{path} takes the password in the URL"
+
+
+class TestLooksLikeBcryptHash:
+    """The check that makes one silent misconfiguration audible.
+
+    `.env` is read by Docker Compose, which interpolates `$NAME`. A bcrypt hash
+    is `$2b$12$<salt><digest>`, so a hash pasted without single quotes has its
+    `$` and the salt's leading letters substituted away with a blank string.
+    What arrives is non-empty — so the startup check for an *unset* hash says
+    nothing — and is not a hash, so every login is refused. The operator sees a
+    correct password rejected and nothing anywhere saying why.
+
+    `verify_password` already refuses these correctly; this is about saying so
+    at startup instead of at the login screen.
+    """
+
+    #: Exactly what compose leaves behind, captured from `docker compose config`
+    #: against a `.env` holding an unquoted hash whose salt began `hnn.`. The
+    #: `$hnn` is gone; `$2b` and `$12` survive because compose does not read a
+    #: `$` followed by a digit as a variable.
+    COMPOSE_MANGLED = "$2b$12.KpQ8vZ3rT1uW9xYzAeL5mNbCdEfGhIjKlMnOpQrStUvWxYz12"
+
+    def test_a_real_hash_is_accepted(self) -> None:
+        assert looks_like_bcrypt_hash(hash_password(PASSWORD))
+
+    def test_the_compose_mangled_hash_is_caught(self) -> None:
+        """The whole point. This is a real value from a real `.env`."""
+        assert not looks_like_bcrypt_hash(self.COMPOSE_MANGLED)
+        # And it is genuinely unusable, which is why it has to be caught.
+        assert not verify_password(PASSWORD, self.COMPOSE_MANGLED)
+
+    def test_a_dollar_escaped_hash_is_caught(self) -> None:
+        """`$$`-escaping is the usual advice for compose and is wrong here.
+
+        pydantic-settings does not interpolate, so it hands the doubled `$`s
+        straight through and the hash never verifies. An operator who "fixed"
+        the compose warning that way must be told, not left with the same
+        silent lockout by a different route.
+        """
+        doubled = hash_password(PASSWORD).replace("$", "$$")
+        assert not looks_like_bcrypt_hash(doubled)
+        assert not verify_password(PASSWORD, doubled)
+
+    def test_an_empty_hash_is_not_structurally_valid(self) -> None:
+        """Not the caller's concern — `main` checks empty first and says
+        something different about it — but the predicate must not call the
+        unconfigured state a hash."""
+        assert not looks_like_bcrypt_hash("")
+
+    @pytest.mark.parametrize("variant", ["2a", "2b", "2x", "2y"])
+    def test_every_bcrypt_variant_prefix_is_accepted(self, variant: str) -> None:
+        """A hash made by another tool, or an older one of ours, is still a
+        hash. Rejecting it would invent an outage this check exists to prevent.
+        """
+        real = hash_password(PASSWORD)
+        assert looks_like_bcrypt_hash(f"${variant}${real.split('$', 2)[2]}")

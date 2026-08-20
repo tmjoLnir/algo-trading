@@ -20,6 +20,7 @@ from typing import Any
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from atp_api.auth import looks_like_bcrypt_hash
 from atp_api.deps import get_current_session, require_write_scope
 from atp_api.middleware import ObservabilityMiddleware
 from atp_api.routers import (
@@ -92,11 +93,32 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # configured there is no password that works — not "any password works" —
     # so the API is safe but unusable, and the difference between those two is
     # exactly what an operator needs told at startup rather than discovered.
-    if not settings.api_password_hash.get_secret_value():
+    configured_hash = settings.api_password_hash.get_secret_value()
+    if not configured_hash:
         log.critical(
             "startup.no_credentials",
             msg="API_PASSWORD_HASH is unset — every login will be refused",
             fix="uv run python scripts/hash_password.py, then put the line in .env",
+        )
+    elif not looks_like_bcrypt_hash(configured_hash):
+        # The same outcome as an unset hash — no password works — reached by a
+        # route that used to say nothing at all. `.env` is read by Docker
+        # Compose, which interpolates `$NAME`, so a hash pasted without quotes
+        # arrives here with its `$salt` substituted away. It is non-empty, so
+        # the branch above stays quiet; it is not a hash, so every login is
+        # refused. Nothing on screen connected the two.
+        #
+        # The value itself is NOT logged, here or anywhere (CLAUDE.md §1.6): it
+        # is a secret even mangled, because what is left of it is still most of
+        # an offline grinding target.
+        log.critical(
+            "startup.malformed_credentials",
+            msg=(
+                "API_PASSWORD_HASH is not a bcrypt hash — every login will be refused. "
+                "A hash pasted into .env without single quotes is truncated by Docker "
+                "Compose, which reads its `$salt` as an unset variable"
+            ),
+            fix="re-run scripts/hash_password.py and paste the line WITH its quotes",
         )
 
     # Pools belong to the application, not to a dependency. A client built

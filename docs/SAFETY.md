@@ -121,8 +121,19 @@ workspace root, which declares no runtime dependencies, so the hashing code's
 raising. `uv run --package atp-api python scripts/hash_password.py` works
 whichever way you synced.
 
+**Paste the `API_PASSWORD_HASH` line with the single quotes the script prints.**
+A bcrypt hash is `$2b$12$<salt><digest>` and Docker Compose interpolates `$NAME`
+in `.env`, so an unquoted hash has its `$salt` replaced by a blank string on the
+way into the container — compose says `The "hnn" variable is not set` (or
+whatever your salt begins with) and the API then refuses every login against
+what is left. Single quotes rather than `$$`-escaping: `Settings` reads the same
+file through pydantic-settings, which does not interpolate, so `$$` would fix
+compose and break every command run outside it.
+
 **With no `API_PASSWORD_HASH` configured, every login is refused** and the API
 logs `CRITICAL` at startup. The unconfigured state is no way in, not a free one.
+A hash that arrived truncated is `CRITICAL` at startup too
+(`startup.malformed_credentials`) — same outcome, and it used to be silent.
 
 **`actor` now comes from the session**, not from a query parameter the caller
 filled in themselves. Until this landed, `POST /risk/halt?actor=whoever` let the
