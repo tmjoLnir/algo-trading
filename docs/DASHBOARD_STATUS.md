@@ -79,12 +79,12 @@ totals understate exposure.
   one `Resume…` per halt, because a halt is keyed on (scope, target) and a
   single button could only ever clear one of the halts on screen while looking
   like it cleared the lot. The nav still has seven tabs and none is Risk, which
-  is where `/risk/status`, `/risk/limits` and `/risk/rejections` would go.
-  `/status` and `/limits` are built as of #75 and **have no reader** — they join
-  `live-vs-backtest` and `market-data/calendar` in the list of endpoints with
-  nobody calling them. A Risk tab is the screen all three want, and it is a nav
-  decision rather than a wiring one, so it was left out rather than guessed at.
-  `/risk/rejections` is still a stub.
+  is not where the risk reads ended up. `/risk/status` and `/risk/limits` are
+  built and read by a panel on the **Strategies** tab (#75) rather than by a
+  tab of their own — `/status` is what a person checks before promoting a
+  strategy, so it sits on the screen that decision is made on and the nav stays
+  at seven. `/risk/rejections` is still a stub, and wants the signals table
+  rather than the orders table.
 - `/dashboard/health` is stubbed (`dashboard.py:567`). Nothing calls it —
   `FeedStatus` reads `data_feed_healthy` off the aggregate instead — so it is a
   dead route rather than a missing feature.
@@ -95,6 +95,21 @@ totals understate exposure.
 The stored rows against the registered classes, which is the point of the
 screen: `donchian_breakout` and `opening_range_breakout` exist in code and have
 never run.
+
+**The risk limits panel sits above them** (#75), from `/risk/status`: each
+account-wide ceiling with the book's current standing against it, the rule name
+that would refuse, and a word — `at limit`, `ok`, `not observable`, `no reading`
+— beside every bar, because colour alone is not a signal every reader has. It
+is on this tab rather than a Risk tab because it is the pre-promotion check and
+this is the pre-promotion screen.
+
+Three states that deliberately do not look alike: a published book gives real
+readings; **no published book gives the ceilings with every reading `—` and no
+bar drawn at all**, since an empty bar and a bar at zero are the same picture
+and one of them means nobody knows what the book holds; and a `/risk/status`
+that fails falls back to `/risk/limits`, which reads config and touches no
+store, so the ceilings still render with the reason for the missing readings
+stated above them.
 
 **Outstanding**
 
@@ -243,7 +258,7 @@ the record.
 | `/market-data/{bars,quote,search}` | **stub** | none |
 | `/risk/halt` | built (#70) | Dashboard button |
 | `/risk/resume` | built (#75) | Halt banner |
-| `/risk/limits`, `/risk/status` | built (#75) | **none** |
+| `/risk/limits`, `/risk/status` | built (#75) | Strategies |
 | `/risk/{flatten-all,rejections}` | **stub** | none |
 
 ## Cross-cutting
@@ -252,11 +267,13 @@ the record.
   whole app — halt, resume, queue a backtest, log in/out — only the kill switch
   touches trading, and now in both directions (#70, #75). The point still
   standing is how narrow the surface is: nothing in the app can place an order,
-  close a position, or move a stop.
-- **Four built endpoints have no reader** (`live-vs-backtest`,
-  `market-data/calendar`, and `risk/limits` and `risk/status` as of #75). The
-  first two have been reader-less for phases; the risk pair is new and wants a
-  Risk tab that does not exist yet.
+  close a position, or move a stop. What the app *reads* about risk is no longer
+  narrow, which is the asymmetry to keep in mind — the limits panel will show a
+  breach it offers no control to act on beyond halting.
+- **Two built endpoints have no reader** (`live-vs-backtest`,
+  `market-data/calendar`), both reader-less for phases. `/risk/limits` is a
+  third only in the ordinary case: it is fetched by the Strategies panel solely
+  when `/risk/status` has failed, which is the case that route exists for.
 - **Nothing here has met real data.** Every test drives fixtures or an ASGI
   transport, and so did the reading behind this document. The gap between "the
   screen renders this correctly" and "the screen agrees with what the worker

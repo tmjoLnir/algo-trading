@@ -52,6 +52,18 @@ export type WhoAmI = Schemas['WhoAmI']
 /** What the login screen may know before there is a session. */
 export type PreSessionContext = Schemas['PreSessionContext']
 
+/**
+ * The risk read endpoints (`/risk/limits`, `/risk/status`).
+ *
+ * `LimitUsageView.current` and `.ceiling` are decimal strings even where the
+ * limit is a count, because one column of a table cannot change type per row —
+ * `unit` says how to read the pair. They go through `src/lib/money.ts` like
+ * every other decimal string: never `parseFloat`.
+ */
+export type RiskLimitsView = Schemas['RiskLimitsView']
+export type LimitUsageView = Schemas['LimitUsageView']
+export type RiskStatusView = Schemas['RiskStatusView']
+
 /** One row of the audit trail, and a page of them. */
 export type AuditEntryView = Schemas['AuditEntryView']
 export type AuditPage = Schemas['AuditPage']

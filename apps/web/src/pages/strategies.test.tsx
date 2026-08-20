@@ -62,13 +62,33 @@ function response(overrides: Partial<StrategiesResponse> = {}): StrategiesRespon
   }
 }
 
+/**
+ * An empty but valid `/risk/status`, for the panel this page now carries.
+ *
+ * Routed separately rather than letting the strategies body answer every
+ * request. These cases are about the strategy lists, and a panel rendering
+ * "the limits could not be read at all" underneath them would be a second
+ * screen silently in a failure state inside tests that are not about it —
+ * `components/risklimits.test.tsx` is where that panel is actually held.
+ */
+const RISK_STATUS = {
+  as_of: '2026-08-20T14:30:00Z',
+  book_as_of: null,
+  book_age_seconds: null,
+  book_published: false,
+  equity: null,
+  limits: [],
+  unmarked_symbols: [],
+}
+
 function stub(status: number, body: unknown) {
-  const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+    const risk = String(input).includes('/risk/')
     return {
-      ok: status < 400,
-      status,
+      ok: risk ? true : status < 400,
+      status: risk ? 200 : status,
       statusText: 'stub',
-      json: async () => body,
+      json: async () => (risk ? RISK_STATUS : body),
     } as Response
   })
   vi.stubGlobal('fetch', fetchMock)

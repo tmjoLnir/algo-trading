@@ -451,9 +451,12 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   incident when an operator most wants to know what the limits are — and
   `/risk/status` reports usage against each of them from the worker's published
   book, mirroring every rule's own comparison including the boundaries the
-  rules deliberately disagree on. Neither has a screen: the Risk tab all three
-  read endpoints want does not exist, and adding one is a nav decision rather
-  than a wiring one.
+  rules deliberately disagree on. Both are read by a panel on the **Strategies**
+  tab rather than by a Risk tab of their own: `/status` is what a person checks
+  before promoting a strategy, so it belongs on the screen that decision is made
+  on, and the nav stays at seven tabs. `/limits` is fetched only when `/status`
+  has failed, which is the case it exists for — it touches no store, so the
+  ceilings still render when the book cannot be read.
 
   One limit is reported as **structurally unobservable** rather than as a
   number, and it is worth recording why here because the same shape blocks the
