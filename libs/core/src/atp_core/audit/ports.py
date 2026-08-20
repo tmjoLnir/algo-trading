@@ -72,11 +72,12 @@ class Action:
     a row written by an older version unloadable by a newer one, which is
     precisely the property an append-only record must not have.
 
-    Only actions that actually occur are listed. The order-flow and kill-switch
-    verbs the table's docstring anticipates — "manual order, strategy promotion
-    to live" — are not here yet because every one of those handlers is still a
-    `NotImplementedError` stub, and a constant for an event nothing emits is a
-    claim the record does not support. They land with their handlers.
+    Only actions that actually occur are listed. The remaining order-flow and
+    strategy-lifecycle verbs the table's docstring anticipates — "manual order,
+    strategy promotion to live" — are not here yet because those handlers are
+    still `NotImplementedError` stubs, and a constant for an event nothing emits
+    is a claim the record does not support. They land with their handlers, which
+    is how `halt_engaged` arrived.
     """
 
     LOGIN = "login"
@@ -89,6 +90,17 @@ class Action:
     #: An authenticated caller refused an action their session may not take — a
     #: read-only session attempting a write, or a failed step-up (ADR 0009).
     FORBIDDEN = "forbidden"
+    #: Trading stopped from the API. Written *after* the switch is engaged, never
+    #: before: an entry claiming a halt that did not take is worse than a halt
+    #: with no entry, because the first is read as "we stopped" by whoever
+    #: reviews the incident.
+    #:
+    #: Only halts engaged through the API reach this record. `scripts/halt.py`
+    #: writes no audit row — it has no session to attribute one to — and neither
+    #: do the automated triggers inside the risk layer, which announce
+    #: themselves through alerts and `risk.killswitch.engaged` instead. So an
+    #: absent row means "not halted *from the dashboard*", never "not halted".
+    HALT_ENGAGED = "halt_engaged"
 
 
 class AuditSink(Protocol):

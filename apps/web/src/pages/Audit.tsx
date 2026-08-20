@@ -30,10 +30,14 @@ const TONE: Record<string, string> = {
   login_failed: 'text-amber-400',
   rate_limited: 'text-rose-400',
   forbidden: 'text-rose-400',
+  // The loudest thing this log records, and the only entry that is about the
+  // book rather than about who was signed in.
+  halt_engaged: 'text-rose-300',
 }
 
 const FILTERS = [
   { value: '', label: 'Everything' },
+  { value: 'halt_engaged', label: 'Trading halted' },
   { value: 'login', label: 'Sign-ins' },
   { value: 'login_failed', label: 'Failed sign-ins' },
   { value: 'rate_limited', label: 'Rate-limited' },

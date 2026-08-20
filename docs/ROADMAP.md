@@ -434,6 +434,16 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   deliberately separate because halting stops new risk while flattening realises
   P&L into a market you may not be able to see.
 
+  **The operator path was its own gap and this file did not name it.** This item
+  built the mechanism and Phase 5 built the screen; nobody owned the wire
+  between them, so `POST /api/v1/risk/halt` raised `NotImplementedError` while
+  the dashboard shipped a `HALT TRADING` button that called it — a safety
+  control that looked live and returned a 500. Closed by #70, which is not
+  ticked anywhere on purpose: it is covered by unit tests against a fake switch
+  and has never engaged a halt in a real Redis from a real browser, which is the
+  demonstration this file asks for. Clearing from the UI is still not built —
+  `/risk/resume` wants a step-up password no screen asks for.
+
 **Before any live order path exists.** Not after.
 
 *Verifiable (proposed):* a strategy that tries to breach every limit is refused
@@ -1456,9 +1466,14 @@ has met a database holding a real strategy's history.
 
   It records less than that docstring implies, deliberately: signing in and out,
   failed attempts, lockouts, and actions refused to a read-only session. Order
-  flow and kill-switch changes are **not** wired, because every one of those
-  handlers is still a `NotImplementedError` stub and a write behind a stub is
-  dead code. They land with their handlers. The table's docstring is now the
+  flow and strategy-lifecycle changes are **not** wired, because those handlers
+  are still `NotImplementedError` stubs and a write behind a stub is dead code.
+  They land with their handlers, which is exactly how the first of them arrived:
+  `halt_engaged` was added by #70 alongside the endpoint that emits it, so
+  "who stopped trading" is answerable for halts engaged through the API. Halts
+  from `scripts/halt.py` and from the risk layer's own triggers are still absent
+  from the record, and attributing those needs an identity the record can stand
+  behind rather than another constant. The table's docstring is still the
   optimistic document and this item is the honest one.
 
   Two rules the design turns on. A failed audit *write* never fails the action —

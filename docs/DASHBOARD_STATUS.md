@@ -33,12 +33,18 @@ stack.
 
 ## The headline
 
-**The one acting control in the entire dashboard is wired to a stub.** The
-`HALT TRADING` button posts to `/api/v1/risk/halt`, and that handler is
-`raise NotImplementedError` (`apps/api/src/atp_api/routers/risk.py:90`). Nothing
-converts that into a 501, so pressing it returns an unhandled 500 and trading
-does not stop. `scripts/halt.py` still says it is "the *only* operator path to
-the kill switch" — and it still is. No web test covers the button.
+**The one acting control in the dashboard now works.** It did not when this
+document was first written: `HALT TRADING` posted to `/api/v1/risk/halt`, which
+was `raise NotImplementedError`, and nothing converted that into a 501 — so the
+button returned an unhandled 500 and trading did not stop. The endpoint is
+implemented, covered by tests, and writes an audit row (#70). `scripts/halt.py`
+is no longer the only operator path to the kill switch, though it remains the
+one that works when the API does not.
+
+**Clearing a halt is still command-line only.** `/risk/resume` is a stub and
+demands a step-up password no screen asks for, which leaves the asymmetry
+docs/RISK.md wants — stopping reflexive, restarting deliberate — enforced by
+what exists rather than by design.
 
 Everything else on every tab is a read, and the reads are real.
 
@@ -54,12 +60,15 @@ totals understate exposure.
 
 **Outstanding**
 
-- `HALT TRADING` calls a stubbed endpoint (above). This is the whole of the
-  tab's write surface.
-- No way to clear a halt. `KillSwitchButton.tsx:6` says resuming is "done from
-  the risk page" — **there is no risk page**; the nav has seven tabs and none is
-  Risk. `/risk/resume` is stubbed too (`risk.py:107`), so clearing is
-  `scripts/halt.py clear` only.
+- `HALT TRADING` is the whole of the tab's write surface, and it is the whole of
+  the app's. It works now (#70), including the 503 it answers when the switch
+  cannot be written — a state that is neither "stopped" nor "trading", because
+  the switch fails closed but records nothing, so trading resumes when the store
+  recovers. The button renders that message rather than swallowing it.
+- No way to clear a halt from any screen. `/risk/resume` is a stub
+  (`risk.py:107`) and wants a password no screen asks for, so clearing is
+  `scripts/halt.py clear --by <name>`. The nav has seven tabs and none is Risk;
+  a resume control needs that screen, or a password prompt on this one.
 - `/dashboard/health` is stubbed (`dashboard.py:567`). Nothing calls it —
   `FeedStatus` reads `data_feed_healthy` off the aggregate instead — so it is a
   dead route rather than a missing feature.
@@ -158,21 +167,28 @@ labelled as such.
 
 ## 7. Audit — `/audit`
 
-**The screen is the finding.** The audit trail records five verbs and only
-five — `login`, `login_failed`, `logout`, `rate_limited`, `forbidden`
-(`atp_core/audit/ports.py:82-91`). There is no order-flow, kill-switch or
-strategy-lifecycle entry because nothing emits one, which the class docstring
-states outright: constants "land with their handlers", and those handlers are
-still stubs.
+**The screen is very nearly the finding.** The audit trail records six verbs:
+five about who was signed in — `login`, `login_failed`, `logout`,
+`rate_limited`, `forbidden` — and one about the book, `halt_engaged`, which
+arrived with the endpoint that emits it (#70). Nothing else is recorded, because
+the class docstring's rule is that a constant for an event nothing emits is a
+claim the record does not support, and the remaining handlers are still stubs.
 
-So the tab is an accurate, complete sign-in log — and calling it an *audit
-trail* over-promises. "Who halted trading", "who promoted this strategy to live"
-and "which order did we send at 14:30" are not answerable here, and ADR 0010's
-lifecycle verbs remain unwired.
+So the tab is a sign-in log with one trading event in it. "Who stopped trading"
+is now answerable — and only for halts engaged through the API: `scripts/halt.py`
+has no session to attribute a row to, and the automated triggers inside the risk
+layer announce themselves through alerts and logs instead. An absent row means
+"not halted *from the dashboard*", never "not halted". "Who promoted this
+strategy to live" and "which order did we send at 14:30" remain unanswerable,
+and ADR 0010's lifecycle verbs remain unwired.
 
 **Outstanding**
 
-- The four lifecycle/order/risk verb families, each blocked on its own handler.
+- The order-flow and strategy-lifecycle verb families, each blocked on its own
+  handler. Clearing a halt is the nearest one: it needs `/risk/resume`.
+- The halts this log cannot see — the CLI's and the risk layer's own. Attributing
+  those means giving each an identity the record can stand behind, which is a
+  larger question than adding a constant.
 - `/risk/rejections` is stubbed (`risk.py:138`) — "a strategy blocked on every
   order looks identical to a strategy with no signals" is currently answered
   only by the dashboard's signal feed, and only for the current book.
@@ -199,21 +215,21 @@ lifecycle verbs remain unwired.
 | `/audit` | built | Audit |
 | `/market-data/calendar` | built | **none** |
 | `/market-data/{bars,quote,search}` | **stub** | none |
-| `/risk/halt` | **stub** | **Dashboard button calls it** |
+| `/risk/halt` | built (#70) | Dashboard button |
 | `/risk/{resume,flatten-all,limits,status,rejections}` | **stub** | none |
 
 ## Cross-cutting
 
-- **One live write path, and it is broken.** Of three mutations in the whole app
-  — halt, queue a backtest, log in/out — only the kill switch touches trading,
-  and its endpoint is a stub. A reader of this UI cannot stop trading from it.
+- **One live write path.** Of three mutations in the whole app — halt, queue a
+  backtest, log in/out — only the kill switch touches trading. It was a stub
+  when this was written and is not any more (#70); the point still standing is
+  how narrow the surface is, not that it is broken.
 - **Two built endpoints have no reader** (`live-vs-backtest`,
-  `market-data/calendar`), and one screen control points at a page that does not
-  exist (the "risk page" in `KillSwitchButton.tsx`).
+  `market-data/calendar`).
 - **Nothing here has met real data.** Every test drives fixtures or an ASGI
-  transport; these screenshots do the same. The gap between "the screen renders
-  this correctly" and "the screen agrees with what the worker holds" is exactly
-  Phase 5's unshown *Verifiable:* line.
+  transport, and so did the reading behind this document. The gap between "the
+  screen renders this correctly" and "the screen agrees with what the worker
+  holds" is exactly Phase 5's unshown *Verifiable:* line.
 - No roadmap tick is warranted by this document. Phase 5's dashboard item is
   already unticked for the reason above, and the ticked "Redis kill switch" item
   (#32) claims only the core mechanism, which does work — it never claimed the

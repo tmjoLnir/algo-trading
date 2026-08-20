@@ -18,7 +18,7 @@ The failures it can be told to produce are the ones that matter:
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -26,6 +26,7 @@ from atp_core.brokers.ports import AccountSnapshot
 from atp_core.domain import Fill, Order, OrderStatus, OrderType, Portfolio, Position
 from atp_core.errors import BrokerConnectionError, OrderRejectedError
 from atp_core.execution.ports import StoredBook
+from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
 
 if TYPE_CHECKING:
     from typing import Any
@@ -208,16 +209,33 @@ class FakeBroker:
 
 
 class FakeKillSwitch:
-    """Records halts instead of reaching Redis."""
+    """Records halts instead of reaching Redis.
+
+    Idempotent the way `RedisKillSwitch` is, and that is load-bearing rather
+    than decorative: `engage` returns the *original* record when a halt is
+    already active for the same scope and target, so a caller cannot tell "I
+    stopped trading" from "it was already stopped" by anything except the
+    identity on the record it gets back. A fake that minted a fresh record each
+    time would let `/risk/halt` pass a test it fails in production.
+    """
 
     def __init__(self, engaged: bool = False) -> None:
         self.engaged = engaged
+        #: One 4-tuple per *call*, including calls that found a halt already in
+        #: force. Kept as a tuple because tests index it positionally.
         self.engagements: list[tuple[str, str, str, str]] = []
         #: What `active_halts` reports. Seeded by a test that needs the halt
         #: banner to have something to render; the engagement list above is a
         #: record of calls rather than of state, and the two are separate
         #: because a test usually cares about exactly one of them.
         self.halts: list[object] = []
+        #: The halt in force per (scope, target), which is what makes the
+        #: idempotence above observable.
+        self._records: dict[tuple[str, str | None], HaltRecord] = {}
+        #: Stamped onto records so a test can assert on the time without
+        #: reaching for a clock. Advances by a second per distinct halt, so two
+        #: halts never share an instant.
+        self._now = datetime(2024, 6, 3, 14, 30, tzinfo=UTC)
 
     def is_engaged(self, strategy_id: str | None = None, symbol: str | None = None) -> bool:
         return self.engaged
@@ -229,13 +247,30 @@ class FakeKillSwitch:
         engaged_by: str,
         detail: str = "",
         target: str | None = None,
-    ) -> object:
+    ) -> HaltRecord:
         self.engaged = True
         self.engagements.append((str(scope), str(reason), engaged_by, detail))
-        return None
+
+        key = (str(scope), target)
+        existing = self._records.get(key)
+        if existing is not None:
+            return existing
+
+        record = HaltRecord(
+            scope=HaltScope(str(scope)),
+            reason=HaltReason(str(reason)),
+            engaged_at=self._now,
+            engaged_by=engaged_by,
+            detail=detail,
+            target=target,
+        )
+        self._now += timedelta(seconds=1)
+        self._records[key] = record
+        return record
 
     def clear(self, scope: object, cleared_by: str, target: str | None = None) -> None:
         self.engaged = False
+        self._records.pop((str(scope), target), None)
 
     def active_halts(self) -> list[object]:
         return list(self.halts)
