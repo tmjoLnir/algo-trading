@@ -189,7 +189,7 @@ the runner dropped a refused order at all four places it can be refused, so the
 table's most important category of row could not exist. The write path exists
 now.
 
-**A refused row now names its refuser as well as its reason** (#PR). The row #78
+**A refused row now names its refuser as well as its reason** (#79). The row #78
 finally produced still could not say *which* rule refused it: `RiskDecision`
 carries `rule` beside `reason` and the router passed only the reason into
 `transition()`, so the rule reached the structured log and never the table. A

@@ -505,7 +505,7 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   failed evaluations halt trading — so raising would let the record of a refused
   stop become the thing that stops the platform.
 
-  **And the row could not name its refuser until #PR.** #78 gave `/orders` its
+  **And the row could not name its refuser until #79.** #78 gave `/orders` its
   first refused row; the rule that refused it was still dropped one layer down.
   `RiskDecision` carries `rule` beside `reason` and `OrderRouter._route` passed
   only the reason into `transition()`, so the rule reached the structured log
@@ -1184,7 +1184,7 @@ wording if it is not the demonstration you want.
   PostgreSQL in CI, and the handler and screen by 12 API and 18 web tests — but
   every row in all of them is a fixture. Nothing here has yet displayed an order
   a *worker* placed and a real risk rule refused, which is what the line below
-  asks for. #PR narrowed the gap by one step without closing it: the screen can
+  asks for. #79 narrowed the gap by one step without closing it: the screen can
   now name the rule that refused a row, so what the paper week has to show is a
   refusal displayed under the name of the rule that actually made it — but the
   rows demonstrating it are still fixtures.
