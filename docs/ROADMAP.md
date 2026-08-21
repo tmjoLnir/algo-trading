@@ -1348,6 +1348,18 @@ wording if it is not the demonstration you want.
   phase's *Verifiable:* line asks of a screen and what the proposed line below
   asks of the numbers.
 
+  **One thing standing between this and that line is gone as of the seed
+  script.** The 409 above — "a backtest needs a row in `strategies`, which a
+  worker writes the first time it loads the strategy" — was not only a confusing
+  state, it was a *prerequisite*: on a clean database the picker was empty and
+  the only way to fill it was to configure a trading worker with broker
+  credentials that a backtest does not need. `make seed` now writes those rows
+  (`scripts/seed.py`), so queueing a run from a browser needs a migrated database
+  and backfilled bars and nothing else. Still unticked, and deliberately: the
+  *Verifiable:* line asks for **real backfilled** history, and the bars this seed
+  writes are fabricated ones under reserved test tickers. It removes an obstacle
+  to showing the line; it does not show it.
+
 - [ ] Live-vs-backtest comparison — @claude.
   Built as of #68: `GET /analytics/live-vs-backtest/{run_id}` serves the live
   metric set, the stored backtest's, the divergence between them, and the reasons
@@ -1394,11 +1406,27 @@ wording if it is not the demonstration you want.
     touched — is a refusal or a data gap, and from the trade count alone it is
     indistinguishable from underperformance.
 
-  Unticked. 18 unit tests on the endpoint and 14 on the core it added, and
-  `make check` is green — but every run in them is a fixture. Nothing has yet
-  compared a real paper record against a real backfilled backtest, which is what
-  the line below asks for. No screen calls it yet either (docs/ANALYTICS.md
-  'Not built yet').
+  **The screen is built**, as the Analytics tab's fourth panel. It sits there
+  rather than on `/backtests` because it is a report about live performance; the
+  run picker it needs is a hook over the same list, not that page. Three things
+  in it are the endpoint's own reasoning carried to the last step, where a
+  plainer table would have undone it: the picker starts **empty**, because
+  defaulting to the newest run would be the screen making the choice this
+  endpoint exists to refuse; the page's date range is **not forwarded**, because
+  the open-at-the-start live window is the honest denominator for "has this held
+  up"; and every row carries its `comparability` with the warnings above it,
+  with a null divergence rendered as a dash. Nothing is coloured good or bad —
+  on most rows the sign is a difference rather than a verdict, the same refusal
+  the backtest comparison table makes about marking a winner. The annualisation
+  warning also gained an answer rather than only a description: a control pins
+  both sides to the basis the response reports for that run, so the client never
+  computes a second copy of `periods_per_year_for`.
+
+  Unticked. 18 unit tests on the endpoint, 14 on the core it added and 9 web
+  tests on the panel, and `make check` is green — but every run in them is a
+  fixture. Nothing has yet compared a real paper record against a real
+  backfilled backtest, which is what the line below asks for, and no amount of
+  screen closes that.
 
 *Verifiable (live-vs-backtest, proposed):* with a strategy that has traded paper
 for a fortnight and a completed backtest of the same strategy on record, the

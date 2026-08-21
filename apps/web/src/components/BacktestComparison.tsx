@@ -18,28 +18,11 @@
  */
 
 import { useBacktestComparison } from '@/hooks/useBacktests'
-import { formatCount, formatStat, formatStatPercent } from '@/lib/stats'
+import { formatMetric } from '@/lib/stats'
 
 interface Props {
   runIds: string[]
   onClear: () => void
-}
-
-/** Which formatter each metric wants. Percentages and counts are not decimals. */
-const PERCENT = new Set([
-  'total_return',
-  'cagr',
-  'volatility',
-  'max_drawdown',
-  'win_rate',
-  'exposure_pct',
-])
-const COUNT = new Set(['num_trades', 'max_drawdown_duration_days'])
-
-function format(name: string, value: number | null | undefined): string {
-  if (PERCENT.has(name)) return formatStatPercent(value)
-  if (COUNT.has(name)) return formatCount(value)
-  return formatStat(value)
 }
 
 export default function BacktestComparison({ runIds, onClear }: Props) {
@@ -101,7 +84,7 @@ export default function BacktestComparison({ runIds, onClear }: Props) {
                         key={run.id}
                         className="px-3 py-1.5 text-right tabular-nums text-slate-200"
                       >
-                        {format(name, byRun[run.id])}
+                        {formatMetric(name, byRun[run.id])}
                       </td>
                     ))}
                   </tr>

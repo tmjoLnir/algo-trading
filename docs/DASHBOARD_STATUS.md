@@ -152,12 +152,19 @@ Opening a run gives metrics, equity curve and per-trade inspection.
 Ticking two finished runs compares them, with the overfitting warning above the
 table and deliberately no "winner" column.
 
+The picker offers strategies that have a `strategies` row, which used to mean
+"that a trading worker has booted". On a clean database that was nothing, so the
+form had nothing to offer and the endpoint answered 409 — a screen whose one
+action was unreachable until you configured a worker with broker credentials the
+backtest does not use. `make seed` writes those rows now, so a migrated database
+plus backfilled bars is the whole prerequisite.
+
 **Outstanding**
 
-- **`/analytics/live-vs-backtest/{run_id}` is implemented and has no screen.**
-  It is referenced only in a comment (`Backtests.tsx:25`) and in the generated
-  schema; nothing in `apps/web/src` calls it. The run picker it needs is this
-  page's list.
+- ~~**`/analytics/live-vs-backtest/{run_id}` is implemented and has no
+  screen.**~~ **Built**, on the Analytics tab rather than this one: it is a
+  report about live performance, and the run picker it needs is a hook rather
+  than a page. This list is still where a run id comes from.
 - No way to cancel or delete a run — by design, per `backtest/ports.py`: arq
   cannot interrupt a running job, so no cancel endpoint exists.
 
@@ -305,7 +312,7 @@ the record.
 | `/strategies` (GET) | built | Strategies |
 | `/strategies` writes, `/available`, `/{id}` | **stub** | none |
 | `/analytics/{performance,trades,attribution}` | built | Analytics |
-| `/analytics/live-vs-backtest/{run_id}` | built | **none** |
+| `/analytics/live-vs-backtest/{run_id}` | built | Analytics |
 | `/analytics/reports/daily` | **stub** | none |
 | `/backtests` + `/compare` + `/{id}/*` | built | Backtests |
 | `/audit` | built | Audit |
@@ -326,8 +333,9 @@ the record.
   close a position, or move a stop. What the app *reads* about risk is no longer
   narrow, which is the asymmetry to keep in mind — the limits panel will show a
   breach it offers no control to act on beyond halting.
-- **Two built endpoints have no reader** (`live-vs-backtest`,
-  `market-data/calendar`), both reader-less for phases. `/risk/limits` is a
+- **One built endpoint has no reader** (`market-data/calendar`), and has been
+  reader-less for phases. `live-vs-backtest` was the other and now has the
+  Analytics tab's fourth panel. `/risk/limits` is a
   third only in the ordinary case: it is fetched by the Strategies panel solely
   when `/risk/status` has failed, which is the case that route exists for.
 - **The Strategies tab is now three panels**: the risk limits, the refused

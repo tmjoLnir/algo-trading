@@ -28,6 +28,8 @@ import { ApiError } from '@/api/client'
 import PerformancePanel from '@/components/PerformancePanel'
 import AttributionTable from '@/components/AttributionTable'
 import TradesTable from '@/components/TradesTable'
+import LiveVsBacktest from '@/components/LiveVsBacktest'
+import { isComparable, useComparableRuns, useLiveVsBacktest } from '@/hooks/useLiveVsBacktest'
 import {
   ALL_TIME_START,
   ATTRIBUTION_DIMENSIONS,
@@ -100,10 +102,23 @@ export default function Analytics() {
   // on every keystroke — three reconstructions of the whole order history per
   // character is not a cost worth paying for live filtering.
   const [strategyDraft, setStrategyDraft] = useState('')
+  // The fourth panel's state, and it is deliberately not part of `period`. That
+  // comparison is keyed on a run, not on a window — see the panel below.
+  const [runId, setRunId] = useState<string | null>(null)
+  // The basis to pin to, held rather than derived, because the only honest
+  // source for it is the server's own answer for this run — `periods_per_year`
+  // computed from the run's timeframe exactly as the engine computed it. A
+  // second copy of that derivation on the client is the kind of duplicate that
+  // drifts and then disagrees with the number it is supposed to explain.
+  const [pinnedBasis, setPinnedBasis] = useState<number | null>(null)
 
   const performance = usePerformance(period)
   const trades = useTrades(period, TRADE_LIMIT)
   const attribution = useAttribution(period, by)
+
+  const runs = useComparableRuns()
+  const comparable = (runs.data?.runs ?? []).filter(isComparable)
+  const comparison = useLiveVsBacktest(runId, pinnedBasis)
 
   const applyPreset = (days: number | 'all') => {
     setPeriod((current) =>
@@ -257,6 +272,72 @@ export default function Analytics() {
         ) : trades.data ? (
           <TradesTable data={trades.data} />
         ) : null}
+      </Panel>
+
+      {/* The fourth panel, and the one shaped unlike the other three.
+          They describe the period chosen above; this one is keyed on a backtest
+          run and ignores that period entirely — the endpoint's live window is
+          open at the start by default, because the denominator for "has this
+          held up" is the whole live record rather than whichever month happens
+          to be selected (docs/ANALYTICS.md). Said on screen rather than left to
+          be inferred from a panel that does not move when the dates do. */}
+      <Panel
+        title="Live vs backtest"
+        control={
+          <div className="flex items-center gap-2">
+            <label className="sr-only" htmlFor="comparison-run">
+              Backtest run
+            </label>
+            <select
+              id="comparison-run"
+              value={runId ?? ''}
+              onChange={(event) => {
+                setRunId(event.target.value || null)
+                // A different run may have a different timeframe, so the basis
+                // pinned for the last one means nothing here.
+                setPinnedBasis(null)
+              }}
+              className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-300"
+            >
+              <option value="">Choose a backtest run…</option>
+              {comparable.map((run) => (
+                <option key={run.id} value={run.id}>
+                  {run.strategy_id} · {(run.spec.symbols ?? []).join(',')} · {run.spec.timeframe} ·{' '}
+                  {run.spec.start.slice(0, 10)}→{run.spec.end.slice(0, 10)}
+                </option>
+              ))}
+            </select>
+          </div>
+        }
+      >
+        <div className="px-4 pb-4">
+          {runId === null ? (
+            <p className="py-6 text-center text-sm text-slate-500">
+              Pick a run above.
+              <span className="mt-1 block text-xs text-slate-600">
+                Nothing is chosen for you: which backtest a live record is judged against is the
+                substance of this comparison, and defaulting to the newest run would compare live
+                against a backtest nobody approved anything with. Only completed runs are offered —
+                a queued or failed one has no metrics to compare.
+                {runs.data && comparable.length === 0
+                  ? ' No completed runs are stored yet; queue one on the Backtests tab.'
+                  : ''}
+              </span>
+            </p>
+          ) : comparison.isLoading ? (
+            <p className="py-6 text-center text-sm text-slate-500">Loading…</p>
+          ) : comparison.error ? (
+            <PanelError error={comparison.error} what="the comparison" />
+          ) : comparison.data ? (
+            <LiveVsBacktest
+              data={comparison.data}
+              pinned={pinnedBasis !== null}
+              onPinnedChange={(next) =>
+                setPinnedBasis(next ? (comparison.data?.backtest.periods_per_year ?? null) : null)
+              }
+            />
+          ) : null}
+        </div>
       </Panel>
     </div>
   )

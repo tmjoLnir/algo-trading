@@ -118,6 +118,15 @@ A run left behind by a worker that was killed is marked **interrupted** the next
 time one starts, rather than sitting at `running` forever — the worst outcome this
 path can produce, and the one nothing else would ever correct.
 
+**On a clean database the queued path needs one thing first.**
+`backtest_runs.strategy_id` is a foreign key onto `strategies`, and for a long
+time the only writer of that table was `StrategyRunner.warmup` at a live session
+open — so the tab's picker was empty, `POST /backtests` answered 409, and
+queueing a backtest meant configuring a *trading* worker with broker credentials
+that a backtest does not need. `make seed` writes those rows (plus some
+fabricated bars under reserved test tickers, see docs/DATA.md). The CLI never
+needed it: it stores no run, so it has no foreign key to satisfy.
+
 Bars come from the database, not the vendor: a backtest has to be reproducible,
 and re-fetching means today's answer can differ from yesterday's because the
 vendor restated something. Run `scripts/backfill_bars.py` first — both the CLI and

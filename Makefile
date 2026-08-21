@@ -145,7 +145,7 @@ migrate:  ## Apply migrations
 revision:  ## Autogenerate a migration:  make revision m="add orders table"
 	uv run alembic -c infra/alembic/alembic.ini revision --autogenerate -m "$(m)"
 
-seed:  ## Seed reference data + a sample strategy
+seed:  ## Dev database: a row per registered strategy + synthetic bars
 	uv run python scripts/seed.py
 
 backfill:  ## Backfill bars:  make backfill sym=AAPL,MSFT from=2020-01-01

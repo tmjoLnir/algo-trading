@@ -102,6 +102,27 @@ export type AttributionRowView = Schemas['AttributionRowView']
 export type AttributionResponse = Schemas['AttributionResponse']
 
 /**
+ * `/analytics/live-vs-backtest/{run_id}` — live held up against one stored run.
+ *
+ * Two thirds of this response is context rather than numbers, and the types
+ * carry that shape: `divergence` is `live - backtest` per metric,
+ * `comparability` says how far each of those rows can be trusted, and
+ * `warnings` says why. A screen that renders the first without the other two
+ * reintroduces exactly the misreading the response is built to prevent
+ * (docs/ANALYTICS.md).
+ *
+ * **A `divergence` value of `null` means not available, never zero.** Zero is
+ * the strongest claim this report can make — live matched the backtest exactly
+ * — so the absence has to render as a dash. The nulls are routine: a stored run
+ * nulls its non-finite metrics on the way into the JSON column, and an infinite
+ * `profit_factor` is precisely the run somebody holds a live record up against.
+ */
+export type LiveVsBacktestResponse = Schemas['LiveVsBacktestResponse']
+export type LiveSideView = Schemas['LiveSideView']
+export type BacktestSideView = Schemas['BacktestSideView']
+export type ComparisonWindowView = Schemas['ComparisonWindowView']
+
+/**
  * The order history (`/orders`).
  *
  * `OrderHistoryView` is not `OrderView`: the latter is the *working* order the

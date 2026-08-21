@@ -203,6 +203,25 @@ make backfill sym=AAPL,MSFT,SPY from=2020-01-01
 Rate limit is 200 req/min on the free tier. The script batches symbols, paginates
 via `next_page_token` to exhaustion, and backs off on 429.
 
+## Seeded data, and why it is not in this table
+
+`make seed` writes bars too, and they are **fabricated** — a driftless random
+walk from `atp_core.data.seed`, so a fresh clone with no vendor credentials still
+has something to run a backtest against.
+
+They are written only under NASDAQ's reserved test tickers (`ZVZZT`, `ZWZZT`,
+`ZXZZT`, `ZJZZT`), and that namespace is the whole safety argument rather than a
+convention. Upserts here are keyed on `(symbol, timeframe, ts)`, so a fabricated
+`SPY` would not sit beside a real `SPY` history — it would overwrite it, bar for
+bar, with no error and no trace. `require_reserved` refuses any other symbol and
+takes no override.
+
+Nothing about a seeded series is evidence. It has no exploitable structure by
+construction, so a strategy scoring well on one has found noise; the reference
+run over the default window returns −1.0% with a Sharpe of −0.12 after realistic
+costs, which is what "nothing to find" looks like. Real history comes from
+`backfill_bars.py` and nowhere else.
+
 ## Sanity checks before trusting a dataset
 
 - [ ] No gaps outside market closures — `backfill_bars.py --verify`

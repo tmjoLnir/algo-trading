@@ -85,10 +85,14 @@ class StoredStrategy:
     Two fields mean something narrower than their names suggest, and a reader
     that assumes otherwise will be wrong in a way nothing corrects:
 
-    - **`state` is not "is it running now".** `ensure` writes `"active"` when it
-      creates a row and never touches it again, so a strategy no worker has
-      loaded for a month still reads `active`. It is the configured lifecycle
-      state, which today nothing but a first boot ever sets.
+    - **`state` is not "is it running now".** `ensure` writes `draft` when it
+      creates a row and never touches it again, so a strategy a worker has been
+      running for a month still reads `draft`. It is the rung the strategy has
+      been promoted to on the ratchet, which today nothing but a first boot —
+      or `scripts/seed.py`, which writes the same first rung — ever sets. (This
+      said `"active"` until #76, which was accurate about the bug and is not
+      what the column holds now: `active` was never a member of
+      `StrategyState`, and a CHECK constraint now refuses it.)
     - **`updated_at` is not "last edited".** The same asymmetry: an existing row
       has only its timestamp bumped, at every worker boot. So it answers "when
       did a worker last start this?", which is the more useful question of the

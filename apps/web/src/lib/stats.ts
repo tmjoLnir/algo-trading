@@ -119,3 +119,78 @@ export function statArrow(value: number | null | undefined): string {
   const sign = statSign(value)
   return sign > 0 ? '▲' : sign < 0 ? '▼' : '–'
 }
+
+/**
+ * How a metric should be read — its unit is in its *name* and nowhere in the
+ * data.
+ *
+ * `compute_all` returns nineteen bare floats. `0.6` is a win rate of 60%, `0.6`
+ * is also a Sharpe of 0.6, and rendering the first as `0.60` understates it by
+ * two orders of magnitude while looking entirely reasonable. Every screen that
+ * shows a metric set therefore needs this mapping, which is why it lives here
+ * rather than being written out again in each of them — two copies would drift,
+ * and the drift would be a percentage rendered as a ratio on one screen only.
+ *
+ * A name this does not know is a `ratio`, which is the harmless default: a new
+ * metric renders as a plain number rather than being silently multiplied by a
+ * hundred.
+ */
+export type MetricUnit = 'percent' | 'count' | 'duration' | 'ratio'
+
+const PERCENT_METRICS: ReadonlySet<string> = new Set([
+  'total_return',
+  'cagr',
+  'volatility',
+  'max_drawdown',
+  'win_rate',
+  'exposure_pct',
+])
+const COUNT_METRICS: ReadonlySet<string> = new Set(['num_trades', 'max_drawdown_duration_days'])
+const DURATION_METRICS: ReadonlySet<string> = new Set(['avg_holding_period_hours'])
+
+export function metricUnit(name: string): MetricUnit {
+  if (PERCENT_METRICS.has(name)) return 'percent'
+  if (COUNT_METRICS.has(name)) return 'count'
+  if (DURATION_METRICS.has(name)) return 'duration'
+  return 'ratio'
+}
+
+/** One metric's value, in the units its name implies. `UNKNOWN` for a null. */
+export function formatMetric(name: string, value: number | null | undefined): string {
+  switch (metricUnit(name)) {
+    case 'percent':
+      return formatStatPercent(value)
+    case 'count':
+      return formatCount(value)
+    case 'duration':
+      return formatDuration(value)
+    default:
+      return formatStat(value)
+  }
+}
+
+/**
+ * A *difference* between two metric values, signed.
+ *
+ * Not `formatMetric` with a sign bolted on, and the duration case is why:
+ * `formatDuration` buckets by magnitude for readability, so a difference of
+ * -12.5 hours would render as `-750m` — technically the same quantity, and
+ * unreadable beside a column of hours. A difference is compared against its own
+ * row rather than understood on its own, so it keeps one unit throughout.
+ *
+ * Counts lose their decimals for the same reason they have none as values: a
+ * divergence of three round trips is `+3`, not `+3.00`.
+ */
+export function formatMetricDelta(name: string, value: number | null | undefined): string {
+  if (unusable(value)) return UNKNOWN
+  switch (metricUnit(name)) {
+    case 'percent':
+      return formatStatPercent(value, { signed: true })
+    case 'count':
+      return formatStat(value, { signed: true, places: 0 })
+    case 'duration':
+      return `${formatStat(value, { signed: true, places: 1 })}h`
+    default:
+      return formatStat(value, { signed: true })
+  }
+}
