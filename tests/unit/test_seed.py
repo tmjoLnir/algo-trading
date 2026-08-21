@@ -134,8 +134,14 @@ class TestGeneratedSeries:
 
     def test_prices_are_decimal_at_cent_resolution(self, year: list[Bar]) -> None:
         """Rule §1.1. The walk underneath is float, which is fine — it generates
-        a number rather than tracking a balance — but what lands in the row is
-        exact."""
+        a number rather than tracking a balance — but what comes out of the
+        generator is exact.
+
+        The exponent is checkable here and only here, on a bar that has not been
+        stored yet. `bars` columns are `NUMERIC(20, 8)` and preserve that scale,
+        so the same price reads back as `104.97000000`; the storage-side check
+        is in `tests/integration/test_seed.py` and asserts the value instead.
+        """
         for bar in year[:20]:
             for price in (bar.open, bar.high, bar.low, bar.close):
                 assert isinstance(price, Decimal)

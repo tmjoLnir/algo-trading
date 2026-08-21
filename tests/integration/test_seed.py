@@ -267,14 +267,28 @@ class TestSeededBars:
         calendar: TradingCalendar,
     ) -> None:
         """Rule §1.1 across the storage boundary. A float anywhere in this path
-        would come back with a tail of binary noise."""
+        would come back with a tail of binary noise.
+
+        **Asserted on the value, not on the exponent**, and the difference is
+        the whole reason this test is worth having. The column is
+        `NUMERIC(20, 8)`, which preserves its declared scale, so a price stored
+        as `104.97` comes back as `Decimal('104.97000000')` — exponent -8 and
+        exactly right. Checking the exponent (as the unit test legitimately does
+        on freshly generated bars, before storage) fails here on a perfectly
+        correct round trip.
+
+        Quantizing catches what actually matters and nothing else: it is a
+        no-op on a value that is exact to the cent, and changes both of the
+        things this test exists to detect — a float's `104.96999999999998` and
+        a genuine sub-cent `104.9712`.
+        """
         _, bars, _ = repos
         await _seed(repos, calendar)
         stored = await bars.get_last_n_bars(SYMBOL, Timeframe.D1, 5)
         assert stored
         for bar in stored:
             assert isinstance(bar.close, Decimal)
-            assert -bar.close.as_tuple().exponent <= 2
+            assert bar.close == bar.close.quantize(Decimal("0.01"))
             assert bar.adj_close == bar.close
 
     async def test_re_seeding_writes_the_same_bars(
