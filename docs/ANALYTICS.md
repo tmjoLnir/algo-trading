@@ -289,9 +289,36 @@ parses one back (docs/DASHBOARD.md).
 
 ## The screen
 
-`/analytics` in the dashboard, and it is the only consumer of the three
-endpoints above. It is a fold over stored fills and adds no server capability of
-its own.
+`/analytics` in the dashboard, and it is the only consumer of the endpoints
+above. It is a fold over stored fills and adds no server capability of its own.
+
+**Four panels, and the fourth is shaped unlike the other three.** Performance,
+attribution and the trade list describe a period the reader chose. Live-vs-
+backtest is keyed on a *run*, and three consequences follow that are the panel's
+whole design rather than its presentation:
+
+- **The picker starts empty.** Which backtest a live record is judged against is
+  the substance of the comparison, so defaulting to the newest run would be the
+  screen making exactly the choice the endpoint refuses to make. Only completed
+  runs are offered — the endpoint answers 400 for any other, so a picker that
+  listed them would offer a choice the server refuses.
+- **The page's date range does not reach it.** The live window is open at the
+  start by default and that default is load-bearing; forwarding the selected
+  month would compare a month of live against a five-year backtest while looking
+  like it had compared everything.
+- **`comparability` renders beside every row and the warnings above them**, and
+  a null divergence renders as a dash. Nothing is coloured good or bad: on most
+  rows the sign is a difference rather than a verdict — more volatility, more
+  round trips or a longer hold is not a failure — so the screen states the
+  difference and leaves the reading to the operator, the same refusal
+  `/backtests`' comparison table makes about marking a winner.
+
+The annualisation warning has an answer on screen rather than only a
+description: a control pins both sides to the backtest's own basis, using the
+`periods_per_year` the response reports for that run. The client never computes
+that number itself — a second copy of `periods_per_year_for` would drift from the
+one the engine used and then disagree with the figure it is supposed to
+explain.
 
 **Three requests, one window.** docs/DASHBOARD.md refuses to assemble the live
 screen from six fetches, because a P&L computed at one instant beside a price
@@ -340,13 +367,6 @@ day is its session day.
 
 Stated here rather than left to be discovered:
 
-- **A screen for the live-vs-backtest comparison.** The endpoint is built; the
-  `/analytics` page does not call it. It wants a run picker rather than a date
-  range — the choice this comparison turns on is *which backtest*, not which
-  month — and that is a different shape from the three panels that page is. The
-  divergence table also has to render `comparability` beside every row and the
-  warnings above them, or the screen reintroduces exactly the misreading the
-  response is built to prevent.
 - **The daily report.** Trades and P&L are available from this module now. The
   other three things the report wants are not gathered anywhere one query can
   reach: rejections are in `signals`, halts are in the kill switch's records,

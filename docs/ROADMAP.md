@@ -1406,11 +1406,27 @@ wording if it is not the demonstration you want.
     touched — is a refusal or a data gap, and from the trade count alone it is
     indistinguishable from underperformance.
 
-  Unticked. 18 unit tests on the endpoint and 14 on the core it added, and
-  `make check` is green — but every run in them is a fixture. Nothing has yet
-  compared a real paper record against a real backfilled backtest, which is what
-  the line below asks for. No screen calls it yet either (docs/ANALYTICS.md
-  'Not built yet').
+  **The screen is built**, as the Analytics tab's fourth panel. It sits there
+  rather than on `/backtests` because it is a report about live performance; the
+  run picker it needs is a hook over the same list, not that page. Three things
+  in it are the endpoint's own reasoning carried to the last step, where a
+  plainer table would have undone it: the picker starts **empty**, because
+  defaulting to the newest run would be the screen making the choice this
+  endpoint exists to refuse; the page's date range is **not forwarded**, because
+  the open-at-the-start live window is the honest denominator for "has this held
+  up"; and every row carries its `comparability` with the warnings above it,
+  with a null divergence rendered as a dash. Nothing is coloured good or bad —
+  on most rows the sign is a difference rather than a verdict, the same refusal
+  the backtest comparison table makes about marking a winner. The annualisation
+  warning also gained an answer rather than only a description: a control pins
+  both sides to the basis the response reports for that run, so the client never
+  computes a second copy of `periods_per_year_for`.
+
+  Unticked. 18 unit tests on the endpoint, 14 on the core it added and 9 web
+  tests on the panel, and `make check` is green — but every run in them is a
+  fixture. Nothing has yet compared a real paper record against a real
+  backfilled backtest, which is what the line below asks for, and no amount of
+  screen closes that.
 
 *Verifiable (live-vs-backtest, proposed):* with a strategy that has traded paper
 for a fortnight and a completed backtest of the same strategy on record, the
