@@ -210,15 +210,17 @@ class TestTheStrategyRow:
         engine = create_engine(clean_decision_tables)
         try:
             factory = create_session_factory(engine)
-            async with (
-                factory() as session,
-                pytest.raises(sqlalchemy.exc.IntegrityError, match="ck_strategies_state"),
-            ):
-                await session.execute(
-                    sqlalchemy.text("UPDATE strategies SET state = :bad WHERE id = :id"),
-                    {"bad": "active", "id": STRATEGY},
-                )
-                await session.commit()
+            # `pytest.raises` is a *synchronous* context manager, so it cannot
+            # join the `async with` group — every item in one must be async, and
+            # combining them raises `TypeError` before the assertion is reached.
+            # Nested, which is also the idiom the rest of this file uses.
+            async with factory() as session:
+                with pytest.raises(sqlalchemy.exc.IntegrityError, match="ck_strategies_state"):
+                    await session.execute(
+                        sqlalchemy.text("UPDATE strategies SET state = :bad WHERE id = :id"),
+                        {"bad": "active", "id": STRATEGY},
+                    )
+                    await session.commit()
         finally:
             await engine.dispose()
 
