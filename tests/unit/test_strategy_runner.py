@@ -151,7 +151,20 @@ class FakeQuoteCache:
 
 
 class FakeRouter:
-    """Records what the runner asked for, in order."""
+    """Records what the runner asked for, in order.
+
+    **A risk refusal carries the order it refused**, as `OrderRouter` does:
+    `transition(order, OrderStatus.REJECTED_RISK, ...)` then
+    `SubmitResult(order=order, ..., submitted=False)`. This fake returned
+    `order=None` for every refusal, which is why nothing here noticed that the
+    runner dropped refused orders on the floor — the read path in `/orders` was
+    built for a row the write path never produced, and a fake that never
+    produced one either could not have caught it.
+
+    `refuse_before_building` models the other half honestly: a refusal from
+    sizing or routing happens before an order exists, and there is genuinely
+    nothing to record.
+    """
 
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -162,7 +175,21 @@ class FakeRouter:
         self.refuse_signals = False
         self.refuse_protection = False
         self.refuse_flatten = False
+        #: Refuse *before* an order is composed — sizing, routing. The refusal
+        #: is then real and there is no order to store.
+        self.refuse_before_building = False
         self._next_id = 0
+
+    def _refused(self, symbol: str, side: Side, rule: str, reason: str) -> SubmitResult:
+        """A refusal shaped like the router's, order included."""
+        if self.refuse_before_building:
+            return SubmitResult(
+                order=None, decision=RiskDecision.deny(rule, reason), submitted=False
+            )
+        order = self._order(symbol, side)
+        order.status = OrderStatus.REJECTED_RISK
+        order.reject_reason = reason
+        return SubmitResult(order=order, decision=RiskDecision.deny(rule, reason), submitted=False)
 
     def _order(self, symbol: str, side: Side, order_type: OrderType = OrderType.MARKET) -> Order:
         self._next_id += 1
@@ -182,11 +209,9 @@ class FakeRouter:
     ) -> SubmitResult:
         self.calls.append("submit_signal")
         self.signals.append(signal)
-        if self.refuse_signals:
-            return SubmitResult(
-                order=None, decision=RiskDecision.deny("a_rule", "nope"), submitted=False
-            )
         side = Side.BUY if signal.action is SignalAction.ENTER_LONG else Side.SELL
+        if self.refuse_signals:
+            return self._refused(signal.symbol, side, "a_rule", "nope")
         return SubmitResult(
             order=self._order(signal.symbol, side), decision=RiskDecision.allow(), submitted=True
         )
@@ -205,10 +230,11 @@ class FakeRouter:
             return ProtectionResult(
                 placed=[],
                 refused=[
-                    SubmitResult(
-                        order=None,
-                        decision=RiskDecision.deny("kill_switch", "halted"),
-                        submitted=False,
+                    self._refused(
+                        entry_order.symbol,
+                        entry_order.side.opposite,
+                        "kill_switch",
+                        "halted",
                     )
                 ],
                 covered_qty=Decimal(0),
@@ -233,9 +259,7 @@ class FakeRouter:
         #: attribution rides on it reaching the order, so tests assert on it.
         self.flatten_purposes.append(purpose)
         if self.refuse_flatten:
-            return SubmitResult(
-                order=None, decision=RiskDecision.deny("kill_switch", "halted"), submitted=False
-            )
+            return self._refused(symbol, Side.SELL, "kill_switch", "halted")
         return SubmitResult(
             order=self._order(symbol, Side.SELL), decision=RiskDecision.allow(), submitted=True
         )
@@ -1124,6 +1148,170 @@ class TestProtectiveExits:
         await runner.evaluate(portfolio)
 
         assert router.flattened == []
+
+
+class TestRefusalsReachTheOrderTable:
+    """Every refusal the runner can hit, stored as the order it refused.
+
+    **`GET /orders` was built for these rows and had never seen one.** Its own
+    docstring says the orders that matter most are the ones that never filled
+    and that "a rejection appears in no other read in the platform";
+    `OrderHistoryTable` renders `rejected_risk` and shows the reason beside it.
+    The whole read path was complete and nothing ever wrote a refused order —
+    the runner dropped it at all four places it can be refused.
+
+    Only one of the four had any durable trace at all: a refused *signal* is
+    recorded as a decision, so `/risk/rejections` could find it. The other
+    three were logged and lost, and they are the ones that describe an open
+    position nobody is managing.
+    """
+
+    @staticmethod
+    def stored(orders: FakeOrderRepository) -> list[Order]:
+        return [o for o in orders.saved.values() if o.status is OrderStatus.REJECTED_RISK]
+
+    @pytest.mark.asyncio
+    async def test_a_refused_signal_is_stored(self) -> None:
+        """Durable twice, and the two say different things.
+
+        The signal records what the strategy *wanted*; this records what was
+        actually composed — the quantity after sizing, the type, the limit —
+        which is what `/orders` is read for.
+        """
+        orders = FakeOrderRepository()
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)], order_repo=orders)
+        router.refuse_signals = True
+        await runner.warmup(portfolio)
+
+        close_bar(runner, bar(1))
+        await runner.evaluate(portfolio)
+
+        (refused,) = self.stored(orders)
+        assert refused.symbol == SYMBOL
+        assert refused.reject_reason == "nope"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_stop_exit_is_stored(self) -> None:
+        """The most expensive of the four.
+
+        The stop triggered, the exit was refused, and the position is still on.
+        Before this it existed only as one `runner.stop_exit_refused` line in a
+        log that rotates.
+        """
+        orders = FakeOrderRepository()
+        runner, router, _, _, portfolio, _ = build(
+            bars=[bar(0)],
+            order_repo=orders,
+            stop_config=StopConfig(
+                stop_type=StopType.FIXED_PCT, value=Decimal("0.02"), broker_side=False
+            ),
+        )
+        await runner.warmup(portfolio)
+        TestProtectiveExits._armed(portfolio, stop="98")
+        router.refuse_flatten = True
+
+        close_bar(runner, bar(1, close=97.0))
+        await runner.evaluate(portfolio)
+
+        assert router.flattened == [SYMBOL]
+        (refused,) = self.stored(orders)
+        assert refused.reject_reason == "halted"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_protective_stop_is_stored(self) -> None:
+        """A position that never had protection at all.
+
+        The same safety layer as the case above, failing at the other end:
+        `runner.position_unprotected` is logged `error` and the position is
+        real whether or not the stop is.
+        """
+        orders = FakeOrderRepository()
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)], order_repo=orders)
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+        await runner.evaluate(portfolio)
+        router.refuse_protection = True
+
+        await runner.on_fill_event(TestFills.a_fill_update("atp-1"), portfolio)
+
+        assert [o.reject_reason for o in self.stored(orders)] == ["halted"]
+
+    @pytest.mark.asyncio
+    async def test_a_refused_shutdown_flatten_is_stored(self) -> None:
+        """The book is still open and the worker has gone home.
+
+        This is the row somebody needs tomorrow morning, when the position is
+        there and nothing in the orders table explains why.
+        """
+        orders = FakeOrderRepository()
+        runner, router, _, _, portfolio, _ = build(order_repo=orders)
+        await runner.warmup(portfolio)
+        portfolio.position(SYMBOL).qty = Decimal("10")
+        portfolio.position(SYMBOL).last_price = Decimal("100")
+        router.refuse_flatten = True
+
+        await runner.shutdown(close_positions=True)
+
+        (refused,) = self.stored(orders)
+        assert refused.symbol == SYMBOL
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_with_no_order_stores_nothing(self) -> None:
+        """Sizing and routing refuse *before* an order is composed.
+
+        There is no order to record, and inventing one would put rows in the
+        table for orders that were never built. The refusal is real; its record
+        is the signal.
+        """
+        orders = FakeOrderRepository()
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)], order_repo=orders)
+        router.refuse_signals = True
+        router.refuse_before_building = True
+        await runner.warmup(portfolio)
+
+        close_bar(runner, bar(1))
+        await runner.evaluate(portfolio)
+
+        assert self.stored(orders) == []
+
+    @pytest.mark.asyncio
+    async def test_an_approved_order_is_not_recorded_as_a_refusal(self) -> None:
+        orders = FakeOrderRepository()
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, _, _, _, portfolio, _ = build(strategy, bars=[bar(0)], order_repo=orders)
+        await runner.warmup(portfolio)
+
+        close_bar(runner, bar(1))
+        await runner.evaluate(portfolio)
+
+        assert self.stored(orders) == []
+
+    @pytest.mark.asyncio
+    async def test_a_failed_write_does_not_fail_the_evaluation(self) -> None:
+        """The opposite of how a *signal* write is treated, on purpose.
+
+        A signal is written on the way into the router and the order that
+        follows carries a foreign key to it, so a signal that cannot be written
+        must stop what comes next. This is written on the way out, about
+        something that already happened and is already in the log. Raising
+        would turn recording a refused stop into a failed evaluation — and
+        three of those halt trading, so the record of the refusal would become
+        the thing that stops the platform.
+        """
+        orders = FakeOrderRepository()
+        orders.save_error = RuntimeError("database is down")
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)], order_repo=orders)
+        router.refuse_signals = True
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+
+        await runner.evaluate(portfolio)
+
+        assert runner.stats.consecutive_errors == 0
 
 
 class TestTheDecisionRecord:

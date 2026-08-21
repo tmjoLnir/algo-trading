@@ -312,17 +312,21 @@ class TestTheBlindSpots:
         assert body["rejections"] == []
         assert body["blind_spots"], "an empty result must still say what it cannot see"
 
-    async def test_the_refused_stop_exit_is_named(self, client: httpx.AsyncClient) -> None:
-        """The one worth naming specifically.
+    async def test_the_refused_stop_exit_is_named_and_pointed_at(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """The one worth naming specifically, and it now has somewhere to point.
 
         A refused entry is a trade that did not happen. A refused *stop exit* is
         a position that should have closed and did not — docs/SAFETY.md's layer
-        5 failing — and it is logged by the worker and stored nowhere.
+        5 failing. It used to be logged and stored nowhere, which made this list
+        an apology; it is stored as a rejected order now, so the list has to
+        send a reader to `/orders` rather than tell them it is lost.
         """
         spots = " ".join((await client.get(REJECTIONS)).json()["blind_spots"])
 
         assert "stop exit" in spots
-        assert "log" in spots
+        assert "/orders" in spots
 
 
 class TestReadOnlySessions:

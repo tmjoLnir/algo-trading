@@ -483,17 +483,27 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   packed form, excluding one rule is a `LIKE` on a bracketed prefix that also
   matches any reason text beginning with a bracket.
 
-  **A gap that endpoint could not close, and this file should carry.** The
-  runner has three refusal paths and only one is recorded. `_record_signal`
-  writes a row for every signal whatever its fate; a **stop exit** the risk
-  chain denied and a **shutdown flatten** it denied are logged
-  (`runner.stop_exit_refused`, `runner.shutdown_flatten_refused`) and stored
-  nowhere. Neither is a signal, so `_record_signal` never sees them, and neither
-  order is tracked, so `_persist` never saves them. These are the more serious
-  of the three: a refused entry is a trade that did not happen, a refused stop
-  exit is a position that should have closed and did not — docs/SAFETY.md's
-  layer 5 failing, silently. The endpoint declares them as blind spots in its
-  own payload, which is honest but is not the fix.
+  **A gap that endpoint could not close, and #78 closed.** The runner has four
+  refusal paths and recorded one. `_record_signal` writes a row for every signal
+  whatever its fate; a **stop exit**, a **protective stop** and a **shutdown
+  flatten** the risk chain denied were logged
+  (`runner.stop_exit_refused`, `runner.position_unprotected`,
+  `runner.shutdown_flatten_refused`) and stored nowhere — none is a signal, and
+  none of their orders was ever tracked, so `_persist` never saw them. These are
+  the more serious three: a refused entry is a trade that did not happen, a
+  refused stop exit is a position that should have closed and did not, and a
+  refused protective stop is one that never had a stop — docs/SAFETY.md's layer
+  5 failing at both ends, silently.
+
+  All four now store the order they refused, which `GET /orders` was already
+  built to render and had never once been given. The endpoint's docstring says
+  "a rejection appears in no other read in the platform" and
+  `OrderHistoryTable` tints `rejected_risk`; the read path was complete and the
+  write path did not exist, so the table's most important category of row could
+  not occur. The write is deliberately swallowed on failure rather than raised:
+  it happens on the way *out*, about something that already happened, and three
+  failed evaluations halt trading — so raising would let the record of a refused
+  stop become the thing that stops the platform.
 
 **Before any live order path exists.** Not after.
 

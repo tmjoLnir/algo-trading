@@ -518,6 +518,9 @@ class StrategyRunner:
                     symbol=position.symbol,
                     reason=result.decision.reason,
                 )
+                # The book is still open and the worker is going home. This is
+                # the row that says so tomorrow morning.
+                await self._record_refusal(result)
         log.warning("runner.stopped", positions_left_open=False)
 
     # ── one pass ────────────────────────────────────────────────────────────
@@ -756,6 +759,10 @@ class StrategyRunner:
                     symbol=position.symbol,
                     reason=result.decision.reason,
                 )
+                # The stop triggered and the exit was refused, so the position
+                # is still on. Of the four refusals recorded here this is the
+                # one most likely to cost money.
+                await self._record_refusal(result)
             elif result.order is not None:
                 self._track(result.order)
 
@@ -881,11 +888,73 @@ class StrategyRunner:
                     rule=result.decision.rule,
                     reason=result.decision.reason,
                 )
+                # Already durable as a decision, above. Recorded as an order
+                # too, because the two answer different questions: the signal
+                # says what the strategy wanted, this says what was actually
+                # composed — the quantity after sizing, the type, the limit —
+                # and `/orders` is where a person looks for that.
+                await self._record_refusal(result)
                 continue
 
             self.stats.orders_submitted += 1
             if result.order is not None:
                 self._track(result.order)
+
+    async def _record_refusal(self, result: SubmitResult) -> None:
+        """Store an order the risk chain refused, so it survives the log.
+
+        **`GET /orders` was built for exactly this row and had never seen one.**
+        Its own docstring says the orders that matter most are the ones that
+        never filled, and that "a rejection appears in no other read in the
+        platform"; `OrderHistoryTable` renders `rejected_risk` in rose and
+        shows the reason beside it. None of it could ever fire, because a
+        refused order was dropped on the floor at every one of the four places
+        the runner can be refused. The read path was complete and the write
+        path did not exist.
+
+        The gap was not evenly serious. A refused *signal* was already durable
+        as a decision (`_record_signal`), so `/risk/rejections` could find it.
+        The other three were logged and lost, and they are the worse ones:
+
+        - a **stop exit** refused leaves a position open that should have
+          closed — docs/SAFETY.md layer 5 failing;
+        - a **protective stop** refused leaves a position that never had
+          protection at all, which is the same layer failing at the other end;
+        - a **shutdown flatten** refused leaves the book open after the worker
+          believes it has gone home.
+
+        Nothing to store when `result.order` is None. That is not a gap: a
+        refusal from sizing or routing happens *before* an order is built, so
+        there is no order to record — those exist as signals, or as nothing,
+        and inventing a row for them would put orders in the table that were
+        never composed.
+
+        **A failure here is swallowed and logged, never raised**, which is the
+        opposite of what `_record_signal` does and the difference is the
+        ordering. A signal is written on the way *into* the router, and the
+        order that follows carries a foreign key to it — so a signal that
+        cannot be written must stop what comes next. This is written on the way
+        *out*, about something that has already happened and is already in the
+        structured log. Raising would make recording a refusal into a failed
+        evaluation, and three of those halt trading: the record of a refused
+        stop would become the thing that stops the platform. It would also
+        break `stop()`, where a raise would leave the worker unable to shut
+        down because it could not write down why it had not flattened.
+        """
+        order = result.order
+        if result.submitted or order is None:
+            return
+        try:
+            await self.order_repo.save(order, run_mode=self.run_mode)
+        except Exception as exc:
+            log.critical(
+                "runner.refusal_unrecorded",
+                symbol=order.symbol,
+                status=order.status.value,
+                reason=order.reject_reason,
+                error=str(exc),
+                effect="the refusal happened and is in this log, but /orders will not show it",
+            )
 
     async def _record_signal(self, signal: Signal, result: SubmitResult) -> None:
         """Keep the decision and its fate, and announce it.
@@ -1089,6 +1158,12 @@ class StrategyRunner:
                 unprotected_qty=str(result.unprotected_qty),
                 refusals=[r.decision.reason for r in result.refused],
             )
+            # A list, because a position can be left unprotected by more than
+            # one refused child. Each is its own row: "the stop was refused" and
+            # "the stop and the target were both refused" are different states
+            # of the same position.
+            for refusal in result.refused:
+                await self._record_refusal(refusal)
 
     def _track(self, order: Order) -> None:
         """Remember an order we believe is working at the venue."""

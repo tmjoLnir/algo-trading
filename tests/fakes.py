@@ -306,8 +306,17 @@ class FakeOrderRepository:
         #: rejections included, which is what `recent_orders` exists to surface
         #: and what `restorable` (non-terminal only) deliberately excludes.
         self.history: list[Order] = []
+        #: Set by a test to stand for a write that cannot land. Unlike the
+        #: signal repository's, this one is used to prove a failure is
+        #: *swallowed*: the runner records a refusal on the way out, about
+        #: something that already happened, and raising there would turn the
+        #: record of a refused stop into the failed evaluation that halts
+        #: trading.
+        self.save_error: Exception | None = None
 
     async def save(self, order: Order, *, run_mode: object) -> None:
+        if self.save_error is not None:
+            raise self.save_error
         self.save_calls.append(order.client_order_id)
         self.saved[order.client_order_id] = replace(order, fills=list(order.fills))
 
