@@ -88,7 +88,7 @@ over a validated tree. Never `eval()` one.
 ## Workflow
 
 ```
-draft → backtest → paper (≥4 weeks) → live
+draft → backtesting → paper (≥4 weeks) → live
 ```
 
 Each gate is enforced by the API. See SAFETY.md for what live additionally

@@ -18,7 +18,7 @@ import type { AvailableStrategyView, StoredStrategyView, StrategiesResponse } fr
  * 2. **An empty table is not an empty platform.** "No worker has registered a
  *    strategy" and "there are no strategies" are different sentences.
  * 3. **`state` is shown as configured, not as running.** `ensure` writes
- *    `active` once and never revisits it.
+ *    `draft` once and never revisits it.
  * 4. **`updated_at` is rendered as what it records** — a worker started this —
  *    rather than as a suggestion somebody edited it.
  */
@@ -37,7 +37,7 @@ const STORED: StoredStrategyView = {
   class_name: 'SmaCrossover',
   params: { fast: 10, slow: 30 },
   ruleset: null,
-  state: 'active',
+  state: 'draft',
   universe: ['SPY', 'QQQ'],
   timeframe: '1d',
   risk_config: { max_position_pct: '0.1' },
@@ -167,12 +167,23 @@ describe('an empty table', () => {
 
 describe('the two misleading columns', () => {
   it('labels the state as configured rather than as running', async () => {
-    // `ensure` writes "active" once and never revisits it, so a strategy no
-    // worker has loaded for a month still reads active.
+    // `ensure` writes `draft` once and never revisits it, so a strategy a
+    // worker has been running for a month still reads draft.
     stub(200, response())
     renderPage()
 
     expect(await screen.findByText('as configured')).toBeTruthy()
+  })
+
+  it('renders a state it does not recognise rather than dropping the row', async () => {
+    // `StoredStrategyView.state` is a bare string on the wire on purpose: a
+    // database that has not run the e2b6d1a70f93 migration still holds
+    // `active`, and a newer server may send a rung this build has never heard
+    // of. The word is what a reader needs; only the tint is unknown.
+    stub(200, response({ strategies: [{ ...STORED, state: 'active' }] }))
+    renderPage()
+
+    expect(await screen.findByText('active')).toBeTruthy()
   })
 
   it('renders updated_at as when a worker last started the strategy', async () => {

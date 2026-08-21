@@ -1188,11 +1188,21 @@ wording if it is not the demonstration you want.
   and a reader needs the whole row.
 
   Two columns are served under names that say what they record, because their
-  own names do not. `state` is not "is it running now": `ensure` writes `active`
-  once and never revisits it, so a strategy nothing has loaded for a month still
-  reads active. `updated_at` is not "last edited": a later boot bumps only the
-  timestamp, so it is served as `last_started_at`. Both are the same asymmetry
-  in `ensure`, seen from the reading side for the first time.
+  own names do not. `state` is not "is it running now": `ensure` writes it once
+  and never revisits it, so a strategy a worker has been running for a month
+  still reads whatever the first boot set. `updated_at` is not "last edited": a
+  later boot bumps only the timestamp, so it is served as `last_started_at`.
+  Both are the same asymmetry in `ensure`, seen from the reading side for the
+  first time.
+
+  What that first boot wrote was `"active"` — a string `StrategyState` has never
+  contained, into a `String(20)` nothing checked, and the only value any row
+  could hold because `ensure` is the platform's only writer of one. So the
+  screen's filter offered five options of which four could not match and the
+  fifth was not a real rung. Fixed in #76: `draft` on a first boot, a CHECK
+  constraint over the enum (migration `e2b6d1a70f93`), the API's filter typed as
+  the enum, and the front end's list derived from the generated union so the
+  drift cannot silently return.
 
   **A trap this nearly shipped into.** `@register` runs at import time, so a
   process that has never imported a strategy module has an empty registry — and

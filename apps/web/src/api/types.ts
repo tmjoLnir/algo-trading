@@ -53,6 +53,16 @@ export type WhoAmI = Schemas['WhoAmI']
 export type PreSessionContext = Schemas['PreSessionContext']
 
 /**
+ * The rungs of the promotion ratchet, straight from the server's own enum.
+ *
+ * Generated, so `useStrategies.ts` can be *checked* against it rather than
+ * hand-maintaining a parallel list. It used to hand-maintain one, and it drifted
+ * — the filter offered `backtest` and `active`, neither of which
+ * `StrategyState` has ever contained, and omitted `live` and `halted`.
+ */
+export type StrategyState = Schemas['StrategyState']
+
+/**
  * The risk read endpoints (`/risk/limits`, `/risk/status`).
  *
  * `LimitUsageView.current` and `.ceiling` are decimal strings even where the

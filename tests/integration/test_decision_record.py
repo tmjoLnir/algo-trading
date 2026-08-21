@@ -24,7 +24,16 @@ import pytest
 import sqlalchemy
 
 from atp_core.clock import SimulatedClock
-from atp_core.domain import Fill, Order, OrderStatus, RunMode, Side, Signal, SignalAction
+from atp_core.domain import (
+    Fill,
+    Order,
+    OrderStatus,
+    RunMode,
+    Side,
+    Signal,
+    SignalAction,
+    StrategyState,
+)
 from atp_core.execution.idempotency import ENTRY, STOP_LOSS, UNKNOWN_PURPOSE
 from atp_core.persistence.db import create_engine, create_session_factory
 from atp_core.persistence.orders import PostgresOrderRepository
@@ -180,6 +189,69 @@ class TestTheStrategyRow:
         strategies, _, _ = repos
         assert await strategies.get("never_registered") is None
 
+    @pytest.mark.asyncio
+    async def test_the_database_refuses_a_state_that_is_not_a_rung(
+        self, clean_decision_tables: str, repos: tuple
+    ) -> None:
+        """The guardrail that was missing, tested where it lives.
+
+        `state` was a bare `String(20)`, so `ensure` writing `"active"` — a
+        value `StrategyState` has never contained — was accepted silently by
+        every layer for four phases. Nothing in Python would have caught it
+        either: the repository writes the column, so a type annotation on the
+        way out cannot see a bad value going in.
+
+        This is why the fix is a CHECK rather than only a corrected literal. A
+        literal can be mistyped again; the column now cannot hold the mistake.
+        """
+        strategies, _, _ = repos
+        await strategies.ensure(a_record())
+
+        engine = create_engine(clean_decision_tables)
+        try:
+            factory = create_session_factory(engine)
+            # `pytest.raises` is a *synchronous* context manager, so it cannot
+            # join the `async with` group — every item in one must be async, and
+            # combining them raises `TypeError` before the assertion is reached.
+            # Nested, which is also the idiom the rest of this file uses.
+            async with factory() as session:
+                with pytest.raises(sqlalchemy.exc.IntegrityError, match="ck_strategies_state"):
+                    await session.execute(
+                        sqlalchemy.text("UPDATE strategies SET state = :bad WHERE id = :id"),
+                        {"bad": "active", "id": STRATEGY},
+                    )
+                    await session.commit()
+        finally:
+            await engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_every_rung_of_the_enum_is_storable(
+        self, clean_decision_tables: str, repos: tuple
+    ) -> None:
+        """The other half, and the one a too-tight constraint would break.
+
+        A CHECK that refused a legitimate rung would be worse than the bug it
+        replaced — a strategy could not be promoted at all. Both directions are
+        asserted because the constraint is generated from the enum, and a
+        generator is exactly the thing that can go wrong in one direction only.
+        """
+        strategies, _, _ = repos
+        await strategies.ensure(a_record())
+
+        engine = create_engine(clean_decision_tables)
+        try:
+            factory = create_session_factory(engine)
+            for rung in StrategyState:
+                async with factory() as session:
+                    await session.execute(
+                        sqlalchemy.text("UPDATE strategies SET state = :rung WHERE id = :id"),
+                        {"rung": rung.value, "id": STRATEGY},
+                    )
+                    await session.commit()
+                assert (await strategies.get(STRATEGY)) is not None, rung
+        finally:
+            await engine.dispose()
+
 
 class TestListingStrategies:
     """`list_all` — the read behind `GET /api/v1/strategies`.
@@ -202,8 +274,12 @@ class TestListingStrategies:
         assert rows[0].id == STRATEGY
         assert rows[0].universe == ("SPY", "QQQ")
         assert rows[0].params == {"fast": 20, "slow": 50}
-        # Written by `ensure` on a first boot, and never touched again.
-        assert rows[0].state == "active"
+        # Written by `ensure` on a first boot, and never touched again. It is
+        # `draft` — the ratchet's first rung — and asserted against the enum
+        # rather than a literal, because a literal is exactly what let this
+        # column hold `"active"` for four phases (migration e2b6d1a70f93).
+        assert rows[0].state == StrategyState.DRAFT
+        assert rows[0].state in set(StrategyState), "the stored state must be a real rung"
 
     @pytest.mark.asyncio
     async def test_a_second_boot_moves_only_the_timestamp(
@@ -243,8 +319,8 @@ class TestListingStrategies:
         await strategies.ensure(a_record("one"))
         await strategies.ensure(a_record("two"))
 
-        assert len(await strategies.list_all(state="active")) == 2
-        assert await strategies.list_all(state="paused") == []
+        assert len(await strategies.list_all(state=StrategyState.DRAFT)) == 2
+        assert await strategies.list_all(state=StrategyState.PAUSED) == []
 
     @pytest.mark.asyncio
     async def test_nothing_stored_is_an_empty_list(self, repos: tuple) -> None:

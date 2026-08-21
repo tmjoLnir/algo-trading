@@ -13,10 +13,12 @@
  * because the columns mean less than they say:
  *
  * - **`state` is not "is it running now".** `StrategyRepository.ensure` writes
- *   `active` when it creates a row and never touches it again, so a strategy no
- *   worker has loaded for a month still reads `active`. It is shown as the
- *   *configured* state, with the liveness question answered by the timestamp
- *   beside it instead.
+ *   `draft` when it creates a row and never touches it again, so a strategy a
+ *   worker has been running for a month still reads `draft` — that is the
+ *   ratchet's first rung and nothing has promoted it off, because the endpoints
+ *   that would are stubs. It is shown as the *configured* state, with the
+ *   liveness question answered by the timestamp beside it instead. It wrote
+ *   `active` until #76, which was not a member of `StrategyState` at all.
  * - **`updated_at` is not "last edited".** The same asymmetry: a later boot
  *   bumps only the timestamp. The API serves it as `last_started_at` and this
  *   screen renders it as "a worker last started this", which is what it records.
@@ -40,15 +42,36 @@ import { ApiError } from '@/api/client'
 import RiskLimitsPanel from '@/components/RiskLimitsPanel'
 import { STRATEGY_STATES, useStrategies } from '@/hooks/useStrategies'
 import { UNKNOWN, formatDateTime } from '@/lib/money'
-import type { AvailableStrategyView, StoredStrategyView } from '@/api/types'
+import type { AvailableStrategyView, StoredStrategyView, StrategyState } from '@/api/types'
 
-/** Tint per lifecycle state. The word is always present; colour is an accent. */
-const STATE_TONE: Record<string, string> = {
-  active: 'text-emerald-400',
-  paper: 'text-sky-400',
-  backtest: 'text-slate-300',
+/**
+ * Tint per rung. The word is always present; colour is an accent.
+ *
+ * A `Record` over the generated union, so a rung added to the server's enum
+ * fails `tsc` here until somebody decides what colour it is. It was
+ * `Record<string, string>` and had drifted: it tinted `active` and `backtest`,
+ * neither of them members, and had nothing for `live` or `halted`.
+ */
+const STATE_TONE: Record<StrategyState, string> = {
   draft: 'text-slate-400',
+  backtesting: 'text-slate-300',
+  paper: 'text-sky-400',
+  live: 'text-emerald-400',
   paused: 'text-amber-400',
+  halted: 'text-rose-400',
+}
+
+/**
+ * The tint for a stored state, which is not guaranteed to be a rung.
+ *
+ * `StoredStrategyView.state` is deliberately a bare string on the wire: a
+ * database that has not run the `e2b6d1a70f93` migration still holds `active`,
+ * and a row written by a newer server may hold a rung this build has never
+ * heard of. Both render in neutral rather than crashing the row — the word
+ * itself is displayed either way, which is the part a reader needs.
+ */
+function toneFor(state: string): string {
+  return STATE_TONE[state as StrategyState] ?? 'text-slate-300'
 }
 
 function Panel({
@@ -109,11 +132,10 @@ function StoredRow({ strategy }: { strategy: StoredStrategyView }) {
         ) : null}
       </td>
       <td className="px-3 py-2 text-left">
-        <span className={`font-medium ${STATE_TONE[strategy.state] ?? 'text-slate-300'}`}>
-          {strategy.state}
-        </span>
-        {/* Said out loud, because "active" is written once and never revisited:
-            a strategy nothing has loaded for a month still reads active. */}
+        <span className={`font-medium ${toneFor(strategy.state)}`}>{strategy.state}</span>
+        {/* Said out loud, because the state is written once and never
+            revisited: a strategy a worker has been running for a month still
+            reads whatever its first boot set, which today is always `draft`. */}
         <div className="text-xs text-slate-600">as configured</div>
       </td>
       <td className="px-3 py-2 text-left text-xs text-slate-400">
