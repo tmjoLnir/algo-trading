@@ -302,14 +302,32 @@ jobs:
           sleep 25
           docker compose ps api
           state=$(docker compose ps api --format '{{.State}}')
-          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:8000/healthz || echo 000)
+          # `|| true` on the assignment, NOT `|| echo 000` inside it. curl
+          # writes its own `000` for a refused connection AND exits non-zero,
+          # so an `echo` in the pipeline appends a second one: the variable
+          # holds `000000`, never equals `000`, and the comparison below can
+          # never be true. That is how this step read when it was written, and
+          # it passed for the same reason a `[ -z ]` on a two-line string does.
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:8000/healthz) || true
           echo "api state=$state  /healthz=$code"
-          if [ "$state" = "running" ] && [ "$code" = "000" ]; then
+
+          # First that the setup took effect at all. If the API still answers,
+          # the malformed value never reached `Settings` — the sed missed, or
+          # the recreate did not happen — and everything below would pass while
+          # demonstrating nothing. A test that cannot fail is worse than absent:
+          # it reports the property as held.
+          [ "$code" = "000" ] || {
+            echo "::error::the API still answers ($code) -- the broken value never took effect, so this step proves nothing"
+            exit 1
+          }
+
+          # Then the regression itself.
+          [ "$state" != "running" ] || {
             echo "::error::the api container is up and serving nothing -- a dead app behind a live reloader, which restart: unless-stopped cannot see"
             docker compose logs --tail=40 api
             exit 1
-          fi
-          echo "a config the API cannot start with does not masquerade as a running API"
+          }
+          echo "a config the API cannot start with does not masquerade as a running API (state=$state)"
 
       - name: And it recovers by itself once the configuration is fixed
         run: |
