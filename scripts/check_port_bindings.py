@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Fail if the compose stack would expose a port, or deploy the wrong code.
+"""Fail if the compose stack would expose a port, deploy the wrong code, or
+come back from a reboot in pieces.
 
 The platform has no authentication — `get_current_user()` is a stub, and every
 endpoint under /risk, /orders and /positions is reachable by anyone who can
@@ -36,6 +37,12 @@ is the development stack; `docker-compose.prod.yml` overlays it into the
 deployed one (ADR 0011). The deployed file is the one where a wrong bind matters
 most, and until it was added here it was the one file nothing looked at.
 
+Restart policies are checked on **both**, and that is a correction rather than a
+widening — see `check_restart_policies`. The one service in the repository still
+missing a policy was `web`, which the overlay puts behind a profile, so scoping
+this check to the deployed configuration meant the only service that could fail
+it was the only one it never saw.
+
 The deployed configuration is additionally checked for *shape*, which is a
 different question from exposure and is here for the same reason. The overlay
 removes the base file's source bind mounts and its `--reload` with compose's
@@ -44,6 +51,13 @@ later, leaves them in place **silently**, and the stack then runs whatever
 source is in the checkout on the host instead of the image that was built and
 tested. Asserting the resolved configuration is the only way to tell — reading
 the file tells you what was intended, not what compose did with it.
+
+The `--reload` half of that reads every part of the resolved command rather than
+asking whether the list contains it as an element. The base file now starts the
+API through `sh -c` so that a configuration it cannot import is an exit rather
+than a reloader idling forever with nothing bound, and an element test against
+`["sh", "-c", "... --reload"]` is False — the check would have gone on passing
+while the flag it exists to catch sat one level down inside the string.
 """
 
 from __future__ import annotations
@@ -164,6 +178,43 @@ def check_bindings(label: str, services: dict) -> list[str]:
     return exposed + public + unclassifiable
 
 
+def check_restart_policies(label: str, services: dict) -> list[str]:
+    """Report every service that would not come back after a reboot.
+
+    **Both configurations**, and the development one is not the afterthought it
+    looks like. This check used to run against the deployed configuration alone,
+    on the reasoning that surviving a reboot is a deployment concern — the same
+    reasoning that once left `db`, `redis` and `api` without a policy while
+    `worker` had one. It is wrong for the same reason it was wrong then: the
+    development file also serves a dashboard, through `make up-prod`, and the
+    cost of a missing policy is not "one service is down" but "the two ends of a
+    request disagree about whether the stack is running".
+
+    Scoping it to `deployed` also meant it could not see the service it needed
+    to. The overlay puts the dev server behind a profile, so `web` is absent
+    from the deployed configuration entirely — the one service in the repository
+    still missing a restart policy was the one service this check never looked
+    at.
+    """
+    problems = [
+        f"{name} has no restart policy — a host reboot leaves it down"
+        for name, service in sorted(services.items())
+        if not service.get("restart")
+    ]
+    if problems:
+        print(f"ERROR [{label}]: a service would not come back after a reboot.")
+        for line in problems:
+            print(f"  {line}")
+        print()
+        print("A stack that comes back in pieces is worse than one that stays down:")
+        print("whatever serves the dashboard renders it perfectly against whatever")
+        print("did not come back, and the result reads as a broken page rather than")
+        print("as a stopped container.")
+    else:
+        print(f"restart policies [{label}]: every service comes back after a reboot")
+    return problems
+
+
 def check_deployed_shape(services: dict) -> list[str]:
     """Report anything that would deploy the checkout instead of the image.
 
@@ -184,12 +235,8 @@ def check_deployed_shape(services: dict) -> list[str]:
                 f"{name} still bind-mounts {volume.get('source')} -> {volume.get('target')}"
             )
         command = service.get("command") or []
-        if "--reload" in command:
+        if any("--reload" in part for part in command):
             problems.append(f"{name} still runs with --reload: {' '.join(command)}")
-
-    for name, service in sorted(services.items()):
-        if not service.get("restart"):
-            problems.append(f"{name} has no restart policy — a host reboot leaves it down")
 
     if problems:
         print("ERROR [deployed]: the deployed configuration is not the deployed shape.")
@@ -197,11 +244,10 @@ def check_deployed_shape(services: dict) -> list[str]:
             print(f"  {line}")
         print()
         print("A source mount or a --reload here means the stack runs whatever is in")
-        print("the checkout rather than the image that was built and tested, and a")
-        print("missing restart policy means a reboot brings the stack back in pieces.")
+        print("the checkout rather than the image that was built and tested.")
         print("`!reset` needs Compose v2.24+ — check `docker compose version`.")
     else:
-        print("deployed shape: code comes from the image, and every service restarts")
+        print("deployed shape: code comes from the image")
     return problems
 
 
@@ -210,6 +256,7 @@ def main() -> int:
     for label, command in CONFIGS:
         services = _resolve(command).get("services", {})
         failures += check_bindings(label, services)
+        failures += check_restart_policies(label, services)
         if label == "deployed":
             failures += check_deployed_shape(services)
         print()

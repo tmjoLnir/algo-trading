@@ -79,7 +79,45 @@ services:
     volumes:
       - ./libs:/app/libs
       - ./apps/api:/app/apps/api
-    command: uvicorn atp_api.main:app --host 0.0.0.0 --port 8000 --reload
+    # Two commands, and the first one is load-bearing.
+    #
+    # `--reload` is a SUPERVISOR, not a server. uvicorn's reloader forks a child
+    # that binds the port and serves; the parent only watches the source. When
+    # the child cannot start at all — `Settings` refusing to validate on a typo
+    # in `.env`, an import error anywhere under `create_app()` — the child dies
+    # and **the parent does not**. It sits there waiting for a file change that
+    # a container has nobody to make.
+    #
+    # That is the failure this whole service is arranged to survive, arriving in
+    # the one shape the arrangement cannot see. The container stays `Up`. Nothing
+    # is listening on 8000. `restart: unless-stopped` below never fires, because
+    # there is no exit to restart — a restart policy acts on a process that
+    # died, and this one is alive and idle. The HEALTHCHECK in the image does
+    # notice, and Docker does nothing with an unhealthy container but label it.
+    #
+    # From a browser it is indistinguishable from the 502 this file already
+    # documents, and it is permanent in a way that one no longer is:
+    #
+    #     connect() failed (111: Connection refused) while connecting to
+    #     upstream, request: "GET /api/v1/auth/me", upstream: "http://172.18.0.4:8000"
+    #
+    # — nginx resolved the API, reached its container and found the port shut,
+    # so the dashboard renders in full and the sign-in screen it renders is
+    # `Cannot reach the API.`, for as long as anyone cares to wait. It also
+    # defeats the diagnosis docs/RUNBOOK.md gives for that screen, which is to
+    # look for a climbing restart count: there isn't one. `docker compose ps`
+    # says `Up`.
+    #
+    # So the app is imported ONCE, in the foreground, before the reloader is
+    # given PID 1. A configuration this process cannot start with is then an
+    # exit code — visible, restarted, and with the traceback in `logs api` —
+    # rather than a silence. It costs one extra import at startup, and only
+    # startup: once this passes, `--reload` behaves exactly as it did, and an
+    # edit that breaks the app mid-session still leaves the reloader waiting for
+    # the edit that fixes it, which is the whole point of running it here.
+    command: >
+      sh -c "python -c 'import atp_api.main' &&
+             exec uvicorn atp_api.main:app --host 0.0.0.0 --port 8000 --reload"
     # THE line that keeps the dashboard working, and it was missing.
     #
     # `web-prod` restarts forever and this did not, which made the two ends of
@@ -215,6 +253,18 @@ services:
       - ./apps/web:/app
       - /app/node_modules
     command: npm run dev -- --host 0.0.0.0
+    # As every other service in this file, and it was the last one without it.
+    #
+    # The asymmetry that produced the permanent 502 — one end of a request
+    # restarting forever while the other stayed down — was fixed on `api` and
+    # left standing here, pointing the other way. After a host reboot or an OOM
+    # kill this stack came back with the API, the worker, the queue and both
+    # stores running and the thing serving the dashboard stopped, so `make up`
+    # was needed to finish a boot that looked complete from every other angle.
+    #
+    # A dev server is worth restarting for the same reason nginx is: it is the
+    # half of the pair a person points a browser at.
+    restart: unless-stopped
 
   web-prod:
     # The dashboard as deployed: `npm run build` output served by nginx, with
