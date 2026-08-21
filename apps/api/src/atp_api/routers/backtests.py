@@ -53,6 +53,7 @@ from atp_core.backtest.ports import BacktestRunRepository as RunRepository
 from atp_core.backtest.runner import (
     COST_MODELS,
     DEFAULT_COST_MODEL,
+    SIZING_METHODS,
     backfill_hint,
     missing_coverage,
     suspicious,
@@ -108,12 +109,18 @@ class BacktestRequest(BaseModel):
     #: the job is queued — so a bad `fast`/`slow` pair is a 400 now rather than a
     #: failed run later.
     params: dict[str, Any] = Field(default_factory=dict)
-    #: Shares per entry. A placeholder that the CLI carries too and says so on
-    #: every run: real sizing is risk-based (docs/RISK.md 'Position sizing'), so
-    #: the reported return is a property of this number as much as of the
-    #: strategy. Stored on the run, because a result whose share count nobody
-    #: recorded cannot be compared with anything.
+    #: Shares per entry under the default `fixed_qty` sizing. Stored on the run,
+    #: because a result whose share count nobody recorded cannot be compared
+    #: with anything.
     qty: Decimal = Decimal("100")
+    #: How a quantity is decided. `fixed_qty` remains the default so a request
+    #: that names neither field is the run it has always been — not because it
+    #: is the right way to size, which docs/RISK.md says is risk-based.
+    sizing_method: str = "fixed_qty"
+    #: What `sizing_method` reads; its meaning follows the method. Omitted means
+    #: `qty`, which is what keeps an old request and a new `fixed_qty` one the
+    #: same run.
+    sizing_value: Decimal | None = None
 
 
 class BacktestSpecView(BaseModel):
@@ -133,6 +140,12 @@ class BacktestSpecView(BaseModel):
     cost_model: str
     params: dict[str, Any] = Field(default_factory=dict)
     qty: str
+    #: Echoed back for the reason the rest of the spec is: a divergence between
+    #: two runs of one strategy is usually a difference in how they were sized,
+    #: and a reader comparing them cannot see that unless it travels with the
+    #: result.
+    sizing_method: str
+    sizing_value: str
 
 
 class BacktestProgressView(BaseModel):
@@ -248,6 +261,11 @@ def _to_spec_view(spec: BacktestRunSpec) -> BacktestSpecView:
         cost_model=spec.cost_model,
         params=dict(spec.params),
         qty=spec.qty,
+        sizing_method=spec.sizing_method or "fixed_qty",
+        # Resolved rather than echoed raw: an old run stores an empty
+        # `sizing_value` and was sized by `qty`, and serving the empty string
+        # would show a reader a field the run did not actually use.
+        sizing_value=spec.sizing_value or spec.qty,
     )
 
 
@@ -331,6 +349,10 @@ def _validated_spec(payload: BacktestRequest) -> BacktestRunSpec:
 
     if payload.cost_model not in COST_MODELS:
         raise _bad_request(f"cost_model must be one of: {', '.join(sorted(COST_MODELS))}")
+    if payload.sizing_method not in SIZING_METHODS:
+        raise _bad_request(f"sizing_method must be one of: {', '.join(sorted(SIZING_METHODS))}")
+    if payload.sizing_value is not None and payload.sizing_value <= 0:
+        raise _bad_request(f"sizing_value must be positive, got {payload.sizing_value}")
     if payload.starting_cash <= 0:
         raise _bad_request(f"starting_cash must be positive, got {payload.starting_cash}")
     if payload.qty <= 0:
@@ -364,6 +386,11 @@ def _validated_spec(payload: BacktestRequest) -> BacktestRunSpec:
         cost_model=payload.cost_model,
         params=dict(payload.params),
         qty=str(payload.qty),
+        sizing_method=payload.sizing_method,
+        # Str, not float, for the reason `starting_cash` is one: this crosses a
+        # JSON column and a process boundary, and a fraction of equity is
+        # exactly the kind of value a binary float rounds visibly.
+        sizing_value="" if payload.sizing_value is None else str(payload.sizing_value),
     )
 
 

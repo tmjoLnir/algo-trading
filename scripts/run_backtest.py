@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import ValidationError
 
 from atp_core.backtest.ports import BacktestRunSpec
-from atp_core.backtest.runner import build_engine, jsonable
+from atp_core.backtest.runner import SIZING_METHODS, build_engine, jsonable, refusal_summary
 from atp_core.config import get_settings
 from atp_core.domain import Timeframe
 from atp_core.errors import ATPError
@@ -86,9 +86,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--qty",
         type=int,
         default=100,
+        help="shares per entry, under the default fixed_qty sizing",
+    )
+    p.add_argument(
+        "--sizing",
+        default="fixed_qty",
+        choices=sorted(SIZING_METHODS),
         help=(
-            "shares per entry. A placeholder: real sizing is risk-based and "
-            "arrives with the risk engine (docs/RISK.md 'Position sizing')"
+            "how a quantity is decided. risk_pct is what docs/RISK.md calls "
+            "real sizing, and it needs the strategy to emit a stop"
+        ),
+    )
+    p.add_argument(
+        "--sizing-value",
+        default=None,
+        help=(
+            "what --sizing reads: a share count for fixed_qty, an amount for "
+            "fixed_notional, a fraction of equity for the rest. Defaults to --qty"
         ),
     )
     p.add_argument("--zero-cost", action="store_true", help="debugging only")
@@ -228,14 +242,15 @@ async def main(argv: list[str] | None = None) -> int:
     # start does not first explain how it would have been caveated.
     if args.zero_cost:
         print("WARNING: zero-cost model — results are NOT evidence about this strategy.")
+    if args.sizing == "fixed_qty":
+        print(
+            f"NOTE: sizing every entry at {args.sizing_value or args.qty} shares. Real "
+            "sizing is risk-based and equalises risk per trade — treat the return "
+            "as a property of this share count (docs/RISK.md 'Position sizing')."
+        )
     print(
-        f"NOTE: sizing every entry at {args.qty} shares. Real sizing is risk-based "
-        "and equalises risk per trade; until the risk engine lands, treat the "
-        "return as a property of this share count (docs/RISK.md)."
-    )
-    print(
-        "NOTE: no pre-trade risk rules are active — the rule chain is Phase 3. "
-        "Orders are still routed through RiskEngine, but nothing refuses them."
+        "NOTE: the risk chain is active. Five of the nine rules apply to a replay "
+        "over bars; the four that cannot are named in risk.engine.backtest_rules."
     )
 
     log.info(
@@ -265,6 +280,8 @@ async def main(argv: list[str] | None = None) -> int:
             cost_model="zero" if args.zero_cost else "alpaca_equities",
             params=params,
             qty=str(args.qty),
+            sizing_method=args.sizing,
+            sizing_value=args.sizing_value or "",
         ),
         limits=settings.risk,
     )
@@ -276,6 +293,13 @@ async def main(argv: list[str] | None = None) -> int:
 
     fees = sum((o.total_fees for o in result.orders), Decimal(0))
     _print_report(strategy.name, symbols, result, result.metrics, fees)
+
+    # Above the "too few trades" note, because it is often the *reason* there
+    # were too few: a run whose entries the chain refused reports a return from
+    # the ones that survived, which is a fact about the limits rather than about
+    # the strategy.
+    if (refusals := refusal_summary(result)) is not None:
+        print(f"\n{refusals}.")
 
     if result.metrics["num_trades"] < 30:
         print(

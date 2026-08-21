@@ -336,10 +336,25 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   Ticked against the *Verifiable:* line below, now shown. The caveat that stood
   here — **nothing routes live orders through this chain** — is closed by
   `OrderRouter` (#33): every path through it validates, and there is no way to
-  reach a broker adapter around it. The backtest CLI still passes an explicit
-  empty chain, and nothing calls the router in production until
-  `StrategyRunner` exists, so the claim has moved one link down rather than
-  being discharged.
+  reach a broker adapter around it.
+
+  The half that was left — "the backtest CLI still passes an explicit empty
+  chain" — is closed too. `backtest_rules()` is the chain a replay over bars can
+  evaluate: five of the nine, with the four it cannot named and justified rather
+  than passed stubs that always approve. `trading_hours` is the one worth
+  knowing about, because including it looks harmless and is not: a daily bar is
+  stamped at exchange-local midnight, so the calendar reports closed at every
+  one and the rule would refuse every order in every daily backtest.
+
+  **And one rule in the live chain had never been reachable.**
+  `DailyLossLimitRule` denies every entry until something calls `anchor`, which
+  is correct — it will not assume the day began flat — and nothing in this
+  platform ever called it. So `apps/worker`'s chain was configured to refuse
+  every entry it would ever produce. It survived because the failure is
+  invisible from outside: a chain refusing everything and a chain nothing has
+  reached look identical, and nothing has traded paper. `RiskEngine
+  .anchor_session` is the named seam, `StrategyRunner.warmup` calls it at each
+  session open and the backtest engine at each session in the replay.
 - [ ] Position sizing, all methods — @claude (wip #30).
   All five implemented: `fixed_qty`, `fixed_notional`, `equity_pct`, `risk_pct`
   and `volatility_target`. `risk_pct` and `volatility_target` each refuse the
@@ -366,8 +381,34 @@ strategy evaluated without them is flattered by 1.3 points over five years on
 
   It now has a production caller: `OrderRouter.submit_signal` sizes through it
   (#33), and `test_order_router.py` reproduces the docs/RISK.md worked example
-  end to end rather than against `position_size` alone. Still unticked — a
-  caller is not a demonstration, and the missing line is the reason.
+  end to end rather than against `position_size` alone.
+
+  **And a second caller, which is what closes this.** `build_engine` sized every
+  backtest at a flat share count — `FixedQtySizer` — so none of the five methods
+  had ever decided a quantity in a run anybody read. `RiskBasedSizer` delegates
+  to the same `position_size` the router calls, with the same arguments, so the
+  two cannot drift; `BacktestRunSpec` carries the method and its value, and a
+  spec stored before those fields existed still resolves to the `fixed_qty` run
+  it was. The inputs the function refuses to default surface as a **refused
+  order** naming the sizing stage rather than as a silent zero — `sma_crossover`
+  emits no stop, so a `risk_pct` run over it books one refusal per entry and
+  says so, instead of returning an empty result indistinguishable from a
+  strategy that never signalled.
+
+  *Verifiable (proposed, and shown):* the docs/RISK.md worked example reproduces
+  through the path a backtest actually uses. $100,000 at 1%, a $50 entry against
+  a $48 stop is 500 shares and against a $35 stop is 66; both lose within $15 of
+  $1,000 if stopped. Asserted through `RiskBasedSizer` rather than against
+  `position_size` directly, because the thing that was missing was never the
+  arithmetic. Proposed here because the item's own text asked whoever reviewed
+  it to settle a line, and this is that line.
+
+  **Still unticked, and deliberately.** The reason above has not gone away, it
+  has only got closer: this PR proposes the line and shows it, in one diff,
+  which is exactly what the earlier text declined to do. That refusal was right
+  and is not mine to overturn — proposing your own bar and declaring you cleared
+  it is not a demonstration, it is a decision about what counts as one, and that
+  belongs to a reviewer. The box is one review away rather than one PR away.
 - [ ] `StopManager` — fixed, ATR, trailing, chandelier, time — @claude (wip #31).
   All six `StopType`s, including `fixed_amount`, which was in the enum but
   missing from docs/RISK.md's table — the row is added rather than the member

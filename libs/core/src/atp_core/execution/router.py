@@ -50,6 +50,8 @@ from typing import TYPE_CHECKING
 
 from atp_core import metrics
 from atp_core.domain import (
+    ROUTING,
+    SIZING,
     Order,
     OrderRequest,
     OrderStatus,
@@ -89,8 +91,13 @@ log = get_logger(__name__)
 #: Stages that can refuse before any `RiskRule` runs. They appear in
 #: `SubmitResult.decision.rule`, so a human reading a refusal on the dashboard is
 #: told which stage refused rather than only that something did.
-SIZING = "position_sizing"
-ROUTING = "routing"
+#:
+#: `SIZING` and `ROUTING` are defined in `atp_core.domain.order` and re-exported
+#: here, which is where they were declared until the backtest engine began
+#: refusing at the same stages: two copies of a `rejected_by` value would drift,
+#: and the point of the field is that a backtest refusal and a live one are the
+#: same record. `NO_ACTION` stays local — nothing is refused, so it never
+#: reaches that column.
 NO_ACTION = "no_action"
 
 

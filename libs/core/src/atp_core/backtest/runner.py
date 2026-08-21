@@ -20,6 +20,7 @@ is given.
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import asdict
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -27,10 +28,10 @@ from typing import TYPE_CHECKING
 
 from atp_core.analytics.performance import PerformanceAnalyzer, TradeRecord
 from atp_core.backtest.costs import ZeroCostModel, alpaca_equities_default
-from atp_core.backtest.engine import BacktestConfig, BacktestEngine, FixedQtySizer
-from atp_core.domain import Timeframe
+from atp_core.backtest.engine import BacktestConfig, BacktestEngine, RiskBasedSizer
+from atp_core.domain import OrderStatus, Timeframe
 from atp_core.errors import ConfigError
-from atp_core.risk.engine import RiskEngine
+from atp_core.risk.engine import RiskEngine, backtest_rules
 from atp_core.strategy import registry
 
 if TYPE_CHECKING:
@@ -71,20 +72,76 @@ ZERO_COST_WARNING = (
     "(docs/BACKTESTING.md 'Ignoring costs')"
 )
 
-#: Said on every run, exactly as the CLI says it on every run. Sizing every
+#: Said on every run that uses it, exactly as the CLI says it. Sizing every
 #: entry at the same share count ignores volatility, so the return is a property
-#: of that number as much as of the strategy.
+#: of that number as much as of the strategy. No longer said on *every* run —
+#: it is now a statement about a choice rather than about the platform.
 FIXED_QTY_WARNING = (
     "every entry was sized at {qty} shares. Real sizing is risk-based and "
     "equalises risk per trade (docs/RISK.md 'Position sizing') — treat this "
     "return as a property of that share count"
 )
 
-#: And this one, because an engine holding an empty rule chain refuses nothing.
+#: Attached only to a run that deliberately asked for no rules. It used to be
+#: attached to all of them, because the engine was always built with an empty
+#: chain; `backtest_rules()` is what changed that.
 NO_RISK_RULES_WARNING = (
     "no pre-trade risk rules were active — orders were routed through "
-    "RiskEngine, but nothing refused them (roadmap Phase 3)"
+    "RiskEngine, but nothing refused them"
 )
+
+#: The methods a request may name, and it is `position_size`'s own list rather
+#: than a second copy: a method this accepted and that one did not would be a
+#: 400 the API could not have foreseen, raised from inside the queue worker.
+SIZING_METHODS: frozenset[str] = frozenset(
+    {"fixed_qty", "fixed_notional", "equity_pct", "risk_pct", "volatility_target"}
+)
+
+
+def refusal_summary(result: BacktestResult) -> str | None:
+    """What this run was refused, by which rule — or None if nothing was.
+
+    **The most important line a result can carry now that the chain is real.**
+    A run whose entries were mostly refused reports a return computed from the
+    few that got through, and that number is not a statement about the strategy
+    at all — it is a statement about a book the limits would not let it hold.
+    The refusals were already in `result.orders`, individually, one warning per
+    order; nobody reads three hundred warnings, and a reader who skims them
+    cannot tell twenty refusals from two.
+
+    Counted per rule for the reason `RiskEngine.validate` counts its metric that
+    way: "risk denied 40 orders" is a curiosity, and "the position cap denied
+    40" is a sizing bug with an address.
+    """
+    refused = [order for order in result.orders if order.status is OrderStatus.REJECTED_RISK]
+    if not refused:
+        return None
+    by_rule = Counter(order.rejected_by or "unknown" for order in refused)
+    breakdown = ", ".join(f"{rule} ({count})" for rule, count in by_rule.most_common())
+    return (
+        f"{len(refused)} of {len(result.orders)} orders were refused before reaching "
+        f"the market — {breakdown}. The return below is what the orders that "
+        f"survived produced, not what the strategy asked for"
+    )
+
+
+def resolve_sizing(spec: BacktestRunSpec) -> tuple[str, Decimal]:
+    """The sizing method this spec asks for, and the value it reads.
+
+    `sizing_value` falls back to `qty`, which is what makes a run stored before
+    either field existed reproduce exactly: no method named is `fixed_qty`, and
+    no value named is the share count that spec already carried.
+
+    Raises `ConfigError` rather than letting `position_size` raise `ValueError`
+    deep inside the run, so a request naming a method that does not exist is a
+    400 at the door instead of a job that fails four minutes later.
+    """
+    method = spec.sizing_method or "fixed_qty"
+    if method not in SIZING_METHODS:
+        known = ", ".join(sorted(SIZING_METHODS))
+        raise ConfigError(f"sizing_method must be one of: {known}")
+    raw = spec.sizing_value or spec.qty
+    return method, _positive_decimal(raw, "sizing_value")
 
 
 def parse_spec_dates(spec: BacktestRunSpec) -> tuple[datetime, datetime]:
@@ -108,6 +165,7 @@ def build_engine(
     *,
     limits: RiskLimits,
     on_progress: ProgressCallback | None = None,
+    with_rules: bool = True,
 ) -> BacktestEngine:
     """Assemble the engine this spec describes.
 
@@ -115,11 +173,17 @@ def build_engine(
     which is what lets the API answer 400 on the ones it can check before
     queueing and the worker record a readable reason on the ones it cannot.
 
-    The risk chain is deliberately empty, and deliberately explicit —
-    `RiskEngine(limits, rules=[])` rather than `default_rules()`, which raises
-    until Phase 3. An unguarded engine has to be something a caller asked for in
-    writing; this is the same line `scripts/run_backtest.py` takes and it carries
-    the same warning onto the result.
+    **The chain is `backtest_rules()`** — the five of the nine that a replay over
+    bars can actually evaluate, with the four it cannot named and justified
+    there rather than passed as stubs that always approve. Until now this built
+    `RiskEngine(limits, rules=[])`, which refused nothing, and every result
+    carried a warning saying so. A backtest with no risk chain reports returns
+    from positions no live account would have been allowed to hold, which is the
+    same class of flattery as running one with no costs.
+
+    `rules=[]` is still reachable, and still deliberate: `with_rules=False` is
+    how a caller asks for an engine that refuses nothing, and the warning goes
+    back on the result when they do.
     """
     start, end = parse_spec_dates(spec)
 
@@ -137,7 +201,7 @@ def build_engine(
         raise ConfigError("a backtest needs at least one symbol")
 
     cash = _positive_decimal(spec.starting_cash, "starting_cash")
-    qty = _positive_decimal(spec.qty, "qty")
+    method, value = resolve_sizing(spec)
 
     strategy_cls = registry.get(spec.strategy_id)  # raises StrategyError if unknown
     try:
@@ -155,8 +219,12 @@ def build_engine(
             starting_cash=cash,
         ),
         cost_model=COST_MODELS[spec.cost_model](),
-        risk_engine=RiskEngine(limits, rules=[]),
-        position_sizer=FixedQtySizer(qty),
+        risk_engine=RiskEngine(limits, rules=backtest_rules() if with_rules else []),
+        # `FixedQtySizer` is not reached even for `fixed_qty`: `position_size`
+        # handles that method too, and routing every method through one function
+        # is what stops a backtest and the live router disagreeing about a
+        # quantity. The class stays for the engine's own mechanics tests.
+        position_sizer=RiskBasedSizer(method, value),
         on_progress=on_progress,
     )
 
@@ -176,12 +244,21 @@ def run_spec(
     that looks too good. `zero` goes first: it is the one that invalidates
     everything below it.
     """
+    method, value = resolve_sizing(spec)
     result = build_engine(spec, limits=limits, on_progress=on_progress).run(bars)
 
     if spec.cost_model == "zero":
         result.warnings.insert(0, ZERO_COST_WARNING)
-    result.warnings.append(FIXED_QTY_WARNING.format(qty=spec.qty))
-    result.warnings.append(NO_RISK_RULES_WARNING)
+    # Only when it is true. This used to be unconditional, because the engine
+    # was always built with a flat share count; saying it on a `risk_pct` run
+    # would now be the result warning about something that did not happen.
+    if method == "fixed_qty":
+        result.warnings.append(FIXED_QTY_WARNING.format(qty=value))
+    # Last, and deliberately: it is the line that says how much of the run
+    # above actually happened, so it should be the one still on screen when a
+    # reader stops scrolling.
+    if (refusals := refusal_summary(result)) is not None:
+        result.warnings.append(refusals)
     return result
 
 

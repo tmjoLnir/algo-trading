@@ -51,6 +51,31 @@ export const COST_MODELS = [
   { value: 'zero', label: 'Zero cost — debugging only, not evidence' },
 ] as const
 
+/**
+ * How a quantity is decided, matching `runner.SIZING_METHODS`.
+ *
+ * `fixed_qty` is first because it is the server's default, not because it is
+ * the right answer: docs/RISK.md is unambiguous that real sizing is risk-based,
+ * and each label says what the value beside it means — the field changes
+ * meaning per method, and a form that left that to be guessed would send a
+ * share count where a fraction of equity was wanted.
+ */
+export const SIZING_METHODS = [
+  { value: 'fixed_qty', label: 'Fixed share count', unit: 'shares per entry' },
+  { value: 'fixed_notional', label: 'Fixed notional', unit: 'currency per entry' },
+  { value: 'equity_pct', label: 'Percent of equity', unit: 'fraction, e.g. 0.05 for 5%' },
+  {
+    value: 'risk_pct',
+    label: 'Risk per trade — needs a stop',
+    unit: 'fraction of equity at risk, e.g. 0.01 for 1%',
+  },
+  {
+    value: 'volatility_target',
+    label: 'Volatility target — needs a volatility',
+    unit: 'target fraction',
+  },
+] as const
+
 /** Timeframes the engine supports, matching `atp_core.domain.Timeframe`. */
 export const TIMEFRAMES = ['1m', '5m', '15m', '30m', '1h', '4h', '1d'] as const
 

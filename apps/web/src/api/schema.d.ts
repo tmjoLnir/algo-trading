@@ -1559,6 +1559,13 @@ export interface components {
              */
             qty: number | string;
             /**
+             * Sizing Method
+             * @default fixed_qty
+             */
+            sizing_method: string;
+            /** Sizing Value */
+            sizing_value?: number | string | null;
+            /**
              * Start
              * Format: date-time
              */
@@ -1637,6 +1644,10 @@ export interface components {
             };
             /** Qty */
             qty: string;
+            /** Sizing Method */
+            sizing_method: string;
+            /** Sizing Value */
+            sizing_value: string;
             /**
              * Start
              * Format: date-time

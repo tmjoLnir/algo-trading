@@ -13,6 +13,18 @@ from typing import TYPE_CHECKING
 
 from atp_core.domain.enums import OrderStatus, OrderType, Side, TimeInForce
 
+#: Stages that can refuse an order *before* any `RiskRule` runs, and the
+#: vocabulary `Order.rejected_by` draws on alongside the rule names.
+#:
+#: Here rather than in `execution.router`, where they began, because the
+#: backtest engine refuses at the same two stages and for the same reasons — and
+#: a refusal in a backtest result has to carry what the same refusal carries in
+#: production, or the two records cannot be compared. `domain` imports nothing
+#: from its siblings, so both callers can reach these without either importing
+#: the other.
+SIZING = "position_sizing"
+ROUTING = "routing"
+
 if TYPE_CHECKING:
     from datetime import datetime
 

@@ -134,11 +134,36 @@ the API name the exact command if the range is empty. The API checks coverage
 *before* queueing, because a run that dies four minutes in for want of history is
 a worse answer than a refusal.
 
-`--qty` is a placeholder. It sizes every entry at the same share count, so the
-reported return is a property of that number as much as of the strategy; real
-sizing is risk-based (docs/RISK.md 'Position sizing'). Until the rule chain
-exists, no pre-trade check refuses anything either — orders are routed through
-`RiskEngine`, but it is holding an empty chain. The CLI says both on every run.
+## Sizing, and what the chain refuses
+
+Both used to be caveats here and neither is any more.
+
+**Sizing goes through `risk.rules.position_size`** — the same function the live
+router calls, with the same arguments. `--sizing` picks the method and
+`--sizing-value` supplies what it reads; `fixed_qty` remains the default so a
+run stored before this existed reproduces exactly, and it still prints the
+warning it always did, because sizing every entry identically still makes the
+return a property of that share count. `risk_pct` is what docs/RISK.md calls
+real sizing and it needs the strategy to emit a stop: a signal without one is
+booked as a **refused order** naming the sizing stage, not silently dropped.
+
+**The rule chain is live in a backtest**, as `risk.engine.backtest_rules()` —
+five of the nine. The other four are excluded by decision rather than omission,
+and `backtest_rules`' docstring gives each reason; the short version is that a
+kill switch, a session calendar, a rate limit and a feed-staleness check are all
+measuring something a replay over bars does not have. `trading_hours` is the
+sharpest case: a daily bar is stamped at exchange-local midnight, so the
+calendar says closed at every one of them and the rule would refuse every order
+in every daily backtest.
+
+**Expect refusals, and read them.** A run's warnings end with one line counting
+what was refused and by which rule. That line matters more than the return above
+it: a backtest whose entries were mostly refused reports what the survivors did,
+which is a statement about the limits rather than about the strategy. The
+default `--qty 100` on a ~$100 stock is $10,000 against a $100,000 account —
+right at `RISK_MAX_POSITION_PCT` — so runs that used to fill will now be
+partly refused. That is the correction, not a regression: those positions were
+always over the limit, and nothing said so.
 
 ## Reading the result
 
