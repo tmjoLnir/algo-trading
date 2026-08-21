@@ -158,7 +158,7 @@ def build_runner(
     that performs it is the same object the runner warms up with.
     """
     strategy_cls = registry.get(settings.worker_strategy)
-    strategy = strategy_cls(_strategy_params(settings))
+    strategy = strategy_cls(strategy_params(settings))
 
     stop_manager = StopManager()
     risk_engine = RiskEngine(
@@ -181,7 +181,7 @@ def build_runner(
         sizing=PositionSizeSpec(
             type=settings.worker_sizing_method, value=settings.worker_sizing_value
         ),
-        stop_config=_stop_config(settings),
+        stop_config=resolve_stop_config(settings),
         timeframe=Timeframe.D1,
         run_mode=settings.run_mode,
         order_repo=order_repo,
@@ -195,7 +195,7 @@ def build_runner(
     return runner, reconciler
 
 
-def _strategy_params(settings: Settings) -> dict[str, Any] | None:
+def strategy_params(settings: Settings) -> dict[str, Any] | None:
     """Parse `WORKER_STRATEGY_PARAMS`, refusing anything malformed.
 
     A typo here would otherwise start a strategy on its defaults while the
@@ -216,7 +216,7 @@ def _strategy_params(settings: Settings) -> dict[str, Any] | None:
     return parsed
 
 
-def _stop_config(settings: Settings) -> StopConfig:
+def resolve_stop_config(settings: Settings) -> StopConfig:
     """The protective stop every entry is armed with.
 
     `multiplier` and `value` are populated from the same setting because the

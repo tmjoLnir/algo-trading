@@ -1041,6 +1041,64 @@ above.
 
 *Verifiable:* a strategy trades the paper account for a week and reconciles clean.
 
+**Not shown, and the two tools that would let it be are built** — @claude (#83).
+Nothing in Phase 4 has met Alpaca; this PR does not change that and could not.
+What it changes is what happens on either side of the week, because the input
+this line needs and cannot re-run is calendar time.
+
+`scripts/preflight.py` (`make preflight`) checks eleven preconditions in about
+two seconds — every one already stated in docs/FIRST_PAPER_RUN.md, in prose or
+in its "most likely to break first" list. The two that matter are the two that
+produce a *silent* week, which that document warns is indistinguishable from a
+strategy that correctly never signalled: warmup history shorter than the
+strategy needs, and a size the position cap refuses. The second is the
+interaction #82 surfaced — `risk_pct` at 1% against a 2×ATR stop asks for ~30%
+of a $100k account against a 10% `RISK_MAX_POSITION_PCT` — priced through
+`position_size`, the same call the router makes, so the prediction is about this
+platform rather than a similar one. The decisions are pure functions in
+`atp_worker.preflight`; the script is the I/O.
+
+`scripts/paper_report.py` (`make paper-report`) answers this line's four clauses
+from the record, with the counts behind each. It exists because the recording
+section of docs/FIRST_PAPER_RUN.md asks for numbers rather than a conclusion and
+nothing produced them, so the tick after a week would have been somebody's
+recollection of a log tail.
+
+**Two of the four clauses have no store behind them, which this file did not
+record.** `execution.reconcile.clean` and `runner.position_unprotected` are log
+lines: no table, no metric, no audit row — and the audit log is the wrong home,
+since that record attributes an action to a *person* (ADR 0008) and a
+reconciliation has no actor. So the report renders those clauses `[?]`, prints
+the grep, and exits non-zero; `--logs <file>` counts them and answers all four.
+`[?]` is deliberately not `[ ]`: unshown is not shown-false, and a report that
+rendered "no unprotected positions found" out of a store that never held them
+would be believed. Making them durable is a real gap and a separate change — it
+wants a decision about where system events live, not a column bolted onto a
+table that is about something else.
+
+One more thing it refuses to flatter: when nothing filled, the stop clause is
+`[?]` rather than `[x]`. No position was ever held, so SAFETY.md's layer 5 was
+never asked to hold.
+
+Three corrections landed with it, each a doc that had drifted in the direction
+that makes the platform look *less* safe or *more* proven than it is.
+FIRST_PAPER_RUN.md's "how to stop" said the dashboard HALT button did not exist
+and `/risk/halt` raised `NotImplementedError` — both closed in #70 and #75, so
+an operator reading it under pressure believed they had one stopping mechanism
+when they had two. `status.py` said there was no order or position repository
+(#44). `/risk/flatten-all` really is still a stub and the text now says exactly
+how far it gets before raising.
+
+And one real defect, found by running the new script: `ALERT_NTFY_TOPIC`,
+`ALERT_NTFY_TOKEN` and `ALERT_TELEGRAM_TOKEN` were plain `str` while every other
+credential in `Settings` is `SecretStr`. `repr(Settings)` therefore rendered
+them in full, and SQLAlchemy puts that repr into an `ArgumentError` message — so
+a mistyped database URL printed a live bot token to the terminal. config.py's
+own prose already said "the topic **is** a credential" and "the bot token **is**
+the bot"; the types now agree with it. `scripts/preflight.py` also renders an
+exception's *type* and never its message, for the same reason.
+
+
 *Verifiable (broker layer, proposed):* the same strategy over the same bars
 produces identical fills through `BacktestEngine` and through `SimulatedBroker`,
 and `AlpacaBroker` round-trips one order against the **paper** endpoint —

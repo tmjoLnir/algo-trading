@@ -16,14 +16,15 @@ thing is where they *disagree*:
     bars         Postgres   what the strategy has to decide on
     broker       Alpaca     the account, its positions, its working orders
 
-**One view is missing and it is the one you probably want.** The runner's own
-book — its `Portfolio`, and the orders it believes are working — lives in the
-worker's memory. There is no order or position repository yet
-(`PositionSnapshotRow` is a table with no reader) and no IPC, so nothing here
-can ask it. What this shows is the *broker's* book, which is the authority
-reconciliation compares against; if the runner disagrees with it, the runner
-halts and says so in its own logs. Closing that gap is what the persistence
-work is for.
+**One view here is the broker's, not the runner's, and the distinction still
+matters.** The runner's own book is now durable — `PositionSnapshotRow` and the
+equity snapshots have readers (#44) — but this reads the *broker's*, which is
+the authority reconciliation compares against. If the two disagree the runner
+halts and says so in its own logs.
+
+For the stored book and what the worker actually did with it, see
+`scripts/paper_report.py`, and the `/positions` tab, which reads the snapshot
+with its age on it.
 """
 
 from __future__ import annotations

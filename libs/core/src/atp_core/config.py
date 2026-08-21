@@ -172,14 +172,22 @@ class Settings(BaseSettings):
     #: directions — reading them and forging them. Generate a long random one
     #: and keep it in the SOPS bundle (docs/DEPLOYMENT.md), not in a commit.
     alert_ntfy_base_url: str = Field(default="https://ntfy.sh", alias="ALERT_NTFY_BASE_URL")
-    alert_ntfy_topic: str = Field(default="", alias="ALERT_NTFY_TOPIC")
-    alert_ntfy_token: str = Field(default="", alias="ALERT_NTFY_TOKEN")
+    #: `SecretStr`, like every other credential here, because the paragraph
+    #: above is not decoration: a plain `str` renders in full inside
+    #: `repr(Settings)`, and SQLAlchemy — among others — puts that repr into
+    #: the message of an ArgumentError. Rule §1.6 says no key appears in an
+    #: exception message; the type is what makes that true rather than hoped.
+    alert_ntfy_topic: SecretStr = Field(default=SecretStr(""), alias="ALERT_NTFY_TOPIC")
+    alert_ntfy_token: SecretStr = Field(default=SecretStr(""), alias="ALERT_NTFY_TOKEN")
     #: Telegram, as an alternative or an addition — configure both and both are
     #: sent, since two configured transports is a request for two. The bot token
     #: **is** the bot: it travels in the URL path, anyone holding it can read the
     #: chat and post to it as you, and it belongs in the SOPS bundle. Get it from
     #: @BotFather, then message the bot once so it has a chat to reply in.
-    alert_telegram_token: str = Field(default="", alias="ALERT_TELEGRAM_TOKEN")
+    alert_telegram_token: SecretStr = Field(default=SecretStr(""), alias="ALERT_TELEGRAM_TOKEN")
+    #: Not a secret and deliberately still a plain string: it identifies the
+    #: conversation, it does not authenticate anything, and a chat id in a log
+    #: is what tells you which chat went quiet.
     alert_telegram_chat_id: str = Field(default="", alias="ALERT_TELEGRAM_CHAT_ID")
     alert_telegram_base_url: str = Field(
         default="https://api.telegram.org", alias="ALERT_TELEGRAM_BASE_URL"

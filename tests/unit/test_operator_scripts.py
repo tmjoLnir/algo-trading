@@ -1,7 +1,9 @@
 """The operator scripts, as far as they can be tested without a live service.
 
-`halt.py` is the one somebody runs while something is going wrong, and until
-the dashboard exists it is the *only* path to the kill switch. So what is
+`halt.py` is the one somebody runs while something is going wrong. It is no
+longer the only path to the kill switch — the dashboard's HALT button reaches
+it through `/risk/halt` (#70) — but it is the one that still works when the API
+is the thing that is down, which is when you most want it. So what is
 tested here is everything that can go wrong before it reaches Redis: the
 argument guards, and the rendering an operator reads under pressure.
 
@@ -49,6 +51,8 @@ def _load(name: str) -> Any:
 halt = _load("halt")
 status = _load("status")
 check_alerts = _load("check_alerts")
+preflight_cli = _load("preflight")
+paper_report = _load("paper_report")
 
 
 class TestHaltArguments:
@@ -376,3 +380,108 @@ class TestHashPasswordOutput:
         settings = Settings(_env_file=env)  # type: ignore[call-arg]
 
         assert verify_password("operator-password", settings.api_password_hash.get_secret_value())
+
+
+class TestPreflightArguments:
+    """The gathering half. The decisions are `atp_worker.preflight`'s and are
+    tested in `test_preflight.py`; what can go wrong here is the arguments and
+    the rendering an operator reads at 09:29."""
+
+    def test_an_unknown_timeframe_lists_the_valid_ones(self) -> None:
+        with pytest.raises(SystemExit, match="1m, 5m, 15m, 30m, 1h, 4h, 1d"):
+            preflight_cli._timeframe("3d")
+
+    def test_no_broker_needs_no_credentials(self) -> None:
+        assert preflight_cli.parse_args(["--no-broker"]).no_broker is True
+
+    def test_an_exception_is_rendered_as_its_type_and_never_its_message(self) -> None:
+        """Rule §1.6, and the reason it is a rule rather than a habit. A driver
+        that is handed `Settings` puts a `repr` of it in the message — SQLAlchemy
+        does exactly this — and every credential the platform holds is in that
+        repr. The `fix` line carries what an operator acts on regardless."""
+        leaked = RuntimeError("connect failed: password=hunter2 token=sk-live-abc")
+
+        assert preflight_cli._why(leaked) == "RuntimeError"
+        assert "hunter2" not in preflight_cli._why(leaked)
+
+    def test_a_run_with_unchecked_items_never_reads_as_ready(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The headline is the only part most people read. "READY" over five
+        checks that did not run is precisely the confusion SKIP exists to
+        prevent, so it says NO FAILURES and names them instead."""
+        from atp_worker.preflight import Check, Preflight, Status
+
+        preflight_cli._render(
+            Preflight([Check("run mode", Status.PASS, ""), Check("history", Status.SKIP, "")])
+        )
+        out = capsys.readouterr().out
+
+        assert "READY" not in out
+        assert "did not run: history" in out
+
+    def test_a_fully_checked_pass_does_say_ready(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from atp_worker.preflight import Check, Preflight, Status
+
+        preflight_cli._render(Preflight([Check("run mode", Status.PASS, "")]))
+        out = capsys.readouterr().out
+
+        assert "READY — every check ran" in out
+        # And the one limit nothing in this repo can check is still stated.
+        assert "Layer 8" in out
+
+    def test_every_status_has_a_mark(self) -> None:
+        """A status added without a mark would raise inside the renderer, which
+        is a crash in the tool an operator reaches for when something is already
+        wrong."""
+        from atp_worker.preflight import Status
+
+        assert set(preflight_cli.MARK) == set(Status)
+
+
+class TestPaperReportArguments:
+    def test_a_malformed_since_is_refused_before_the_query(self) -> None:
+        with pytest.raises(SystemExit, match="--since must be YYYY-MM-DD"):
+            paper_report._since("last tuesday")
+
+    def test_a_missing_log_file_is_refused_rather_than_counted_as_zero(self) -> None:
+        """Zero clean reconciliations and zero mismatches is a real and
+        meaningful answer — it says the reconciler never ran. Reading it out of
+        a path that does not exist would put that finding in front of someone
+        who simply mistyped a filename."""
+        with pytest.raises(SystemExit, match="no such file"):
+            paper_report._log_counts("/nowhere/worker.log")
+
+    def test_no_log_file_leaves_the_two_clauses_unanswered(self) -> None:
+        assert paper_report._log_counts(None) == {
+            "reconcile_lines": None,
+            "mismatch_lines": None,
+            "unprotected_lines": None,
+        }
+
+    def test_the_markers_are_counted_from_the_log(self, tmp_path: Path) -> None:
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "execution.reconcile.clean x\n"
+            "execution.reconcile.clean y\n"
+            "execution.reconcile.mismatch z\n"
+            "runner.position_unprotected SPY\n",
+            encoding="utf-8",
+        )
+
+        assert paper_report._log_counts(str(log)) == {
+            "reconcile_lines": 2,
+            "mismatch_lines": 1,
+            "unprotected_lines": 1,
+        }
+
+    def test_an_unanswered_clause_survives_into_the_markdown(self, tmp_path: Path) -> None:
+        """A roadmap block that listed three clauses would read as a line with
+        three clauses, and the fourth would stop existing."""
+        from atp_core.analytics.paper_run import assess
+
+        block = paper_report._markdown(assess([], [], strategy_id="x"), "x", "paper")
+
+        assert block.count("- [") == 4
+        assert "[?]" in block
+        assert "were not shown" in block
