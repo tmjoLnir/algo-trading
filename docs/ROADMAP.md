@@ -2107,6 +2107,43 @@ has met a database holding a real strategy's history.
   `docker-compose.yml` now; the overlay's copies are a restatement, and its
   header says so.
 
+  **Two of that item's conclusions were wrong, and an operator found both.** The
+  first was scope: the fix said "`db`, `redis` and `api` carry a policy now", and
+  `web` did not. The overlay puts the dev server behind a profile, so the check
+  added alongside — which read the *deployed* configuration only — could not see
+  the one service still missing one. A reboot brought back the API, the worker,
+  the queue and both stores, and left the thing serving the dashboard stopped.
+  `check_restart_policies` now runs against both configurations, which is where
+  it should have been from the start; verified by removing the line and watching
+  the check fail.
+
+  The second was the belief that a restart policy is what makes an API exit
+  recoverable. It makes an *exit* recoverable, and the failure that kept the
+  dashboard on `Cannot reach the API.` through three separate fixes was not one.
+  `docker-compose.yml` runs the API as `uvicorn --reload`, and `--reload` is a
+  supervisor: it forks a child that binds the port and keeps a parent that only
+  watches files. Any `Settings` value that will not validate — one typo in
+  `.env`, and `atp_api.main` builds its app at import — kills the child and
+  leaves the parent idling for an edit that a container has nobody to make. The
+  process never exits, so `restart: unless-stopped` never fires; the HEALTHCHECK
+  notices and Docker does nothing with an unhealthy container but label it. What
+  reaches the operator is `docker compose ps` reporting `Up 3 hours (unhealthy)`
+  and nginx reporting `connect() failed (111: Connection refused)` — refused
+  rather than a 502, because the container was found and the port was shut.
+  Every earlier fix had addressed a *cause* of the API not starting; none of
+  them could address the fact that not starting was permanent and silent.
+
+  The API is now imported once in the foreground before the reloader is given
+  PID 1, so a configuration it cannot start with is an exit code, a climbing
+  restart count and a traceback in `logs api` — the diagnosis docs/RUNBOOK.md
+  already gives for that screen, which until now was advice for a symptom the
+  stack could not produce. CI asserts it as behaviour rather than as YAML: a
+  malformed risk limit is written into `.env`, and the job fails if the api
+  container is `running` while nothing answers on 8000. It also now requires
+  every container with a healthcheck to report `healthy` — the previous step
+  read `.State`, which is `running` for a container that has been unhealthy for
+  hours, and would have passed this bug at every stage.
+
   `scripts/check_port_bindings.py` now checks **both** configurations. It read
   only the development one, so the deployed file — where a wrong bind matters
   most — would have been the one thing nothing looked at. It also asserts the

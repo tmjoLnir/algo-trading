@@ -236,6 +236,43 @@ That is fixed — a missing broker credential is now a CRITICAL log line
 process that will not run — but any *other* `Settings` error still exits the
 same way, and `.env` is where to look.
 
+**`Up` is not proof it is serving, and this is the case that wasted the most
+time.** The paragraph above says to look for a climbing restart count. There was
+a shape of this failure that never produced one, and the advice sent you looking
+for the wrong thing:
+
+```
+$ docker compose ps api
+NAME     IMAGE      STATUS                     PORTS
+atp-api  atp-api    Up 3 hours (unhealthy)     127.0.0.1:8000->8000/tcp
+```
+
+Three hours, no restarts, and nothing listening on 8000. The API is started with
+`uvicorn --reload` in `docker-compose.yml`, and `--reload` is a *supervisor*: it
+forks a child that binds the port and keeps a parent that only watches files.
+A child that cannot start at all — again, one bad value in `.env` — dies and
+leaves the parent alive, idling for an edit that a container has nobody to make.
+So the process never exits, `restart: unless-stopped` never fires, and the only
+thing that notices is the HEALTHCHECK, which Docker acts on by writing
+`(unhealthy)` in a column nobody reads.
+
+Through nginx that is a refused connection rather than a 502, which is the
+tell — nginx *found* the container and the port was shut:
+
+```
+connect() failed (111: Connection refused) while connecting to upstream,
+request: "GET /api/v1/auth/me", upstream: "http://172.18.0.4:8000/api/v1/auth/me"
+```
+
+**This is fixed** — the API is now imported once in the foreground before the
+reloader is given PID 1, so a configuration it cannot start with is an exit code
+and a restart count again, with the traceback in `docker compose logs api`. On a
+checkout without that, `docker compose restart api` clears it for as long as
+`.env` stays broken; read the log and fix the value. The two things worth
+carrying forward: read the `(unhealthy)` in `docker compose ps`, and treat
+`Connection refused` from nginx as *different* from a 502 — refused means the
+container is there and the port is not.
+
 **Otherwise it clears itself.** The screen re-asks every five seconds and renders
 the login form as soon as the API answers, so a stack that is merely still
 starting needs no reload. It did not always, and the sentence on screen was the giveaway: the

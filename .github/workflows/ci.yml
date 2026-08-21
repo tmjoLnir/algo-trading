@@ -207,6 +207,26 @@ jobs:
             exit 1
           fi
 
+      # `running` is not `serving`, and the gap between them is this job's
+      # blind spot. `.State` is `running` for a container whose HEALTHCHECK has
+      # been failing for an hour: Docker labels an unhealthy container and does
+      # nothing else to it, and the step above reads only the label it does not
+      # set. The failure that shape describes — the API container up, nothing
+      # bound to 8000, every proxied request refused — would pass everything
+      # before this line.
+      - name: Every service with a healthcheck is actually healthy
+        run: |
+          for i in $(seq 1 60); do
+            unhealthy=$(docker compose ps --format '{{.Service}} {{.Health}}' \
+              | awk '$2 != "" && $2 != "healthy" { print $1 " is " $2 }')
+            [ -z "$unhealthy" ] && { echo "every healthcheck reports healthy"; exit 0; }
+            sleep 2
+          done
+          docker compose ps
+          echo "::error::a container is running but not healthy -- $unhealthy"
+          docker compose logs --tail=60 api
+          exit 1
+
       # The hop the browser actually makes, which nothing above exercises: the
       # steps before this reach the API on its own published port and the dev
       # server at `/`, so a dashboard whose every API call fails would pass all
@@ -255,6 +275,55 @@ jobs:
             sleep 1
           done
           echo "::error::the API does not start in paper mode without broker credentials"
+          docker compose logs --tail=40 api
+          exit 1
+
+      # The regression this branch exists for, asserted as behaviour rather
+      # than as YAML.
+      #
+      # `uvicorn --reload` is a supervisor: the child binds the port, the parent
+      # watches the source. A child that cannot start — any `Settings` value
+      # that will not validate, which is one typo in `.env` — dies and leaves
+      # the parent running, waiting for a file change nobody in a container is
+      # going to make. The container stays `running`, nothing is bound to 8000,
+      # and `restart: unless-stopped` never fires because nothing exited. nginx
+      # then answers `connect() failed (111: Connection refused)` on every
+      # request forever, behind a dashboard that renders perfectly and a
+      # `docker compose ps` that says `Up`.
+      #
+      # A malformed number rather than a run mode on purpose: it reproduces the
+      # class exactly — a ValidationError raised while `atp_api.main` builds its
+      # app at import — and cannot be misread as switching this job towards
+      # live trading (CLAUDE.md 1.8).
+      - name: A configuration the API cannot start with is an exit, not a silence
+        run: |
+          sed -i 's/^RISK_MAX_POSITION_PCT=.*/RISK_MAX_POSITION_PCT=not-a-number/' .env
+          docker compose up -d --force-recreate api || true
+          sleep 25
+          docker compose ps api
+          state=$(docker compose ps api --format '{{.State}}')
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:8000/healthz || echo 000)
+          echo "api state=$state  /healthz=$code"
+          if [ "$state" = "running" ] && [ "$code" = "000" ]; then
+            echo "::error::the api container is up and serving nothing -- a dead app behind a live reloader, which restart: unless-stopped cannot see"
+            docker compose logs --tail=40 api
+            exit 1
+          fi
+          echo "a config the API cannot start with does not masquerade as a running API"
+
+      - name: And it recovers by itself once the configuration is fixed
+        run: |
+          sed -i 's/^RISK_MAX_POSITION_PCT=.*/RISK_MAX_POSITION_PCT=0.10/' .env
+          docker compose up -d --force-recreate api
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/healthz | grep -q '"ok"'; then
+              code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5173/api/v1/auth/me)
+              [ "$code" = "401" ] || { echo "::error::login gate answers $code after recovery"; exit 1; }
+              echo "api healthy again after ~${i}s, login gate: 401"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the api did not come back after restoring .env"
           docker compose logs --tail=40 api
           exit 1
 
