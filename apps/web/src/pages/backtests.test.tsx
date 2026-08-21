@@ -51,6 +51,10 @@ const SPEC: BacktestSpecView = {
   qty: '100',
   sizing_method: 'fixed_qty',
   sizing_value: '100',
+  stop_type: '',
+  stop_value: '',
+  stop_period: 14,
+  stop_bars: 0,
 }
 
 const STRATEGY: StoredStrategyView = {
@@ -525,6 +529,130 @@ describe('the form', () => {
     expect(body.sizing_method).toBe('equity_pct')
     // A string, like every other decimal the form sends.
     expect(body.sizing_value).toBe('0.05')
+  })
+
+  it('asks for no stop by default, so an unconfigured request is unchanged', async () => {
+    // Every run this platform has stored was unprotected beyond what its
+    // strategy emitted. Defaulting the form to `atr` would change what a
+    // re-queued old spec reports, which is why the empty option is offered
+    // rather than removed.
+    const fetchMock = stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': { body: list([]) },
+      'POST /backtests': { body: run({ status: 'queued' }) },
+    })
+    renderPage()
+
+    fireEvent.change(await screen.findByPlaceholderText('SPY'), { target: { value: 'SPY' } })
+    // No stop chosen, so there is nothing to give a value to.
+    expect(screen.queryByLabelText('Stop value')).toBeNull()
+    fireEvent.click(screen.getByText('Queue backtest'))
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some((call) => call[1]?.method === 'POST')).toBe(true),
+    )
+    const post = fetchMock.mock.calls.find((call) => call[1]?.method === 'POST')
+    const body = JSON.parse(String(post?.[1]?.body))
+    expect(body.stop_type).toBe('')
+    expect(body.stop_value).toBeNull()
+    expect(body.stop_bars).toBe(0)
+  })
+
+  it('reveals the value field and states what the number means', async () => {
+    // A multiple of ATR and a fraction of price are both '2' to a text input,
+    // and the two put the stop in completely different places.
+    stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': { body: list([]) },
+    })
+    renderPage()
+
+    await screen.findByPlaceholderText('SPY')
+    fireEvent.change(screen.getByLabelText('Stop'), { target: { value: 'atr' } })
+
+    const value = screen.getByLabelText('Stop value') as HTMLInputElement
+    expect(value.placeholder).toContain('multiple of ATR')
+    // An ATR stop measures its multiple against a lookback, so that is asked
+    // for too — and only for the types that read one.
+    expect(screen.getByLabelText('ATR period')).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText('Stop'), { target: { value: 'fixed_pct' } })
+    expect(screen.queryByLabelText('ATR period')).toBeNull()
+    expect((screen.getByLabelText('Stop value') as HTMLInputElement).placeholder).toContain(
+      'fraction',
+    )
+  })
+
+  it('clears the value when the stop type changes', async () => {
+    // Same hazard as the sizing value: 2 carried from an ATR multiple into a
+    // fixed percent is a 200% stop, which the server would accept as a number
+    // and refuse only as a level below zero.
+    stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': { body: list([]) },
+    })
+    renderPage()
+
+    await screen.findByPlaceholderText('SPY')
+    fireEvent.change(screen.getByLabelText('Stop'), { target: { value: 'atr' } })
+    fireEvent.change(screen.getByLabelText('Stop value'), { target: { value: '2' } })
+    fireEvent.change(screen.getByLabelText('Stop'), { target: { value: 'fixed_pct' } })
+
+    expect((screen.getByLabelText('Stop value') as HTMLInputElement).value).toBe('')
+  })
+
+  it('sends a time stop as a bar count rather than a price distance', async () => {
+    // A time stop says when to leave, not where. Sending its number as
+    // `stop_value` would be a distance the server has nowhere to measure, and
+    // it refuses a time stop with no bar count rather than defaulting one.
+    const fetchMock = stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': { body: list([]) },
+      'POST /backtests': { body: run({ status: 'queued' }) },
+    })
+    renderPage()
+
+    fireEvent.change(await screen.findByPlaceholderText('SPY'), { target: { value: 'SPY' } })
+    fireEvent.change(screen.getByLabelText('Stop'), { target: { value: 'time' } })
+    expect((screen.getByLabelText('Stop value') as HTMLInputElement).placeholder).toContain('bars')
+    fireEvent.change(screen.getByLabelText('Stop value'), { target: { value: '10' } })
+    fireEvent.click(screen.getByText('Queue backtest'))
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some((call) => call[1]?.method === 'POST')).toBe(true),
+    )
+    const post = fetchMock.mock.calls.find((call) => call[1]?.method === 'POST')
+    const body = JSON.parse(String(post?.[1]?.body))
+    expect(body.stop_type).toBe('time')
+    expect(body.stop_bars).toBe(10)
+    expect(body.stop_value).toBeNull()
+  })
+
+  it('sends a price stop as a string, with its ATR period', async () => {
+    const fetchMock = stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': { body: list([]) },
+      'POST /backtests': { body: run({ status: 'queued' }) },
+    })
+    renderPage()
+
+    fireEvent.change(await screen.findByPlaceholderText('SPY'), { target: { value: 'SPY' } })
+    fireEvent.change(screen.getByLabelText('Stop'), { target: { value: 'atr' } })
+    fireEvent.change(screen.getByLabelText('Stop value'), { target: { value: '2' } })
+    fireEvent.change(screen.getByLabelText('ATR period'), { target: { value: '20' } })
+    fireEvent.click(screen.getByText('Queue backtest'))
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some((call) => call[1]?.method === 'POST')).toBe(true),
+    )
+    const post = fetchMock.mock.calls.find((call) => call[1]?.method === 'POST')
+    const body = JSON.parse(String(post?.[1]?.body))
+    expect(body.stop_type).toBe('atr')
+    // A string, because the multiple becomes a price distance on the server and
+    // a float would carry binary rounding into it.
+    expect(body.stop_value).toBe('2')
+    expect(body.stop_period).toBe(20)
+    expect(body.stop_bars).toBe(0)
   })
 
   it('sends money as a string and a timezone-aware window', async () => {

@@ -51,6 +51,7 @@ from atp_core.execution.trade_updates import apply_trade_update
 from atp_core.indicators import dispatch
 from atp_core.logging import correlation_id, get_logger
 from atp_core.risk.killswitch import HaltReason, HaltScope
+from atp_core.risk.stops import target_hit
 from atp_core.strategy.ports import SignalOutcome, StrategyRecord
 
 if TYPE_CHECKING:
@@ -823,30 +824,11 @@ class StrategyRunner:
             # sending a second order — so it is still ours to watch, and
             # returning early on both would leave a broker-side configuration
             # with no upside exit at all.
-            return TAKE_PROFIT if self._target_hit(position, bar) else None
+            return TAKE_PROFIT if target_hit(position, bar) else None
 
         if self.stop_manager.should_trigger(position, bar):
             return STOP_LOSS
-        return TAKE_PROFIT if self._target_hit(position, bar) else None
-
-    @staticmethod
-    def _target_hit(position: Position, bar: Bar) -> bool:
-        """Did this bar trade through the take-profit?
-
-        The mirror of `StopManager.should_trigger`: a long's target is above it,
-        so the bar's HIGH is what reaches it, and a short's is below, so the LOW
-        does. Comparing against the close would miss a bar that spiked through
-        the target and settled back — the position did hit it.
-
-        Lives here rather than on `StopManager` because a target is not a stop:
-        `StopManager` computes levels from a `StopConfig` and refuses to invent
-        one for a config that does not describe a distance from entry, whereas
-        this reads a level already armed on the position by whoever chose it.
-        """
-        target = position.take_profit_price
-        if target is None or position.is_flat:
-            return False
-        return bar.high >= target if position.is_long else bar.low <= target
+        return TAKE_PROFIT if target_hit(position, bar) else None
 
     def _bars_held(self, position: Position) -> int | None:
         """How many completed bars since the position opened."""

@@ -107,6 +107,25 @@ class BacktestRunSpec:
     #: equity for the rest. Empty means "use `qty`", which is what makes an old
     #: spec and a new `fixed_qty` one the same run.
     sizing_value: str = ""
+    #: How every entry is protected, by `StopType` name. **Empty means the run
+    #: arms only what its strategy asks for**, which is what this engine did
+    #: unconditionally before stops were configurable — so a spec stored without
+    #: it still reproduces exactly.
+    #:
+    #: Not a default of `atr`, even though that is `WORKER_STOP_TYPE`'s default
+    #: and docs/RISK.md's recommendation. Changing the protection on a stored run
+    #: would change its result, and a spec is a record of what was asked for.
+    stop_type: str = ""
+    #: What the stop type reads: a multiple for `atr` and `chandelier`, a
+    #: fraction or an amount for the fixed and trailing kinds. One field for both
+    #: because `apps/worker` uses one setting for both, and for the reason it
+    #: gives — two would let a caller fill in the one their type ignores.
+    stop_value: str = ""
+    #: Lookback for the ATR the `atr` and `chandelier` types need.
+    stop_period: int = 14
+    #: How many bars a `time` stop holds for. Zero is "not configured", which
+    #: that stop type refuses rather than defaults.
+    stop_bars: int = 0
 
 
 @dataclass(frozen=True, slots=True)

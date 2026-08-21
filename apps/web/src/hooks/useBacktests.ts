@@ -76,6 +76,30 @@ export const SIZING_METHODS = [
   },
 ] as const
 
+/**
+ * How every entry is protected, matching `atp_core.domain.StopType`.
+ *
+ * The empty option is first and is the current behaviour of every stored run:
+ * arm only what the strategy itself emits. It is offered rather than removed
+ * because a run's protection is part of what it was, and defaulting one on
+ * would change what a re-run of an old spec reports.
+ *
+ * `unit` says what the value means, because it changes per type — a multiple of
+ * ATR and a fraction of price are both "2" to a text input.
+ */
+export const STOP_TYPES = [
+  { value: '', label: 'None — only what the strategy emits', unit: '' },
+  { value: 'atr', label: 'ATR (docs/RISK.md default)', unit: 'multiple of ATR, e.g. 2' },
+  { value: 'chandelier', label: 'Chandelier — trailing, off ATR', unit: 'multiple of ATR, e.g. 3' },
+  { value: 'fixed_pct', label: 'Fixed percent — has a target too', unit: 'fraction, e.g. 0.03' },
+  { value: 'fixed_amount', label: 'Fixed amount — has a target too', unit: 'price distance' },
+  { value: 'trailing_pct', label: 'Trailing percent', unit: 'fraction, e.g. 0.05' },
+  { value: 'time', label: 'Time — exits after n bars', unit: 'bars to hold' },
+] as const
+
+/** The two whose value is a multiple of ATR, so they also need a period. */
+export const ATR_STOP_TYPES: ReadonlySet<string> = new Set(['atr', 'chandelier'])
+
 /** Timeframes the engine supports, matching `atp_core.domain.Timeframe`. */
 export const TIMEFRAMES = ['1m', '5m', '15m', '30m', '1h', '4h', '1d'] as const
 

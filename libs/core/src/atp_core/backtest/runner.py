@@ -30,8 +30,10 @@ from atp_core.analytics.performance import PerformanceAnalyzer, TradeRecord
 from atp_core.backtest.costs import ZeroCostModel, alpaca_equities_default
 from atp_core.backtest.engine import BacktestConfig, BacktestEngine, RiskBasedSizer
 from atp_core.domain import OrderStatus, Timeframe
+from atp_core.domain.enums import StopType
 from atp_core.errors import ConfigError
 from atp_core.risk.engine import RiskEngine, backtest_rules
+from atp_core.risk.stops import StopConfig
 from atp_core.strategy import registry
 
 if TYPE_CHECKING:
@@ -122,6 +124,60 @@ def refusal_summary(result: BacktestResult) -> str | None:
         f"{len(refused)} of {len(result.orders)} orders were refused before reaching "
         f"the market — {breakdown}. The return below is what the orders that "
         f"survived produced, not what the strategy asked for"
+    )
+
+
+#: Stop types a request may name — `StopType`'s own members, so a name this
+#: accepted and `StopManager` did not would be a failure raised from inside the
+#: queue worker rather than a 400 at the door.
+STOP_TYPES: frozenset[str] = frozenset(t.value for t in StopType)
+
+#: The two types whose `value` is a *multiple* of ATR rather than a fraction or
+#: an amount. `apps/worker._stop_config` makes the same split from one setting,
+#: for the reason it states: separate fields would let a caller fill in the one
+#: their configured type ignores.
+_MULTIPLIER_TYPES: frozenset[StopType] = frozenset({StopType.ATR, StopType.CHANDELIER})
+
+
+def resolve_stop_config(spec: BacktestRunSpec) -> StopConfig | None:
+    """The protection this spec asks for, or None to arm only what signals carry.
+
+    None is the honest answer for an unconfigured spec rather than a default
+    `atr`: every run stored before these fields existed has no stop type, and
+    giving it one would change what those runs report. A spec records what was
+    asked for.
+
+    **`broker_side` is False, and that is not a preference.** Live, a broker-side
+    stop rests at the venue and fires without us — which is why `StrategyRunner`
+    skips its own check for one. In a replay there is no venue: the engine *is*
+    the fill model, and a config claiming the level was resting somewhere else
+    would describe a protection nothing in the run provides.
+    """
+    if not spec.stop_type:
+        return None
+    if spec.stop_type not in STOP_TYPES:
+        known = ", ".join(sorted(STOP_TYPES))
+        raise ConfigError(f"stop_type must be one of: {known}")
+
+    stop_type = StopType(spec.stop_type)
+    if stop_type is StopType.TIME:
+        if spec.stop_bars <= 0:
+            raise ConfigError("a time stop needs a positive stop_bars")
+        return StopConfig(stop_type=stop_type, bars=spec.stop_bars, broker_side=False)
+
+    if not spec.stop_value:
+        raise ConfigError(f"a {spec.stop_type} stop needs stop_value")
+    value = _positive_decimal(spec.stop_value, "stop_value")
+    if spec.stop_period <= 0:
+        raise ConfigError(f"stop_period must be positive, got {spec.stop_period}")
+
+    multiplied = stop_type in _MULTIPLIER_TYPES
+    return StopConfig(
+        stop_type=stop_type,
+        value=None if multiplied else value,
+        multiplier=value if multiplied else None,
+        period=spec.stop_period,
+        broker_side=False,
     )
 
 
@@ -226,6 +282,7 @@ def build_engine(
         # quantity. The class stays for the engine's own mechanics tests.
         position_sizer=RiskBasedSizer(method, value),
         on_progress=on_progress,
+        stop_config=resolve_stop_config(spec),
     )
 
 

@@ -41,6 +41,15 @@ notional makes your riskiest positions your largest, which is precisely backward
 Rule of thumb: 0.5–2% risk per trade. Above 2%, a normal losing streak of 8–10
 trades — which happens to good strategies — is an account-threatening event.
 
+**`risk_pct` and the position cap can contradict each other, and the cap wins.**
+A wide stop buys a large position by construction: 1% of $100,000 against a
+2×ATR stop of $3.27 is 305 shares of a $97 stock, which is 29.5% of the account
+against a 10% `RISK_MAX_POSITION_PCT` — so `max_position_size` refuses the whole
+entry rather than trimming it. Nothing is wrong with either number; they are
+measuring different things, and a strategy whose stop is wide relative to its
+price needs a risk fraction small enough that the resulting notional fits. This
+is visible the moment stops reach a backtest, as a run with a refusal per entry.
+
 ### Where it is applied
 
 Two callers, one function. `OrderRouter._size` sizes a live signal and
@@ -118,6 +127,38 @@ ATR(14).
   wide enough to swamp the entry, produces a level price can never reach. The
   position looks guarded and is not, so `StopManager` refuses it at
   construction rather than arming it.
+
+### Where they are applied
+
+Two callers, one `StopManager` — the same shape sizing has, and for the same
+reason. `StrategyRunner` derives a level for a live signal and
+`BacktestEngine` derives one for a backtested signal; both call `initial_stop`,
+`update_trailing`, `time_exit_due`, `should_trigger` and `take_profit_level`
+rather than comparing prices themselves.
+
+Until a backtest could be given a `StopConfig`, only the live half of that
+existed. A strategy configured behind `WORKER_STOP_TYPE=atr` was backtested
+naked, because no shipped strategy emits a level of its own — so the backtest
+measured a strategy nobody was going to run. `--stop` on the CLI, the **Stop**
+field on the Backtests tab, and `stop_type` on a `BacktestRunSpec` are the same
+choice reaching a replay; docs/BACKTESTING.md has the table and the caveats.
+
+Two differences a replay cannot avoid, both deliberate:
+
+- **Nothing is broker-side.** There is no venue in a replay, so `broker_side` is
+  False on every backtest stop. A config claiming otherwise would describe
+  protection the run does not provide, and the first placement rule above would
+  read as satisfied when it was not.
+- **A bar is the finest resolution there is.** When a bar's range spans both the
+  stop and the target, the stop is taken. The bar cannot say which came first,
+  and the pessimistic reading is the only honest one.
+
+Everything else holds identically, including the two anchors a derived level
+uses: the stop comes from the price the decision was taken at, because that is
+what the sizer measured risk against, and the take-profit comes from the actual
+fill. `OrderRouter.submit_protective_orders` does exactly the same, and if that
+ever changes it has to change in both places or a backtest and a live run will
+arm different levels from the same signal.
 
 ### What stops cannot do
 

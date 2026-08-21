@@ -17,7 +17,8 @@ backtested strategy be trusted in paper and live.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from contextlib import suppress
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
@@ -43,12 +44,14 @@ from atp_core.domain import (
     Timeframe,
     TimeInForce,
 )
-from atp_core.errors import BacktestError, DataGapError, LookaheadError
-from atp_core.execution.idempotency import ENTRY, EXIT, STOP_LOSS, TAKE_PROFIT
+from atp_core.domain.enums import StopType
+from atp_core.errors import ATPError, BacktestError, DataGapError, LookaheadError
+from atp_core.execution.idempotency import ENTRY, EXIT, STOP_LOSS, TAKE_PROFIT, TIME_EXIT
 from atp_core.execution.matching import intended_price
 from atp_core.indicators import dispatch
 from atp_core.logging import get_logger
 from atp_core.risk.rules import position_size
+from atp_core.risk.stops import FROM_ENTRY_TYPES, TRAILING_TYPES, StopManager, target_hit
 
 if TYPE_CHECKING:
     from datetime import date, datetime
@@ -56,6 +59,7 @@ if TYPE_CHECKING:
     from atp_core.backtest.costs import CostModel
     from atp_core.domain import Bar, Signal
     from atp_core.risk.engine import RiskEngine
+    from atp_core.risk.stops import StopConfig
     from atp_core.strategy.base import Strategy
 
 log = get_logger(__name__)
@@ -263,6 +267,20 @@ class BacktestContext:
             return []
         return self._bars[symbol][: index + 1]
 
+    def visible(self, symbol: str) -> list[Bar]:
+        """Every completed bar for this symbol, oldest first.
+
+        For a caller that wants the whole window rather than a fixed lookback —
+        the engine's own ATR, which feeds stop placement, is the one today. It
+        goes through the cursor like everything else, so a stop can no more be
+        placed from a bar that has not happened than a strategy can trade on one.
+
+        Returns what exists rather than raising, matching `closes` and unlike
+        `history`: an indicator with too few bars answers `None`, which is the
+        honest state during warmup rather than an error.
+        """
+        return self._visible(symbol)
+
     # ── StrategyContext ─────────────────────────────────────────────────────
 
     @property
@@ -375,12 +393,22 @@ class BacktestEngine:
         risk_engine: RiskEngine,
         position_sizer: PositionSizer | None = None,
         on_progress: ProgressCallback | None = None,
+        stop_config: StopConfig | None = None,
     ) -> None:
         self.strategy = strategy
         self.config = config
         self.cost_model = cost_model
         self.risk_engine = risk_engine
         self.position_sizer = position_sizer
+        #: How every entry is protected, or None for a run that arms only what
+        #: its strategy asks for. None is what this engine did unconditionally
+        #: until now — `sma_crossover` emits no stop, so an ATR-stopped strategy
+        #: could be configured live and backtested naked, which is the divergence
+        #: ADR 0006 exists to refuse.
+        self.stop_config = stop_config
+        #: Stateless; held rather than constructed per call so the engine and
+        #: the live runner are visibly using one implementation.
+        self.stop_manager = StopManager()
         #: Called as the timeline advances, if a caller supplied one. A callback
         #: rather than anything this class does itself: reporting progress means
         #: writing somewhere, and core writes nowhere (CLAUDE.md §1.3). The CLI
@@ -389,10 +417,20 @@ class BacktestEngine:
         self.on_progress = on_progress
 
         self._portfolio = Portfolio(cash=config.starting_cash, starting_equity=config.starting_cash)
+        #: Set for the duration of a run. Held so stop placement can read the
+        #: same cursor-bounded window a strategy reads — an ATR computed off the
+        #: whole series would place stops with volatility that had not happened.
+        self._context: BacktestContext | None = None
         self._pending: list[Order] = []
         self._result: BacktestResult | None = None
         #: order id → (stop, target), armed onto the position once it fills.
         self._protection: dict[str, tuple[Decimal | None, Decimal | None]] = {}
+        #: symbol → how many bars the open position has been held for, which is
+        #: what a `time` stop counts. Kept here rather than derived from
+        #: `position.opened_at` and the bar series, because the engine already
+        #: walks every bar and counting as it goes is exact — inferring it would
+        #: mean re-scanning history on every bar of every position.
+        self._bars_held: dict[str, int] = {}
         #: Net P&L of each completed round trip, and how long each was held.
         #: Accumulated as positions return to flat rather than by matching fills
         #: after the fact — the engine watches every fill go by, so it does not
@@ -428,6 +466,7 @@ class BacktestEngine:
         first_ts = min(series[0].ts for series in bars.values() if series)
         clock = SimulatedClock(first_ts)
         context = BacktestContext(bars, self._portfolio, clock, symbols)
+        self._context = context
 
         result = BacktestResult(
             config=self.config, strategy_name=self.strategy.name, portfolio=self._portfolio
@@ -435,6 +474,7 @@ class BacktestEngine:
         self._result = result
         self._pending = []
         self._protection = {}
+        self._bars_held = {}
         self._trade_pnls = []
         self._holding_hours = []
         self._trade_base = {}
@@ -488,6 +528,13 @@ class BacktestEngine:
                 #    which would emit one per symbol per timestamp; the curve is
                 #    appended once below instead, after every symbol is marked.
                 self._portfolio.position(symbol).last_price = bar.close
+
+                # A completed bar the position lived through, counted before the
+                # stops are asked so that a `bars=1` time stop exits on the bar
+                # after the entry rather than two later. Only bars this symbol
+                # printed count: a halted name does not age its own position.
+                if symbol in self._bars_held:
+                    self._bars_held[symbol] += 1
 
                 self._check_stops(bar, result)  # 3
                 self._fill_pending_for(bar, result)  # 4
@@ -600,10 +647,28 @@ class BacktestEngine:
         if position.is_flat:
             return
 
+        # Ratchet first, so a bar that both extends the move and retraces into
+        # the *old* level is judged against the stop that bar justified — which
+        # is what a venue-side trailing stop would have done.
+        self._maintain_trailing(bar)
+
         stop, target = position.stop_loss_price, position.take_profit_price
         long = position.is_long
-        hit_stop = stop is not None and (bar.low <= stop if long else bar.high >= stop)
-        hit_target = target is not None and (bar.high >= target if long else bar.low <= target)
+        # `StopManager.should_trigger` and `target_hit` rather than the same
+        # comparisons written out here. Both were inline in this method and in
+        # `StrategyRunner`, and two implementations of "did the bar reach the
+        # level" is the divergence ADR 0006 refuses: a strategy backtested
+        # against one and run live against the other is not one strategy.
+        hit_stop = self.stop_manager.should_trigger(position, bar)
+        hit_target = target_hit(position, bar)
+
+        # A time stop is not a level, so it is asked separately and answers last
+        # — a position that would have been stopped out or hit its target on
+        # this bar did that, and only a position still open when the bar closes
+        # runs out of time on it.
+        if not hit_stop and not hit_target and self._time_exit_due(bar):
+            self._exit_at_market(position, bar, result, purpose=TIME_EXIT)
+            return
 
         if not hit_stop and not hit_target:
             return
@@ -645,6 +710,36 @@ class BacktestEngine:
             price = max(bar.open, intended) if long else min(bar.open, intended)
 
         self._execute(order, bar, price, result, note=reason)
+        result.orders.append(order)
+
+    def _exit_at_market(
+        self, position: Position, bar: Bar, result: BacktestResult, *, purpose: str
+    ) -> None:
+        """Close a position at this bar's close, for a reason that is not a level.
+
+        The `time` stop is the only caller and the price is the reason it needs
+        its own path. A level exit fills at the level or at the open when the bar
+        gapped through it; a time exit has no level — the rule is "leave after n
+        bars", and the honest price for a decision taken on a completed bar is
+        that bar's close, which is where the clock stands when the engine asks.
+
+        `purpose` rides onto the order and into the trade reconstruction, so a
+        time exit is attributable as one rather than folding into `exit`. That
+        matters for the same reason the stop/target labels do: exit-reason
+        attribution is how a strategy's stops are judged, and a bucket that
+        silently absorbs a second kind of exit makes it lie.
+        """
+        order = Order(
+            symbol=bar.symbol,
+            side=Side.SELL if position.is_long else Side.BUY,
+            qty=abs(position.qty),
+            order_type=OrderType.MARKET,
+            strategy_id=self.strategy.name,
+            created_at=bar.ts,
+            status=OrderStatus.SUBMITTED,
+            purpose=purpose,
+        )
+        self._execute(order, bar, bar.close, result, note=purpose)
         result.orders.append(order)
 
     # ── 4. fills ────────────────────────────────────────────────────────────
@@ -763,6 +858,15 @@ class BacktestEngine:
         levels = self._protection.pop(order.id, None)
         if levels is not None and not position.is_flat:
             position.stop_loss_price, position.take_profit_price = levels
+        if not position.is_flat:
+            # Fills whatever the order did not carry, from the price we actually
+            # got. `OrderRouter.submit_protective_orders` does this at the same
+            # point and on the same condition — a level the request supplied is
+            # left alone, and only the gaps are derived against the average fill.
+            self._arm_from_config(position, order)
+            self._bars_held.setdefault(order.symbol, 0)
+        else:
+            self._bars_held.pop(order.symbol, None)
 
         log.debug(
             "backtest.fill",
@@ -774,6 +878,147 @@ class BacktestEngine:
         )
 
     # ── 5-7. signals ────────────────────────────────────────────────────────
+
+    # ── stops ───────────────────────────────────────────────────────────────
+
+    def _atr(self, symbol: str) -> Decimal | None:
+        """ATR over the configured period, from the bars visible *so far*.
+
+        The lookahead guarantee applies here as much as to anything a strategy
+        reads: this is computed off `BacktestContext`'s cursor, so it can only
+        ever see completed bars. An ATR over the whole series would place stops
+        using volatility that had not happened yet — the quietest possible way
+        to make a backtest fictional.
+
+        Float in, `Decimal` out via `str`, matching `StrategyRunner._atr` — never
+        `Decimal(float)`, which inherits the binary rounding rule §1.1 exists to
+        avoid. ATR is a statistic, so computing it in float is fine; the moment
+        it becomes a price distance it stops being one.
+        """
+        if self.stop_config is None or self._context is None:
+            return None
+        history = self._context.visible(symbol)
+        value = dispatch.compute("atr", history, self.stop_config.period)
+        return None if value is None else Decimal(str(value))
+
+    def _with_derived_stop(self, signal: Signal, bar: Bar) -> Signal:
+        """A signal with a protective level, if the config describes one.
+
+        The strategy's own level always wins — a signal that names a stop is
+        returned untouched, because deriving one over the top would override a
+        deliberate choice with a configured default. `StrategyRunner._derive_stop`
+        takes the identical position.
+
+        Anchored to this bar's close, which is the price the decision was taken
+        at and the price the sizer measures risk from — and the level the
+        position goes on to carry, because `_arm_from_config` fills gaps rather
+        than overwriting. The fill lands at the next bar's open, so the realised
+        risk per share differs slightly from the assumed one. Re-anchoring to
+        the fill would close that gap and open a worse one: live, the derived
+        level rides into `OrderRouter._requested_protection` and is likewise
+        kept, so a backtest that re-anchored would arm a different stop than
+        production from the same signal.
+
+        A failure is a refusal, not a guess: an ATR stop with no ATR is exactly
+        the input `StopManager` declines to default, and returning the signal
+        unchanged hands the decision to the sizer — which will refuse it in turn
+        and say so on the result.
+        """
+        if self.stop_config is None or signal.stop_loss_price is not None:
+            return signal
+        if self.stop_config.stop_type is StopType.TIME:
+            return signal  # not a level; `time_exit_due` owns it
+
+        side = Side.BUY if signal.action is SignalAction.ENTER_LONG else Side.SELL
+        try:
+            level = self.stop_manager.initial_stop(
+                bar.close, side, self.stop_config, self._atr(signal.symbol)
+            )
+        except (ValueError, ATPError):
+            return signal
+        return replace(signal, stop_loss_price=level)
+
+    def _arm_from_config(self, position: Position, order: Order) -> None:
+        """Put the configured protection on a position that has just filled.
+
+        Only fills the gaps, and the asymmetry that produces is deliberate
+        rather than an oversight. An entry whose stop was derived at decision
+        time arrives here already carrying it, so what this actually derives is
+        the take-profit — against the fill, while the stop stays anchored to the
+        close the decision was taken at.
+
+        That is precisely what `OrderRouter.submit_protective_orders` does with
+        a `_with_stop`-derived signal live: same condition, same two anchors. It
+        is a poorer story than "both anchored to the fill", and it is the one
+        that matters, because a backtest and a live run arming different levels
+        from the same signal is the divergence ADR 0006 refuses. Change it in
+        one place and it must change in both.
+
+        The take-profit is armed here and only from a config that can express
+        one — `StopManager.take_profit_level` refuses anything that is not a
+        fixed distance from entry, because a trailing or time rule says *when*
+        to leave rather than *where*, and a target that quietly does not exist
+        is a position with no upside exit.
+        """
+        if self.stop_config is None or position.is_flat:
+            return
+        if self.stop_config.stop_type is StopType.TIME:
+            return
+
+        side = Side.BUY if position.is_long else Side.SELL
+        entry = position.avg_entry_price
+        if position.stop_loss_price is None:
+            # Suppressed, not defaulted: left unprotected rather than protected
+            # at an invented level. A position that looks guarded and is not is
+            # worse than one openly unguarded (`risk/stops.py`).
+            with suppress(ValueError, ATPError):
+                position.stop_loss_price = self.stop_manager.initial_stop(
+                    entry, side, self.stop_config, self._atr(order.symbol)
+                )
+        if position.take_profit_price is None and self.stop_config.stop_type in FROM_ENTRY_TYPES:
+            with suppress(ValueError, ATPError):
+                position.take_profit_price = self.stop_manager.take_profit_level(
+                    entry, side, self.stop_config
+                )
+
+    def _maintain_trailing(self, bar: Bar) -> None:
+        """Ratchet a trailing stop against this bar.
+
+        Runs before the level is tested, so a bar that both extends the move and
+        retraces into the *old* stop is judged against the level that bar
+        justified — which is what a venue-side trailing stop would have done.
+
+        `update_trailing` mutates the position and returns the new level only
+        when it actually moved, so a stop can never be widened by this call.
+        """
+        if self.stop_config is None:
+            return
+        if self.stop_config.stop_type not in TRAILING_TYPES:
+            return
+        position = self._portfolio.position(bar.symbol)
+        if position.is_flat:
+            return
+        # A chandelier with no ATR yet — during warmup, before the period has
+        # enough bars. The stop simply does not ratchet on this bar.
+        with suppress(ValueError, ATPError):
+            self.stop_manager.update_trailing(
+                position, bar, self.stop_config, self._atr(bar.symbol)
+            )
+
+    def _time_exit_due(self, bar: Bar) -> bool:
+        """Whether a `time` stop has run out on this symbol's position.
+
+        Counted from fills rather than inferred from `opened_at` and the bar
+        series: this engine walks every bar anyway, so counting is exact and
+        costs nothing, where inferring would re-scan history per position per
+        bar.
+        """
+        if self.stop_config is None or self.stop_config.stop_type is not StopType.TIME:
+            return False
+        held = self._bars_held.get(bar.symbol)
+        if held is None:
+            return False
+        return self.stop_manager.time_exit_due(held, self.stop_config)
 
     @staticmethod
     def _book_refusal(
@@ -819,6 +1064,13 @@ class BacktestEngine:
             qty = abs(position.qty)
             purpose = EXIT
         elif signal.action in (SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT):
+            # Before sizing, because `risk_pct` is *defined* off the distance to
+            # the stop. `StrategyRunner._derive_stop` does this at the same point
+            # and for the same reason: the documented default pair is an ATR stop
+            # with risk-based sizing, no `Signal` carries an ATR-derived level,
+            # and without this every entry from a default-configured strategy is
+            # refused at sizing for want of a stop to measure against.
+            signal = self._with_derived_stop(signal, bar)
             if self.position_sizer is None:
                 raise BacktestError(
                     "an entry signal needs a position_sizer; real sizing is "

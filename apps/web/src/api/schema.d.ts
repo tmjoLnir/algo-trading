@@ -1575,6 +1575,23 @@ export interface components {
              * @default 100000
              */
             starting_cash: number | string;
+            /**
+             * Stop Bars
+             * @default 0
+             */
+            stop_bars: number;
+            /**
+             * Stop Period
+             * @default 14
+             */
+            stop_period: number;
+            /**
+             * Stop Type
+             * @default
+             */
+            stop_type: string;
+            /** Stop Value */
+            stop_value?: number | string | null;
             /** Strategy Id */
             strategy_id: string;
             /** Symbols */
@@ -1655,6 +1672,14 @@ export interface components {
             start: string;
             /** Starting Cash */
             starting_cash: string;
+            /** Stop Bars */
+            stop_bars: number;
+            /** Stop Period */
+            stop_period: number;
+            /** Stop Type */
+            stop_type: string;
+            /** Stop Value */
+            stop_value: string;
             /** Strategy Id */
             strategy_id: string;
             /** Symbols */
