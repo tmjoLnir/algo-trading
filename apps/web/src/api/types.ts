@@ -53,6 +53,16 @@ export type WhoAmI = Schemas['WhoAmI']
 export type PreSessionContext = Schemas['PreSessionContext']
 
 /**
+ * `/risk/rejections` — the decisions the risk chain refused.
+ *
+ * `RejectionView` is a *signal*, not an order: a refused signal never becomes
+ * an order, so the orders table cannot show it. `indicators` are strings for
+ * the reason every decimal on the wire is one.
+ */
+export type RejectionView = Schemas['RejectionView']
+export type RejectionsResponse = Schemas['RejectionsResponse']
+
+/**
  * The rungs of the promotion ratchet, straight from the server's own enum.
  *
  * Generated, so `useStrategies.ts` can be *checked* against it rather than

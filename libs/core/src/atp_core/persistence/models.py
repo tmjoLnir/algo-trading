@@ -128,7 +128,14 @@ class SignalRow(Base):
     strategy underperformed its backtest."""
 
     __tablename__ = "signals"
-    __table_args__ = (Index("ix_signals_strategy_ts", "strategy_id", "ts"),)
+    __table_args__ = (
+        Index("ix_signals_strategy_ts", "strategy_id", "ts"),
+        # `/risk/rejections` reads the newest refusals, optionally for one
+        # strategy and one rule. Neither existing index serves it: the one above
+        # leads on `strategy_id`, and the query is not scoped to a strategy by
+        # default — the first question is "is *anything* being refused".
+        Index("ix_signals_rejected_by_ts", "rejected_by", "ts"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     strategy_id: Mapped[str] = mapped_column(ForeignKey("strategies.id"))
@@ -140,6 +147,17 @@ class SignalRow(Base):
     indicators: Mapped[JsonDict] = mapped_column(JSON, default=dict)
     acted_on: Mapped[bool] = mapped_column(Boolean, default=False)
     rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: Which rule refused this, or `no_action` for a HOLD-shaped outcome the
+    #: router approved. Its own column as of `f4d2e8b1a075`.
+    #:
+    #: It was packed into `rejection_reason` as `"[rule] reason"` and split back
+    #: out on read, and the repository said adding a column was "not worth a
+    #: migration for one string". That was true while nothing queried it. It
+    #: stopped being true the moment `/risk/rejections` needed to *filter* on
+    #: the rule — excluding `no_action`, which is not a refusal — because that
+    #: filter would otherwise be a `LIKE` against a bracketed prefix, matching
+    #: any reason text that happened to start with one.
+    rejected_by: Mapped[str | None] = mapped_column(String(50), nullable=True)
 
 
 class OrderRow(Base):

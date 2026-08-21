@@ -12,7 +12,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, model_validator
 
 from atp_api.auth import authenticate
@@ -23,6 +23,7 @@ from atp_api.deps import (
     get_clock,
     get_kill_switch,
     get_portfolio_repository,
+    get_signal_repository,
     get_snapshot_store,
 )
 from atp_api.routers.dashboard import day_pnl_since_open
@@ -35,6 +36,7 @@ from atp_core.domain import RunMode
 from atp_core.execution.ports import PortfolioRepository
 from atp_core.logging import get_logger
 from atp_core.risk.killswitch import HaltReason, HaltScope, KillSwitch
+from atp_core.strategy.ports import SignalRepository
 
 log = get_logger(__name__)
 
@@ -888,12 +890,135 @@ async def flatten_all(
     raise NotImplementedError
 
 
-@router.get("/rejections")
-async def list_rejections(limit: int = 100) -> list[dict[str, object]]:
+class RejectionView(BaseModel):
+    """One decision the risk chain refused.
+
+    A *signal*, not an order, and the distinction is the endpoint's whole
+    subject: a refused signal never becomes an order, so the orders table
+    cannot show it. `signal_id` is the row in `signals`, which also carries the
+    indicators the strategy was looking at when it decided.
+    """
+
+    signal_id: str
+    at: datetime
+    strategy_id: str
+    symbol: str
+    action: str
+    #: The rule that refused it, by its own `name` — the same string
+    #: `/risk/status` puts on the limit's row and `RiskDecision.rule` carries.
+    rule: str
+    #: What a human reads. Null for a refusal recorded with a rule and no words,
+    #: which is possible and is not worth inventing a sentence for.
+    reason: str | None
+    #: What the strategy was looking at, as strings. Never parsed to numbers:
+    #: the column holds prices, period counts and boolean flags together, and
+    #: this layer cannot tell which is which (`persistence.signals._to_signal`).
+    indicators: dict[str, str] = Field(default_factory=dict)
+
+
+class RejectionsResponse(BaseModel):
+    """Refusals, and an honest account of which ones are missing."""
+
+    rejections: list[RejectionView]
+
+    #: How many of **the refusals below** each rule accounts for — not of all
+    #: history. It is computed over the returned page, because counting the
+    #: whole table would be a second query whose answer would not match the
+    #: rows on the screen. The name a reader wants is usually the one at the
+    #: top of a short list anyway: "which rule is refusing everything".
+    by_rule: dict[str, int] = Field(default_factory=dict)
+
+    #: **What this endpoint structurally cannot show**, in the payload rather
+    #: than only in the docs, for the same reason `/risk/status` marks the order
+    #: rate unobservable: an empty list here reads as "nothing is being
+    #: refused", and a screen that renders it needs the sentence that stops a
+    #: person concluding that.
+    blind_spots: list[str] = Field(default_factory=list)
+
+
+#: Refusals that happen and are never stored, so no query can find them.
+#:
+#: `runner._record_signal` writes a row for every *signal* whatever its fate,
+#: which is what makes this endpoint possible. The runner's two other refusal
+#: paths write nothing: a stop exit the risk chain denied
+#: (`runner.py`, `runner.stop_exit_refused`) and a shutdown flatten it denied
+#: (`runner.shutdown_flatten_refused`) are logged and dropped. Neither is a
+#: signal, so `_record_signal` never sees them, and neither order is ever
+#: tracked, so `_persist` never saves them either.
+#:
+#: These are the *worse* refusals. A refused entry means a trade that did not
+#: happen; a refused stop exit means a position that should have closed and did
+#: not, which is docs/SAFETY.md's layer-5 failure. Saying so here is the least
+#: this endpoint can do until they are recorded.
+BLIND_SPOTS = [
+    "a stop exit refused by the risk chain is written to the worker's log and "
+    "nowhere else, so it cannot appear here — and it is the more serious "
+    "refusal, because it leaves a position open that should have closed",
+    "a shutdown flatten refused by the risk chain is likewise logged only",
+    "`no_action` outcomes are excluded on purpose: a HOLD, or an exit against "
+    "an already-flat position, is approved rather than refused",
+]
+
+
+@router.get("/rejections", response_model=RejectionsResponse)
+async def list_rejections(
+    signals: Annotated[SignalRepository, Depends(get_signal_repository)],
+    strategy_id: str | None = None,
+    rule: str | None = None,
+    since: datetime | None = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+) -> RejectionsResponse:
     """Recently blocked orders and why.
 
     A strategy silently doing nothing because a limit rejects it every time
     looks identical to a strategy with no signals — this endpoint is how you
     tell the difference.
+
+    Read from `signals`, which is where refusals live. They are deliberately
+    **not** in the orders table: `runner.evaluate` skips `_track` when the
+    router refuses, so a refused order never enters the open-order set that
+    `_persist` walks, and nothing else saves it. That is why
+    `/risk/status` reports the order rate as unobservable, and it is the same
+    fact seen from the other side — the record exists, it is just kept as a
+    decision rather than as an order.
+
+    **The filtering happens in SQL.** Reading the newest hundred signals and
+    keeping the refused ones would answer a different question: "were any of
+    the last hundred decisions refused" is "no" for a strategy blocked all week
+    that has since emitted one HOLD, and an empty list reads as "nothing is
+    being refused" (`SignalRepository.rejections`).
+
+    A read, so a read-only session may call it. Nothing here is a secret an
+    operator watching the book should not see — and this is precisely the screen
+    someone reaches for when a strategy appears to be doing nothing.
     """
-    raise NotImplementedError
+    found = await signals.rejections(strategy_id=strategy_id, rule=rule, since=since, limit=limit)
+
+    counts: dict[str, int] = {}
+    views: list[RejectionView] = []
+    for signal, outcome in found:
+        # `rejected_by` is what the repository filtered on, so it is never None
+        # here — but the type says it can be, and a view built from `or ""`
+        # would put a nameless rule on the screen rather than failing loudly.
+        refusing = outcome.rejected_by
+        if refusing is None:  # pragma: no cover — excluded by the query above
+            continue
+        counts[refusing] = counts.get(refusing, 0) + 1
+        views.append(
+            RejectionView(
+                signal_id=signal.id,
+                at=signal.ts,
+                strategy_id=signal.strategy_id,
+                symbol=signal.symbol,
+                action=signal.action.value,
+                rule=refusing,
+                reason=outcome.rejection_reason,
+                indicators={k: str(v) for k, v in signal.indicators.items()},
+            )
+        )
+
+    return RejectionsResponse(
+        rejections=views,
+        by_rule=dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))),
+        blind_spots=list(BLIND_SPOTS),
+    )

@@ -83,8 +83,8 @@ totals understate exposure.
   built and read by a panel on the **Strategies** tab (#75) rather than by a
   tab of their own — `/status` is what a person checks before promoting a
   strategy, so it sits on the screen that decision is made on and the nav stays
-  at seven. `/risk/rejections` is still a stub, and wants the signals table
-  rather than the orders table.
+  at seven. `/risk/rejections` joined them there (#PR), reading `signals`
+  rather than `orders` for the reason below.
 - `/dashboard/health` is stubbed (`dashboard.py:567`). Nothing calls it —
   `FeedStatus` reads `data_feed_healthy` off the aggregate instead — so it is a
   dead route rather than a missing feature.
@@ -239,9 +239,24 @@ the record.
 - The halts this log cannot see — the CLI's and the risk layer's own. Attributing
   those means giving each an identity the record can stand behind, which is a
   larger question than adding a constant.
-- `/risk/rejections` is stubbed (`risk.py:138`) — "a strategy blocked on every
-  order looks identical to a strategy with no signals" is currently answered
-  only by the dashboard's signal feed, and only for the current book.
+- ~~`/risk/rejections` is stubbed~~ **Built (#PR)**, on the Strategies tab. "A
+  strategy blocked on every order looks identical to a strategy with no
+  signals" was previously answerable only from the dashboard's signal feed, and
+  only for the current book; it is now a durable, filterable query.
+
+  **It surfaced a gap worth its own line.** The runner records a row for every
+  *signal* whatever its fate, which is what makes the endpoint possible. Its two
+  other refusal paths record nothing: a **stop exit** the risk chain denied
+  (`runner.stop_exit_refused`) and a **shutdown flatten** it denied
+  (`runner.shutdown_flatten_refused`) are logged and dropped. Neither is a
+  signal, so `_record_signal` never sees them, and neither order is ever
+  tracked, so `_persist` never saves them.
+
+  Those are the *worse* refusals. A refused entry is a trade that did not
+  happen; a refused stop exit is a position that should have closed and did
+  not, which is docs/SAFETY.md's layer 5 failing. The endpoint reports them as
+  blind spots in its own payload — the screen renders them whether or not there
+  are rows — but reporting is not recording, and recording them is outstanding.
 
 ---
 
@@ -268,7 +283,8 @@ the record.
 | `/risk/halt` | built (#70) | Dashboard button |
 | `/risk/resume` | built (#75) | Halt banner |
 | `/risk/limits`, `/risk/status` | built (#75) | Strategies |
-| `/risk/{flatten-all,rejections}` | **stub** | none |
+| `/risk/rejections` | built (#PR) | Strategies |
+| `/risk/flatten-all` | **stub** | none |
 
 ## Cross-cutting
 
@@ -283,6 +299,11 @@ the record.
   `market-data/calendar`), both reader-less for phases. `/risk/limits` is a
   third only in the ordinary case: it is fetched by the Strategies panel solely
   when `/risk/status` has failed, which is the case that route exists for.
+- **The Strategies tab is now three panels**: the risk limits, the refused
+  decisions, and the strategies themselves. That is deliberate rather than
+  accretion — all three answer one question, "why is this strategy not
+  trading", from the three places the answer can be: a limit it is against, a
+  refusal it has already hit, or nothing having run it at all.
 - **Nothing here has met real data.** Every test drives fixtures or an ASGI
   transport, and so did the reading behind this document. The gap between "the
   screen renders this correctly" and "the screen agrees with what the worker

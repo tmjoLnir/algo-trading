@@ -33,6 +33,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from atp_core.domain import Signal, SignalAction
+from atp_core.execution.router import NO_ACTION
 from atp_core.logging import get_logger
 from atp_core.persistence.db import session_scope
 from atp_core.persistence.models import SignalRow
@@ -69,7 +70,8 @@ class PostgresSignalRepository:
                     reason=signal.reason,
                     indicators={k: str(v) for k, v in signal.indicators.items()},
                     acted_on=outcome.acted_on,
-                    rejection_reason=_reason(outcome),
+                    rejection_reason=outcome.rejection_reason,
+                    rejected_by=outcome.rejected_by,
                 )
                 # The outcome is the mutable half: a signal recorded on its way
                 # into the router and updated when the router answers is one
@@ -81,7 +83,8 @@ class PostgresSignalRepository:
                     index_elements=[SignalRow.id],
                     set_={
                         "acted_on": outcome.acted_on,
-                        "rejection_reason": _reason(outcome),
+                        "rejection_reason": outcome.rejection_reason,
+                        "rejected_by": outcome.rejected_by,
                     },
                 )
             )
@@ -93,6 +96,49 @@ class PostgresSignalRepository:
         query = select(SignalRow).order_by(SignalRow.ts.desc()).limit(limit)
         if strategy_id is not None:
             query = query.where(SignalRow.strategy_id == strategy_id)
+        async with session_scope(self._session_factory) as session:
+            rows = (await session.execute(query)).scalars().all()
+        return [_to_signal(row) for row in rows]
+
+    async def rejections(
+        self,
+        *,
+        strategy_id: str | None = None,
+        rule: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[tuple[Signal, SignalOutcome]]:
+        """Refusals only, newest first. What `/risk/rejections` reads.
+
+        **Filtered in SQL rather than in the caller, and that is the whole
+        point of the method existing.** Taking the newest N signals and keeping
+        the refused ones would answer "were any of the last hundred decisions
+        refused" — a completely different question, and one whose answer is
+        "no" for a strategy that has been blocked for a week and has since
+        emitted anything at all. An operator reading an empty list would
+        conclude nothing is being refused.
+
+        `no_action` is excluded here rather than left to the caller. It is not a
+        refusal: `SubmitResult.no_action` marks a HOLD, or an exit against an
+        already-flat position, and the router reports it as *approved* on
+        purpose so it does not inflate the count an operator reads to decide
+        whether the risk config is too tight. Including it would put that
+        inflation back one layer up, where the reason it is wrong is much less
+        visible.
+        """
+        query = (
+            select(SignalRow)
+            .where(SignalRow.rejected_by.is_not(None), SignalRow.rejected_by != NO_ACTION)
+            .order_by(SignalRow.ts.desc())
+            .limit(limit)
+        )
+        if strategy_id is not None:
+            query = query.where(SignalRow.strategy_id == strategy_id)
+        if rule is not None:
+            query = query.where(SignalRow.rejected_by == rule)
+        if since is not None:
+            query = query.where(SignalRow.ts >= since)
+
         async with session_scope(self._session_factory) as session:
             rows = (await session.execute(query)).scalars().all()
         return [_to_signal(row) for row in rows]
@@ -113,25 +159,19 @@ class PostgresSignalRepository:
         return [_to_signal(row) for row in rows]
 
 
-def _reason(outcome: SignalOutcome) -> str | None:
-    """Flatten the two rejection fields into the one column the schema has.
-
-    `SignalRow` stores `rejection_reason` and no `rejected_by`, so the rule name
-    is prefixed onto the reason rather than dropped: "which rule refused this"
-    is the question an operator asks first, and a reason without it sends them
-    reading the whole chain. Adding a column would be the tidier answer and is
-    not worth a migration for one string — but the flattening is lossy, so
-    `_split_reason` below is its exact inverse and the round trip is tested.
-    """
-    if outcome.rejection_reason is None and outcome.rejected_by is None:
-        return None
-    if outcome.rejected_by is None:
-        return outcome.rejection_reason
-    return f"[{outcome.rejected_by}] {outcome.rejection_reason or ''}".rstrip()
-
-
 def _split_reason(stored: str | None) -> tuple[str | None, str | None]:
-    """Inverse of `_reason`: `(rejection_reason, rejected_by)`."""
+    """Unpack a legacy `"[rule] reason"` value into `(reason, rule)`.
+
+    Both fields have their own column as of `f4d2e8b1a075`, which backfills
+    every stored row by this same grammar. This survives it as a **read-side
+    fallback only**, for a row whose `rejected_by` is null while its
+    `rejection_reason` still carries a bracketed prefix — a row written by a
+    worker running older code against a migrated database, which is what a
+    rolling deploy looks like for the minutes it takes.
+
+    Nothing writes the packed form any more. When the fallback stops firing in
+    practice it can go, and the migration is what makes that safe to check.
+    """
     if stored is None:
         return None, None
     if stored.startswith("[") and "]" in stored:
@@ -150,7 +190,15 @@ def _to_signal(row: SignalRow) -> tuple[Signal, SignalOutcome]:
     what it asked for; guessing here would turn a period of `20` into `20.0` and
     a price into a binary float.
     """
-    reason, rejected_by = _split_reason(row.rejection_reason)
+    # The columns, unless this is a row from a straggling writer — see
+    # `_split_reason`. Checking `rejected_by` first means the fallback costs
+    # nothing on every row written since the migration.
+    reason: str | None
+    rejected_by: str | None
+    if row.rejected_by is not None:
+        reason, rejected_by = row.rejection_reason, row.rejected_by
+    else:
+        reason, rejected_by = _split_reason(row.rejection_reason)
     signal = Signal(
         strategy_id=row.strategy_id,
         symbol=row.symbol,

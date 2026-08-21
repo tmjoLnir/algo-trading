@@ -444,6 +444,151 @@ class TestTheSignalRecord:
         assert [s.id for s, _ in found] == ["sig-a", "sig-b"]
 
 
+class TestTheRejectionsQuery:
+    """`SignalRepository.rejections` — what `/risk/rejections` reads.
+
+    Against a real database because the filtering is the subject: the whole
+    method exists so the `WHERE` happens before the `LIMIT`, and a fake that
+    filtered a Python list would prove nothing about the SQL that ships.
+    """
+
+    @pytest.mark.asyncio
+    async def test_it_returns_refusals_newest_first(self, repos: tuple) -> None:
+        strategies, signals, _ = repos
+        await strategies.ensure(a_record())
+        await signals.save(
+            a_signal("old", ts=T0 - timedelta(hours=2)),
+            SignalOutcome(acted_on=False, rejection_reason="a", rejected_by="rate_limit"),
+        )
+        await signals.save(
+            a_signal("new", ts=T0),
+            SignalOutcome(acted_on=False, rejection_reason="b", rejected_by="rate_limit"),
+        )
+
+        found = await signals.rejections()
+
+        assert [s.id for s, _ in found] == ["new", "old"]
+
+    @pytest.mark.asyncio
+    async def test_an_acted_on_signal_is_not_a_refusal(self, repos: tuple) -> None:
+        strategies, signals, _ = repos
+        await strategies.ensure(a_record())
+        await signals.save(a_signal("done"), SignalOutcome(acted_on=True))
+
+        assert await signals.rejections() == []
+
+    @pytest.mark.asyncio
+    async def test_no_action_is_excluded_in_sql(self, repos: tuple) -> None:
+        """The exclusion that keeps phantom rejections off the screen.
+
+        A HOLD is stored with a non-null rejection field and `acted_on=False`,
+        so a query that only asked for "not acted on" would return every hold a
+        strategy ever made. The router marks these *approved* on purpose, and
+        this is where that intent has to survive into the database.
+        """
+        strategies, signals, _ = repos
+        await strategies.ensure(a_record())
+        await signals.save(
+            a_signal("hold"),
+            SignalOutcome(acted_on=False, rejection_reason="SPY: hold", rejected_by="no_action"),
+        )
+        await signals.save(
+            a_signal("real", ts=T0 + timedelta(minutes=1)),
+            SignalOutcome(
+                acted_on=False, rejection_reason="down 3%", rejected_by="daily_loss_limit"
+            ),
+        )
+
+        found = await signals.rejections()
+
+        assert [s.id for s, _ in found] == ["real"]
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_older_than_the_limit_is_still_found(self, repos: tuple) -> None:
+        """The property the method exists for, proved in SQL.
+
+        A strategy blocked last week that has since emitted hundreds of holds is
+        the case an operator is investigating. `recent(limit=10)` would return
+        ten holds; this has to return the refusal.
+        """
+        strategies, signals, _ = repos
+        await strategies.ensure(a_record())
+        await signals.save(
+            a_signal("ancient", ts=T0 - timedelta(days=7)),
+            SignalOutcome(
+                acted_on=False, rejection_reason="full", rejected_by="max_open_positions"
+            ),
+        )
+        for minute in range(40):
+            await signals.save(
+                a_signal(f"hold{minute}", ts=T0 - timedelta(minutes=minute)),
+                SignalOutcome(acted_on=False, rejection_reason="hold", rejected_by="no_action"),
+            )
+
+        found = await signals.rejections(limit=5)
+
+        assert [s.id for s, _ in found] == ["ancient"]
+        assert [s.id for s, _ in await signals.recent(limit=5)] != ["ancient"]
+
+    @pytest.mark.asyncio
+    async def test_it_filters_by_rule_and_by_strategy(self, repos: tuple) -> None:
+        strategies, signals, _ = repos
+        await strategies.ensure(a_record())
+        await strategies.ensure(a_record("other"))
+        await signals.save(
+            a_signal("a"),
+            SignalOutcome(acted_on=False, rejection_reason="x", rejected_by="rate_limit"),
+        )
+        await signals.save(
+            a_signal("b", ts=T0 + timedelta(minutes=1), strategy_id="other"),
+            SignalOutcome(acted_on=False, rejection_reason="y", rejected_by="kill_switch"),
+        )
+
+        assert [s.id for s, _ in await signals.rejections(rule="rate_limit")] == ["a"]
+        assert [s.id for s, _ in await signals.rejections(strategy_id="other")] == ["b"]
+
+    @pytest.mark.asyncio
+    async def test_it_filters_by_since(self, repos: tuple) -> None:
+        strategies, signals, _ = repos
+        await strategies.ensure(a_record())
+        await signals.save(
+            a_signal("old", ts=T0 - timedelta(days=2)),
+            SignalOutcome(acted_on=False, rejection_reason="x", rejected_by="rate_limit"),
+        )
+        await signals.save(
+            a_signal("new", ts=T0),
+            SignalOutcome(acted_on=False, rejection_reason="y", rejected_by="rate_limit"),
+        )
+
+        found = await signals.rejections(since=T0 - timedelta(hours=1))
+
+        assert [s.id for s, _ in found] == ["new"]
+
+    @pytest.mark.asyncio
+    async def test_the_rule_survives_its_own_column(self, repos: tuple) -> None:
+        """`rejected_by` is a column as of `f4d2e8b1a075`, not a prefix.
+
+        It used to be packed into `rejection_reason` as `"[rule] reason"` and
+        split back out on read. The reason is now stored whole — a reason that
+        happens to begin with a bracket is no longer parsed as a rule name.
+        """
+        strategies, signals, _ = repos
+        await strategies.ensure(a_record())
+        await signals.save(
+            a_signal("bracketed"),
+            SignalOutcome(
+                acted_on=False,
+                rejection_reason="[not a rule] the reason itself began with a bracket",
+                rejected_by="max_position_size",
+            ),
+        )
+
+        ((_, outcome),) = await signals.rejections()
+
+        assert outcome.rejected_by == "max_position_size"
+        assert outcome.rejection_reason == "[not a rule] the reason itself began with a bracket"
+
+
 class TestTheOrderJoin:
     @pytest.mark.asyncio
     async def test_an_order_stores_the_decision_that_caused_it(self, repos: tuple) -> None:

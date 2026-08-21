@@ -81,14 +81,23 @@ const RISK_STATUS = {
   unmarked_symbols: [],
 }
 
+/** An empty but valid `/risk/rejections`, for the other panel this page carries. */
+const RISK_REJECTIONS = {
+  rejections: [],
+  by_rule: {},
+  blind_spots: ['a stop exit refused by the risk chain is written to the log only'],
+}
+
 function stub(status: number, body: unknown) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
-    const risk = String(input).includes('/risk/')
+    const url = String(input)
+    const risk = url.includes('/risk/')
+    const riskBody = url.includes('/risk/rejections') ? RISK_REJECTIONS : RISK_STATUS
     return {
       ok: risk ? true : status < 400,
       status: risk ? 200 : status,
       statusText: 'stub',
-      json: async () => (risk ? RISK_STATUS : body),
+      json: async () => (risk ? riskBody : body),
     } as Response
   })
   vi.stubGlobal('fetch', fetchMock)
