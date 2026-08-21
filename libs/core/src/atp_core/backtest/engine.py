@@ -31,6 +31,7 @@ from atp_core.backtest.metrics import (
 )
 from atp_core.clock import SimulatedClock
 from atp_core.domain import (
+    SIZING,
     Fill,
     Order,
     OrderStatus,
@@ -47,9 +48,10 @@ from atp_core.execution.idempotency import ENTRY, EXIT, STOP_LOSS, TAKE_PROFIT
 from atp_core.execution.matching import intended_price
 from atp_core.indicators import dispatch
 from atp_core.logging import get_logger
+from atp_core.risk.rules import position_size
 
 if TYPE_CHECKING:
-    from datetime import datetime
+    from datetime import date, datetime
 
     from atp_core.backtest.costs import CostModel
     from atp_core.domain import Bar, Signal
@@ -68,10 +70,16 @@ PROGRESS_EVERY = 500
 class PositionSizer(Protocol):
     """Turns intent into a quantity.
 
-    A seam, not a home: real sizing is risk-based and lands with the risk engine
-    (docs/RISK.md 'Position sizing', roadmap Phase 3). The engine takes one
-    rather than computing a quantity itself, so that when `risk.rules
-    .position_size` exists there is nothing here to delete.
+    A seam, not a home: real sizing is risk-based and lives with the risk engine
+    (docs/RISK.md 'Position sizing'). The engine takes one rather than computing
+    a quantity itself, and that seam has held — `RiskBasedSizer` below delegates
+    to `risk.rules.position_size` and there was nothing here to delete.
+
+    An implementation **may raise `ValueError`** to mean "this cannot be sized",
+    which is `position_size`'s own contract for the two inputs it refuses to
+    default. `_handle_signal` books that as a refused order naming the sizing
+    stage rather than letting it end the run, so an unsizeable signal is one
+    line in the result instead of a crash or a silence.
     """
 
     def __call__(self, signal: Signal, portfolio: Portfolio, price: Decimal) -> Decimal: ...
@@ -111,6 +119,46 @@ class FixedQtySizer:
 
     def __call__(self, signal: Signal, portfolio: Portfolio, price: Decimal) -> Decimal:
         return self.qty
+
+
+@dataclass(frozen=True, slots=True)
+class RiskBasedSizer:
+    """Sizes through `risk.rules.position_size` — the same call the live router
+    makes, with the same arguments in the same order.
+
+    That identity is the point rather than a convenience. `OrderRouter._size`
+    and this are the two places a quantity is decided in this platform, and a
+    backtest that sized by its own arithmetic would produce a return the live
+    strategy could never reproduce — the divergence CLAUDE.md §5 names as the
+    hardest class of bug here to notice. There is one sizing function; both
+    callers pass a `PositionSizeSpec` to it and neither does any maths.
+
+    **Refuses by raising, and the engine records the refusal.** `position_size`
+    raises `ValueError` for the two inputs it will not default — a stop for
+    `risk_pct`, a volatility for `volatility_target` — and that exception is the
+    honest answer to "how big should this be" when the answer is undefined. The
+    engine catches it and books a refused order naming the sizing stage, exactly
+    as the router returns `SubmitResult.refused(SIZING, ...)`. Returning zero
+    instead would drop the signal silently, and a strategy whose every entry was
+    dropped is indistinguishable from one that never signalled.
+
+    `strength` is deliberately not applied. `Signal.strength` says it scales
+    position size "when sizing allows", nothing in the live path scales by it
+    today, and a backtest that did would report returns from a rule production
+    does not run.
+    """
+
+    method: str
+    value: Decimal
+
+    def __call__(self, signal: Signal, portfolio: Portfolio, price: Decimal) -> Decimal:
+        return position_size(
+            self.method,
+            portfolio.equity,
+            price,
+            stop_price=signal.stop_loss_price,
+            risk_pct=self.value,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,10 +456,27 @@ class BacktestEngine:
         total = len(timeline)
         self._report_progress(0, total)
 
+        session: date | None = None
+
         for done, ts in enumerate(timeline, start=1):
             # 1. The clock stands at the bar's CLOSE: `Bar.ts` is its open, and
             #    a decision taken on a completed bar is taken once it has ended.
             clock.set(ts + step)
+
+            # A new session: tell the rules that own a day boundary where this
+            # one started. Done *before* this bar is marked or filled, so the
+            # anchor is the equity carried in overnight rather than a number
+            # this session has already moved.
+            #
+            # Keyed on the UTC date, which is the session date for every equity
+            # market this platform trades: the cash session runs 13:30–21:00 UTC
+            # at the widest and a daily bar is stamped at exchange-local
+            # midnight, so neither straddles a UTC day boundary. The same
+            # assumption `PerformanceAnalyzer.daily_returns` documents, and it
+            # would need the exchange's own trading day for an overnight future.
+            if session != ts.date():
+                session = ts.date()
+                self.risk_engine.anchor_session(self._portfolio.equity)
 
             printed = [s for s in symbols if ts in index_of.get(s, {})]
             for symbol in printed:
@@ -710,6 +775,31 @@ class BacktestEngine:
 
     # ── 5-7. signals ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _book_refusal(
+        order: Order, bar: Bar, result: BacktestResult, *, rule: str, reason: str
+    ) -> None:
+        """Record an order this run refused, and why.
+
+        One path for both stages that can refuse — the sizer and the rule chain
+        — because a reader counting refusals should not have to know which of
+        them produced a given row. `rejected_by` carries the rule name or the
+        stage label from the same vocabulary production uses
+        (`domain.order.SIZING`), so "refusals by rule" is countable across a
+        backtest and a live record alike.
+
+        The order goes into `result.orders` rather than being dropped. A refused
+        order is the most informative row a run produces: docs/ANALYTICS.md's
+        point about the signals table applies here exactly — a strategy whose
+        every idea was refused is otherwise indistinguishable from one that had
+        no ideas, and those two call for opposite responses.
+        """
+        order.status = OrderStatus.REJECTED_RISK
+        order.reject_reason = reason
+        order.rejected_by = rule
+        result.warnings.append(f"{bar.ts.isoformat()} {order.symbol}: refused ({rule}) {reason}")
+        result.orders.append(order)
+
     def _handle_signal(self, signal: Signal, bar: Bar, result: BacktestResult) -> None:
         """Size, risk-check, and queue for the next bar."""
         if signal.action is SignalAction.HOLD:
@@ -735,7 +825,41 @@ class BacktestEngine:
                     "risk-based and lands with the risk engine (docs/RISK.md)"
                 )
             side = Side.BUY if signal.action is SignalAction.ENTER_LONG else Side.SELL
-            qty = self.position_sizer(signal, self._portfolio, bar.close)
+            try:
+                qty = self.position_sizer(signal, self._portfolio, bar.close)
+            except ValueError as exc:
+                # Undefined, not zero. `position_size` refuses to invent a stop
+                # for `risk_pct` or a volatility for `volatility_target`, and a
+                # strategy configured to size by risk while emitting signals
+                # with no stop is one strategy misconfigured — the same reading
+                # `OrderRouter._size` takes, where it becomes a refusal on the
+                # dashboard rather than an exception up the runner's loop.
+                #
+                # Booked as a refused order rather than dropped, because a
+                # strategy whose every entry was silently discarded produces an
+                # empty result indistinguishable from one that never signalled.
+                self._book_refusal(
+                    Order(
+                        symbol=signal.symbol,
+                        side=side,
+                        # A refused order still has to be a valid `Order`, and an
+                        # `Order` refuses a non-positive quantity. One share is
+                        # the smallest honest placeholder for "we never got as
+                        # far as deciding how many" — the reason says so, and
+                        # `status` keeps it out of every fill and P&L path.
+                        qty=Decimal(1),
+                        order_type=OrderType.MARKET,
+                        strategy_id=signal.strategy_id,
+                        signal_id=signal.id,
+                        created_at=bar.ts,
+                        purpose=ENTRY,
+                    ),
+                    bar,
+                    result,
+                    rule=SIZING,
+                    reason=str(exc),
+                )
+                return
             purpose = ENTRY
         else:
             raise BacktestError(f"{signal.action} is not modelled by the backtest engine")
@@ -759,18 +883,7 @@ class BacktestEngine:
 
         decision = self.risk_engine.validate(order, self._portfolio)
         if not decision.approved:
-            order.status = OrderStatus.REJECTED_RISK
-            order.reject_reason = decision.reason
-            # The rule as well as the reason, so a refusal in a backtest result
-            # carries what the same refusal carries in production. It was
-            # already in the warning below as free text; this is the field a
-            # reader can group by.
-            order.rejected_by = decision.rule
-            result.warnings.append(
-                f"{bar.ts.isoformat()} {order.symbol}: risk denied "
-                f"({decision.rule}) {decision.reason}"
-            )
-            result.orders.append(order)
+            self._book_refusal(order, bar, result, rule=decision.rule, reason=decision.reason)
             return
 
         if decision.adjusted_qty is not None:

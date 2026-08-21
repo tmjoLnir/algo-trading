@@ -4,10 +4,13 @@ If these pass and the engine is still wrong, every backtest the platform
 produces is fiction. Treat a failure here as a correctness emergency, never as
 a test to relax.
 
-The risk engine is Phase 3 and still a stub, so these inject a permissive
-double. That is the phase boundary, not a shortcut: the engine's job here is to
-*call* the gate on every order, and `_AllowAllRisk` is what lets the fill
-mechanics be tested before the gate exists.
+These inject a permissive risk double, and the reason has changed even though
+the double has not. It was a phase boundary — the chain did not exist yet. Now
+it does, and `build_engine` gives every real run `backtest_rules()`; the double
+is what keeps *these* tests about fill timing rather than about how a rule sizes
+a book. A fixture whose expected P&L moved because a limit was tuned would be a
+lookahead test nobody could trust. `tests/unit/test_risk_engine.py` owns the
+rules, and the tests below that assert the gate is *reached* still do.
 """
 
 from __future__ import annotations
@@ -92,19 +95,35 @@ def ramp(count: int = 20, *, symbol: str = "TEST", volume: float = 1_000_000) ->
     ]
 
 
-class _AllowAllRisk:
-    """Stands in for `RiskEngine` until Phase 3 implements the chain."""
+class _RiskDouble:
+    """The surface `BacktestEngine` uses of a `RiskEngine`, and only that.
+
+    Two methods, because the engine calls two: `validate` on every order and
+    `anchor_session` on every new session date. A double carrying one of them
+    would pass until the day the engine started calling the other, which is
+    exactly what happened when session anchoring landed — so both live here,
+    and `anchored` is recorded because "was the day boundary reached" is worth
+    asserting rather than assuming.
+    """
 
     def __init__(self) -> None:
         self.seen: list[Order] = []
+        self.anchored: list[Decimal] = []
 
+    def anchor_session(self, equity: Decimal) -> int:
+        self.anchored.append(equity)
+        return 1
+
+
+class _AllowAllRisk(_RiskDouble):
     def validate(self, order: Order, portfolio: Portfolio) -> RiskDecision:
         self.seen.append(order)
         return RiskDecision.allow()
 
 
-class _DenyAllRisk:
+class _DenyAllRisk(_RiskDouble):
     def validate(self, order: Order, portfolio: Portfolio) -> RiskDecision:
+        self.seen.append(order)
         return RiskDecision.deny("test_rule", "denied by test")
 
 
@@ -309,7 +328,11 @@ class TestFills:
 
         assert result.orders[0].status is OrderStatus.REJECTED_RISK
         assert result.portfolio.position("TEST").is_flat
-        assert any("risk denied" in w for w in result.warnings)
+        # The warning names the rule, not just the fact of a refusal. Both
+        # stages that can refuse — the sizer and the chain — book through one
+        # path now, so the rule name is what tells them apart in a result.
+        assert any("refused (test_rule)" in w for w in result.warnings)
+        assert result.orders[0].rejected_by == "test_rule"
         # A refusal in a backtest carries what the same refusal carries live.
         # The rule was already in the warning text above; this is the field a
         # reader can group by, and the engine is the mirror of the live loop.

@@ -410,6 +410,22 @@ class StrategyRunner:
                 "See docs/RUNBOOK.md 'Reconciliation mismatch'."
             )
 
+        # The day's starting equity, and **nothing was setting it**.
+        # `default_rules()` has always included `DailyLossLimitRule`, that rule
+        # is default-closed and denies every entry until it is anchored, and no
+        # path in this platform ever called `anchor` — so this runner was
+        # configured to refuse every entry it would ever produce. It went
+        # unnoticed because a chain refusing everything and a chain nothing has
+        # reached look identical from outside, and nothing has traded paper yet.
+        #
+        # Here rather than in `run`'s loop because this is the session boundary:
+        # `warmup` is re-run at each open, and anchoring per iteration would
+        # re-anchor to a drawn-down number and grant the day a second allowance.
+        # After reconciliation, so the anchor is the book the broker agrees we
+        # hold rather than the one we believed before checking.
+        anchored = self.router.risk_engine.anchor_session(portfolio.equity)
+        log.info("runner.session_anchored", equity=str(portfolio.equity), rules=anchored)
+
         self.strategy.on_start()
         self.stats.started_at = self.clock.now()
         log.info(

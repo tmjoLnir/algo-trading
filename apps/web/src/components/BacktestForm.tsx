@@ -25,9 +25,9 @@
  * two answers to one question and the client's would be the one that drifts.
  */
 
-import { useState } from 'react'
+import { cloneElement, useState } from 'react'
 import { ApiError } from '@/api/client'
-import { COST_MODELS, TIMEFRAMES, useQueueBacktest } from '@/hooks/useBacktests'
+import { COST_MODELS, SIZING_METHODS, TIMEFRAMES, useQueueBacktest } from '@/hooks/useBacktests'
 import type { AvailableStrategyView, StoredStrategyView } from '@/api/types'
 
 interface Props {
@@ -50,6 +50,16 @@ function defaultRange(): { start: string; end: string } {
   return { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) }
 }
 
+/**
+ * One labelled control.
+ *
+ * The label is associated by `htmlFor`, and the hint is **outside** it, tied on
+ * with `aria-describedby`. Wrapping both in one `<label>` — which this did —
+ * folds the hint into the field's accessible name, so a screen reader announces
+ * "Sizing how a quantity is decided" as the name of the control rather than as
+ * a description of it. The distinction is also what lets a test ask for a field
+ * by the name a person would call it.
+ */
 function Field({
   label,
   hint,
@@ -57,14 +67,22 @@ function Field({
 }: {
   label: string
   hint?: string
-  children: React.ReactNode
+  children: React.ReactElement<{ id?: string; 'aria-describedby'?: string }>
 }) {
+  const id = label.toLowerCase().replace(/[^a-z0-9]+/g, '-')
+  const hintId = hint ? `${id}-hint` : undefined
   return (
-    <label className="flex flex-col gap-1 text-xs">
-      <span className="font-medium text-slate-400">{label}</span>
-      {children}
-      {hint ? <span className="text-slate-600">{hint}</span> : null}
-    </label>
+    <div className="flex flex-col gap-1 text-xs">
+      <label htmlFor={id} className="font-medium text-slate-400">
+        {label}
+      </label>
+      {cloneElement(children, { id, 'aria-describedby': hintId })}
+      {hint ? (
+        <span id={hintId} className="text-slate-600">
+          {hint}
+        </span>
+      ) : null}
+    </div>
   )
 }
 
@@ -83,12 +101,18 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
   const [timeframe, setTimeframe] = useState('1d')
   const [cash, setCash] = useState('100000')
   const [qty, setQty] = useState('100')
+  const [sizingMethod, setSizingMethod] = useState('fixed_qty')
+  // Held separately from `qty` so switching method does not silently reinterpret
+  // a share count as a fraction of equity — 100 shares and 100× the account are
+  // the same three characters.
+  const [sizingValue, setSizingValue] = useState('')
   const [costModel, setCostModel] = useState<string>(COST_MODELS[0].value)
 
   // The picked strategy's own declaration of what it takes. Shown rather than
   // rendered as a form: nothing here builds inputs from a JSON Schema, and
   // pretending to would mean silently dropping the fields it could not handle.
   const picked = available.find((entry) => entry.name === strategyId)
+  const sizingUnit = SIZING_METHODS.find((option) => option.value === sizingMethod)?.unit ?? 'value'
   const paramsSchema = picked?.params_schema ?? {}
 
   const submit = (event: React.FormEvent) => {
@@ -108,6 +132,10 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
       // Strings. See the module docstring — this is why the inputs are text.
       starting_cash: cash,
       qty,
+      sizing_method: sizingMethod,
+      // Omitted rather than empty: the server reads "not given" as "use qty",
+      // which is what keeps a fixed_qty request identical to what it always was.
+      sizing_value: sizingValue.trim() || null,
       cost_model: costModel,
       params: {},
     })
@@ -209,15 +237,49 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
           />
         </Field>
 
-        <Field label="Shares per entry" hint="a placeholder — real sizing is risk-based">
-          <input
-            value={qty}
-            onChange={(event) => setQty(event.target.value)}
-            inputMode="decimal"
+        <Field label="Sizing" hint="how a quantity is decided">
+          <select
+            value={sizingMethod}
+            onChange={(event) => {
+              setSizingMethod(event.target.value)
+              setSizingValue('')
+            }}
             disabled={!mayAct}
             className={INPUT}
-          />
+          >
+            {SIZING_METHODS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
         </Field>
+
+        {sizingMethod === 'fixed_qty' ? (
+          <Field
+            label="Shares per entry"
+            hint="a constant — the return is a property of this number too"
+          >
+            <input
+              value={qty}
+              onChange={(event) => setQty(event.target.value)}
+              inputMode="decimal"
+              disabled={!mayAct}
+              className={INPUT}
+            />
+          </Field>
+        ) : (
+          <Field label="Sizing value" hint={sizingUnit}>
+            <input
+              value={sizingValue}
+              onChange={(event) => setSizingValue(event.target.value)}
+              inputMode="decimal"
+              placeholder={sizingUnit}
+              disabled={!mayAct}
+              className={INPUT}
+            />
+          </Field>
+        )}
 
         <Field label="Cost model">
           <select

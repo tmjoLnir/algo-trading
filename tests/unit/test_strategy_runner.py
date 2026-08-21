@@ -21,6 +21,7 @@ import pytest
 from atp_core.brokers.ports import TradeUpdate
 from atp_core.channels import CHANNEL_ORDERS, CHANNEL_SIGNALS
 from atp_core.clock import SimulatedClock
+from atp_core.config import get_settings
 from atp_core.dashboard.snapshot import DEFAULT_SIGNAL_LIMIT
 from atp_core.domain import (
     Bar,
@@ -41,7 +42,7 @@ from atp_core.errors import ExecutionError
 from atp_core.execution.idempotency import FLATTEN, STOP_LOSS, TAKE_PROFIT, TIME_EXIT
 from atp_core.execution.reconciliation import ReconciliationReport
 from atp_core.execution.router import ProtectionResult, SubmitResult
-from atp_core.risk.engine import RiskDecision
+from atp_core.risk.engine import RiskDecision, RiskEngine, backtest_rules
 from atp_core.risk.stops import StopConfig, StopManager
 from atp_core.strategy.base import Strategy
 from atp_core.strategy.rules import PositionSizeSpec
@@ -164,9 +165,15 @@ class FakeRouter:
     `refuse_before_building` models the other half honestly: a refusal from
     sizing or routing happens before an order exists, and there is genuinely
     nothing to record.
+
+    It carries a **real** `RiskEngine`, because `warmup` anchors the session
+    through it. A stub that only recorded the call would pass while the rule
+    that needs anchoring still went un-anchored, which is the failure that made
+    the anchoring necessary in the first place.
     """
 
     def __init__(self) -> None:
+        self.risk_engine = RiskEngine(get_settings().risk, rules=backtest_rules())
         self.calls: list[str] = []
         self.signals: list[Signal] = []
         self.flattened: list[str] = []

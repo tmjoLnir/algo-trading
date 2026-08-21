@@ -366,6 +366,8 @@ const COMPARISON_RUN: BacktestOut = {
     cost_model: 'alpaca_equities',
     params: {},
     qty: '100',
+    sizing_method: 'fixed_qty',
+    sizing_value: '100',
   },
   metrics: { ...METRICS, profit_factor: null },
   error: null,

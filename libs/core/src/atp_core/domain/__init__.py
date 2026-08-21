@@ -12,11 +12,13 @@ from atp_core.domain.enums import (
     TimeInForce,
 )
 from atp_core.domain.market import Bar, Instrument, Quote, Trade
-from atp_core.domain.order import Fill, Order, OrderRequest
+from atp_core.domain.order import ROUTING, SIZING, Fill, Order, OrderRequest
 from atp_core.domain.position import Portfolio, Position
 from atp_core.domain.signal import Signal
 
 __all__ = [
+    "ROUTING",
+    "SIZING",
     "Bar",
     "Fill",
     "Instrument",

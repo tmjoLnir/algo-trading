@@ -49,6 +49,8 @@ const SPEC: BacktestSpecView = {
   cost_model: 'alpaca_equities',
   params: {},
   qty: '100',
+  sizing_method: 'fixed_qty',
+  sizing_value: '100',
 }
 
 const STRATEGY: StoredStrategyView = {
@@ -455,6 +457,74 @@ describe('the form', () => {
     fireEvent.click(screen.getByText('Queue backtest'))
 
     expect(await screen.findByText(/--symbols SPY --start 2024-01-01/)).toBeTruthy()
+  })
+
+  it('defaults to a fixed share count and sends no sizing value for it', async () => {
+    // The server reads a missing `sizing_value` as "use qty", which is what
+    // keeps a request that names neither field the run it has always been.
+    const fetchMock = stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': { body: list([]) },
+      'POST /backtests': { body: run({ status: 'queued' }) },
+    })
+    renderPage()
+
+    fireEvent.change(await screen.findByPlaceholderText('SPY'), { target: { value: 'SPY' } })
+    fireEvent.click(screen.getByText('Queue backtest'))
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some((call) => call[1]?.method === 'POST')).toBe(true),
+    )
+    const post = fetchMock.mock.calls.find((call) => call[1]?.method === 'POST')
+    const body = JSON.parse(String(post?.[1]?.body))
+    expect(body.sizing_method).toBe('fixed_qty')
+    expect(body.sizing_value).toBeNull()
+    expect(body.qty).toBe('100')
+  })
+
+  it('swaps the input and clears the value when the sizing method changes', async () => {
+    // 100 shares and 100x the account are the same three characters. Carrying
+    // the number across would reinterpret it silently, and the server would
+    // accept it — `equity_pct` of 100 is a valid fraction.
+    stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': { body: list([]) },
+    })
+    renderPage()
+
+    await screen.findByPlaceholderText('SPY')
+    expect(screen.getByLabelText('Shares per entry')).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText('Sizing'), { target: { value: 'risk_pct' } })
+
+    expect(screen.queryByLabelText('Shares per entry')).toBeNull()
+    const value = screen.getByLabelText('Sizing value') as HTMLInputElement
+    expect(value.value).toBe('')
+    // The unit is stated, because the field changes meaning per method.
+    expect(value.placeholder).toContain('fraction of equity at risk')
+  })
+
+  it('sends the chosen method and its value', async () => {
+    const fetchMock = stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': { body: list([]) },
+      'POST /backtests': { body: run({ status: 'queued' }) },
+    })
+    renderPage()
+
+    fireEvent.change(await screen.findByPlaceholderText('SPY'), { target: { value: 'SPY' } })
+    fireEvent.change(screen.getByLabelText('Sizing'), { target: { value: 'equity_pct' } })
+    fireEvent.change(screen.getByLabelText('Sizing value'), { target: { value: '0.05' } })
+    fireEvent.click(screen.getByText('Queue backtest'))
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some((call) => call[1]?.method === 'POST')).toBe(true),
+    )
+    const post = fetchMock.mock.calls.find((call) => call[1]?.method === 'POST')
+    const body = JSON.parse(String(post?.[1]?.body))
+    expect(body.sizing_method).toBe('equity_pct')
+    // A string, like every other decimal the form sends.
+    expect(body.sizing_value).toBe('0.05')
   })
 
   it('sends money as a string and a timezone-aware window', async () => {

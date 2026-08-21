@@ -69,6 +69,25 @@ class RiskRule(Protocol):
     def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision: ...
 
 
+class SessionAnchored(Protocol):
+    """A rule that measures something against where the session started.
+
+    `DailyLossLimitRule` is the only one today, and it is *default-closed* about
+    it: with no anchor it denies every entry rather than assuming the day began
+    flat. That is the right instinct and it made the missing call invisible —
+    a chain that refuses everything and a chain that is not reached at all look
+    identical from outside, and nothing in this platform had ever called
+    `anchor` in production.
+
+    So the anchoring is a named seam on the engine (`anchor_session`) rather
+    than something each caller remembers to do to one rule it happens to know
+    about. A caller that owns a session boundary calls it; a rule that has one
+    implements this.
+    """
+
+    def anchor(self, equity: Decimal) -> None: ...
+
+
 class RiskEngine:
     """Runs the rule chain. The only gate between a signal and the market."""
 
@@ -99,9 +118,9 @@ class RiskEngine:
         reference sees the same number.
 
         An empty rule chain approves everything. That is only reachable by
-        constructing `RiskEngine(limits, rules=[])` deliberately — `default_rules`
-        raises until Phase 3 lands, so nothing gets an unguarded engine by
-        omission.
+        constructing `RiskEngine(limits, rules=[])` deliberately — the two chain
+        builders below both return rules, and `RiskEngine(limits)` with none at
+        all raises, so nothing gets an unguarded engine by omission.
         """
         adjusted: Decimal | None = None
         for rule in self.rules:
@@ -124,6 +143,36 @@ class RiskEngine:
         decision = self.validate(order, portfolio)
         if not decision.approved:
             raise RiskLimitBreachedError(decision.rule, decision.reason)
+
+    def anchor_session(self, equity: Decimal) -> int:
+        """Tell every session-aware rule where the trading day started.
+
+        **Called by whoever owns the session boundary**: the live runner at each
+        open, the backtest engine at each new session in the replay. Returns how
+        many rules were anchored, which is what lets a caller assert it reached
+        something rather than trusting that it did.
+
+        This exists because nothing was calling it. `default_rules()` has always
+        included `DailyLossLimitRule`, that rule denies every entry until it is
+        anchored, and no production path ever anchored one — so the live chain
+        was configured to refuse every entry it ever saw. It went unnoticed
+        because the rule is default-closed and correct to be: a chain refusing
+        everything for want of an anchor is indistinguishable, from outside,
+        from a chain nothing has reached yet, and nothing has traded paper.
+
+        Idempotent in the sense that matters and *not* in the sense that does
+        not: calling it twice in one session re-anchors to a possibly drawn-down
+        number and silently grants the day a second allowance, which is the
+        mistake `DailyLossLimitRule.day_start_equity` warns about. Call it on
+        the boundary, not on the loop.
+        """
+        anchored = 0
+        for rule in self.rules:
+            anchor = getattr(rule, "anchor", None)
+            if callable(anchor):
+                anchor(equity)
+                anchored += 1
+        return anchored
 
 
 def default_rules(
@@ -166,6 +215,62 @@ def default_rules(
         TradingHoursRule(calendar=calendar, clock=clock),
         RateLimitRule(clock=clock),
         StaleDataRule(clock=clock, last_tick_at=last_tick_at),
+        MaxPositionSizeRule(),
+        MaxExposureRule(),
+        MaxOpenPositionsRule(),
+        DailyLossLimitRule(),
+        BuyingPowerRule(),
+    ]
+
+
+def backtest_rules() -> list[RiskRule]:
+    """The chain a replay over bars can actually evaluate.
+
+    Five of the nine, and **the four that are absent are absent by decision
+    rather than by omission** — which is the distinction `default_rules` exists
+    to enforce, applied honestly rather than dodged by passing stubs that always
+    approve. A no-op kill switch and a `last_tick_at` returning the current bar
+    would let this call `default_rules` and claim nine rules; all four would
+    approve unconditionally, and the chain would be theatre with a longer name.
+
+    What each of the four would actually be measuring:
+
+    - **`trading_hours`** asks the calendar whether the market is open at
+      `clock.now()`. A daily bar is stamped at exchange-local *midnight*
+      (docs/DATA.md), so the calendar says closed at both its open and its close
+      — the rule would refuse every order in every daily backtest. And it could
+      never do useful work anyway: every stored bar is a session by
+      construction, so the honest answer is always "open".
+    - **`stale_data`** measures a quote against a feed clock. The bar series
+      *is* the feed here; freshness is zero by construction and there is no
+      staleness for the rule to find.
+    - **`kill_switch`** reads a halt an operator engaged. A replay has no
+      operator and no halt state.
+    - **`rate_limit`** is the runaway-loop guard — a bug that re-emits an order
+      every tick. The event loop here emits at most one order per signal per
+      bar and cannot run away, and simulated time advances a whole bar between
+      orders, so the trailing minute means something different from what the
+      rule was written against.
+
+    What is left is every rule that is a statement about the *shape of the
+    book*, and those are the ones a backtest most needs: they are what turn "the
+    strategy said buy" into "and the account could actually hold that". A
+    backtest that ignored them reports returns from positions no live account
+    would have been allowed to take.
+
+    `DailyLossLimitRule` denies every entry until something calls
+    `RiskEngine.anchor_session` — deliberately, and the caller here is the
+    engine's own session boundary.
+    """
+    from atp_core.risk.rules import (
+        BuyingPowerRule,
+        DailyLossLimitRule,
+        MaxExposureRule,
+        MaxOpenPositionsRule,
+        MaxPositionSizeRule,
+    )
+
+    return [
         MaxPositionSizeRule(),
         MaxExposureRule(),
         MaxOpenPositionsRule(),

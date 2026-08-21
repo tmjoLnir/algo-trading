@@ -90,12 +90,23 @@ class BacktestRunSpec:
     cost_model: str
     #: Strategy parameters, as the strategy's own `params_schema` describes them.
     params: dict[str, object] = field(default_factory=dict)
-    #: Shares per entry. A placeholder that the CLI also carries and says so on
-    #: every run: real sizing is risk-based (docs/RISK.md 'Position sizing'), so
-    #: the reported return is a property of this number as much as of the
-    #: strategy. Stored on the run because a result whose share count nobody
-    #: recorded cannot be compared with anything.
+    #: Shares per entry under `fixed_qty` sizing, and the value every run stored
+    #: before `sizing_method` existed was sized by. Kept rather than folded into
+    #: `sizing_value` so those rows still deserialize and still reproduce: a
+    #: spec with neither new field is a `fixed_qty` run of `qty` shares, which is
+    #: exactly what it was when it was written.
     qty: str = "100"
+    #: How a quantity is decided — one of `risk.rules.position_size`'s methods.
+    #: Defaults to `fixed_qty` for the back-compatibility above, *not* because it
+    #: is the right way to size: docs/RISK.md is unambiguous that real sizing is
+    #: risk-based, and a fixed share count makes the reported return a property
+    #: of that number as much as of the strategy.
+    sizing_method: str = "fixed_qty"
+    #: What `sizing_method` reads, and its meaning follows the method — a share
+    #: count for `fixed_qty`, an amount for `fixed_notional`, a fraction of
+    #: equity for the rest. Empty means "use `qty`", which is what makes an old
+    #: spec and a new `fixed_qty` one the same run.
+    sizing_value: str = ""
 
 
 @dataclass(frozen=True, slots=True)

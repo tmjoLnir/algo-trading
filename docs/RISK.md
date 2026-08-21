@@ -41,6 +41,19 @@ notional makes your riskiest positions your largest, which is precisely backward
 Rule of thumb: 0.5–2% risk per trade. Above 2%, a normal losing streak of 8–10
 trades — which happens to good strategies — is an account-threatening event.
 
+### Where it is applied
+
+Two callers, one function. `OrderRouter._size` sizes a live signal and
+`backtest.engine.RiskBasedSizer` sizes a backtested one, and both delegate to
+`position_size` rather than doing arithmetic of their own — a backtest that
+sized differently would report a return the live strategy could not reproduce,
+which CLAUDE.md §5 names as the hardest class of bug here to notice.
+
+Both also treat the two inputs `position_size` refuses to default — a stop for
+`risk_pct`, a volatility for `volatility_target` — as a **refusal** rather than
+an error: one strategy misconfigured, recorded and visible, instead of an
+exception that takes a runner's loop or a whole backtest down.
+
 ## Stop losses
 
 | Type | Level | Good for |

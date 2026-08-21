@@ -506,16 +506,33 @@ class TestWarningsTravelWithTheResult:
 
         assert "NOT evidence" in result.warnings[0]
 
-    async def test_every_run_states_its_share_count_and_its_empty_rule_chain(
-        self, ctx: dict[str, Any]
-    ) -> None:
-        """Both caveats the CLI prints on every single run, on every queued one
-        too. Sizing every entry identically ignores volatility, and an engine
-        holding an empty rule chain refuses nothing."""
+    async def test_a_fixed_qty_run_states_its_share_count(self, ctx: dict[str, Any]) -> None:
+        """Still said, because it is still true of a run sized this way: sizing
+        every entry identically ignores volatility, so the return is a property
+        of the share count as much as of the strategy."""
         from atp_core.backtest.runner import run_spec
 
         result = run_spec(a_spec(), {"SPY": bars()}, limits=get_settings().risk)
-        joined = " ".join(result.warnings)
 
-        assert "sized at 10 shares" in joined
-        assert "no pre-trade risk rules" in joined
+        assert "sized at 10 shares" in " ".join(result.warnings)
+
+    async def test_a_risk_sized_run_does_not_claim_a_share_count(self, ctx: dict[str, Any]) -> None:
+        """The warning is about a choice now, not about the platform. Saying it
+        on a run that sized by risk would be the result warning about something
+        that did not happen."""
+        from atp_core.backtest.runner import run_spec
+
+        spec = a_spec(sizing_method="equity_pct", sizing_value="0.05")
+        result = run_spec(spec, {"SPY": bars()}, limits=get_settings().risk)
+
+        assert "sized at" not in " ".join(result.warnings)
+
+    async def test_no_run_claims_an_empty_rule_chain_any_more(self, ctx: dict[str, Any]) -> None:
+        """This warning rode on every result while `build_engine` passed
+        `rules=[]`. It does not any more, and a run still carrying it would mean
+        the chain had been dropped again."""
+        from atp_core.backtest.runner import run_spec
+
+        result = run_spec(a_spec(), {"SPY": bars()}, limits=get_settings().risk)
+
+        assert "no pre-trade risk rules" not in " ".join(result.warnings)
