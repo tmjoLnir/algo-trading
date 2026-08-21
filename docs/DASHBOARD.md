@@ -322,7 +322,7 @@ columns mean less than they say:
   worker has been running for a month still reads `draft` — that is the
   ratchet's first rung and the endpoints that would promote it off are stubs.
   The screen shows it as the configured state and puts the liveness question on
-  the timestamp instead. It wrote `active` until #PR, which `StrategyState` has
+  the timestamp instead. It wrote `active` until #76, which `StrategyState` has
   never contained; a CHECK constraint now refuses anything outside the enum.
 - **`updated_at` is not "last edited".** The same asymmetry — a later boot bumps
   only the timestamp — so the API serves it as `last_started_at` and the column

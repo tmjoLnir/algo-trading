@@ -18,7 +18,7 @@
  *   ratchet's first rung and nothing has promoted it off, because the endpoints
  *   that would are stubs. It is shown as the *configured* state, with the
  *   liveness question answered by the timestamp beside it instead. It wrote
- *   `active` until #PR, which was not a member of `StrategyState` at all.
+ *   `active` until #76, which was not a member of `StrategyState` at all.
  * - **`updated_at` is not "last edited".** The same asymmetry: a later boot
  *   bumps only the timestamp. The API serves it as `last_started_at` and this
  *   screen renders it as "a worker last started this", which is what it records.

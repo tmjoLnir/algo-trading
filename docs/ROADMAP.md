@@ -1199,7 +1199,7 @@ wording if it is not the demonstration you want.
   contained, into a `String(20)` nothing checked, and the only value any row
   could hold because `ensure` is the platform's only writer of one. So the
   screen's filter offered five options of which four could not match and the
-  fifth was not a real rung. Fixed in #PR: `draft` on a first boot, a CHECK
+  fifth was not a real rung. Fixed in #76: `draft` on a first boot, a CHECK
   constraint over the enum (migration `e2b6d1a70f93`), the API's filter typed as
   the enum, and the front end's list derived from the generated union so the
   drift cannot silently return.

@@ -118,7 +118,7 @@ stated above them.
   /{id}/pause`, `GET /{id}`, `GET /strategies/available`
   (`strategies.py:225,238,249,257,275,282`). The page says so and explains why —
   the promotion ratchet's preconditions cannot be checked yet.
-- ~~**The lifecycle vocabulary has drifted three ways.**~~ **Fixed (#PR.)**
+- ~~**The lifecycle vocabulary has drifted three ways.**~~ **Fixed (#76.)**
   `STRATEGY_STATES` offered `draft, backtest, paper, active, paused`; the domain
   enum `StrategyState` had `draft, backtesting, paper, live, paused, halted`;
   and `StrategyRepository.ensure` wrote the literal `"active"`, which was not a
