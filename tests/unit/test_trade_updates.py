@@ -516,6 +516,50 @@ class TestTheApplier:
         assert apply_trade_update(order, cancelled) is True
         assert order.status is OrderStatus.CANCELLED
 
+    def test_a_pushed_rejection_names_the_venue_that_refused(self) -> None:
+        """The third of the three ways a venue refusal reaches an order.
+
+        The other two are the router's, on submission and on acknowledgement,
+        and both take the name from the broker they submitted to. This one had
+        no venue in reach: the runner consumes this stream and reaches a broker
+        only through the router (rule §1.5), so the name travels on the event
+        rather than being handed to the applier. Without it, this would be the
+        one refusal path that stored a refusal without saying who refused.
+        """
+        order = an_order()
+        rejected = TradeUpdate(
+            event="rejected",
+            client_order_id=CLIENT_ID,
+            broker_order_id="brk-abc-123",
+            symbol="SPY",
+            at=datetime(2024, 6, 3, 14, 30, tzinfo=UTC),
+            status=OrderStatus.REJECTED,
+            reason="insufficient buying power",
+            broker="alpaca-live",
+        )
+
+        assert apply_trade_update(order, rejected) is True
+        assert order.status is OrderStatus.REJECTED
+        assert order.rejected_by == "alpaca-live"
+        assert order.reject_reason == "insufficient buying power"
+
+    def test_a_pushed_cancel_records_no_refuser(self) -> None:
+        """A cancel is not a refusal. Stamping the venue's name on one would
+        put a refuser on an order nothing refused."""
+        order = an_order()
+        cancelled = TradeUpdate(
+            event="canceled",
+            client_order_id=CLIENT_ID,
+            broker_order_id="brk-abc-123",
+            symbol="SPY",
+            at=datetime(2024, 6, 3, 14, 30, tzinfo=UTC),
+            status=OrderStatus.CANCELLED,
+            broker="alpaca-live",
+        )
+
+        assert apply_trade_update(order, cancelled) is True
+        assert order.rejected_by is None
+
     def test_a_replayed_status_against_a_terminal_order_is_discarded(self) -> None:
         """Ordinary after a reconnect, and must not overwrite a status the
         order has legitimately moved past."""

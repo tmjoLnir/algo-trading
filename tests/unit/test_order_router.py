@@ -215,6 +215,10 @@ class TestSubmit:
         assert result.order is not None
         assert result.order.status is OrderStatus.REJECTED_RISK
         assert result.order.reject_reason == result.decision.reason
+        # Who as well as why. The rule was logged and dropped before
+        # `b8e3f01c7d24`, so a stored refusal could say "no price available for
+        # SPY" without naming which of the three rules that check one said it.
+        assert result.order.rejected_by == result.decision.rule == "kill_switch"
         assert broker.submit_calls == []
 
     async def test_a_venue_rejection_is_a_value_too(self) -> None:
@@ -229,6 +233,9 @@ class TestSubmit:
         assert result.order is not None
         assert result.order.status is OrderStatus.REJECTED
         assert result.order.reject_reason == "symbol is halted"
+        # The venue is a refuser like a rule is, and the column carries it:
+        # `status` says which vocabulary to read the name in.
+        assert result.order.rejected_by == broker.name
         assert not switch.engaged
 
     async def test_the_quantity_does_not_change_the_key(self) -> None:
@@ -287,6 +294,10 @@ class TestSubmit:
         assert not result.submitted
         assert result.order is not None
         assert result.order.status is OrderStatus.REJECTED_RISK
+        # No rule refused this — the chain approved and left nothing to trade,
+        # so the refuser is the routing stage that caught it. Naming the last
+        # rule to vote would blame a rule that said yes.
+        assert result.order.rejected_by == ROUTING
         assert broker.submit_calls == []
 
     async def test_the_router_refuses_an_order_it_did_not_build(self) -> None:
@@ -1157,6 +1168,12 @@ class TestAcknowledgement:
 
         assert not result.submitted
         assert broker.cancelled == []
+        # The third way a venue refusal reaches an order, and it names its
+        # refuser like the other two. The venue's own copy carries no broker
+        # name — only the router knows which venue it submitted to.
+        assert result.order is not None
+        assert result.order.rejected_by == broker.name
+        assert result.order.reject_reason == "insufficient buying power"
         assert routed.has_broker_side_protection("SPY", portfolio.position("SPY"))
 
     async def test_an_ack_reporting_a_rejection_is_adopted(self) -> None:

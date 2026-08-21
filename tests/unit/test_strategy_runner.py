@@ -189,6 +189,10 @@ class FakeRouter:
         order = self._order(symbol, side)
         order.status = OrderStatus.REJECTED_RISK
         order.reject_reason = reason
+        # Both halves, as `OrderRouter._route` records them. A fake that set
+        # only the reason would let a refusal reach the order table unable to
+        # say which rule made it, and no test here would notice.
+        order.rejected_by = rule
         return SubmitResult(order=order, decision=RiskDecision.deny(rule, reason), submitted=False)
 
     def _order(self, symbol: str, side: Side, order_type: OrderType = OrderType.MARKET) -> Order:
@@ -1190,6 +1194,29 @@ class TestRefusalsReachTheOrderTable:
         (refused,) = self.stored(orders)
         assert refused.symbol == SYMBOL
         assert refused.reject_reason == "nope"
+
+    @pytest.mark.asyncio
+    async def test_a_stored_refusal_names_the_rule_that_made_it(self) -> None:
+        """What #78 stored, and what it could not yet say.
+
+        That change gave `/orders` its first refused row. The row still could
+        not name its refuser: the router had `decision.rule` beside
+        `decision.reason` and passed only the reason to `transition()`, so the
+        rule reached the log and never the table. A reason alone does not
+        identify a limit — several rules say "no price available for SPY" —
+        and the rule name is the string the risk limits panel is listed under.
+        """
+        orders = FakeOrderRepository()
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)], order_repo=orders)
+        router.refuse_signals = True
+        await runner.warmup(portfolio)
+
+        close_bar(runner, bar(1))
+        await runner.evaluate(portfolio)
+
+        (refused,) = self.stored(orders)
+        assert refused.rejected_by == "a_rule"
 
     @pytest.mark.asyncio
     async def test_a_refused_stop_exit_is_stored(self) -> None:

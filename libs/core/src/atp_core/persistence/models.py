@@ -202,6 +202,19 @@ class OrderRow(Base):
     filled_qty: Mapped[Decimal] = mapped_column(MONEY, default=Decimal(0))
     avg_fill_price: Mapped[Decimal | None] = mapped_column(MONEY, nullable=True)
     reject_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: *Who* refused this order, where `reject_reason` is *why* — a rule name
+    #: (`max_gross_exposure`) or the pre-rule stage `routing` when `status` is
+    #: `rejected_risk`, the broker's name when it is `rejected`. Added by
+    #: `b8e3f01c7d24`.
+    #:
+    #: Nullable, and unlike `signals.rejected_by` it could not be backfilled:
+    #: there the rule had been packed into the reason as `"[rule] reason"` and
+    #: the migration parsed it back out, whereas an order's reason never
+    #: carried it — `transition()` was given `decision.reason` and not
+    #: `decision.rule`. Rows written before this column are null and stay null,
+    #: which is why the screen distinguishes "nothing refused this" from
+    #: "something refused it and did not say who".
+    rejected_by: Mapped[str | None] = mapped_column(String(50), nullable=True)
     run_mode: Mapped[str] = mapped_column(String(10))  # paper vs live must be separable
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

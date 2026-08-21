@@ -761,6 +761,11 @@ class BacktestEngine:
         if not decision.approved:
             order.status = OrderStatus.REJECTED_RISK
             order.reject_reason = decision.reason
+            # The rule as well as the reason, so a refusal in a backtest result
+            # carries what the same refusal carries in production. It was
+            # already in the warning below as free text; this is the field a
+            # reader can group by.
+            order.rejected_by = decision.rule
             result.warnings.append(
                 f"{bar.ts.isoformat()} {order.symbol}: risk denied "
                 f"({decision.rule}) {decision.reason}"

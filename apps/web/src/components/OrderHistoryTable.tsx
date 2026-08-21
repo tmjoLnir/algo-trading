@@ -8,12 +8,14 @@
  *
  * Three rules shape it.
  *
- * **A refusal shows why it was refused.** The same rule docs/DASHBOARD.md makes
- * for signals — show `reason` on every one, including refused ones. A rejection
- * on screen with no reason tells the reader something went wrong and not what,
- * which is the half of the message they cannot act on. A refused order whose
- * reason was never recorded says *that*, rather than rendering the dash that
- * means "nothing refused this".
+ * **A refusal shows who refused it and why.** The same rule docs/DASHBOARD.md
+ * makes for signals — show `reason` on every one, including refused ones. A
+ * rejection on screen with no reason tells the reader something went wrong and
+ * not what, which is the half of the message they cannot act on. The other half
+ * is `rejected_by`: "SPY has no price" does not say which of the three rules
+ * that check a price refused, and only the rule name gets a reader to the limit
+ * they would have to change. A refused order missing either says *that*, rather
+ * than rendering the dash that means "nothing refused this".
  *
  * **A partial fill is a proportion, not a status.** `filled_qty` against `qty`
  * is what says whether an order moved 5 shares or 500 of the 500 it asked for,
@@ -120,21 +122,53 @@ function FillProgress({ filled, asked }: { filled: string; asked: string }) {
 }
 
 /**
- * Why an order was refused, or why the cell is empty.
+ * Who refused an order and why, or why the cell is empty.
  *
- * Three states, not two. Nothing refused this order — a dash. Something refused
- * it and said why — the reason. Something refused it and no reason was
- * recorded — said out loud, because a silent dash there is indistinguishable
- * from the first case and means the opposite.
+ * Nothing refused this order — a dash. Something refused it and no trace of
+ * either half was recorded — said out loud, because a silent dash there is
+ * indistinguishable from the first case and means the opposite.
+ *
+ * Otherwise both halves, refuser first, and **each states its own absence**. A
+ * venue can refuse without saying why — `_adopt` knows the broker it submitted
+ * to whether or not the venue's copy carried a reason — so either line can be
+ * the missing one, and a line that simply vanished would read as though the
+ * other was all there ever was to say. `rejected_by` names a risk rule
+ * (`max_gross_exposure`), the pre-rule stage `routing`, or the broker — the
+ * status beside it says which vocabulary to read it in. **The rule name is the
+ * point of the pairing**: the risk limits panel on the Strategies tab lists
+ * each limit under the name of the rule that enforces it, precisely so a reader
+ * can carry the string from a refusal here to the ceiling that predicted it.
+ * Until the column existed that trip was one-way — the panel named the rules
+ * and this table had nothing to match them against.
+ *
+ * A refusal stored before the column existed says its refuser was not recorded
+ * rather than leaving the line blank, the same admission `purpose` makes on the
+ * rows that predate its own column. That is not a transitional state that
+ * clears: an order's reason text never carried the rule name, so there was
+ * nothing for the migration to recover it from and those rows say this
+ * permanently.
  */
 function Reason({ order }: { order: OrderHistoryView }) {
-  if (order.reject_reason) {
-    return <span className="text-rose-300">{order.reject_reason}</span>
+  if (!order.reject_reason && !order.rejected_by) {
+    if (REFUSED.has(order.status)) {
+      return <span className="text-amber-400">refused, but no reason was recorded</span>
+    }
+    return <span className="text-slate-600">{UNKNOWN}</span>
   }
-  if (REFUSED.has(order.status)) {
-    return <span className="text-amber-400">refused, but no reason was recorded</span>
-  }
-  return <span className="text-slate-600">{UNKNOWN}</span>
+  return (
+    <div>
+      {order.rejected_by ? (
+        <div className="font-medium text-rose-300">{order.rejected_by}</div>
+      ) : (
+        <div className="text-xs text-amber-400/70">refuser not recorded</div>
+      )}
+      {order.reject_reason ? (
+        <div className="text-xs text-rose-300/80">{order.reject_reason}</div>
+      ) : (
+        <div className="text-xs text-amber-400/70">no reason was recorded</div>
+      )}
+    </div>
+  )
 }
 
 /** The price an order asked for, which depends on its type. */

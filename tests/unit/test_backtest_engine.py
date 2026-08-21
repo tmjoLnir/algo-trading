@@ -310,6 +310,11 @@ class TestFills:
         assert result.orders[0].status is OrderStatus.REJECTED_RISK
         assert result.portfolio.position("TEST").is_flat
         assert any("risk denied" in w for w in result.warnings)
+        # A refusal in a backtest carries what the same refusal carries live.
+        # The rule was already in the warning text above; this is the field a
+        # reader can group by, and the engine is the mirror of the live loop.
+        assert result.orders[0].rejected_by == "test_rule"
+        assert result.orders[0].reject_reason == "denied by test"
 
     def test_every_order_is_shown_to_the_risk_engine(self) -> None:
         """Rule §1.5 — there is no path to a fill that skips the gate."""

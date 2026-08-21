@@ -77,6 +77,7 @@ class PostgresOrderRepository:
                         "filled_qty": order.filled_qty,
                         "avg_fill_price": order.avg_fill_price,
                         "reject_reason": order.reject_reason,
+                        "rejected_by": order.rejected_by,
                         "submitted_at": order.submitted_at,
                         "filled_at": order.filled_at,
                     },
@@ -251,6 +252,7 @@ class PostgresOrderRepository:
             "filled_qty": order.filled_qty,
             "avg_fill_price": order.avg_fill_price,
             "reject_reason": order.reject_reason,
+            "rejected_by": order.rejected_by,
             "run_mode": run_mode.value,
             "created_at": order.created_at,
             "submitted_at": order.submitted_at,
@@ -306,6 +308,10 @@ class PostgresOrderRepository:
         if stored_status not in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
             order.status = stored_status
         order.reject_reason = row.reject_reason
+        # Null on a row written before the column existed, and left null rather
+        # than guessed: the reason text never carried the rule, so there is
+        # nothing to recover it from (`b8e3f01c7d24`).
+        order.rejected_by = row.rejected_by
         return order
 
 
