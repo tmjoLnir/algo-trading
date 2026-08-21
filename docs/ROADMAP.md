@@ -468,6 +468,33 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   read as calm during precisely the runaway the limit exists to catch, and
   understating it is the direction that makes a breached limit look compliant.
 
+  **`/risk/rejections` is that same fact read from the other side** (#77). The
+  record exists; it is kept as a decision rather than as an order, so the
+  endpoint reads `signals`. Three things had to be true for it to be worth
+  having. It filters in SQL, because taking the newest hundred signals and
+  keeping the refused ones answers "were any of the last hundred decisions
+  refused" — which is "no" for a strategy blocked all week that has since
+  emitted one HOLD. It excludes `no_action`, which the router marks *approved*
+  precisely so holds do not inflate the count an operator reads to judge
+  whether risk is too tight. And `rejected_by` became a real column
+  (`f4d2e8b1a075`): it had been packed into `rejection_reason` as
+  `"[rule] reason"` on the grounds that a column was "not worth a migration for
+  one string", which was true only while nothing queried it — against the
+  packed form, excluding one rule is a `LIKE` on a bracketed prefix that also
+  matches any reason text beginning with a bracket.
+
+  **A gap that endpoint could not close, and this file should carry.** The
+  runner has three refusal paths and only one is recorded. `_record_signal`
+  writes a row for every signal whatever its fate; a **stop exit** the risk
+  chain denied and a **shutdown flatten** it denied are logged
+  (`runner.stop_exit_refused`, `runner.shutdown_flatten_refused`) and stored
+  nowhere. Neither is a signal, so `_record_signal` never sees them, and neither
+  order is tracked, so `_persist` never saves them. These are the more serious
+  of the three: a refused entry is a trade that did not happen, a refused stop
+  exit is a position that should have closed and did not — docs/SAFETY.md's
+  layer 5 failing, silently. The endpoint declares them as blind spots in its
+  own payload, which is honest but is not the fix.
+
 **Before any live order path exists.** Not after.
 
 *Verifiable (proposed):* a strategy that tries to breach every limit is refused

@@ -39,6 +39,7 @@
 
 import { useState } from 'react'
 import { ApiError } from '@/api/client'
+import RejectionsPanel from '@/components/RejectionsPanel'
 import RiskLimitsPanel from '@/components/RiskLimitsPanel'
 import { STRATEGY_STATES, useStrategies } from '@/hooks/useStrategies'
 import { UNKNOWN, formatDateTime } from '@/lib/money'
@@ -217,6 +218,7 @@ export default function Strategies() {
     return (
       <div className="space-y-4">
         <RiskLimitsPanel />
+        <RejectionsPanel />
         <p className="p-8 text-sm text-slate-400">Loading…</p>
       </div>
     )
@@ -226,6 +228,7 @@ export default function Strategies() {
     return (
       <div className="space-y-4">
         <RiskLimitsPanel />
+        <RejectionsPanel />
         <p className="p-8 text-sm text-amber-400">
           Could not load the strategies.
           <span className="mt-1 block text-xs text-amber-200/70">
@@ -239,6 +242,7 @@ export default function Strategies() {
   return (
     <div className="space-y-4">
       <RiskLimitsPanel />
+      <RejectionsPanel />
 
       {neverRun.length > 0 ? (
         // The answer to "I wrote a strategy and nothing is happening", which

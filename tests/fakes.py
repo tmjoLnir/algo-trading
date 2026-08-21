@@ -472,6 +472,37 @@ class FakeSignalRepository:
         rows.sort(key=lambda pair: pair[0].ts, reverse=True)
         return rows[:limit]
 
+    async def rejections(
+        self,
+        *,
+        strategy_id: str | None = None,
+        rule: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[tuple[Signal, SignalOutcome]]:
+        """Refusals only, and the exclusions are real rather than a pass-through.
+
+        `no_action` is dropped here exactly as the SQL drops it. A fake that
+        returned every not-acted-on signal would let the endpoint pass a test it
+        fails against Postgres — and fail it in the specific direction that
+        matters, by reporting HOLDs as refusals.
+
+        The limit is applied *after* filtering, like the real query's, so a test
+        can prove that a rejection older than the newest hundred signals is
+        still found.
+        """
+        rows = [
+            pair
+            for pair in self.stored.values()
+            if pair[1].rejected_by is not None
+            and pair[1].rejected_by != "no_action"
+            and (strategy_id is None or pair[0].strategy_id == strategy_id)
+            and (rule is None or pair[1].rejected_by == rule)
+            and (since is None or pair[0].ts >= since)
+        ]
+        rows.sort(key=lambda pair: pair[0].ts, reverse=True)
+        return rows[:limit]
+
     async def between(
         self, start: datetime, end: datetime, *, strategy_id: str | None = None
     ) -> list[tuple[Signal, SignalOutcome]]:

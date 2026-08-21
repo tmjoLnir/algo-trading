@@ -951,6 +951,24 @@ export interface paths {
          *     A strategy silently doing nothing because a limit rejects it every time
          *     looks identical to a strategy with no signals — this endpoint is how you
          *     tell the difference.
+         *
+         *     Read from `signals`, which is where refusals live. They are deliberately
+         *     **not** in the orders table: `runner.evaluate` skips `_track` when the
+         *     router refuses, so a refused order never enters the open-order set that
+         *     `_persist` walks, and nothing else saves it. That is why
+         *     `/risk/status` reports the order rate as unobservable, and it is the same
+         *     fact seen from the other side — the record exists, it is just kept as a
+         *     decision rather than as an order.
+         *
+         *     **The filtering happens in SQL.** Reading the newest hundred signals and
+         *     keeping the refused ones would answer a different question: "were any of
+         *     the last hundred decisions refused" is "no" for a strategy blocked all week
+         *     that has since emitted one HOLD, and an empty list reads as "nothing is
+         *     being refused" (`SignalRepository.rejections`).
+         *
+         *     A read, so a read-only session may call it. Nothing here is a secret an
+         *     operator watching the book should not see — and this is precisely the screen
+         *     someone reaches for when a strategy appears to be doing nothing.
          */
         get: operations["list_rejections_api_v1_risk_rejections_get"];
         put?: never;
@@ -2160,6 +2178,52 @@ export interface components {
         PreSessionContext: {
             /** Run Mode */
             run_mode: string;
+        };
+        /**
+         * RejectionView
+         * @description One decision the risk chain refused.
+         *
+         *     A *signal*, not an order, and the distinction is the endpoint's whole
+         *     subject: a refused signal never becomes an order, so the orders table
+         *     cannot show it. `signal_id` is the row in `signals`, which also carries the
+         *     indicators the strategy was looking at when it decided.
+         */
+        RejectionView: {
+            /** Action */
+            action: string;
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Indicators */
+            indicators?: {
+                [key: string]: string;
+            };
+            /** Reason */
+            reason: string | null;
+            /** Rule */
+            rule: string;
+            /** Signal Id */
+            signal_id: string;
+            /** Strategy Id */
+            strategy_id: string;
+            /** Symbol */
+            symbol: string;
+        };
+        /**
+         * RejectionsResponse
+         * @description Refusals, and an honest account of which ones are missing.
+         */
+        RejectionsResponse: {
+            /** Blind Spots */
+            blind_spots?: string[];
+            /** By Rule */
+            by_rule?: {
+                [key: string]: number;
+            };
+            /** Rejections */
+            rejections: components["schemas"]["RejectionView"][];
         };
         /**
          * ResumeRequest
@@ -3697,6 +3761,9 @@ export interface operations {
     list_rejections_api_v1_risk_rejections_get: {
         parameters: {
             query?: {
+                strategy_id?: string | null;
+                rule?: string | null;
+                since?: string | null;
                 limit?: number;
             };
             header?: never;
@@ -3711,9 +3778,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    }[];
+                    "application/json": components["schemas"]["RejectionsResponse"];
                 };
             };
             /** @description Validation Error */

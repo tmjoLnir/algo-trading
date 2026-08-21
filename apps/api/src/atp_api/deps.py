@@ -41,9 +41,10 @@ from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.dashboard import RedisSnapshotStore
 from atp_core.persistence.orders import PostgresOrderRepository
 from atp_core.persistence.positions import PostgresPortfolioRepository
+from atp_core.persistence.signals import PostgresSignalRepository
 from atp_core.persistence.strategies import PostgresStrategyRepository
 from atp_core.risk.killswitch import KillSwitch
-from atp_core.strategy.ports import StrategyRepository
+from atp_core.strategy.ports import SignalRepository, StrategyRepository
 
 #: `Redis` and the SQLAlchemy session types are imported at RUNTIME, not behind
 #: `if TYPE_CHECKING`. FastAPI resolves a dependency's annotations when it wires
@@ -239,6 +240,22 @@ async def get_strategy_repository(
     moment anything here did write.
     """
     return PostgresStrategyRepository(session_factory, clock)
+
+
+async def get_signal_repository(
+    session_factory: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
+) -> SignalRepository:
+    """The `signals` table — every decision a strategy made and what became of it.
+
+    Read-only from this process, like every other repository here. The runner is
+    the only writer, at every evaluation.
+
+    This is the table that answers "why is nothing happening": a strategy whose
+    every idea the risk chain refused is, from the orders table alone,
+    indistinguishable from a strategy that had no ideas, and those two call for
+    opposite responses. `/risk/rejections` is the reader.
+    """
+    return PostgresSignalRepository(session_factory)
 
 
 async def get_backtest_repository(

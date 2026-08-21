@@ -204,6 +204,29 @@ class SignalRepository(Protocol):
         """
         ...
 
+    async def rejections(
+        self,
+        *,
+        strategy_id: str | None = None,
+        rule: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[tuple[Signal, SignalOutcome]]:
+        """Refused decisions only, newest first.
+
+        Its own method rather than a filter over `recent`, because the two
+        answer different questions and only one of them is useful here. Keeping
+        the refusals out of `recent(limit=100)` answers "were any of the last
+        hundred decisions refused" — which is "no" for a strategy blocked all
+        week that has since emitted a single HOLD, and an empty list reads as
+        "nothing is being refused".
+
+        Excludes `no_action`, which is not a refusal: the router marks a HOLD
+        and an exit against a flat position as *approved* so they do not inflate
+        the count an operator reads to judge whether risk is too tight.
+        """
+        ...
+
     async def between(
         self, start: datetime, end: datetime, *, strategy_id: str | None = None
     ) -> list[tuple[Signal, SignalOutcome]]:
