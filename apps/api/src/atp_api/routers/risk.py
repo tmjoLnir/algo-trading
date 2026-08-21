@@ -936,25 +936,26 @@ class RejectionsResponse(BaseModel):
     blind_spots: list[str] = Field(default_factory=list)
 
 
-#: Refusals that happen and are never stored, so no query can find them.
+#: What this endpoint does not cover, said in the payload rather than only here.
 #:
-#: `runner._record_signal` writes a row for every *signal* whatever its fate,
-#: which is what makes this endpoint possible. The runner's two other refusal
-#: paths write nothing: a stop exit the risk chain denied
-#: (`runner.py`, `runner.stop_exit_refused`) and a shutdown flatten it denied
-#: (`runner.shutdown_flatten_refused`) are logged and dropped. Neither is a
-#: signal, so `_record_signal` never sees them, and neither order is ever
-#: tracked, so `_persist` never saves them either.
+#: This reads `signals`, so it shows refusals of things a *strategy decided*.
+#: The runner can also be refused three ways that never involve a signal — a
+#: stop exit, a protective stop, and a shutdown flatten — and those are the ones
+#: that describe an open position nobody is managing.
 #:
-#: These are the *worse* refusals. A refused entry means a trade that did not
-#: happen; a refused stop exit means a position that should have closed and did
-#: not, which is docs/SAFETY.md's layer-5 failure. Saying so here is the least
-#: this endpoint can do until they are recorded.
+#: They used to be logged and dropped, which made this list an apology. They are
+#: stored as orders now, so the list is a signpost instead: the refusal is real,
+#: it is durable, and it is on the Orders tab rather than this one. Pointing
+#: somewhere is worth much more than confessing to nowhere, and the distinction
+#: still has to be drawn — an operator reading an empty table here has *not*
+#: established that nothing was refused.
 BLIND_SPOTS = [
-    "a stop exit refused by the risk chain is written to the worker's log and "
-    "nowhere else, so it cannot appear here — and it is the more serious "
-    "refusal, because it leaves a position open that should have closed",
-    "a shutdown flatten refused by the risk chain is likewise logged only",
+    "refusals that never involved a signal are not here: a stop exit, a "
+    "protective stop or a shutdown flatten refused by the risk chain is stored "
+    "as a rejected order, so `/orders` is where those appear",
+    "those are the more serious refusals — a refused entry is a trade that did "
+    "not happen, a refused stop exit is a position that should have closed and "
+    "did not — so an empty table here does not mean nothing was refused",
     "`no_action` outcomes are excluded on purpose: a HOLD, or an exit against "
     "an already-flat position, is approved rather than refused",
 ]

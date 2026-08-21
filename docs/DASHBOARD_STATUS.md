@@ -180,6 +180,15 @@ Order history with filters, fill progress per row, and the distinction the table
 exists for: `refused by risk` (our own engine) is a different word from
 `refused by venue`.
 
+**It had never rendered a `rejected_risk` row, and could not have** (fixed in
+#PR). This endpoint's docstring has always said the orders that matter most are
+the ones that never filled, and that "a rejection appears in no other read in
+the platform"; `OrderHistoryTable` tints `rejected_risk` and shows the reason
+beside it. The whole read path was built and complete. Nothing ever wrote one —
+the runner dropped a refused order at all four places it can be refused, so the
+table's most important category of row could not exist. The write path exists
+now.
+
 **Outstanding**
 
 - Read-only. `POST /orders`, `DELETE /orders/{id}` and `POST /orders/cancel-all`
@@ -244,19 +253,21 @@ the record.
   signals" was previously answerable only from the dashboard's signal feed, and
   only for the current book; it is now a durable, filterable query.
 
-  **It surfaced a gap worth its own line.** The runner records a row for every
-  *signal* whatever its fate, which is what makes the endpoint possible. Its two
-  other refusal paths record nothing: a **stop exit** the risk chain denied
-  (`runner.stop_exit_refused`) and a **shutdown flatten** it denied
-  (`runner.shutdown_flatten_refused`) are logged and dropped. Neither is a
-  signal, so `_record_signal` never sees them, and neither order is ever
-  tracked, so `_persist` never saves them.
+  **It surfaced a gap, and #PR closed it.** The runner records a row for every
+  *signal* whatever its fate, which is what makes this endpoint possible. Its
+  other refusal paths recorded nothing: a **stop exit**, a **protective stop**
+  and a **shutdown flatten** the risk chain denied were logged and dropped —
+  none is a signal, so `_record_signal` never saw them, and none of their orders
+  was ever tracked, so `_persist` never saved them either.
 
-  Those are the *worse* refusals. A refused entry is a trade that did not
-  happen; a refused stop exit is a position that should have closed and did
-  not, which is docs/SAFETY.md's layer 5 failing. The endpoint reports them as
-  blind spots in its own payload — the screen renders them whether or not there
-  are rows — but reporting is not recording, and recording them is outstanding.
+  Those are the *worse* refusals: a refused entry is a trade that did not
+  happen, a refused stop exit is a position that should have closed and did not,
+  and a refused protective stop is one that never had a stop at all — the two
+  ends of docs/SAFETY.md's layer 5. They are stored as rejected orders now, so
+  they appear on the **Orders** tab. The blind-spot list this endpoint sends is
+  consequently a signpost rather than an apology: it still has to say that an
+  empty table here does not mean nothing was refused, but it can now say where
+  the rest is.
 
 ---
 
