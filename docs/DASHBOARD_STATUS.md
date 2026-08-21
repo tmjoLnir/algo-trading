@@ -152,6 +152,13 @@ Opening a run gives metrics, equity curve and per-trade inspection.
 Ticking two finished runs compares them, with the overfitting warning above the
 table and deliberately no "winner" column.
 
+The picker offers strategies that have a `strategies` row, which used to mean
+"that a trading worker has booted". On a clean database that was nothing, so the
+form had nothing to offer and the endpoint answered 409 — a screen whose one
+action was unreachable until you configured a worker with broker credentials the
+backtest does not use. `make seed` writes those rows now, so a migrated database
+plus backfilled bars is the whole prerequisite.
+
 **Outstanding**
 
 - **`/analytics/live-vs-backtest/{run_id}` is implemented and has no screen.**

@@ -52,7 +52,7 @@ make up                       # postgres+timescale, redis, api, web
                               # writes .env from .env.example on first run —
                               # fill in ALPACA_* before leaving backtest mode
 make migrate                  # create schema
-make seed                     # backfill a little bar history
+make seed                     # strategy rows + synthetic bars (dev only)
 open http://localhost:5173    # dashboard
 open http://localhost:8000/docs   # OpenAPI
 ```

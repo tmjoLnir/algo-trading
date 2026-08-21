@@ -1348,6 +1348,18 @@ wording if it is not the demonstration you want.
   phase's *Verifiable:* line asks of a screen and what the proposed line below
   asks of the numbers.
 
+  **One thing standing between this and that line is gone as of the seed
+  script.** The 409 above — "a backtest needs a row in `strategies`, which a
+  worker writes the first time it loads the strategy" — was not only a confusing
+  state, it was a *prerequisite*: on a clean database the picker was empty and
+  the only way to fill it was to configure a trading worker with broker
+  credentials that a backtest does not need. `make seed` now writes those rows
+  (`scripts/seed.py`), so queueing a run from a browser needs a migrated database
+  and backfilled bars and nothing else. Still unticked, and deliberately: the
+  *Verifiable:* line asks for **real backfilled** history, and the bars this seed
+  writes are fabricated ones under reserved test tickers. It removes an obstacle
+  to showing the line; it does not show it.
+
 - [ ] Live-vs-backtest comparison — @claude.
   Built as of #68: `GET /analytics/live-vs-backtest/{run_id}` serves the live
   metric set, the stored backtest's, the divergence between them, and the reasons
