@@ -237,6 +237,61 @@ class TestQueueingARun:
         assert explicit.status_code == 202
         assert explicit.json()["spec"]["cost_model"] == "zero"
 
+    async def test_a_request_that_names_no_stop_stores_none(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """An old client sends none of these fields and gets the run it always
+        got: only levels the strategy itself emits. Defaulting to `atr` here
+        would change what a re-queued stored spec reports."""
+        spec = (await client.post(BACKTESTS, json=a_request())).json()["spec"]
+
+        assert spec["stop_type"] == ""
+        assert spec["stop_value"] == ""
+        assert spec["stop_bars"] == 0
+
+    async def test_the_stop_travels_with_the_run_that_used_it(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """Two runs of one strategy differing only in how entries were protected
+        are different results, and a reader comparing them a week later cannot
+        see that unless the protection is on the spec."""
+        response = await client.post(
+            BACKTESTS, json=a_request(stop_type="atr", stop_value="2.5", stop_period=20)
+        )
+
+        assert response.status_code == 202
+        spec = response.json()["spec"]
+        assert spec["stop_type"] == "atr"
+        # A string, like every other decimal on a spec: the multiple becomes a
+        # price distance in the engine, and a JSON float would carry binary
+        # rounding into it (CLAUDE.md §1.1).
+        assert spec["stop_value"] == "2.5"
+        assert isinstance(spec["stop_value"], str)
+        assert spec["stop_period"] == 20
+
+    @pytest.mark.parametrize(
+        ("override", "expected"),
+        [
+            ({"stop_type": "trailing"}, "stop_type must be one of"),
+            ({"stop_type": "atr", "stop_value": "0"}, "stop_value must be positive"),
+            # The cross-field rules, which only the resolver knows. They are a
+            # 400 at the door rather than a failure four minutes into a queued
+            # job, and they are not restated here — the API calls the same
+            # function the worker builds the engine from, so the set it accepts
+            # is the set that can actually run.
+            ({"stop_type": "atr"}, "needs stop_value"),
+            ({"stop_type": "time"}, "positive stop_bars"),
+            ({"stop_type": "atr", "stop_value": "2", "stop_period": 0}, "stop_period"),
+        ],
+    )
+    async def test_a_stop_that_cannot_be_built(
+        self, client: httpx.AsyncClient, override: dict[str, Any], expected: str
+    ) -> None:
+        response = await client.post(BACKTESTS, json=a_request(**override))
+
+        assert response.status_code == 400
+        assert expected in response.json()["detail"]
+
 
 class TestRefusalsBeforeTheJobIsQueued:
     """Everything judgeable from the request is judged now, not in four minutes."""

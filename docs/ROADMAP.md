@@ -438,12 +438,45 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   arms it on the position, and sends a broker-side stop. So "nothing arms these"
   no longer holds.
 
+  **And a second caller, which is the gap this item did not name.** Every
+  `StopManager` method above had exactly one production caller — the live
+  runner. `BacktestEngine` watched only the levels a `Signal` happened to carry,
+  and no shipped strategy emits one, so a strategy configured behind
+  `WORKER_STOP_TYPE=atr` was backtested naked. Not a missing feature: a
+  *divergence*, of the kind CLAUDE.md §5 calls the hardest here to notice,
+  because the backtest reported a number belonging to a strategy nobody was
+  going to run. `BacktestRunSpec` now carries the stop, `--stop` and the
+  Backtests tab set it, and a spec stored without one still resolves to the
+  unprotected run it was.
+
+  Three things moved rather than being reimplemented, which is the whole point.
+  `target_hit` had a private copy in the engine and another in the runner and
+  now lives in `risk/stops.py` with both calling it. `should_trigger` replaces
+  the engine's own inline comparison. And the ordering matches live: the stop is
+  derived before sizing, because `risk_pct` is defined off the distance to it —
+  which is why a `risk_pct` run over a stopless strategy books a refusal per
+  entry, and why `--stop atr` is what fixes that rather than a sizing default.
+
+  The ATR that places the level goes through the same cursor a strategy reads,
+  so it cannot see the volatility it is about to be measured against; a stop it
+  cannot derive leaves the position openly unprotected rather than armed at an
+  invented level. `broker_side` is False on every backtest stop, because there
+  is no venue in a replay and a config claiming otherwise would report a
+  protection the run does not provide.
+
   Unticked all the same, and for a sharper reason than before: broker-side stops
   are docs/SAFETY.md's layer 5, and a layer is only demonstrated by watching it
   hold. Nothing has yet placed one of these against a real venue, and four of
   the nine rules can refuse a protective stop — which the router reports rather
   than hides, but which no *Verifiable:* line yet exercises. Phase 4's paper
   week is the demonstration.
+
+  That reason is untouched by the above, and this PR does not weaken it. A
+  backtest places no broker-side stop by construction, so watching one hold at a
+  venue is still the thing that has not happened. What changed is the scope of
+  what is left: the engine-side half now has two callers and is exercised on
+  every level type, long and short, and Phase 4's paper week is the only
+  outstanding demonstration rather than one of two.
 - [x] Redis kill switch — @claude (#32).
   `RedisKillSwitch` over the three halt scopes, tested against a real Redis as
   well as in memory. Ticked on docs/SAFETY.md's own go-live checklist rather

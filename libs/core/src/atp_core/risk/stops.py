@@ -72,6 +72,32 @@ def _guard_level(level: Decimal, what: str) -> Decimal:
     return level
 
 
+def target_hit(position: Position, bar: Bar) -> bool:
+    """Did this bar trade through the take-profit?
+
+    The mirror of `StopManager.should_trigger`: a long's target sits above it,
+    so the bar's HIGH is what reaches it, and a short's is below, so the LOW
+    does. Comparing against the close would miss a bar that spiked through the
+    target and settled back — the position did hit it.
+
+    A **module function rather than a `StopManager` method**, and the distinction
+    is the one `StrategyRunner` drew when this lived there: `StopManager`
+    computes levels *from a `StopConfig`*, and refuses to invent one for a config
+    that does not describe a distance from entry. This reads a level already
+    armed on the position by whoever chose it, which is a different job.
+
+    It is here rather than there because it now has two callers. The live runner
+    and the backtest engine each had their own copy, and two implementations of
+    "did the bar reach the target" is precisely the divergence ADR 0006 exists to
+    refuse — a strategy backtested with a target and run live with a subtly
+    different one is not the same strategy.
+    """
+    target = position.take_profit_price
+    if target is None or position.is_flat:
+        return False
+    return bar.high >= target if position.is_long else bar.low <= target
+
+
 class StopManager:
     """Computes and maintains protective levels for open positions."""
 

@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from atp_core.backtest.runner import STOP_TYPES
+
 if TYPE_CHECKING:
     from types import ModuleType
 
@@ -103,6 +105,39 @@ class TestArgumentRefusals:
     def test_non_positive_cash(self) -> None:
         with pytest.raises(SystemExit, match="--cash must be positive"):
             run([*BASE, "--cash", "-1"])
+
+    def test_an_unknown_stop_type_is_refused_by_the_parser(self) -> None:
+        """`choices` from `STOP_TYPES`, so the CLI cannot accept a name the
+        engine has no `StopType` for — the refusal is the parser's, before any
+        bars are loaded."""
+        with pytest.raises(SystemExit):
+            cli.parse_args([*BASE, "--stop", "trailing"])
+
+    @pytest.mark.parametrize("stop_type", sorted(STOP_TYPES))
+    def test_every_stop_the_engine_knows_is_offered(self, stop_type: str) -> None:
+        """The parser's choices are `STOP_TYPES` itself. A type the engine
+        gained and this did not would be unreachable from the one entry point
+        an operator has."""
+        assert cli.parse_args([*BASE, "--stop", stop_type]).stop == stop_type
+
+    def test_the_stop_flags_reach_the_spec(self) -> None:
+        """Parsed, not merely accepted: an argument the parser takes and the
+        spec drops is a run protected differently from what was asked for."""
+        args = cli.parse_args([*BASE, "--stop", "atr", "--stop-value", "2", "--stop-period", "20"])
+
+        assert args.stop == "atr"
+        assert args.stop_value == "2"
+        assert args.stop_period == 20
+        assert args.stop_bars == 0
+
+    def test_no_stop_flag_means_no_stop(self) -> None:
+        """The default is what every run this CLI has produced did: arm only
+        what the strategy emits. `main` says so out loud rather than leaving an
+        operator to infer it."""
+        args = cli.parse_args(BASE)
+
+        assert args.stop is None
+        assert args.stop_bars == 0
 
     def test_unknown_strategy_names_the_registered_ones(self) -> None:
         """The registry is only populated by importing the examples package,

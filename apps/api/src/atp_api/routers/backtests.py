@@ -54,8 +54,10 @@ from atp_core.backtest.runner import (
     COST_MODELS,
     DEFAULT_COST_MODEL,
     SIZING_METHODS,
+    STOP_TYPES,
     backfill_hint,
     missing_coverage,
+    resolve_stop_config,
     suspicious,
 )
 from atp_core.clock import Clock
@@ -121,6 +123,16 @@ class BacktestRequest(BaseModel):
     #: `qty`, which is what keeps an old request and a new `fixed_qty` one the
     #: same run.
     sizing_value: Decimal | None = None
+    #: How every entry is protected, by `StopType` name. Omitted arms only what
+    #: the strategy itself emits — which for a crossover is nothing, and which is
+    #: what every run stored before this field did.
+    stop_type: str = ""
+    #: A multiple for `atr`/`chandelier`, a fraction or an amount for the rest.
+    stop_value: Decimal | None = None
+    #: ATR lookback, for the two types that need one.
+    stop_period: int = 14
+    #: Bars to hold, for a `time` stop. Refused rather than defaulted there.
+    stop_bars: int = 0
 
 
 class BacktestSpecView(BaseModel):
@@ -146,6 +158,13 @@ class BacktestSpecView(BaseModel):
     #: result.
     sizing_method: str
     sizing_value: str
+    #: Echoed for the reason the sizing fields are: two runs of one strategy that
+    #: differ only in how their entries were protected are different results, and
+    #: a reader comparing them cannot see that unless it travels with them.
+    stop_type: str
+    stop_value: str
+    stop_period: int
+    stop_bars: int
 
 
 class BacktestProgressView(BaseModel):
@@ -266,6 +285,10 @@ def _to_spec_view(spec: BacktestRunSpec) -> BacktestSpecView:
         # `sizing_value` and was sized by `qty`, and serving the empty string
         # would show a reader a field the run did not actually use.
         sizing_value=spec.sizing_value or spec.qty,
+        stop_type=spec.stop_type,
+        stop_value=spec.stop_value,
+        stop_period=spec.stop_period,
+        stop_bars=spec.stop_bars,
     )
 
 
@@ -353,6 +376,10 @@ def _validated_spec(payload: BacktestRequest) -> BacktestRunSpec:
         raise _bad_request(f"sizing_method must be one of: {', '.join(sorted(SIZING_METHODS))}")
     if payload.sizing_value is not None and payload.sizing_value <= 0:
         raise _bad_request(f"sizing_value must be positive, got {payload.sizing_value}")
+    if payload.stop_type and payload.stop_type not in STOP_TYPES:
+        raise _bad_request(f"stop_type must be one of: {', '.join(sorted(STOP_TYPES))}")
+    if payload.stop_value is not None and payload.stop_value <= 0:
+        raise _bad_request(f"stop_value must be positive, got {payload.stop_value}")
     if payload.starting_cash <= 0:
         raise _bad_request(f"starting_cash must be positive, got {payload.starting_cash}")
     if payload.qty <= 0:
@@ -374,7 +401,7 @@ def _validated_spec(payload: BacktestRequest) -> BacktestRunSpec:
     except (TypeError, ValueError) as exc:
         raise _bad_request(f"strategy rejected its params: {exc}") from None
 
-    return BacktestRunSpec(
+    spec = BacktestRunSpec(
         strategy_id=payload.strategy_id,
         symbols=symbols,
         start=payload.start,
@@ -391,7 +418,22 @@ def _validated_spec(payload: BacktestRequest) -> BacktestRunSpec:
         # JSON column and a process boundary, and a fraction of equity is
         # exactly the kind of value a binary float rounds visibly.
         sizing_value="" if payload.sizing_value is None else str(payload.sizing_value),
+        stop_type=payload.stop_type,
+        stop_value="" if payload.stop_value is None else str(payload.stop_value),
+        stop_period=payload.stop_period,
+        stop_bars=payload.stop_bars,
     )
+
+    # The cross-field stop rules — an `atr` with no multiple, a `time` with no
+    # bar count — live in the resolver rather than being restated here, so the
+    # set this accepts is the set the worker can build. Called for its refusal
+    # and its result discarded: `build_engine` calls it again in the worker,
+    # which is where the config is actually needed.
+    try:
+        resolve_stop_config(spec)
+    except ATPError as exc:
+        raise _bad_request(str(exc)) from None
+    return spec
 
 
 async def _require_coverage(bars: BarRepository, spec: BacktestRunSpec) -> None:

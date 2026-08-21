@@ -89,6 +89,13 @@ uv run python scripts/run_backtest.py \
   --strategy sma_crossover --symbols SPY,QQQ \
   --start 2020-01-01 --end 2024-12-31 --timeframe 1d \
   --qty 100 --out results.json
+
+# ...and the same run with the protection a live worker would give it
+uv run python scripts/run_backtest.py \
+  --strategy sma_crossover --symbols SPY,QQQ \
+  --start 2020-01-01 --end 2024-12-31 --timeframe 1d \
+  --sizing risk_pct --sizing-value 0.003 \
+  --stop atr --stop-value 2 --stop-period 14 --out results.json
 ```
 
 Or from the dashboard's **Backtests** tab, over `POST /api/v1/backtests`. Both
@@ -155,6 +162,77 @@ measuring something a replay over bars does not have. `trading_hours` is the
 sharpest case: a daily bar is stamped at exchange-local midnight, so the
 calendar says closed at every one of them and the rule would refuse every order
 in every daily backtest.
+
+## Stops, and what a run without them is measuring
+
+**A backtest arms nothing you did not ask it to.** Until `--stop` (or the form's
+**Stop** field) exists on a run, the engine watches only the levels a `Signal`
+itself carries — and none of the shipped strategies emits one, so every run this
+platform had produced was an unprotected one. If that strategy is configured
+live behind `WORKER_STOP_TYPE=atr`, the backtest and the live worker are running
+two different strategies, and the number on the screen belongs to the one you
+are not going to trade. That is CLAUDE.md §5's divergence in its purest form: no
+error, no warning, just a result about something else.
+
+The default is still "no stop", and deliberately. Defaulting a stored spec to
+`atr` would change what every historical run reports, and a spec is a record of
+what was asked for. The CLI says so out loud on every run that omits it.
+
+| `--stop` | Reads `--stop-value` as | Also arms a target | Trails |
+|---|---|---|---|
+| `atr` | a multiple of ATR | no | no |
+| `chandelier` | a multiple of ATR | no | yes |
+| `fixed_pct` | a fraction of entry | yes | no |
+| `fixed_amount` | a price distance | yes | no |
+| `trailing_pct` | a fraction | no | yes |
+| `time` | — (uses `--stop-bars`) | no | — |
+
+`atp_core.risk.StopManager` computes every one of those levels, and it is the
+same object `StrategyRunner` uses live — one implementation, two callers (ADR
+0006). So is `should_trigger`, and so is `target_hit`, which had a private copy
+in each until this landed.
+
+Four things the engine does with them that are worth knowing before reading a
+result:
+
+1. **The stop is derived before the size, not after.** `risk_pct` sizing is
+   *defined* off `|entry − stop|`, so a stop that arrives at fill time arrives
+   too late to size anything. This is why `--sizing risk_pct` over a stopless
+   strategy books a refusal per entry, and why adding `--stop` fixes it.
+2. **A strategy's own level always wins.** A configured stop fills gaps; it
+   never overwrites a level the signal named.
+3. **A trailing stop ratchets before the bar is tested against it.** A bar that
+   both extends the move and retraces into the level *that bar* justified is
+   stopped out, which is what a venue-side trailing stop would have done.
+4. **A time exit fills at that bar's close.** It has no level to fill at, and
+   the close is where the clock stands when the engine asks. It is labelled
+   `time_exit` rather than folded into `exit`, because exit-reason attribution
+   is how a strategy's stops get judged.
+
+**The ATR that places the stop is computed from bars that had closed.** It goes
+through the same cursor a strategy reads, so it cannot see the volatility it is
+about to be measured against. An ATR over the whole series would place stops
+using a future that had not happened — the quietest possible way to make a
+backtest fictional, and one that flatters it.
+
+**A stop that cannot be derived leaves the position openly unprotected.** An ATR
+stop during warmup has no ATR, and `StopManager` refuses to default one. The
+entry still happens and carries no stop, which is worse than it sounds and much
+better than the alternative: a position that *looks* guarded at an invented
+level is a position whose risk you have mismeasured.
+
+**`broker_side` is False for every backtest stop, and that is not a preference.**
+Live, the initial stop rests at the venue and fires without us (docs/SAFETY.md
+layer 5). In a replay there is no venue — the engine *is* the fill model — so a
+config claiming the level was resting elsewhere would describe a protection the
+run does not provide.
+
+**Expect the position cap to bite when you turn stops on.** docs/RISK.md's
+recommended pair is `risk_pct` at 1% with a 2×ATR stop, and on a ~$97 stock with
+an ATR near $1.64 that asks for 305 shares — 29.5% of a $100,000 account against
+a 10% `RISK_MAX_POSITION_PCT`, so `max_position_size` refuses every entry. The
+refusal line says so. It is not a bug in either the sizer or the cap; it is the
+two limits meeting, and the run above uses 0.3% because that is what fits.
 
 **Expect refusals, and read them.** A run's warnings end with one line counting
 what was refused and by which rule. That line matters more than the return above

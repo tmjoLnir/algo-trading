@@ -32,7 +32,13 @@ from typing import TYPE_CHECKING, Any
 from pydantic import ValidationError
 
 from atp_core.backtest.ports import BacktestRunSpec
-from atp_core.backtest.runner import SIZING_METHODS, build_engine, jsonable, refusal_summary
+from atp_core.backtest.runner import (
+    SIZING_METHODS,
+    STOP_TYPES,
+    build_engine,
+    jsonable,
+    refusal_summary,
+)
 from atp_core.config import get_settings
 from atp_core.domain import Timeframe
 from atp_core.errors import ATPError
@@ -105,6 +111,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "fixed_notional, a fraction of equity for the rest. Defaults to --qty"
         ),
     )
+    p.add_argument(
+        "--stop",
+        default=None,
+        choices=sorted(STOP_TYPES),
+        help=(
+            "how every entry is protected. Omitted arms only what the strategy "
+            "itself asks for, which for sma_crossover is nothing"
+        ),
+    )
+    p.add_argument(
+        "--stop-value",
+        default=None,
+        help="a multiple for atr/chandelier, a fraction or amount for the rest",
+    )
+    p.add_argument("--stop-period", type=int, default=14, help="ATR lookback")
+    p.add_argument("--stop-bars", type=int, default=0, help="bars to hold, for a time stop")
     p.add_argument("--zero-cost", action="store_true", help="debugging only")
     p.add_argument("--out", default=None, help="write full results to JSON")
     return p.parse_args(argv)
@@ -252,6 +274,12 @@ async def main(argv: list[str] | None = None) -> int:
         "NOTE: the risk chain is active. Five of the nine rules apply to a replay "
         "over bars; the four that cannot are named in risk.engine.backtest_rules."
     )
+    if args.stop is None:
+        print(
+            "NOTE: no stop configured, so only levels the strategy itself emits are "
+            "armed. A strategy backtested naked and run live behind an ATR stop is "
+            "not the same strategy (--stop, docs/RISK.md 'Stop losses')."
+        )
 
     log.info(
         "backtest.starting",
@@ -282,6 +310,10 @@ async def main(argv: list[str] | None = None) -> int:
             qty=str(args.qty),
             sizing_method=args.sizing,
             sizing_value=args.sizing_value or "",
+            stop_type=args.stop or "",
+            stop_value=args.stop_value or "",
+            stop_period=args.stop_period,
+            stop_bars=args.stop_bars,
         ),
         limits=settings.risk,
     )

@@ -27,7 +27,14 @@
 
 import { cloneElement, useState } from 'react'
 import { ApiError } from '@/api/client'
-import { COST_MODELS, SIZING_METHODS, TIMEFRAMES, useQueueBacktest } from '@/hooks/useBacktests'
+import {
+  ATR_STOP_TYPES,
+  COST_MODELS,
+  SIZING_METHODS,
+  STOP_TYPES,
+  TIMEFRAMES,
+  useQueueBacktest,
+} from '@/hooks/useBacktests'
 import type { AvailableStrategyView, StoredStrategyView } from '@/api/types'
 
 interface Props {
@@ -106,6 +113,9 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
   // a share count as a fraction of equity — 100 shares and 100× the account are
   // the same three characters.
   const [sizingValue, setSizingValue] = useState('')
+  const [stopType, setStopType] = useState('')
+  const [stopValue, setStopValue] = useState('')
+  const [stopPeriod, setStopPeriod] = useState('14')
   const [costModel, setCostModel] = useState<string>(COST_MODELS[0].value)
 
   // The picked strategy's own declaration of what it takes. Shown rather than
@@ -113,6 +123,10 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
   // pretending to would mean silently dropping the fields it could not handle.
   const picked = available.find((entry) => entry.name === strategyId)
   const sizingUnit = SIZING_METHODS.find((option) => option.value === sizingMethod)?.unit ?? 'value'
+  const stopUnit = STOP_TYPES.find((option) => option.value === stopType)?.unit ?? 'value'
+  // A time stop counts bars rather than measuring a distance, so its number
+  // goes to `stop_bars` and `stop_value` stays empty.
+  const stopIsTime = stopType === 'time'
   const paramsSchema = picked?.params_schema ?? {}
 
   const submit = (event: React.FormEvent) => {
@@ -136,6 +150,13 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
       // Omitted rather than empty: the server reads "not given" as "use qty",
       // which is what keeps a fixed_qty request identical to what it always was.
       sizing_value: sizingValue.trim() || null,
+      stop_type: stopType,
+      // A time stop counts bars rather than measuring a distance, so its number
+      // goes to `stop_bars` and `stop_value` stays empty — the server refuses a
+      // time stop with no bar count rather than defaulting one.
+      stop_value: stopIsTime ? null : stopValue.trim() || null,
+      stop_bars: stopIsTime ? Number(stopValue.trim() || 0) : 0,
+      stop_period: Number(stopPeriod.trim() || 14),
       cost_model: costModel,
       params: {},
     })
@@ -280,6 +301,49 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
             />
           </Field>
         )}
+
+        <Field label="Stop" hint="how every entry is protected">
+          <select
+            value={stopType}
+            onChange={(event) => {
+              setStopType(event.target.value)
+              setStopValue('')
+            }}
+            disabled={!mayAct}
+            className={INPUT}
+          >
+            {STOP_TYPES.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </Field>
+
+        {stopType ? (
+          <Field label="Stop value" hint={stopUnit}>
+            <input
+              value={stopValue}
+              onChange={(event) => setStopValue(event.target.value)}
+              inputMode="decimal"
+              placeholder={stopUnit}
+              disabled={!mayAct}
+              className={INPUT}
+            />
+          </Field>
+        ) : null}
+
+        {ATR_STOP_TYPES.has(stopType) ? (
+          <Field label="ATR period" hint="lookback the multiple is measured against">
+            <input
+              value={stopPeriod}
+              onChange={(event) => setStopPeriod(event.target.value)}
+              inputMode="numeric"
+              disabled={!mayAct}
+              className={INPUT}
+            />
+          </Field>
+        ) : null}
 
         <Field label="Cost model">
           <select
