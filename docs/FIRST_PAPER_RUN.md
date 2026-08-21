@@ -16,13 +16,19 @@ still passed 648 unit tests.
 
 ## Read this part first: how to stop
 
-`RUNBOOK.md` says *"HALT. Dashboard, top right."* **That does not exist yet.**
-The dashboard is Phase 5 and `POST /api/v1/risk/halt` still raises
-`NotImplementedError`. Before placing a single order, know which of these you
-will use:
+`RUNBOOK.md` says *"HALT. Dashboard, top right."* **That now exists** — the
+button is wired to `POST /api/v1/risk/halt` (#70) and clearing it to
+`/risk/resume` (#75). Both are covered by unit tests against a fake switch and
+neither has engaged a halt in a real Redis from a real browser, which is one of
+the things this run is the first chance to watch.
+
+So there are two paths to the same switch and you should know both, because the
+dashboard depends on the API being up and the CLI does not. Before placing a
+single order, decide which you will reach for:
 
 **1. Engage the kill switch** — stops new orders across every process, leaves
 positions and their broker-side stops alone. This is the halt the runbook means.
+From the dashboard, or from the terminal, which works when the API does not:
 
 ```bash
 uv run python scripts/halt.py engage --by "<your name>" --detail "why"
@@ -44,9 +50,11 @@ shutdown: it does *not* halt, and it deliberately leaves positions open with
 their broker-side stops intact, because liquidating on every restart would turn
 a deploy into a taxable event.
 
-**3. Flatten** — there is no operator path for this yet
-(`/api/v1/risk/flatten-all` is also a stub). Use Alpaca's own web UI. Halting is
-not flattening: halting stops new risk, flattening realises P&L.
+**3. Flatten** — there is still no operator path for this.
+`/api/v1/risk/flatten-all` authenticates, demands the confirmation phrase and a
+step-up password, and then raises `NotImplementedError`; the dashboard has no
+control for it. Use Alpaca's own web UI. Halting is not flattening: halting
+stops new risk, flattening realises P&L into whatever the market is offering.
 
 Layer 8 of `SAFETY.md` applies here and is outside this codebase: **set position
 and loss limits in Alpaca's own controls too.** They are the only limits that
@@ -72,6 +80,41 @@ still hold when this platform is the thing that is broken.
   ```bash
   uv run python scripts/run_backtest.py --strategy sma_crossover --symbols SPY
   ```
+
+### Then check them all at once
+
+```bash
+make preflight            # or: uv run python scripts/preflight.py
+```
+
+Eleven checks in about two seconds, each one a precondition stated above or an
+entry from "the things most likely to break first" below. It exits non-zero on
+anything that would stop the week producing an answer, and prints the command or
+the setting that fixes it.
+
+**Why a script and not just this list.** The input this demonstration needs and
+cannot re-run is calendar time. Almost everything on the list presents the same
+way when it is missed — the worker comes up, runs its loop, and never fills
+anything — and *"a week of no signals is not a week of correct trading"* is the
+caveat at the bottom of this page. A week that ends in silence you cannot
+attribute is a week spent.
+
+Two of the checks are worth naming because they are the ones that produce that
+silence, and neither is visible from a log line until it is too late:
+
+- **Warmup history.** `sma_crossover` needs 51 bars before it will decide
+  anything. Thirty stored bars is not an error, it is five days of nothing.
+- **A size the position cap refuses.** `risk_pct` at 1% against a 2×ATR stop
+  asks for roughly 30% of a $100k account on a ~$97 name, and
+  `RISK_MAX_POSITION_PCT` caps a position at 10% — so `max_position_size`
+  refuses every entry. Both numbers are right; they measure different things.
+  The preflight prices the first entry through `position_size` — the same call
+  the router makes — and says which value would fit.
+
+Run it again with the stack up and the credentials in place: without them the
+venue and database checks report `--` (not checked) rather than passing, because
+"we did not look" and "we looked and it was fine" are the two things worth never
+confusing.
 
 ---
 
@@ -240,3 +283,29 @@ Paste the numbers rather than the conclusion. `ROADMAP.md`'s existing entries
 are written that way on purpose: the Phase 1 and Phase 2 lines quote the actual
 output, so a later reader can disagree with the interpretation without re-running
 anything.
+
+```bash
+make paper-report                                   # what the record can answer
+uv run python scripts/paper_report.py --logs worker.log --markdown
+```
+
+It reads the orders, the refusals and the equity history the worker wrote, and
+answers each clause with the counts behind it. `--markdown` emits the block to
+paste into `ROADMAP.md`.
+
+**Two of the four clauses have no store behind them, and the report says so
+rather than filling them in.** Reconciliation reports `execution.reconcile.clean`
+and an unprotected position reports `runner.position_unprotected`; both are log
+lines, and there is no table, no audit row and no metric a query can reach. The
+audit log is the wrong home for them too — that record exists to attribute an
+action to a *person* (ADR 0008) and a reconciliation has no actor.
+
+So without `--logs` those clauses render as `[?]` with the exact grep beside
+them, and the command exits non-zero. `[?]` is not `[ ]`: it means *unshown*, not
+*shown false*, and it must not be ticked either way. Pass `--logs <file>` and it
+counts the markers itself and answers all four.
+
+One more thing the report will not do for you: a clause it marks `[x]` because
+nothing filled is marked `[?]` instead. Nothing was ever owned, so SAFETY.md's
+layer 5 was never asked to hold, and a green tick there would be the emptiest
+kind.

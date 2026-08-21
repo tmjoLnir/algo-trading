@@ -387,8 +387,8 @@ def build_alert_sink(settings: Settings, *, client: httpx.Client | None = None) 
         sinks.append(
             NtfyAlertSink(
                 settings.alert_ntfy_base_url,
-                settings.alert_ntfy_topic,
-                token=settings.alert_ntfy_token,
+                settings.alert_ntfy_topic.get_secret_value(),
+                token=settings.alert_ntfy_token.get_secret_value(),
                 timeout_seconds=settings.alert_timeout_seconds,
                 client=client,
             )
@@ -396,7 +396,7 @@ def build_alert_sink(settings: Settings, *, client: httpx.Client | None = None) 
     if settings.alert_telegram_token and settings.alert_telegram_chat_id:
         sinks.append(
             TelegramAlertSink(
-                settings.alert_telegram_token,
+                settings.alert_telegram_token.get_secret_value(),
                 settings.alert_telegram_chat_id,
                 base_url=settings.alert_telegram_base_url,
                 timeout_seconds=settings.alert_timeout_seconds,

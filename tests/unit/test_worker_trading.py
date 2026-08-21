@@ -143,10 +143,10 @@ class TestThingsThatAreNotLocks:
 
 class TestStrategyParams:
     def test_empty_means_the_strategys_own_defaults(self) -> None:
-        assert trading._strategy_params(settings()) is None
+        assert trading.strategy_params(settings()) is None
 
     def test_json_is_parsed(self) -> None:
-        parsed = trading._strategy_params(settings(worker_strategy_params='{"fast": 20}'))
+        parsed = trading.strategy_params(settings(worker_strategy_params='{"fast": 20}'))
 
         assert parsed == {"fast": 20}
 
@@ -155,11 +155,11 @@ class TestStrategyParams:
         operator does not think it has — the quietest way to trade the wrong
         thing."""
         with pytest.raises(ConfigError, match="not valid JSON"):
-            trading._strategy_params(settings(worker_strategy_params="{fast: 20}"))
+            trading.strategy_params(settings(worker_strategy_params="{fast: 20}"))
 
     def test_a_json_scalar_is_refused(self) -> None:
         with pytest.raises(ConfigError, match="must be a JSON object"):
-            trading._strategy_params(settings(worker_strategy_params="20"))
+            trading.strategy_params(settings(worker_strategy_params="20"))
 
 
 class TestStopConfig:
@@ -167,7 +167,7 @@ class TestStopConfig:
         """The two families read the same setting differently, and giving each
         its own variable would let an operator set the one their type
         ignores."""
-        config = trading._stop_config(
+        config = trading.resolve_stop_config(
             settings(worker_stop_type="atr", worker_stop_multiplier=Decimal("3"))
         )
 
@@ -176,7 +176,7 @@ class TestStopConfig:
         assert config.value is None
 
     def test_a_fixed_pct_stop_gets_a_value_and_no_multiplier(self) -> None:
-        config = trading._stop_config(
+        config = trading.resolve_stop_config(
             settings(worker_stop_type="fixed_pct", worker_stop_multiplier=Decimal("0.02"))
         )
 
@@ -187,7 +187,7 @@ class TestStopConfig:
     def test_the_default_is_atr(self) -> None:
         """docs/RISK.md prefers it over a fixed percentage, which is too tight
         on a volatile name and too loose on a dull one."""
-        assert trading._stop_config(settings()).stop_type is StopType.ATR
+        assert trading.resolve_stop_config(settings()).stop_type is StopType.ATR
 
 
 class TestDefaults:

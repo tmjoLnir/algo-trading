@@ -151,6 +151,13 @@ seed:  ## Dev database: a row per registered strategy + synthetic bars
 backfill:  ## Backfill bars:  make backfill sym=AAPL,MSFT from=2020-01-01
 	uv run python scripts/backfill_bars.py --symbols "$(sym)" --start "$(from)"
 
+# ── paper trading ───────────────────────────────────────────────────────────
+preflight:  ## Is this configuration ready for a paper week?  (docs/FIRST_PAPER_RUN.md)
+	uv run python scripts/preflight.py $(args)
+
+paper-report:  ## What the paper run demonstrated:  make paper-report args="--logs worker.log"
+	uv run python scripts/paper_report.py $(args)
+
 # ── quality ─────────────────────────────────────────────────────────────────
 test:  ## All tests
 	uv run pytest
