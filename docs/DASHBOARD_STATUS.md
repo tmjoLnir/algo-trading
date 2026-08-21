@@ -83,7 +83,7 @@ totals understate exposure.
   built and read by a panel on the **Strategies** tab (#75) rather than by a
   tab of their own — `/status` is what a person checks before promoting a
   strategy, so it sits on the screen that decision is made on and the nav stays
-  at seven. `/risk/rejections` joined them there (#PR), reading `signals`
+  at seven. `/risk/rejections` joined them there (#77), reading `signals`
   rather than `orders` for the reason below.
 - `/dashboard/health` is stubbed (`dashboard.py:567`). Nothing calls it —
   `FeedStatus` reads `data_feed_healthy` off the aggregate instead — so it is a
@@ -239,7 +239,7 @@ the record.
 - The halts this log cannot see — the CLI's and the risk layer's own. Attributing
   those means giving each an identity the record can stand behind, which is a
   larger question than adding a constant.
-- ~~`/risk/rejections` is stubbed~~ **Built (#PR)**, on the Strategies tab. "A
+- ~~`/risk/rejections` is stubbed~~ **Built (#77)**, on the Strategies tab. "A
   strategy blocked on every order looks identical to a strategy with no
   signals" was previously answerable only from the dashboard's signal feed, and
   only for the current book; it is now a durable, filterable query.
@@ -283,7 +283,7 @@ the record.
 | `/risk/halt` | built (#70) | Dashboard button |
 | `/risk/resume` | built (#75) | Halt banner |
 | `/risk/limits`, `/risk/status` | built (#75) | Strategies |
-| `/risk/rejections` | built (#PR) | Strategies |
+| `/risk/rejections` | built (#77) | Strategies |
 | `/risk/flatten-all` | **stub** | none |
 
 ## Cross-cutting

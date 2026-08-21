@@ -468,7 +468,7 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   read as calm during precisely the runaway the limit exists to catch, and
   understating it is the direction that makes a breached limit look compliant.
 
-  **`/risk/rejections` is that same fact read from the other side** (#PR). The
+  **`/risk/rejections` is that same fact read from the other side** (#77). The
   record exists; it is kept as a decision rather than as an order, so the
   endpoint reads `signals`. Three things had to be true for it to be worth
   having. It filters in SQL, because taking the newest hundred signals and
