@@ -14,9 +14,11 @@ import type { OrderHistoryView, OrdersResponse } from '@/api/types'
  * refusals and about partial fills — the two places where a status word alone
  * misleads.
  *
- * 1. **A refusal carries its reason**, and a refusal whose reason was never
- *    recorded says so rather than rendering the dash that means "nothing
- *    refused this". Two different facts must not collapse into one glyph.
+ * 1. **A refusal carries who refused it and why**, and a refusal missing either
+ *    says so rather than rendering the dash that means "nothing refused this".
+ *    Two different facts must not collapse into one glyph. The refuser is the
+ *    half the risk limits panel is built to be read against — it lists every
+ *    limit under its rule's name so that string can be carried from here.
  * 2. **A partial fill is a proportion.** `cancelled` covers an order that never
  *    traded and one that filled 90% before the cancel landed, and those are
  *    different positions.
@@ -48,6 +50,7 @@ const ORDER: OrderHistoryView = {
   status: 'filled',
   purpose: 'entry',
   reject_reason: null,
+  rejected_by: null,
   strategy_id: 'sma_cross',
   signal_id: 'sig-1',
   created_at: '2026-08-14T13:35:00Z',
@@ -111,6 +114,96 @@ describe('a refused order', () => {
   it('leaves the reason cell a dash when nothing refused the order', () => {
     render(<OrderHistoryTable orders={[ORDER]} />)
     expect(screen.getByText('—')).toBeTruthy()
+  })
+
+  it('names the rule that refused it, not only what it said', () => {
+    // The half that was never stored until `rejected_by` existed. "no price
+    // available for SPY" is said by three different rules, and only the name
+    // tells a reader which limit they would have to change.
+    render(
+      <OrderHistoryTable
+        orders={[
+          {
+            ...ORDER,
+            status: 'rejected_risk',
+            filled_qty: '0',
+            rejected_by: 'max_gross_exposure',
+            reject_reason: 'SPY would take gross exposure to 112% of equity',
+          },
+        ]}
+      />,
+    )
+
+    // The exact string the risk limits panel prints beside that limit, so a
+    // reader can carry it from this row to the ceiling that predicted it.
+    expect(screen.getByText('max_gross_exposure')).toBeTruthy()
+    expect(screen.getByText('SPY would take gross exposure to 112% of equity')).toBeTruthy()
+  })
+
+  it('names the broker when the venue was the one that refused', () => {
+    // One column, two vocabularies, and the status says which: `rejected_risk`
+    // names a rule of ours, `rejected` names the venue.
+    render(
+      <OrderHistoryTable
+        orders={[
+          {
+            ...ORDER,
+            status: 'rejected',
+            filled_qty: '0',
+            rejected_by: 'alpaca-paper',
+            reject_reason: 'insufficient buying power',
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText('alpaca-paper')).toBeTruthy()
+    expect(screen.getByText('refused by venue')).toBeTruthy()
+  })
+
+  it('admits the reason is unknown when only the refuser was recorded', () => {
+    // Reachable, not hypothetical: a venue can refuse without saying why, and
+    // the router knows the broker it submitted to either way. Dropping the line
+    // would read as though the broker's name was all there was to say.
+    render(
+      <OrderHistoryTable
+        orders={[
+          {
+            ...ORDER,
+            status: 'rejected',
+            filled_qty: '0',
+            rejected_by: 'alpaca-paper',
+            reject_reason: null,
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText('alpaca-paper')).toBeTruthy()
+    expect(screen.getByText(/no reason was recorded/)).toBeTruthy()
+  })
+
+  it('admits the refuser is unknown on a row stored before the column existed', () => {
+    // Permanent, not transitional. An order's reason text never carried the
+    // rule name, so the migration had nothing to recover it from — unlike
+    // `signals.rejected_by`, which was packed into the reason and unpacked.
+    // Blanking the line would read as "the reason is all there was to say".
+    render(
+      <OrderHistoryTable
+        orders={[
+          {
+            ...ORDER,
+            status: 'rejected_risk',
+            filled_qty: '0',
+            rejected_by: null,
+            reject_reason: 'over the limit',
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText(/refuser not recorded/)).toBeTruthy()
+    expect(screen.getByText('over the limit')).toBeTruthy()
   })
 })
 

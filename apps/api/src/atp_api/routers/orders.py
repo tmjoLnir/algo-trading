@@ -65,9 +65,10 @@ class OrderHistoryView(BaseModel):
     to describe a finished one — which needs the three fields that one has no
     use for and would be null on every row it serves.
 
-    `reject_reason` is the field this whole endpoint is for. `purpose` is the
-    second: it says whether an order was an entry, a stop or a target, and it is
-    the only thing that can distinguish two exits that agree on everything else.
+    `reject_reason` is the field this whole endpoint is for, and `rejected_by`
+    is its other half — why, and who. `purpose` is the second: it says whether
+    an order was an entry, a stop or a target, and it is the only thing that can
+    distinguish two exits that agree on everything else.
 
     Every monetary field is a `Decimal` and reaches the browser as a string
     (docs/DASHBOARD.md).
@@ -93,6 +94,17 @@ class OrderHistoryView(BaseModel):
     purpose: str | None
     #: Null unless something refused it. Non-null is the row a reader came for.
     reject_reason: str | None
+    #: *Who* refused it, where `reject_reason` is *why* — the risk rule that
+    #: said no (`max_gross_exposure`), the pre-rule stage `routing`, or the
+    #: broker's name when the venue refused. `status` says which of the two it
+    #: is: `rejected_risk` names one of ours, `rejected` names the venue.
+    #:
+    #: Null on a refusal stored before the column existed, which is not the
+    #: same fact as null on an order nothing refused. The screen distinguishes
+    #: them, because a rule name is the string that gets a reader from a
+    #: refusal to the limit that predicted it — the cross-reference the risk
+    #: limits panel is built around.
+    rejected_by: str | None
     strategy_id: str | None
     signal_id: str | None
     #: When the decision was made. Never null on a stored order, and the field
@@ -133,6 +145,7 @@ def _to_view(order: Order) -> OrderHistoryView:
         status=order.status.value,
         purpose=order.purpose,
         reject_reason=order.reject_reason,
+        rejected_by=order.rejected_by,
         strategy_id=order.strategy_id,
         signal_id=order.signal_id,
         created_at=order.created_at,

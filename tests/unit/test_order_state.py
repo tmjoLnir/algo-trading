@@ -97,7 +97,54 @@ class TestTransition:
         transition(order, OrderStatus.SUBMITTED, at=TS)
         assert order.submitted_at == TS
 
-        transition(order, OrderStatus.REJECTED, reason="halted symbol")
+        transition(order, OrderStatus.REJECTED, reason="halted symbol", rejected_by="alpaca-paper")
+        assert order.reject_reason == "halted symbol"
+        assert order.rejected_by == "alpaca-paper"
+
+    def test_a_refusal_records_who_as_well_as_why(self) -> None:
+        """The two were computed together and only one was kept.
+
+        `RiskDecision` carries `rule` beside `reason`, and the router passed the
+        reason alone — so a stored refusal could say "no price available for
+        SPY" without naming which of the three rules that check a price had
+        said it. Taken together here so they cannot drift apart again.
+        """
+        order = _order(qty="100")
+        order.status = OrderStatus.PENDING_RISK
+
+        transition(
+            order,
+            OrderStatus.REJECTED_RISK,
+            reason="SPY would take gross exposure to 112% of equity",
+            rejected_by="max_gross_exposure",
+        )
+
+        assert order.rejected_by == "max_gross_exposure"
+        assert order.reject_reason == "SPY would take gross exposure to 112% of equity"
+
+    def test_it_records_a_refuser_on_no_other_status(self) -> None:
+        """A cancel is not a refusal. Stamping one would put a rule name on an
+        order nothing refused, which the screen reads as "this was refused"."""
+        order = _order(qty="100")
+        order.status = OrderStatus.SUBMITTED
+
+        transition(order, OrderStatus.CANCELLED, reason="pulled", rejected_by="kill_switch")
+
+        assert order.rejected_by is None
+        assert order.reject_reason is None
+
+    def test_a_redelivered_refusal_does_not_blank_the_refuser(self) -> None:
+        """Brokers re-send, and a repeat of a status the order already holds is
+        discarded. It must leave the refusal it already recorded standing —
+        a redelivery that arrived carrying neither half would otherwise erase
+        the record of who refused and why."""
+        order = _order(qty="100")
+        order.status = OrderStatus.PENDING_SUBMIT
+        transition(order, OrderStatus.REJECTED, reason="halted symbol", rejected_by="alpaca-live")
+
+        assert not transition(order, OrderStatus.REJECTED)
+
+        assert order.rejected_by == "alpaca-live"
         assert order.reject_reason == "halted symbol"
 
     def test_it_never_stamps_filled_at(self) -> None:

@@ -2017,9 +2017,10 @@ export interface components {
          *     to describe a finished one — which needs the three fields that one has no
          *     use for and would be null on every row it serves.
          *
-         *     `reject_reason` is the field this whole endpoint is for. `purpose` is the
-         *     second: it says whether an order was an entry, a stop or a target, and it is
-         *     the only thing that can distinguish two exits that agree on everything else.
+         *     `reject_reason` is the field this whole endpoint is for, and `rejected_by`
+         *     is its other half — why, and who. `purpose` is the second: it says whether
+         *     an order was an entry, a stop or a target, and it is the only thing that can
+         *     distinguish two exits that agree on everything else.
          *
          *     Every monetary field is a `Decimal` and reaches the browser as a string
          *     (docs/DASHBOARD.md).
@@ -2049,6 +2050,8 @@ export interface components {
             qty: string;
             /** Reject Reason */
             reject_reason: string | null;
+            /** Rejected By */
+            rejected_by: string | null;
             /** Side */
             side: string;
             /** Signal Id */

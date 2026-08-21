@@ -80,6 +80,17 @@ class TradeUpdate:
     #: disagreement gets resolved.
     position_qty: Decimal | None = None
     reason: str | None = None
+    #: Which venue this event came from, as `BrokerPort.name` reports it.
+    #: Recorded as `Order.rejected_by` when the event refuses the order, so a
+    #: rejection pushed on the stream names its refuser like the two
+    #: router-side refusal paths do.
+    #:
+    #: On the event rather than passed alongside it: this is the *venue's* view
+    #: of an order, and nothing between the adapter and the applier knows which
+    #: venue that is — the runner reaches a broker only through the router
+    #: (rule §1.5), so asking it to supply the name would mean handing it the
+    #: one dependency that rule exists to keep away from it.
+    broker: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

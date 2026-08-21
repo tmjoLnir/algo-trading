@@ -866,7 +866,12 @@ class OrderRouter:
 
         decision = self.risk_engine.validate(order, portfolio)
         if not decision.approved:
-            transition(order, OrderStatus.REJECTED_RISK, reason=decision.reason)
+            transition(
+                order,
+                OrderStatus.REJECTED_RISK,
+                reason=decision.reason,
+                rejected_by=decision.rule,
+            )
             metrics.order_rejected("risk")
             log.warning(
                 "order.risk_denied",
@@ -886,7 +891,7 @@ class OrderRouter:
         # plain constructor, and an order for nothing must not reach a venue.
         if order.qty <= 0:
             reason = f"risk left {order.qty} of {order.symbol} to trade"
-            transition(order, OrderStatus.REJECTED_RISK, reason=reason)
+            transition(order, OrderStatus.REJECTED_RISK, reason=reason, rejected_by=ROUTING)
             metrics.order_rejected("risk")
             return SubmitResult.refused(ROUTING, reason, order)
 
@@ -902,7 +907,7 @@ class OrderRouter:
         except OrderRejectedError as exc:
             metrics.order_submit_seconds(self.broker.name, time.perf_counter() - started)
             metrics.order_rejected("broker")
-            transition(order, OrderStatus.REJECTED, reason=str(exc))
+            transition(order, OrderStatus.REJECTED, reason=str(exc), rejected_by=self.broker.name)
             log.warning(
                 "order.broker_rejected",
                 order_id=order.id,
@@ -991,7 +996,9 @@ class OrderRouter:
 
         reported = acknowledged.status
         if reported in (OrderStatus.REJECTED, OrderStatus.CANCELLED, OrderStatus.EXPIRED):
-            transition(order, reported, reason=acknowledged.reject_reason)
+            transition(
+                order, reported, reason=acknowledged.reject_reason, rejected_by=self.broker.name
+            )
             return False
         if reported in (OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED):
             log.info(

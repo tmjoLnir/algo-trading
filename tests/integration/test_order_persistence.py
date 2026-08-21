@@ -566,6 +566,7 @@ class TestTheHistoryRead:
         symbol: str = "SPY",
         strategy_id: str | None = None,
         reject_reason: str | None = None,
+        rejected_by: str | None = None,
         run_mode: RunMode = RunMode.PAPER,
     ) -> Order:
         order = Order(
@@ -580,6 +581,7 @@ class TestTheHistoryRead:
         )
         order.status = status
         order.reject_reason = reject_reason
+        order.rejected_by = rejected_by
         await orders.save(order, run_mode=run_mode)
         return order
 
@@ -622,6 +624,81 @@ class TestTheHistoryRead:
         assert [o.client_order_id for o in rows] == ["atp-refused"]
         assert rows[0].reject_reason == "MaxPositionSize: 500 exceeds the 100 limit"
         assert await orders.filled_orders(RunMode.PAPER, until=T0 + timedelta(days=1)) == []
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_comes_back_with_the_rule_that_made_it(
+        self, orders: PostgresOrderRepository
+    ) -> None:
+        """Who refused, not only why, survives the round trip.
+
+        The two are stored in separate columns and read back separately, so
+        this pins that the *pair* survives — a reason restored beside a null
+        refuser is the pre-`b8e3f01c7d24` row, and a screen has to be able to
+        tell that apart from a refusal that named its rule.
+        """
+        await self._store(
+            orders,
+            "atp-over-exposed",
+            created_at=T0,
+            status=OrderStatus.REJECTED_RISK,
+            reject_reason="SPY would take gross exposure to 112% of equity",
+            rejected_by="max_gross_exposure",
+        )
+
+        rows = await orders.recent_orders(RunMode.PAPER)
+
+        assert rows[0].rejected_by == "max_gross_exposure"
+        assert rows[0].reject_reason == "SPY would take gross exposure to 112% of equity"
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_stored_without_a_rule_reads_back_null(
+        self, orders: PostgresOrderRepository
+    ) -> None:
+        """Every refusal written before the column existed, permanently.
+
+        `f4d2e8b1a075` could backfill `signals.rejected_by` because the rule
+        had been packed into the reason as `"[rule] reason"`. An order's reason
+        never carried it, so there was nothing for the migration to parse and
+        these rows stay null. Pinned because the read path must not invent a
+        rule for them — a guessed refuser points a reader at a limit that did
+        not refuse anything.
+        """
+        await self._store(
+            orders,
+            "atp-legacy-refusal",
+            created_at=T0,
+            status=OrderStatus.REJECTED_RISK,
+            reject_reason="over the limit",
+        )
+
+        rows = await orders.recent_orders(RunMode.PAPER)
+
+        assert rows[0].rejected_by is None
+        assert rows[0].reject_reason == "over the limit"
+
+    @pytest.mark.asyncio
+    async def test_a_venue_refusal_names_the_broker_in_the_same_column(
+        self, orders: PostgresOrderRepository
+    ) -> None:
+        """One column, two vocabularies, told apart by `status`.
+
+        Sharing is what lets a reader ask "who refused this order" once. It
+        stays countable by rule because `rejected_risk` and `rejected` select
+        the two apart.
+        """
+        await self._store(
+            orders,
+            "atp-venue-refused",
+            created_at=T0,
+            status=OrderStatus.REJECTED,
+            reject_reason="insufficient buying power",
+            rejected_by="alpaca-paper",
+        )
+
+        rows = await orders.recent_orders(RunMode.PAPER)
+
+        assert rows[0].status is OrderStatus.REJECTED
+        assert rows[0].rejected_by == "alpaca-paper"
 
     @pytest.mark.asyncio
     async def test_the_limit_keeps_the_newest_rather_than_the_first(

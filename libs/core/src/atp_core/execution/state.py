@@ -103,6 +103,7 @@ def transition(
     *,
     at: datetime | None = None,
     reason: str | None = None,
+    rejected_by: str | None = None,
 ) -> bool:
     """Move an order to `target`, through the table rather than around it.
 
@@ -121,10 +122,18 @@ def transition(
     meaningful when a *fill* comes with it — which is `Order.apply_fill`'s job,
     not this one.
 
-    `at` and `reason` fill the fields that belong to the move itself, so a
-    caller cannot record the transition and forget the timestamp that explains
-    it. `filled_at` is deliberately absent: it is set by `apply_fill` from the
-    fill's own timestamp, because a status carries no execution time.
+    `at`, `reason` and `rejected_by` fill the fields that belong to the move
+    itself, so a caller cannot record the transition and forget the timestamp
+    that explains it. `filled_at` is deliberately absent: it is set by
+    `apply_fill` from the fill's own timestamp, because a status carries no
+    execution time.
+
+    `rejected_by` is *who* refused and `reason` is *why*. They are taken at one
+    call for the reason the pair exists at all: both are computed together —
+    `RiskDecision` carries `rule` beside `reason` — and recorded separately they
+    drift, which is how the rule came to be logged while only the reason was
+    stored. Either may still arrive alone, because a venue can refuse without
+    saying why: the broker's name is known and the reason is not.
     """
     current = order.status
     if current is target:
@@ -143,6 +152,12 @@ def transition(
     order.status = target
     if target is OrderStatus.SUBMITTED and at is not None:
         order.submitted_at = at
-    if reason is not None and target in (OrderStatus.REJECTED, OrderStatus.REJECTED_RISK):
-        order.reject_reason = reason
+    # Only on a refusal, and each guarded separately so a caller that knows one
+    # half does not blank the other — `_adopt` names the broker it submitted to
+    # whether or not the venue's copy carried a reason.
+    if target in (OrderStatus.REJECTED, OrderStatus.REJECTED_RISK):
+        if reason is not None:
+            order.reject_reason = reason
+        if rejected_by is not None:
+            order.rejected_by = rejected_by
     return True

@@ -295,6 +295,32 @@ class TestStatusTranslation:
         )
         assert order.reject_reason == "symbol halted"
 
+    def test_a_trade_update_names_the_venue_it_came_from(self) -> None:
+        """The adapter stamps its own name, because nothing downstream can.
+
+        A rejection pushed on this stream is one of the three ways a venue
+        refusal reaches an order, and it is the only one with no broker within
+        reach when it lands: the runner consumes the stream and reaches a
+        broker only through the router (rule §1.5). Carried on the event, it
+        becomes `Order.rejected_by` in `execution.trade_updates`.
+        """
+        broker = make_broker()
+        update = broker._to_trade_update(
+            {
+                "stream": "trade_updates",
+                "data": {
+                    "event": "rejected",
+                    "order": order_payload(status="rejected", reject_reason="symbol halted"),
+                },
+            }
+        )
+
+        assert update is not None
+        # Paper and live are different venues and the name separates them, the
+        # same distinction `run_mode` keeps in the order table.
+        assert update.broker == broker.name == "alpaca-paper"
+        assert update.reason == "symbol halted"
+
 
 class TestFillTranslation:
     def test_prices_and_quantities_arrive_as_decimal(self) -> None:

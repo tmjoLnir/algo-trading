@@ -67,6 +67,14 @@ def apply_trade_update(order: Order, update: TradeUpdate) -> bool:
     replayed status, an event carrying neither. Raises `ReconciliationError`
     for the cases where our book and the venue's have genuinely diverged, which
     is a page-a-human outcome rather than a branch to handle (docs/RUNBOOK.md).
+
+    A status event that refuses the order records `update.broker` as its
+    refuser. This is the third of the three ways a venue refusal reaches an
+    order — the other two are the router's, on submission and on
+    acknowledgement — and it is the one that had no venue name within reach,
+    because the runner consumes this stream and reaches a broker only through
+    the router (rule §1.5). Carrying it on the event is what avoids handing the
+    runner that dependency.
     """
     if update.client_order_id != order.client_order_id:
         raise ReconciliationError(
@@ -151,7 +159,9 @@ def _apply_status(order: Order, update: TradeUpdate) -> bool:
         # its first positional argument, so an `event=` keyword collides with it.
         log.debug("execution.trade_update.no_op", venue_event=update.event, order_id=order.id)
         return False
-    return state.transition(order, update.status, at=update.at, reason=update.reason)
+    return state.transition(
+        order, update.status, at=update.at, reason=update.reason, rejected_by=update.broker
+    )
 
 
 def _already_seen(order: Order, update: TradeUpdate) -> bool:

@@ -189,6 +189,26 @@ the runner dropped a refused order at all four places it can be refused, so the
 table's most important category of row could not exist. The write path exists
 now.
 
+**A refused row now names its refuser as well as its reason** (#79). The row #78
+finally produced still could not say *which* rule refused it: `RiskDecision`
+carries `rule` beside `reason` and the router passed only the reason into
+`transition()`, so the rule reached the structured log and never the table. A
+reason alone does not identify a limit — three separate rules refuse with "no
+price available for SPY" — and the rule name is the one string that gets a
+reader from a refusal to the ceiling that predicted it, which is exactly the
+cross-reference the risk limits panel is laid out for. `orders.rejected_by`
+(migration `b8e3f01c7d24`) holds a rule name, the pre-rule stage `routing`, or
+the broker when the venue was the refuser; `status` says which of the two
+vocabularies to read it in, which keeps refusals countable by rule while one
+column answers "who refused this order".
+
+Unlike `signals.rejected_by`, **it could not be backfilled**. There the rule had
+been packed into the reason as `"[rule] reason"` and the migration parsed it
+back out. An order's reason never carried it, so every refusal stored before the
+column says its refuser was not recorded — permanently, not until some
+straggling writer catches up. The table states that rather than leaving the line
+blank, the same admission `purpose` makes on rows that predate its own column.
+
 **Outstanding**
 
 - Read-only. `POST /orders`, `DELETE /orders/{id}` and `POST /orders/cancel-all`

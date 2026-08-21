@@ -90,6 +90,23 @@ class Order:
     submitted_at: datetime | None = None
     filled_at: datetime | None = None
     reject_reason: str | None = None
+    #: *Who* refused this order, where `reject_reason` is *why*. A risk refusal
+    #: names the rule (`max_gross_exposure`, `kill_switch`) or the pre-rule
+    #: stage that refused (`routing`); a venue refusal names the broker.
+    #:
+    #: Both halves were already computed and only one was kept. `RiskDecision`
+    #: carries `rule` beside `reason`, and the router logged both and stored the
+    #: reason alone — so a refused order could say "no price available for SPY"
+    #: and never say which of the three rules that check a price had said it.
+    #: Unlike `signals.rejected_by`, there is no recovering it from the reason
+    #: text: the rule name was never packed in there, so rows written before
+    #: this field existed are null and stay null.
+    #:
+    #: Read with `status`, which says which vocabulary this is drawn from:
+    #: `rejected_risk` means a rule name, `rejected` means a broker. That
+    #: pairing is what keeps "refusals by rule" countable while still letting
+    #: one column answer "who refused this order".
+    rejected_by: str | None = None
 
     def __post_init__(self) -> None:
         if self.qty <= 0:

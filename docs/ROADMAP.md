@@ -505,6 +505,30 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   failed evaluations halt trading — so raising would let the record of a refused
   stop become the thing that stops the platform.
 
+  **And the row could not name its refuser until #79.** #78 gave `/orders` its
+  first refused row; the rule that refused it was still dropped one layer down.
+  `RiskDecision` carries `rule` beside `reason` and `OrderRouter._route` passed
+  only the reason into `transition()`, so the rule reached the structured log
+  and never the table. A reason on its own does not identify a limit — three
+  rules refuse with "no price available for SPY" — and the rule name is what
+  gets a reader from a refusal to the ceiling that predicted it, which the risk
+  limits panel is laid out for and had no counterpart to be read against.
+
+  `orders.rejected_by` (`b8e3f01c7d24`) is set inside `transition()` beside
+  `reject_reason`, on the same condition and from the same call, because the two
+  drifting apart is how the rule came to be logged and the reason stored. It
+  holds a rule name, the pre-rule stage `routing` where the chain approved and
+  left nothing to trade, or the broker where the venue refused — `status` says
+  which vocabulary applies, which is what keeps refusals countable by rule while
+  one column answers "who refused this order". All three venue paths fill it,
+  including the pushed one: the name travels on `TradeUpdate` because the runner
+  consumes that stream and reaches a broker only through the router (rule §1.5).
+
+  Unlike `signals.rejected_by`, **there was nothing to backfill**. That column
+  was reconstructed by unpacking `"[rule] reason"`; an order's reason never
+  carried the rule, so rows written before this one are null permanently and
+  the table says so rather than leaving the line blank.
+
 **Before any live order path exists.** Not after.
 
 *Verifiable (proposed):* a strategy that tries to breach every limit is refused
@@ -1156,11 +1180,14 @@ wording if it is not the demonstration you want.
   it. A strategy refused every morning for a month was, from the dashboard and
   from analytics alike, indistinguishable from one that never placed an order.
 
-  Unticked. The SQL is covered by seven integration tests against a real
-  PostgreSQL in CI, and the handler and screen by 12 API and 15 web tests — but
+  Unticked. The SQL is covered by ten integration tests against a real
+  PostgreSQL in CI, and the handler and screen by 12 API and 18 web tests — but
   every row in all of them is a fixture. Nothing here has yet displayed an order
   a *worker* placed and a real risk rule refused, which is what the line below
-  asks for.
+  asks for. #79 narrowed the gap by one step without closing it: the screen can
+  now name the rule that refused a row, so what the paper week has to show is a
+  refusal displayed under the name of the rule that actually made it — but the
+  rows demonstrating it are still fixtures.
 
 - [ ] Stored-book positions endpoint and screen — @claude.
   `GET /api/v1/positions` and the `/positions` tab. Third of the five stub tabs,

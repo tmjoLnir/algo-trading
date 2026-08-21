@@ -748,6 +748,7 @@ class AlpacaBroker:
             fill=fill,
             position_qty=None if position_qty is None else _as_decimal(position_qty),
             reason=str(payload.get("reject_reason")) if payload.get("reject_reason") else None,
+            broker=self.name,
         )
 
     # ── translation ─────────────────────────────────────────────────────────
