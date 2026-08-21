@@ -7,13 +7,31 @@ strategy that placed it.
 
 `ensure` is an upsert that deliberately updates almost nothing, and the
 asymmetry between insert and update is the point. On a **first** boot the worker
-is the only thing that knows this strategy exists, so it writes what it has —
-including `state="active"`, because a strategy a worker is running is not a
-draft. On every **later** boot the row may have been edited by a
-strategy-management API that knows more about it than a booting worker does, so
-only `updated_at` moves. That keeps "when did a worker last run this?"
-answerable without letting a restart quietly reset a strategy someone had
-configured.
+is the only thing that knows this strategy exists, so it writes what it has. On
+every **later** boot the row may have been edited by a strategy-management API
+that knows more about it than a booting worker does, so only `updated_at` moves.
+That keeps "when did a worker last run this?" answerable without letting a
+restart quietly reset a strategy someone had configured.
+
+**The state a first boot writes is `draft`, and this used to be `"active"`** —
+a string that is not a member of `StrategyState` at all, which nothing rejected
+because the column is a plain `String(20)`. The consequence was not cosmetic: it
+was the only value any row could ever hold, so filtering by any real state
+matched nothing, and the dashboard's filter offered four options that could not
+occur.
+
+The word was wrong, and so was the reasoning behind it — "a strategy a worker is
+running is not a draft" conflates *running* with *promoted*. `state` is the
+rung a strategy has been promoted to on the ratchet (draft → backtesting →
+paper → live), and every rung above the first is a human decision the API is
+supposed to gate. A booting worker has been granted nothing by anybody; it is
+running because somebody set `WORKER_STRATEGY`, which is a fact about the
+deployment rather than an authorisation. A worker that wrote itself onto a
+higher rung would be the ratchet with its pawl removed.
+
+Nothing is lost by saying `draft`, because the question that word seems to
+answer is answered elsewhere and better: *is it running* is `updated_at`, which
+this method bumps on every boot and which the API serves as `last_started_at`.
 """
 
 from __future__ import annotations
@@ -23,18 +41,52 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from atp_core.domain import StrategyState
 from atp_core.logging import get_logger
 from atp_core.persistence.db import session_scope
 from atp_core.persistence.models import StrategyRow
 from atp_core.strategy.ports import StoredStrategy, StrategyRecord
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from atp_core.clock import Clock
     from atp_core.strategy.ports import StrategyRepository
 
 log = get_logger(__name__)
+
+
+def first_boot_values(record: StrategyRecord, now: datetime) -> dict[str, object]:
+    """The columns a first boot writes into `strategies`.
+
+    Pulled out of `ensure` so they can be asserted **without a database**, and
+    that is the whole reason it is a function. The defect this module's
+    docstring describes lived in this dict: a `state` of `"active"`, which
+    `StrategyState` has never contained. It survived four phases because the
+    only place it was observable was a real Postgres — mypy cannot see into
+    `.values()`, which takes `Any`, and every other layer read the column back
+    as the `str` it is.
+
+    `state` is the enum member rather than its value, which SQLAlchemy stores as
+    the string either way. Referring to the member is what makes a typo a
+    `mypy` error instead of a row nothing can match.
+    """
+    return {
+        "id": record.id,
+        "name": record.name,
+        "description": "",
+        "kind": record.kind,
+        "class_name": record.class_name,
+        "params": dict(record.params or {}),
+        "ruleset": None,
+        "state": StrategyState.DRAFT,
+        "universe": list(record.universe),
+        "timeframe": record.timeframe,
+        "created_at": now,
+        "updated_at": now,
+    }
 
 
 class PostgresStrategyRepository:
@@ -49,25 +101,17 @@ class PostgresStrategyRepository:
         self._clock = clock
 
     async def ensure(self, record: StrategyRecord) -> None:
-        """Create the row if it is absent; otherwise only bump `updated_at`."""
+        """Create the row if it is absent; otherwise only bump `updated_at`.
+
+        The new row starts at `draft` — the ratchet's first rung, and the
+        column's own default. See the module docstring for why a running worker
+        does not put itself on a higher one.
+        """
         now = self._clock.now()
         async with session_scope(self._session_factory) as session:
             await session.execute(
                 pg_insert(StrategyRow)
-                .values(
-                    id=record.id,
-                    name=record.name,
-                    description="",
-                    kind=record.kind,
-                    class_name=record.class_name,
-                    params=dict(record.params or {}),
-                    ruleset=None,
-                    state="active",
-                    universe=list(record.universe),
-                    timeframe=record.timeframe,
-                    created_at=now,
-                    updated_at=now,
-                )
+                .values(**first_boot_values(record, now))
                 # Only the timestamp. See the module docstring: everything else
                 # in this row may have been edited by someone who knows more
                 # about it than a booting worker does, and an upsert that reset

@@ -29,6 +29,7 @@ import pytest
 from atp_api.auth import Scope, Session
 from atp_api.deps import get_current_session, get_strategy_repository
 from atp_api.main import create_app
+from atp_core.domain import StrategyState
 from atp_core.strategy import registry
 from atp_core.strategy.ports import StoredStrategy
 from tests.fakes import FakeStrategyRepository
@@ -52,7 +53,7 @@ def a_strategy(
     strategy_id: str = SHIPPED,
     *,
     name: str | None = None,
-    state: str = "active",
+    state: str = StrategyState.DRAFT,
     kind: str = "coded",
     created_at: datetime = T0,
     started_at: datetime | None = None,
@@ -225,8 +226,8 @@ class TestTheStateFilter:
         self, client: httpx.AsyncClient, strategies: FakeStrategyRepository
     ) -> None:
         strategies.rows = [
-            a_strategy("live_one", state="active"),
-            a_strategy("old_one", state="paused"),
+            a_strategy("live_one", state=StrategyState.LIVE),
+            a_strategy("old_one", state=StrategyState.PAUSED),
         ]
 
         body = (await client.get(f"{STRATEGIES}?state=paused")).json()
@@ -243,10 +244,47 @@ class TestTheStateFilter:
         one nothing has ever loaded — which is the opposite of the truth, on the
         single field this endpoint exists to get right.
         """
-        strategies.rows = [a_strategy(SHIPPED, state="active")]
+        strategies.rows = [a_strategy(SHIPPED, state=StrategyState.LIVE)]
 
         body = (await client.get(f"{STRATEGIES}?state=paused")).json()
 
         assert body["strategies"] == []
         assert body["never_run"] == []
         assert body["available"][0]["has_run"] is True
+
+    @pytest.mark.asyncio
+    async def test_every_rung_of_the_ratchet_is_a_valid_filter(
+        self, client: httpx.AsyncClient, strategies: FakeStrategyRepository
+    ) -> None:
+        """All six, and the screen's filter has to offer exactly these.
+
+        The dashboard used to offer `backtest` and `active` — neither a member —
+        and to omit `live` and `halted`. Every option it listed but one matched
+        nothing by construction.
+        """
+        for rung in StrategyState:
+            strategies.rows = [a_strategy("one", state=rung)]
+
+            response = await client.get(f"{STRATEGIES}?state={rung.value}")
+
+            assert response.status_code == 200, rung
+            assert [s["id"] for s in response.json()["strategies"]] == ["one"], rung
+
+    @pytest.mark.asyncio
+    async def test_a_state_that_is_not_a_rung_is_refused(
+        self, client: httpx.AsyncClient, strategies: FakeStrategyRepository
+    ) -> None:
+        """422, not an empty 200.
+
+        As a bare string this returned `200` with no rows, which reads as "no
+        strategy is in that state" and is indistinguishable from the truth —
+        the wrong half of the two to believe. `active` is the case that matters:
+        it was written into every row for four phases, so it is the word a
+        person is most likely to still be typing.
+        """
+        strategies.rows = [a_strategy("one", state=StrategyState.DRAFT)]
+
+        response = await client.get(f"{STRATEGIES}?state=active")
+
+        assert response.status_code == 422
+        assert "draft" in response.text, "the refusal should name the rungs that exist"

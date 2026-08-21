@@ -318,9 +318,12 @@ Two labels here are deliberately not the column names behind them, because the
 columns mean less than they say:
 
 - **`state` is not "is it running now".** `StrategyRepository.ensure` writes
-  `active` when it creates a row and never touches it again, so a strategy no
-  worker has loaded for a month still reads `active`. The screen shows it as the
-  configured state and puts the liveness question on the timestamp instead.
+  `draft` when it creates a row and never touches it again, so a strategy a
+  worker has been running for a month still reads `draft` — that is the
+  ratchet's first rung and the endpoints that would promote it off are stubs.
+  The screen shows it as the configured state and puts the liveness question on
+  the timestamp instead. It wrote `active` until #PR, which `StrategyState` has
+  never contained; a CHECK constraint now refuses anything outside the enum.
 - **`updated_at` is not "last edited".** The same asymmetry — a later boot bumps
   only the timestamp — so the API serves it as `last_started_at` and the column
   header reads "a worker last started this". Under its own name it would invite
@@ -339,7 +342,7 @@ computed against the **unfiltered** table. Otherwise filtering to `paused` would
 report every active strategy as one nothing has ever loaded.
 
 **Only the read is built**, and here the reason is sharper than elsewhere.
-Create, edit, promote and pause are the promotion ratchet — draft → backtest →
+Create, edit, promote and pause are the promotion ratchet — draft → backtesting →
 paper → live. One of its two missing preconditions is now available and the other
 is not: `backtest_runs` has a reader as of the backtests page, so "a completed
 backtest on record" is answerable, but the audit trail's lifecycle verbs are still

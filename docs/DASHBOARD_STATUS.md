@@ -118,15 +118,24 @@ stated above them.
   /{id}/pause`, `GET /{id}`, `GET /strategies/available`
   (`strategies.py:225,238,249,257,275,282`). The page says so and explains why —
   the promotion ratchet's preconditions cannot be checked yet.
-- **The lifecycle vocabulary has drifted three ways.** `STRATEGY_STATES` in
-  `useStrategies.ts:27` offers `draft, backtest, paper, active, paused`. The
-  domain enum `StrategyState` has `draft, backtesting, paper, live, paused,
-  halted`. And `StrategyRepository.ensure` writes the literal `"active"`
-  (`persistence/strategies.py:65`), which is not a member of that enum at all —
-  the column is a plain `String(20)`, so nothing rejects it. Net effect: the
-  filter can never match `backtesting`, `live` or `halted`, and `draft` and
-  `paused` are unreachable because nothing writes them. Only `active` and
-  `paper` can ever appear.
+- ~~**The lifecycle vocabulary has drifted three ways.**~~ **Fixed (#PR.)**
+  `STRATEGY_STATES` offered `draft, backtest, paper, active, paused`; the domain
+  enum `StrategyState` had `draft, backtesting, paper, live, paused, halted`;
+  and `StrategyRepository.ensure` wrote the literal `"active"`, which was not a
+  member of that enum at all, into a plain `String(20)` nothing checked.
+
+  This audit understated it. `ensure` is the **only** writer of a state value in
+  the platform — the strategy write endpoints are all stubs — so `active` was
+  not one possible value among several, it was the only value any row could ever
+  hold. Of the filter's five options, four could not match by construction and
+  the fifth matched a state the domain did not recognise.
+
+  Now: `ensure` writes `draft`, the ratchet's first rung; a CHECK constraint
+  refuses anything outside the enum (migration `e2b6d1a70f93`, which rewrites
+  the existing rows first); the API's `state` filter is the enum, so a typo is a
+  422 rather than an empty 200; and the screen's filter and tint map are both
+  `Record`s over the generated union, so a rung added on the server fails `tsc`
+  here until somebody labels it.
 - Stored descriptions are always blank — `ensure` writes `description=""` and
   no write path exists to fill it, so the description column renders empty for
   every row a worker created. The registry descriptions beneath it are the only

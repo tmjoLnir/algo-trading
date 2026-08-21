@@ -1063,10 +1063,17 @@ export interface paths {
          *     identical to "nothing is written".
          *
          *     `state` filters the stored half only. The registry has no state — a class is
-         *     not draft or active, it is just compiled — so a filtered request still
+         *     not draft or live, it is just compiled — so a filtered request still
          *     reports every available class, and `never_run` is still computed against the
          *     unfiltered table rather than against the filtered view. Otherwise filtering
-         *     to `paused` would report every active strategy as never run.
+         *     to `paused` would report every running strategy as never run.
+         *
+         *     It is the `StrategyState` enum rather than a bare string, so an unrecognised
+         *     value is a 422 naming the six rungs. As a string a typo returned `200` with
+         *     an empty list, which reads as "no strategy is in that state" — indistinguishable
+         *     from the truth, and the wrong half of the two to believe. This is the same
+         *     class of defect the whole change fixes, one layer up: a state vocabulary
+         *     nothing was checking.
          *
          *     Unscoped by run mode: `strategies` has no such column, because a strategy is
          *     the same strategy whichever mode runs it. Its *orders* are separable, and
@@ -2371,10 +2378,18 @@ export interface components {
          *     Two fields carry a health warning, and the response says so rather than
          *     leaving each client to discover it:
          *
-         *     `state` is **not** "is it running now". `ensure` writes `"active"` when it
-         *     creates a row and never touches it again, so a strategy no worker has loaded
-         *     for a month still reads `active`. It is the configured lifecycle state, and
+         *     `state` is **not** "is it running now". `ensure` writes `draft` when it
+         *     creates a row and never touches it again, so a strategy a worker has been
+         *     running for a month still reads `draft` — that is the ratchet's first rung
+         *     and nothing has promoted it off. It is the configured lifecycle state, and
          *     today nothing but a first boot ever sets it.
+         *
+         *     Typed `str` and not `StrategyState`, deliberately, and the asymmetry with
+         *     the filter below is the point. This is a **response**: a database that has
+         *     not run the `e2b6d1a70f93` migration still holds `active`, and a row written
+         *     by a newer version may hold a rung this one has never heard of. A response
+         *     model that refused either would turn a readable screen into a 500 over a
+         *     word. Input is the opposite case and is validated.
          *
          *     `last_started_at` is the `updated_at` column, renamed to what it actually
          *     means. The same asymmetry: an existing row has only its timestamp bumped, at
@@ -2522,6 +2537,11 @@ export interface components {
              */
             updated_at: string;
         };
+        /**
+         * StrategyState
+         * @enum {string}
+         */
+        StrategyState: "draft" | "backtesting" | "paper" | "live" | "paused" | "halted";
         /**
          * Timeframe
          * @enum {string}
@@ -3763,7 +3783,7 @@ export interface operations {
     list_strategies_api_v1_strategies_get: {
         parameters: {
             query?: {
-                state?: string | null;
+                state?: components["schemas"]["StrategyState"] | null;
             };
             header?: never;
             path?: never;

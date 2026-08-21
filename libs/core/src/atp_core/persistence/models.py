@@ -22,6 +22,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -31,6 +32,8 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+from atp_core.domain import StrategyState
 
 MONEY = Numeric(20, 8)
 
@@ -73,8 +76,30 @@ class BarRow(Base):
     trade_count: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
+#: The states a `strategies` row may hold, as a SQL predicate.
+#:
+#: Built from `StrategyState` rather than written out, so adding a rung to the
+#: ratchet cannot leave the database accepting a value the domain does not know
+#: — or refusing one it does.
+STRATEGY_STATES_SQL = ", ".join(f"'{state.value}'" for state in StrategyState)
+
+
 class StrategyRow(Base):
     __tablename__ = "strategies"
+    #: `state` was a bare `String(20)` and the repository wrote `"active"` into
+    #: it — a value `StrategyState` has never contained. Nothing anywhere
+    #: objected, so every row in the table held a state no filter could match.
+    #:
+    #: A CHECK rather than a native PG enum: adding a rung is then one migration
+    #: altering one constraint, instead of an `ALTER TYPE` that cannot run in a
+    #: transaction on older servers. And unlike `audit_log.action` — which stays
+    #: deliberately unconstrained because an append-only record must remain
+    #: readable when the vocabulary changes — this column is current
+    #: configuration over a closed set, so a value outside it is a bug rather
+    #: than history.
+    __table_args__ = (
+        CheckConstraint(f"state IN ({STRATEGY_STATES_SQL})", name="ck_strategies_state"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     name: Mapped[str] = mapped_column(String(100), unique=True)
@@ -84,7 +109,10 @@ class StrategyRow(Base):
     class_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     params: Mapped[JsonDict] = mapped_column(JSON, default=dict)
     ruleset: Mapped[JsonDict | None] = mapped_column(JSON, nullable=True)
-    state: Mapped[str] = mapped_column(String(20), default="draft")
+    #: The ratchet rung this strategy has been promoted to, never "is it running
+    #: now" — that is `updated_at`. Defaulted from the enum so the default and
+    #: the constraint above cannot disagree.
+    state: Mapped[str] = mapped_column(String(20), default=StrategyState.DRAFT)
     universe: Mapped[JsonList] = mapped_column(JSON, default=list)
     timeframe: Mapped[str] = mapped_column(String(8), default="1d")
     risk_config: Mapped[JsonDict] = mapped_column(JSON, default=dict)

@@ -14,24 +14,46 @@
 
 import { useQuery } from '@tanstack/react-query'
 import { apiGet } from '@/api/client'
-import type { StrategiesResponse } from '@/api/types'
+import type { StrategiesResponse, StrategyState } from '@/api/types'
 
 /**
- * Lifecycle states the filter offers.
+ * The rungs of the promotion ratchet, in ratchet order.
  *
- * `active` is the only one a worker ever writes, and it writes it once — see
- * the page for why that is not "running now". The others exist in the schema
- * and are reachable only once something can edit a strategy, which is a write
- * and is not built.
+ * **A `Record` over the generated union rather than a hand-written array, and
+ * that is the whole point of it.** This list used to be written out by hand and
+ * had drifted from the server in both directions at once: it offered `backtest`
+ * and `active` — neither of which `StrategyState` has ever contained — and
+ * omitted `live` and `halted` entirely. Four of its five options could not
+ * match a row by construction, and the fifth matched only because the
+ * repository was writing a state that was not a member either.
+ *
+ * Typed this way, a rung added to the server's enum fails `tsc` here until
+ * somebody gives it a label, and a label for something that is not a rung fails
+ * too. The drift becomes a build error instead of an empty filter nobody
+ * questions.
+ *
+ * Only `draft` is reachable today: `ensure` writes it on a first boot and the
+ * write endpoints that would move a strategy up the ratchet are all stubs. That
+ * is a real state of affairs rather than a gap in this list — see the page for
+ * why `state` is not "is it running now".
  */
-export const STRATEGY_STATES = [
+const STATE_LABEL: Record<StrategyState, string> = {
+  draft: 'Draft',
+  backtesting: 'Backtesting',
+  paper: 'Paper',
+  live: 'Live',
+  paused: 'Paused',
+  halted: 'Halted',
+}
+
+/** The ratchet's rungs in order, behind an "everything" option. */
+export const STRATEGY_STATES: readonly { value: StrategyState | ''; label: string }[] = [
   { value: '', label: 'Every state' },
-  { value: 'draft', label: 'Draft' },
-  { value: 'backtest', label: 'Backtest' },
-  { value: 'paper', label: 'Paper' },
-  { value: 'active', label: 'Active' },
-  { value: 'paused', label: 'Paused' },
-] as const
+  ...(Object.keys(STATE_LABEL) as StrategyState[]).map((value) => ({
+    value,
+    label: STATE_LABEL[value],
+  })),
+]
 
 export function useStrategies(state: string) {
   return useQuery<StrategiesResponse>({
