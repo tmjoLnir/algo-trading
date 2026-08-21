@@ -2107,12 +2107,13 @@ has met a database holding a real strategy's history.
   `docker-compose.yml` now; the overlay's copies are a restatement, and its
   header says so.
 
-  **Two of that item's conclusions were wrong, and an operator found both.** The
-  first was scope: the fix said "`db`, `redis` and `api` carry a policy now", and
-  `web` did not. The overlay puts the dev server behind a profile, so the check
-  added alongside — which read the *deployed* configuration only — could not see
-  the one service still missing one. A reboot brought back the API, the worker,
-  the queue and both stores, and left the thing serving the dashboard stopped.
+  **Two of that item's conclusions were wrong, and an operator found both** —
+  @claude (#84). The first was scope: the fix said "`db`, `redis` and `api`
+  carry a policy now", and `web` did not. The overlay puts the dev server behind
+  a profile, so the check added alongside — which read the *deployed*
+  configuration only — could not see the one service still missing one. A reboot
+  brought back the API, the worker, the queue and both stores, and left the
+  thing serving the dashboard stopped.
   `check_restart_policies` now runs against both configurations, which is where
   it should have been from the start; verified by removing the line and watching
   the check fail.
