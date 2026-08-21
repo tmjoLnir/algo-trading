@@ -181,7 +181,7 @@ exists for: `refused by risk` (our own engine) is a different word from
 `refused by venue`.
 
 **It had never rendered a `rejected_risk` row, and could not have** (fixed in
-#PR). This endpoint's docstring has always said the orders that matter most are
+#78). This endpoint's docstring has always said the orders that matter most are
 the ones that never filled, and that "a rejection appears in no other read in
 the platform"; `OrderHistoryTable` tints `rejected_risk` and shows the reason
 beside it. The whole read path was built and complete. Nothing ever wrote one —
@@ -253,7 +253,7 @@ the record.
   signals" was previously answerable only from the dashboard's signal feed, and
   only for the current book; it is now a durable, filterable query.
 
-  **It surfaced a gap, and #PR closed it.** The runner records a row for every
+  **It surfaced a gap, and #78 closed it.** The runner records a row for every
   *signal* whatever its fate, which is what makes this endpoint possible. Its
   other refusal paths recorded nothing: a **stop exit**, a **protective stop**
   and a **shutdown flatten** the risk chain denied were logged and dropped —

@@ -483,7 +483,7 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   packed form, excluding one rule is a `LIKE` on a bracketed prefix that also
   matches any reason text beginning with a bracket.
 
-  **A gap that endpoint could not close, and #PR closed.** The runner has four
+  **A gap that endpoint could not close, and #78 closed.** The runner has four
   refusal paths and recorded one. `_record_signal` writes a row for every signal
   whatever its fate; a **stop exit**, a **protective stop** and a **shutdown
   flatten** the risk chain denied were logged
