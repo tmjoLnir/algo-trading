@@ -141,6 +141,29 @@ the API name the exact command if the range is empty. The API checks coverage
 *before* queueing, because a run that dies four minutes in for want of history is
 a worse answer than a refusal.
 
+**An empty range is the easy case. A partial one used to be silent.** Asking for
+2017–2025 and holding bars only from late 2020 produced a run that reported the
+window it was asked for and measured a different one, with no error and no
+warning. Two checks in `BacktestEngine._validate` close that:
+
+- **A hole inside a symbol's history is refused** — bars either side of a stretch
+  longer than `max_gap_days` (10 by default) and none inside. There is no benign
+  reading of one: `BacktestContext.closes` slices by *position, not by date*, so
+  a 50-bar average spanning a hole silently averages prices from either side of
+  it, and a bar-counting stop measures the hole as one bar. The refusal names the
+  exact `backfill_bars.py` range to re-fetch. Calendar days against a flat
+  threshold rather than sessions against an exchange calendar, because the engine
+  is handed bars rather than a venue and one run's symbols can trade on exchanges
+  whose holidays disagree; the longest US equity closure this century was six
+  days, so the default clears every weekend and holiday comfortably. Raise it if
+  a symbol genuinely stopped trading for a month — not to quiet a real hole.
+- **A window shorter than the one requested warns.** A series starting after
+  `--start` or ending before `--end` has legitimate causes — an ETF's inception,
+  a delisting, a backfill that has not caught up — so it cannot refuse. One
+  aggregated line per shortfall covers the whole universe rather than one per
+  symbol, and it is placed ahead of everything the run appends, so it survives a
+  caller that prints only the first handful of warnings.
+
 ## Sizing, and what the chain refuses
 
 Both used to be caveats here and neither is any more.
@@ -256,6 +279,25 @@ always over the limit, and nothing said so.
 
 **A Sharpe above 3 on a simple strategy is a bug until proven otherwise.** Check
 fill timing first, then data alignment. It is almost never a discovery.
+
+**Every metric in that table counts closed round trips. `ending_equity` does
+not.** A trade's P&L is only known when it closes, so `num_trades`, `win_rate`,
+`profit_factor` and `expectancy` are computed from completed trips — while
+ending equity marks the still-open ones to the last bar. A run that finishes
+holding winners therefore reports a gain its closed trades never made, and a
+`profit_factor` below 1 can sit directly beneath a positive total return without
+either being wrong.
+
+So the report states both halves. `realized_pnl` is what the closed trips made,
+net of fees; `unrealized_pnl` is the mark on whatever was still open at the end;
+`open_positions` counts them. They add back to `ending_equity - starting_equity`
+exactly, because the realised half is computed as the remainder rather than as a
+second sum that could drift from it. The CLI prints the split under ending equity
+and says how much of the return is a mark.
+
+Read `expectancy` and `realized_pnl` together as the track record. A large
+`unrealized_pnl` is not a result — it is a position, and it is a statement about
+one arbitrary day.
 
 ## Before believing a result
 
