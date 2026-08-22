@@ -2,7 +2,7 @@
 .PHONY: help install up up-prod deploy down logs migrate revision seed backfill \
         secrets-check secrets-install backup backup-verify backup-list backup-restore \
         test test-unit \
-        test-integration lint typecheck fmt check check-bindings gen-types build-web \
+        test-integration lint typecheck fmt check check-bindings check-env gen-types build-web \
         dev-api dev-worker dev-web clean
 
 WEB := apps/web
@@ -150,6 +150,13 @@ seed:  ## Dev database: a row per registered strategy + synthetic bars
 
 backfill:  ## Backfill bars:  make backfill sym=AAPL,MSFT from=2020-01-01
 	uv run python scripts/backfill_bars.py --symbols "$(sym)" --start "$(from)"
+
+check-env:  ## Which value in .env stops the platform starting?
+	@# Deliberately not part of `make check`: that runs against a developer's
+	@# machine in CI, where there is no .env and nothing to diagnose. This is an
+	@# operator command for the moment the stack will not come up, and it needs
+	@# no container, database or network — see the header of the script.
+	uv run python scripts/check_env.py
 
 # ── paper trading ───────────────────────────────────────────────────────────
 preflight:  ## Is this configuration ready for a paper week?  (docs/FIRST_PAPER_RUN.md)

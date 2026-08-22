@@ -37,7 +37,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from atp_core.config import get_settings
+from atp_core.config import config_problem_summary, get_settings
 from atp_core.domain import Timeframe
 from atp_core.errors import ATPError
 from atp_core.indicators import dispatch
@@ -79,6 +79,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 async def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    # Before `get_settings()`, which raises on a configuration that will not
+    # validate — and this is one of the two scripts someone runs *because*
+    # nothing is working, so dying with the traceback it exists to explain is
+    # the least useful thing it could do.
+    unloadable = config_problem_summary()
+    if unloadable is not None:
+        print(f"cannot read the configuration: {unloadable}")
+        print("run `make check-env` — it names the value, the line, and what is wrong")
+        return 1
+
     settings = get_settings()
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     symbols = symbols or settings.worker_symbol_list

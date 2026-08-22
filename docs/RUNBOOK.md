@@ -273,6 +273,33 @@ carrying forward: read the `(unhealthy)` in `docker compose ps`, and treat
 `Connection refused` from nginx as *different* from a 502 — refused means the
 container is there and the port is not.
 
+**Which value?** `make check-env`. It reads the same `.env` through the same
+`Settings` and names what will not load, where you wrote it, and why:
+
+```
+$ make check-env
+environment: 1 problem
+
+  RISK_MAX_POSITION_PCT    .env line 51
+    Input should be a valid decimal
+    you wrote: not-a-number
+```
+
+It needs no container, database or network, which is the point — the situation
+it is for is one where nothing starts. It reports *every* broken value in one
+run rather than one per restart, and it never prints a credential: a problem on
+a secret says so and withholds the value (§1.6).
+
+Read the `from the environment` line when you get one. `.env` is not the only
+source and it does not win: compose sets `DATABASE_URL` and `REDIS_URL` in
+`environment:`, and an `export` in your shell beats the file too. A key that is
+both exported and written in `.env` is being read from the export, and editing
+the line you can see will not change it.
+
+`make preflight` and `make status` no longer die on this. They used to call
+`get_settings()` and exit with the same traceback they were being run to
+explain; they now say which variable will not load and point here.
+
 **Otherwise it clears itself.** The screen re-asks every five seconds and renders
 the login form as soon as the API answers, so a stack that is merely still
 starting needs no reload. It did not always, and the sentence on screen was the giveaway: the

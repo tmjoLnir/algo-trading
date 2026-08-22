@@ -19,7 +19,7 @@ import pytest
 from pydantic import SecretStr
 
 from atp_core.brokers import AlpacaBroker
-from atp_core.config import Settings
+from atp_core.config import RiskLimits, Settings
 from atp_core.domain.enums import RunMode
 from atp_core.errors import MissingBrokerCredentialsError
 
@@ -53,9 +53,20 @@ def _settings_read_only_their_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
     under test. This does **not** weaken conftest's live-trading guard: that
     runs once at session start, before any fixture here, and refuses the whole
     session if `ATP_RUN_MODE=live` was exported.
+
+    **`.env` is the same input by a second route**, and clearing the variables
+    alone left it open. `Settings` reads `env_file=".env"` relative to the
+    working directory, so on any machine that has run `make up` — which writes
+    one from `.env.example`, where `ATP_RUN_MODE=backtest` — the tests below
+    asserting a `paper` default read `backtest` out of that file and failed.
+    Exactly the failure this docstring already describes, arriving through the
+    file rather than the environment, and invisible in CI because a fresh clone
+    has no `.env`. Detaching the file makes "nothing is set" mean it.
     """
     for name in _AMBIENT:
         monkeypatch.delenv(name, raising=False)
+    for model in (Settings, RiskLimits):
+        monkeypatch.setitem(model.model_config, "env_file", None)
 
 
 def test_live_mode_requires_second_flag() -> None:
