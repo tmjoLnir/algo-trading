@@ -300,6 +300,32 @@ the line you can see will not change it.
 `get_settings()` and exit with the same traceback they were being run to
 explain; they now say which variable will not load and point here.
 
+**It reports a second thing, and that one is worse.** A key `.env` assigns that
+nothing reads:
+
+```
+.env: 1 key that nothing reads
+
+  RISK_MAX_POSITION_PC    .env line 51
+    did you mean RISK_MAX_POSITION_PCT?
+```
+
+Nothing is broken here. Nothing exits, nothing appears in any log, and the API
+starts perfectly — the value simply had no effect. `Settings` is configured to
+ignore what it does not recognise, which is correct because this file is shared
+with compose and Vite, and the cost is that a **misspelling is silent**. The
+operator who wrote that line believes the position cap is 2%. It is 10%, five
+times looser, and every other symptom on this page is absent.
+
+That is the reason to run `make check-env` when nothing is wrong: a stack that
+will not boot tells you so, and a limit you believe you tightened does not. Run
+it after editing `.env`, and before `make up-prod` or a paper week.
+
+A key read by something other than `Settings` — the `VITE_*` pair, the dev
+proxy target, the dashboard bind address — is not reported. Those are listed in
+`READ_ELSEWHERE` in `scripts/check_env.py` with what reads each, and the test
+suite fails if that list drifts in either direction.
+
 **Otherwise it clears itself.** The screen re-asks every five seconds and renders
 the login form as soon as the API answers, so a stack that is merely still
 starting needs no reload. It did not always, and the sentence on screen was the giveaway: the

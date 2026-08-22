@@ -33,14 +33,37 @@ and anything it cannot classify is withheld too.
 
 from __future__ import annotations
 
+import difflib
 import os
 import sys
 from pathlib import Path
 
-from atp_core.config import ConfigProblem, config_problems
+from atp_core.config import ConfigProblem, config_problems, known_env_vars
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = REPO_ROOT / ".env"
+
+#: Keys that belong in `.env` and are deliberately NOT `Settings` fields, with
+#: what reads each. Without this the unknown-key check below would report all
+#: four as typos on a stock `.env`, which is the fastest way to teach someone to
+#: ignore it.
+#:
+#: Every entry is a key read by something that is not Python: keep it that way.
+#: A `Settings` field that ends up here is a field the platform silently stopped
+#: reading, which is the exact failure this check exists to catch.
+READ_ELSEWHERE = {
+    # Vite inlines `import.meta.env.VITE_*` into the bundle at BUILD time
+    # (infra/docker/web.Dockerfile), so these never reach a running process.
+    "VITE_API_BASE_URL": "read by Vite at build time",
+    "VITE_WS_URL": "read by Vite at build time",
+    # Read by vite.config.ts in the web container, not by any Python process.
+    "ATP_DEV_PROXY_TARGET": "read by the dev server (apps/web/vite.config.ts)",
+    # Interpolated by compose into the published port, before anything starts.
+    "ATP_WEB_BIND_ADDR": "read by docker compose (docker-compose.yml)",
+    # Set in compose `environment:` for the api/worker/queue containers; it is a
+    # real `Settings` field there, and absent from a stock `.env`.
+    "ATP_DB_PASSWORD": "read by docker compose (docker-compose.prod.yml)",
+}
 
 
 def env_file_lines(path: Path = ENV_FILE) -> dict[str, int]:
@@ -99,6 +122,30 @@ def describe(problem: ConfigProblem, lines: dict[str, int]) -> list[str]:
     return out
 
 
+def unread_keys(lines: dict[str, int]) -> list[tuple[str, int, str]]:
+    """Keys assigned in `.env` that nothing will read, worst-first by line.
+
+    The silent half of a broken `.env`. `Settings` ignores what it does not
+    recognise — correctly, since the file is shared with compose and Vite — so a
+    misspelled key is dropped without a word and the field keeps its default.
+    An operator who wrote `RISK_MAX_POSITION_PC=0.02` believes the cap is 2%;
+    it is 10%.
+
+    A close match is offered where one exists, because "read by nothing" and
+    "you are one character out" are the same finding and only the second is
+    actionable in one step.
+    """
+    known = known_env_vars()
+    found: list[tuple[str, int, str]] = []
+    for key, line in sorted(lines.items(), key=lambda kv: kv[1]):
+        if key in known or key in READ_ELSEWHERE:
+            continue
+        near = difflib.get_close_matches(key, sorted(known), n=1, cutoff=0.8)
+        note = f"did you mean {near[0]}?" if near else "nothing in this platform reads it"
+        found.append((key, line, note))
+    return found
+
+
 def main(argv: list[str] | None = None) -> int:
     # `Settings` resolves `env_file=".env"` against the *working directory*, so
     # run from `scripts/` or from a subpackage it would read a different file
@@ -108,25 +155,48 @@ def main(argv: list[str] | None = None) -> int:
     # and "the repo's .env" is what an operator means in any case.
     os.chdir(REPO_ROOT)
     problems = config_problems()
-    if not problems:
-        print("environment: every value loads")
+    lines = env_file_lines()
+    unread = unread_keys(lines)
+
+    if not problems and not unread:
+        print("environment: every value loads, and every key in .env is read")
         if not ENV_FILE.is_file():
             print("  no .env here — defaults only (`make up` writes one from .env.example)")
         return 0
 
-    lines = env_file_lines()
-    count = len(problems)
-    # "problem" rather than "value": one of these is a rule *between* values
-    # (§1.8's two locks) and has no single variable behind it.
-    print(f"environment: {count} problem{'' if count == 1 else 's'}\n")
-    for problem in problems:
-        for line in describe(problem, lines):
-            print(line)
-        print()
+    # ── values that will not load ───────────────────────────────────────────
+    if problems:
+        count = len(problems)
+        # "problem" rather than "value": one of these is a rule *between* values
+        # (§1.8's two locks) and has no single variable behind it.
+        print(f"environment: {count} problem{'' if count == 1 else 's'}\n")
+        for problem in problems:
+            for line in describe(problem, lines):
+                print(line)
+            print()
+        print("Until these are fixed the API cannot start — it builds its app at import,")
+        print("so the container exits and is restarted, and the dashboard's sign-in screen")
+        print('shows "Cannot reach the API." (docs/RUNBOOK.md, "Before you sign in").')
 
-    print("Until these are fixed the API cannot start — it builds its app at import,")
-    print("so the container exits and is restarted, and the dashboard's sign-in screen")
-    print('shows "Cannot reach the API." (docs/RUNBOOK.md, "Before you sign in").')
+    # ── keys nothing reads ──────────────────────────────────────────────────
+    # Reported separately because it is a different failure with a different
+    # shape: nothing is broken, nothing exits, and the value simply had no
+    # effect. That is worse than a crash for a risk limit — a stack that will
+    # not boot tells you so, and a cap you believe you tightened does not.
+    if unread:
+        if problems:
+            print()
+        count = len(unread)
+        print(f".env: {count} key{'' if count == 1 else 's'} that nothing reads\n")
+        for key, line, note in unread:
+            print(f"  {key}    .env line {line}")
+            print(f"    {note}")
+            print()
+        print("These load cleanly and have NO effect: `Settings` ignores what it does not")
+        print("recognise, because this file is shared with compose and Vite. A misspelled")
+        print("limit is the dangerous one — the field silently keeps its default, so a cap")
+        print("you believe you tightened is still whatever it was.")
+
     return 1
 
 
