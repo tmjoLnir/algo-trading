@@ -95,6 +95,18 @@ def ramp(count: int = 20, *, symbol: str = "TEST", volume: float = 1_000_000) ->
     ]
 
 
+def series(days: list[int], *, symbol: str = "TEST") -> list[Bar]:
+    """Bars on exactly the given day offsets from `START`.
+
+    `ramp` covers every calendar day, which is the one shape real daily data
+    never has. Gap tests need to state their own spacing.
+    """
+    return [
+        bar(i, open_=100 + i, high=101.5 + i, low=99 + i, close=100.5 + i, symbol=symbol)
+        for i in days
+    ]
+
+
 class _RiskDouble:
     """The surface `BacktestEngine` uses of a `RiskEngine`, and only that.
 
@@ -188,14 +200,18 @@ def engine(
     participation: Decimal = Decimal("0.10"),
     risk: Any = None,
     symbols: list[str] | None = None,
+    start: datetime = START,
+    end: datetime | None = None,
+    max_gap_days: int = 10,
 ) -> BacktestEngine:
     config = BacktestConfig(
         symbols=symbols or ["TEST"],
-        start=START,
-        end=START + timedelta(days=365),
+        start=start,
+        end=end if end is not None else START + timedelta(days=365),
         timeframe=Timeframe.D1,
         starting_cash=cash,
         max_volume_participation=participation,
+        max_gap_days=max_gap_days,
     )
     return BacktestEngine(
         strategy=strategy,
@@ -403,6 +419,97 @@ class TestValidation:
         with pytest.raises(DataGapError, match="not 1d"):
             engine(ScriptedStrategy({})).run({"TEST": bars})
 
+    def test_an_interior_hole_is_refused(self) -> None:
+        """The failure this check exists for: bars either side, none inside.
+
+        Nothing downstream would have said so. `closes()` slices by position,
+        so an average spanning the hole quietly mixes prices from both sides.
+        """
+        with pytest.raises(DataGapError, match="hole"):
+            engine(ScriptedStrategy({})).run({"TEST": series([0, 1, 2, 3, 4, *range(700, 705)])})
+
+    def test_the_hole_refusal_names_the_range_to_backfill(self) -> None:
+        """The next thing anyone does with this error is re-fetch."""
+        with pytest.raises(DataGapError) as caught:
+            engine(ScriptedStrategy({})).run({"TEST": series([0, 1, 2, *range(400, 404)])})
+
+        message = str(caught.value)
+        assert "backfill_bars.py --symbols TEST" in message
+        assert "--start 2024-01-04" in message  # the last bar before the hole
+        assert "--end 2025-02-05" in message  # the first bar after it
+
+    def test_weekends_and_holidays_are_not_holes(self) -> None:
+        """Real daily data is full of three- and four-day steps. A check that
+        fired on those would be turned off within a week."""
+        weekdays = [0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 15, 16, 17, 18]  # incl. a Monday holiday
+        result = engine(ScriptedStrategy({})).run({"TEST": series(weekdays)})
+        assert not any("hole" in w for w in result.warnings)
+
+    def test_max_gap_days_admits_a_genuine_closure(self) -> None:
+        """A symbol really can stop trading for a month. The threshold is a
+        setting so that case is expressible — not so a real hole can be hidden."""
+        bars = series([0, 1, 2, *range(40, 44)])
+        with pytest.raises(DataGapError, match="hole"):
+            engine(ScriptedStrategy({})).run({"TEST": bars})
+        engine(ScriptedStrategy({}), max_gap_days=60).run({"TEST": bars})
+
+    def test_an_unrequested_empty_series_is_ignored(self) -> None:
+        """A symbol outside `config.symbols` has no first or last bar to compare
+        against the window, and must not take the run down on the way past."""
+        result = engine(ScriptedStrategy({}), start=START, end=START + timedelta(days=9)).run(
+            {"TEST": ramp(10), "EXTRA": []}
+        )
+        assert not any("coverage" in w for w in result.warnings)
+
+    def test_a_late_start_warns_rather_than_refusing(self) -> None:
+        """An ETF's inception is a legitimate reason to have no history, so this
+        cannot refuse — but it was silent before, and silence is what let a
+        nine-year request quietly become a five-year run."""
+        result = engine(ScriptedStrategy({}), start=START - timedelta(days=400)).run(
+            {"TEST": ramp(10)}
+        )
+        assert any("coverage" in w and "no bars until after" in w for w in result.warnings)
+
+    def test_an_early_end_warns_too(self) -> None:
+        result = engine(ScriptedStrategy({}), end=START + timedelta(days=400)).run(
+            {"TEST": ramp(10)}
+        )
+        assert any("coverage" in w and "stop supplying bars before" in w for w in result.warnings)
+
+    def test_a_full_window_warns_about_neither(self) -> None:
+        result = engine(ScriptedStrategy({}), start=START, end=START + timedelta(days=9)).run(
+            {"TEST": ramp(10)}
+        )
+        assert not any("coverage" in w for w in result.warnings)
+
+    def test_coverage_is_one_warning_for_the_whole_universe(self) -> None:
+        """Not one per symbol. Twenty lines would push every other warning out
+        of the ten a CLI shows, which is the failure this is here to prevent."""
+        symbols = [f"S{i}" for i in range(20)]
+        result = engine(
+            ScriptedStrategy({}),
+            symbols=symbols,
+            start=START - timedelta(days=400),
+            end=START + timedelta(days=9),
+        ).run({s: ramp(10, symbol=s) for s in symbols})
+
+        coverage = [w for w in result.warnings if "coverage" in w]
+        assert len(coverage) == 1
+        assert "20 symbol(s)" in coverage[0]
+        assert "and 12 more" in coverage[0]
+
+    def test_coverage_warnings_lead_the_list(self) -> None:
+        """A caller printing the first handful has to see them."""
+        result = engine(
+            ScriptedStrategy({5: SignalAction.ENTER_LONG}),
+            risk=_DenyAllRisk(),
+            start=START - timedelta(days=400),
+        ).run({"TEST": ramp(10)})
+
+        assert result.warnings
+        assert "coverage" in result.warnings[0]
+        assert any("refused" in w for w in result.warnings)
+
 
 #: 20 daily bars: (open, high, low, close). Deliberately NOT a straight ramp.
 #: On a linear path a fill at the signal bar's close and a fill at the next
@@ -431,6 +538,57 @@ FIXTURE_BARS: list[tuple[float, float, float, float]] = [
     (135, 137, 134, 136),  # 18
     (136, 138, 135, 137),  # 19
 ]
+
+
+class TestRealisedVersusUnrealised:
+    """A run that ends holding a position reports two different things, and only
+    one of them is a track record.
+
+    Every per-trade metric is computed from closed round trips, because that is
+    the only point a trade's P&L is known. `ending_equity` marks the open ones
+    to the last bar. Nothing on the report used to distinguish them, so a run
+    whose closed trades lost money could still show a gain.
+    """
+
+    def held(self) -> BacktestResult:
+        """Enters on bar 5 and never exits, over a rising ramp."""
+        return engine(ScriptedStrategy({5: SignalAction.ENTER_LONG})).run({"TEST": ramp(20)})
+
+    def test_an_open_winner_is_a_gain_with_no_completed_trade(self) -> None:
+        result = self.held()
+
+        assert result.portfolio.open_positions
+        assert result.metrics["num_trades"] == 0  # nothing closed
+        assert result.total_return > 0  # and yet
+        assert result.unrealized_pnl > 0
+        # Nothing has been realised at all: these engines use `ZeroCostModel`,
+        # so entering cost nothing and the entire gain is a mark.
+        assert result.realized_pnl == Decimal(0)
+
+    def test_the_two_halves_reconcile_to_ending_equity(self) -> None:
+        """Exactly, in Decimal. `realized_pnl` is the remainder for this reason:
+        two independent sums would drift and the report would not add up."""
+        result = self.held()
+        equity = result.portfolio
+        assert result.realized_pnl + result.unrealized_pnl == equity.equity - equity.starting_equity
+
+    def test_a_closed_run_carries_nothing_unrealised(self) -> None:
+        result = engine(ScriptedStrategy({5: SignalAction.ENTER_LONG, 12: SignalAction.EXIT})).run(
+            {"TEST": ramp(20)}
+        )
+
+        assert result.portfolio.open_positions == []
+        assert result.unrealized_pnl == Decimal(0)
+        assert result.realized_pnl == result.portfolio.equity - result.portfolio.starting_equity
+
+    def test_the_report_carries_the_split(self) -> None:
+        report = self.held().to_report()
+
+        assert report["open_positions"] == 1
+        assert Decimal(str(report["unrealized_pnl"])) > 0
+        assert Decimal(str(report["realized_pnl"])) + Decimal(str(report["unrealized_pnl"])) == (
+            Decimal(str(report["ending_equity"])) - Decimal(str(report["starting_equity"]))
+        )
 
 
 class TestAgainstKnownFixture:

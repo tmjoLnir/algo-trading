@@ -166,6 +166,8 @@ def _print_report(
     print(f"{'═' * 58}")
     print(f"  {'Starting equity':<32}{float(result.portfolio.starting_equity):>13,.2f}")
     print(f"  {'Ending equity':<32}{float(result.portfolio.equity):>13,.2f}")
+    print(f"  {'  ...realised (closed trades)':<32}{float(result.realized_pnl):>13,.2f}")
+    print(f"  {'  ...unrealised (still open)':<32}{float(result.unrealized_pnl):>13,.2f}")
     print(f"  {'Fees and commissions':<32}{float(fees):>13,.2f}")
     print(
         f"  {'Signals / orders / filled':<32}"
@@ -332,6 +334,18 @@ async def main(argv: list[str] | None = None) -> int:
     # the strategy.
     if (refusals := refusal_summary(result)) is not None:
         print(f"\n{refusals}.")
+
+    # Before the trade-count note, because it changes what every statistic
+    # under it is a statement about: a run that ends holding winners reports an
+    # equity its closed trades never earned, and the metrics below count only
+    # the closed ones.
+    if open_positions := result.portfolio.open_positions:
+        print(
+            f"\n{len(open_positions)} position(s) still open at the end, carrying "
+            f"{float(result.unrealized_pnl):,.2f} of unrealised mark-to-market. That is part of "
+            "the return above and part of none of the trade statistics below, which count "
+            "closed round trips only."
+        )
 
     if result.metrics["num_trades"] < 30:
         print(

@@ -21,6 +21,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from decimal import Decimal
+from itertools import pairwise
 from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
@@ -183,6 +184,18 @@ class BacktestConfig:
 
     warmup_bars: int | None = None  # defaults to strategy.warmup_bars
 
+    #: A stretch of this many calendar days with no bar is a hole in the data
+    #: rather than a closed market, and `_validate` refuses the run.
+    #:
+    #: Calendar days against a flat threshold rather than sessions against an
+    #: exchange calendar, deliberately: the engine is handed bars, not a venue,
+    #: and one run's symbols can trade on exchanges whose holidays disagree. The
+    #: longest closure US equities have had this century is six calendar days
+    #: (September 2001), so the default clears every weekend, holiday and
+    #: half-day by a wide margin while still catching a hole large enough to
+    #: distort an indicator.
+    max_gap_days: int = 10
+
 
 @dataclass(slots=True)
 class BacktestResult:
@@ -203,8 +216,37 @@ class BacktestResult:
             return Decimal(0)
         return (self.portfolio.equity - start) / start
 
+    @property
+    def unrealized_pnl(self) -> Decimal:
+        """Mark-to-market on positions still open at the last bar.
+
+        This is the half of the return that no trade statistic can see. Every
+        per-trade metric — `num_trades`, `win_rate`, `profit_factor`,
+        `expectancy` — is computed from completed round trips, because that is
+        the only point a trade's P&L is known. A run that ends holding winners
+        therefore reports an `ending_equity` its closed trades never earned.
+        """
+        return sum((p.unrealized_pnl for p in self.portfolio.open_positions), Decimal(0))
+
+    @property
+    def realized_pnl(self) -> Decimal:
+        """What the closed round trips actually made, net of fees.
+
+        The remainder rather than a second sum over trades, so this and
+        `unrealized_pnl` always add back to `ending_equity - starting_equity`
+        exactly. It also puts the entry fees of a still-open position on the
+        realised side, which is where that cash has genuinely gone.
+        """
+        return self.portfolio.equity - self.portfolio.starting_equity - self.unrealized_pnl
+
     def to_report(self) -> dict[str, object]:
-        """Serialisable summary for the API and the dashboard."""
+        """Serialisable summary for the API and the dashboard.
+
+        `realized_pnl` and `unrealized_pnl` are reported separately because
+        `ending_equity` alone is readable two ways and only one of them is a
+        track record. They are money, so they are strings here and stay out of
+        `metrics`, which is a bag of floats by contract (CLAUDE.md §1.1).
+        """
         filled = [o for o in self.orders if o.filled_qty > 0]
         return {
             "strategy": self.strategy_name,
@@ -215,6 +257,9 @@ class BacktestResult:
             "starting_equity": str(self.portfolio.starting_equity),
             "ending_equity": str(self.portfolio.equity),
             "total_return": str(self.total_return),
+            "realized_pnl": str(self.realized_pnl),
+            "unrealized_pnl": str(self.unrealized_pnl),
+            "open_positions": len(self.portfolio.open_positions),
             "orders": len(self.orders),
             "filled_orders": len(filled),
             "signals": len(self.signals),
@@ -222,6 +267,28 @@ class BacktestResult:
             "metrics": dict(self.metrics),
             "warnings": list(self.warnings),
         }
+
+
+def _coverage_warning(
+    complaint: str, boundary: datetime, found: list[tuple[str, datetime]]
+) -> list[str]:
+    """One aggregated line per kind of shortfall, never one per symbol.
+
+    A twenty-symbol universe whose history all begins late would otherwise emit
+    twenty warnings and push everything else out of the handful a CLI prints —
+    which is the failure this warning exists to prevent, reintroduced.
+    """
+    if not found:
+        return []
+    names = sorted(symbol for symbol, _ in found)
+    shown = ", ".join(names[:8])
+    more = "" if len(names) <= 8 else f", and {len(names) - 8} more"
+    edges = [ts for _, ts in found]
+    return [
+        f"coverage: {len(names)} symbol(s) {complaint} the requested {boundary.date()} "
+        f"(spanning {min(edges).date()} to {max(edges).date()}): {shown}{more}. "
+        f"The run measures a shorter window than it was asked for."
+    ]
 
 
 class BacktestContext:
@@ -453,7 +520,7 @@ class BacktestEngine:
         gaps, duplicate timestamps and unsorted input each produce plausible but
         wrong results, so fail loudly (`DataGapError`) rather than proceeding.
         """
-        self._validate(bars)
+        coverage = self._validate(bars)
 
         warmup = (
             self.config.warmup_bars
@@ -471,6 +538,11 @@ class BacktestEngine:
         result = BacktestResult(
             config=self.config, strategy_name=self.strategy.name, portfolio=self._portfolio
         )
+        # Ahead of anything the loop appends, so a short window stays inside the
+        # handful of warnings a caller prints. A run that refuses three hundred
+        # orders would otherwise bury the reason its window was not the one
+        # asked for.
+        result.warnings.extend(coverage)
         self._result = result
         self._pending = []
         self._protection = {}
@@ -616,13 +688,34 @@ class BacktestEngine:
 
     # ── validation ──────────────────────────────────────────────────────────
 
-    def _validate(self, bars: dict[str, list[Bar]]) -> None:
+    @property
+    def _gap_limit(self) -> timedelta:
+        return timedelta(days=self.config.max_gap_days)
+
+    def _validate(self, bars: dict[str, list[Bar]]) -> list[str]:
+        """Refuse input that would produce a plausible but wrong result.
+
+        Returns the coverage warnings the run should carry. A series that starts
+        after `config.start` or ends before `config.end` has legitimate causes —
+        an ETF's inception, a delisting, a backfill that has not caught up — so
+        it is reported rather than refused. Reported loudly, though: the run
+        then measures a shorter window than the one asked for, and until this
+        existed nothing said so.
+        """
         missing = [s for s in self.config.symbols if s not in bars or not bars[s]]
         if missing:
             raise DataGapError(f"no bars supplied for {', '.join(missing)}")
 
+        starts_late: list[tuple[str, datetime]] = []
+        ends_early: list[tuple[str, datetime]] = []
+
         for symbol, series in bars.items():
             timestamps = [b.ts for b in series]
+            if not timestamps:
+                # Only reachable for a symbol outside `config.symbols` — the
+                # check above already refused an empty series for one the run
+                # asked for. Nothing below has a first or last bar to read.
+                continue
             if timestamps != sorted(timestamps):
                 raise DataGapError(f"{symbol} bars are not in chronological order")
             if len(set(timestamps)) != len(timestamps):
@@ -632,6 +725,43 @@ class BacktestEngine:
                 raise DataGapError(
                     f"{symbol} has {len(wrong)} bar(s) that are not {self.config.timeframe.value}"
                 )
+            self._refuse_holes(symbol, timestamps)
+            if timestamps[0] - self.config.start > self._gap_limit:
+                starts_late.append((symbol, timestamps[0]))
+            if self.config.end - timestamps[-1] > self._gap_limit:
+                ends_early.append((symbol, timestamps[-1]))
+
+        return [
+            *_coverage_warning("have no bars until after", self.config.start, starts_late),
+            *_coverage_warning("stop supplying bars before", self.config.end, ends_early),
+        ]
+
+    def _refuse_holes(self, symbol: str, timestamps: list[datetime]) -> None:
+        """Raise on an interior hole — bars either side of a stretch, none inside.
+
+        This is a refusal rather than a warning because there is no benign
+        reading of one. `BacktestContext.closes` returns the last N closes *by
+        position, not by date*, so a 50-bar average spanning a hole silently
+        averages prices from either side of it, and a bar-counting stop measures
+        the hole as a single bar. Neither announces itself: the run completes and
+        reports a number about a series that never existed, which is the quietest
+        way a backtest becomes fiction (CLAUDE.md §5).
+
+        The message names the exact re-fetch, because the next thing anyone does
+        with this error is backfill the range it found.
+        """
+        holes = [(a, b) for a, b in pairwise(timestamps) if b - a > self._gap_limit]
+        if not holes:
+            return
+        shown = "; ".join(f"{a.date()} → {b.date()} ({(b - a).days}d)" for a, b in holes[:3])
+        more = "" if len(holes) <= 3 else f", and {len(holes) - 3} more"
+        first, second = holes[0]
+        raise DataGapError(
+            f"{symbol} has {len(holes)} hole(s) in its stored history, each longer than the "
+            f"{self.config.max_gap_days}-day `max_gap_days`: {shown}{more}. Backfill before "
+            f"running: scripts/backfill_bars.py --symbols {symbol} "
+            f"--start {first.date()} --end {second.date()}"
+        )
 
     # ── 3. stops ────────────────────────────────────────────────────────────
 
