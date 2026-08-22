@@ -32,6 +32,7 @@ from atp_core.config import (
     _resolve,
     config_problem_summary,
     config_problems,
+    known_env_vars,
 )
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
@@ -212,3 +213,84 @@ class TestReadingTheEnvFile:
 
     def test_a_missing_file_is_not_an_error(self, tmp_path: Path) -> None:
         assert check_env.env_file_lines(tmp_path / "nope") == {}
+
+
+class TestKeysNothingReads:
+    """The silent half of a broken `.env`.
+
+    `Settings` is `extra="ignore"`, which is right — the file is shared with
+    compose and Vite — and the cost is that a misspelled key is dropped without
+    a word. `RISK_MAX_POSITION_PC=0.02` loads cleanly and leaves the cap at
+    0.10, five times looser than the operator believes they set.
+    """
+
+    def test_known_names_cover_aliases_and_the_risk_prefix(self) -> None:
+        known = known_env_vars()
+        assert "ATP_RUN_MODE" in known  # aliased
+        assert "ALPACA_API_KEY" in known  # unaliased, field name upper
+        assert "RISK_MAX_POSITION_PCT" in known  # nested, env_prefix applied
+        assert "max_position_pct" not in known  # never the field name
+
+    def test_a_misspelled_key_is_reported_with_the_name_meant(self) -> None:
+        found = check_env.unread_keys({"RISK_MAX_POSITION_PC": 51})
+        assert len(found) == 1
+        key, line, note = found[0]
+        assert (key, line) == ("RISK_MAX_POSITION_PC", 51)
+        assert "RISK_MAX_POSITION_PCT" in note
+
+    def test_a_key_nothing_resembles_is_still_reported(self) -> None:
+        found = check_env.unread_keys({"MY_OWN_TOOL_VAR": 9})
+        assert [k for k, _, _ in found] == ["MY_OWN_TOOL_VAR"]
+        assert "nothing in this platform reads it" in found[0][2]
+
+    def test_a_recognised_key_is_not_reported(self) -> None:
+        assert check_env.unread_keys({"ATP_RUN_MODE": 18}) == []
+
+    def test_keys_read_by_something_other_than_settings_are_not_reported(self) -> None:
+        """Vite, the dev server and compose all read from this file.
+
+        Without the allowlist a stock `.env` reports four typos, which is the
+        fastest way to teach someone to ignore this check.
+        """
+        lines = dict.fromkeys(check_env.READ_ELSEWHERE, 1)
+        assert check_env.unread_keys(lines) == []
+
+    def test_reported_in_file_order(self) -> None:
+        found = check_env.unread_keys({"ZZZ_LATE": 90, "AAA_EARLY": 3})
+        assert [k for k, _, _ in found] == ["AAA_EARLY", "ZZZ_LATE"]
+
+
+class TestTheAllowlistDoesNotDrift:
+    """Both directions, because both are silent.
+
+    `READ_ELSEWHERE` is the one hand-maintained list here, and a stale entry
+    fails *open* — the check stops reporting a key it should report.
+    """
+
+    def test_a_stock_env_example_has_nothing_unread(self) -> None:
+        """The guard for a key added to `.env.example` and nowhere else.
+
+        A new key that is neither a `Settings` field nor in the allowlist is
+        either a typo in the example file or a setting nothing implements. Both
+        are worth failing a build over, and neither is visible by reading.
+        """
+        example = Path(__file__).resolve().parents[2] / ".env.example"
+        lines = check_env.env_file_lines(example)
+        assert lines, "no keys parsed from .env.example — the parser or the path is wrong"
+        assert check_env.unread_keys(lines) == []
+
+    def test_no_settings_field_is_hiding_in_the_allowlist(self) -> None:
+        """The inverse, and the one that matters more.
+
+        A `Settings` field listed in `READ_ELSEWHERE` is a field the platform
+        reads and the check has been told to ignore — so a typo in it would go
+        unreported, which is the exact failure this whole class exists for.
+        """
+        overlap = known_env_vars() & set(check_env.READ_ELSEWHERE)
+        assert overlap == set(), f"these are real Settings fields: {sorted(overlap)}"
+
+    def test_every_allowlisted_key_says_what_reads_it(self) -> None:
+        """A bare list becomes a dumping ground; a list of reasons does not."""
+        for key, why in check_env.READ_ELSEWHERE.items():
+            assert why.strip(), f"{key} has no explanation"
+            assert "read by" in why, f"{key} does not say what reads it: {why!r}"

@@ -2173,6 +2173,37 @@ has met a database holding a real strategy's history.
   This is an operator command for the moment the stack will not come up, and it
   needs no container, database or network.
 
+  **It then only answered half the question, and the missing half was the
+  dangerous one.** `make check-env` reported values that would not *load* — and
+  a misspelled key does not fail to load, it is dropped. `Settings` is
+  `extra="ignore"`, correctly, because `.env` is shared with compose and Vite
+  and a process that refused to start over a variable meant for one of them
+  would be wrong. The cost is silence:
+
+      RISK_MAX_POSITION_PC=0.02      # the T is missing
+
+  loads cleanly, reports nothing, and leaves `max_position_pct` at its `0.10`
+  default. The operator believes they capped a position at 2% of equity; the
+  platform will let one reach 10%, and no log line, probe, banner or check said
+  otherwise. It is a worse failure than the one above it — a stack that will not
+  boot announces itself, and a risk limit you believe you tightened does not.
+  Nothing in this repository looked for it.
+
+  `known_env_vars()` derives the accepted names from the models, so it cannot
+  lag a field added tomorrow, and `check_env` reports every assignment in `.env`
+  that is not one of them, with a close match where there is one. The keys that
+  legitimately are not `Settings` fields — the `VITE_*` pair, `ATP_DEV_PROXY_TARGET`,
+  `ATP_WEB_BIND_ADDR`, `ATP_DB_PASSWORD` — are allowlisted with what reads each,
+  because a check that reports four false positives on a stock `.env` is a check
+  people learn to skip.
+
+  That allowlist is the one hand-maintained thing here, and a stale entry fails
+  *open* — the check stops reporting a key it should. Two tests pin it in both
+  directions: a stock `.env.example` must produce no unread keys, and no real
+  `Settings` field may appear in the list. Both were mutation-checked.
+  `.env.example` documents the trap in its header and marks the dashboard
+  section as deliberately not `Settings`.
+
   `scripts/check_port_bindings.py` now checks **both** configurations. It read
   only the development one, so the deployed file — where a wrong bind matters
   most — would have been the one thing nothing looked at. It also asserts the

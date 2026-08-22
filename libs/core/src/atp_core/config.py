@@ -459,6 +459,38 @@ def config_problems() -> list[ConfigProblem]:
     return list(dict.fromkeys(problems))
 
 
+def known_env_vars() -> frozenset[str]:
+    """Every variable name `Settings` and `RiskLimits` will actually read.
+
+    For the other half of "what is wrong with my `.env`", and it is the half
+    that fails silently. `Settings` is configured `extra="ignore"`, which is the
+    right setting — `.env` is shared with compose, Vite and the dev-server
+    proxy, and a process that refused to start over a variable meant for one of
+    them would be wrong. The cost is that a **misspelled** key is dropped
+    without a word:
+
+        RISK_MAX_POSITION_PC=0.02      # the T is missing
+
+    loads cleanly, reports nothing, and leaves `max_position_pct` at its 0.10
+    default — five times looser than the operator believes they just set. That
+    direction is the reason this exists. `config_problems()` cannot see it,
+    because from pydantic's side nothing went wrong.
+
+    Derived from the models rather than listed, so it cannot drift: a field
+    added tomorrow is known here the moment it exists.
+    """
+    names: set[str] = set()
+    for model in _ENV_MODELS:
+        prefix = model.model_config.get("env_prefix") or ""
+        for field_name, field in model.model_fields.items():
+            alias = getattr(field, "alias", None)
+            if isinstance(alias, str) and alias:
+                names.add(alias.upper())
+            else:
+                names.add(f"{prefix}{field_name}".upper())
+    return frozenset(names)
+
+
 def config_problem_summary() -> str | None:
     """One line naming what will not load, or `None` when everything does.
 
