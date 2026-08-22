@@ -19,7 +19,7 @@ from decimal import Decimal
 import pytest
 from pydantic import SecretStr
 
-from atp_core.config import Settings
+from atp_core.config import RiskLimits, Settings
 from atp_core.domain import RunMode, StopType
 from atp_core.errors import ConfigError
 from atp_worker import trading
@@ -38,8 +38,17 @@ _AMBIENT = (
 
 @pytest.fixture(autouse=True)
 def _no_ambient_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Take the ambient configuration out of every test in this file.
+
+    Both routes into `Settings`, not just the environment: it also reads
+    `env_file=".env"`, so on a machine that has run `make up` the defaults
+    asserted below are read out of that file instead of from the code. CI never
+    sees it — a fresh clone has no `.env` — which is what let it stand.
+    """
     for name in _AMBIENT:
         monkeypatch.delenv(name, raising=False)
+    for model in (Settings, RiskLimits):
+        monkeypatch.setitem(model.model_config, "env_file", None)
 
 
 def settings(**kwargs: object) -> Settings:

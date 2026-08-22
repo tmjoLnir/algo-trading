@@ -2145,6 +2145,34 @@ has met a database holding a real strategy's history.
   read `.State`, which is `running` for a container that has been unhealthy for
   hours, and would have passed this bug at every stage.
 
+  **That made the failure visible and left the operator a translation to do** —
+  `make check-env` finishes the job. The API exiting loudly answers "something in
+  the configuration is wrong"; the next question is *which value*, and the only
+  answer was a pydantic traceback naming a **field**. `max_position_pct` is not
+  in `.env`; `RISK_MAX_POSITION_PCT` is, and mapping one to the other means
+  knowing that `RiskLimits` carries an `env_prefix`. The script reads the same
+  file through the same `Settings` and prints the name as written, the line it is
+  on, and what is wrong with it — for every broken value at once rather than one
+  per restart. Secrets are never printed, and anything it cannot classify is
+  withheld too, which is the safe direction for a value that failed to load and
+  is still a credential.
+
+  It also reports **where the value came from**, because `.env` is neither the
+  only source nor the winning one: compose sets `DATABASE_URL` and `REDIS_URL` in
+  `environment:` and an `export` beats the file, so a key that is both exported
+  and written is being read from the export — and the first implementation of
+  this pointed at the `.env` line anyway, which is worse than saying nothing.
+
+  The two tools an operator reaches for when nothing works, `scripts/preflight.py`
+  and `scripts/status.py`, **were themselves killed by the fault they would be
+  run to diagnose**: both called `get_settings()` and exited with the traceback
+  they existed to explain. Both now name the variable and point at
+  `make check-env`.
+
+  Not in `make check`: there is no `.env` on a CI runner and nothing to diagnose.
+  This is an operator command for the moment the stack will not come up, and it
+  needs no container, database or network.
+
   `scripts/check_port_bindings.py` now checks **both** configurations. It read
   only the development one, so the deployed file — where a wrong bind matters
   most — would have been the one thing nothing looked at. It also asserts the

@@ -6,11 +6,12 @@ use `settings.redacted()`.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache
 from typing import Any, Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from atp_core.domain.enums import RunMode
@@ -314,3 +315,163 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Process-wide settings singleton. Call `get_settings.cache_clear()` in tests."""
     return Settings()
+
+
+# ── telling an operator which value is the problem ──────────────────────────
+#
+# `Settings()` raising is how this platform refuses to start on a configuration
+# it cannot trust, and that is right. What was missing is anything that turns
+# the raising into an answer.
+#
+# The API builds its app at import, so a value that will not load is a process
+# that will not run (#84). That is now an exit and a restart count rather than a
+# container idling behind a reloader — but the operator's next question,
+# "*which* value?", had one answer: read a pydantic traceback out of
+# `docker compose logs api` and translate a field name back into the line you
+# typed. `max_position_pct` is not what is in `.env`; `RISK_MAX_POSITION_PCT` is.
+#
+# Worse, the two tools an operator would reach for to ask — `scripts/preflight.py`
+# and `scripts/status.py` — call `get_settings()` themselves, so the same bad
+# value killed the diagnosis along with the platform.
+
+
+@dataclass(frozen=True)
+class ConfigProblem:
+    """One value in the environment that will not load, named as it was written.
+
+    `env_var` is the name in `.env`, not the field name — those differ for every
+    aliased field and for all of `RiskLimits`, and the field name is the half a
+    traceback gives you.
+
+    `value` is `None` for a secret, and that is not the same as an empty value:
+    the renderer must not print what it cannot show. A malformed credential is
+    still a credential, and most of one is still an offline grinding target
+    (CLAUDE.md §1.6).
+    """
+
+    env_var: str
+    reason: str
+    value: str | None
+
+    @property
+    def is_whole_configuration(self) -> bool:
+        """Whether this is a rule *between* values rather than a bad one.
+
+        `ATP_RUN_MODE=live` without `ATP_ALLOW_LIVE_TRADING=true` is the only one
+        today (§1.8). It has no single offending variable, so it renders without
+        pointing at one rather than blaming whichever half was read last.
+        """
+        return not self.env_var
+
+
+#: Every model that reads the environment, in the order an operator meets them.
+_ENV_MODELS: tuple[type[BaseSettings], ...] = (RiskLimits, Settings)
+
+
+def _resolve(model: type[BaseSettings], reported: str) -> tuple[str, bool]:
+    """Map what pydantic reported to `(env var, is secret)`.
+
+    Pydantic names the *alias* in `loc` for an aliased field and the *field
+    name* for an unaliased one, so both arrive here and neither can be assumed:
+    `Settings` reports `WORKER_METRICS_PORT` while `RiskLimits` reports
+    `max_position_pct` for the value written as `RISK_MAX_POSITION_PCT`.
+
+    An unrecognised name is treated as a secret. That direction is deliberate —
+    the cost of redacting a value that was safe to show is a slightly less
+    helpful line, and the cost of the other mistake is a credential in a
+    terminal (CLAUDE.md §1.6).
+    """
+    fields = model.model_fields
+    field_name: str | None = None
+    if reported in fields:
+        field_name = reported
+    else:
+        for name, field in fields.items():
+            if getattr(field, "alias", None) == reported:
+                field_name = name
+                break
+    if field_name is None:
+        return reported.upper(), True
+
+    field = fields[field_name]
+    alias = getattr(field, "alias", None)
+    prefix = model.model_config.get("env_prefix") or ""
+    env_var = alias if isinstance(alias, str) and alias else f"{prefix}{field_name}".upper()
+    return env_var, field.annotation is SecretStr
+
+
+def _problems_from(model: type[BaseSettings], exc: ValidationError) -> list[ConfigProblem]:
+    """One model's validation failure, as lines about `.env`."""
+    problems: list[ConfigProblem] = []
+    for error in exc.errors():
+        loc = error.get("loc") or ()
+        if not loc:
+            # A rule *between* values rather than a bad one. `error["input"]`
+            # here is the whole input mapping — every credential in it — so it
+            # is never rendered; the message carries what is needed anyway.
+            problems.append(ConfigProblem(env_var="", reason=str(error.get("msg", "")), value=None))
+            continue
+        env_var, secret = _resolve(model, str(loc[0]))
+        problems.append(
+            ConfigProblem(
+                env_var=env_var,
+                reason=str(error.get("msg", "")),
+                value=None if secret else str(error.get("input", "")),
+            )
+        )
+    return problems
+
+
+def config_problems() -> list[ConfigProblem]:
+    """Every environment value that stops this platform starting, or `[]`.
+
+    Reads the environment exactly as `Settings` does — same `.env`, same
+    precedence — because a checker that resolved configuration its own way would
+    eventually disagree with the thing it is checking, and the disagreement
+    would surface as "the check passes and the API still will not start".
+
+    **`RiskLimits` is checked first and separately, and `Settings` is then built
+    with it supplied.** Not tidiness: `Settings.risk` is a `default_factory`, so
+    a bad `RISK_*` value raises out of that factory *during* `Settings()` and
+    takes the rest of the validation with it. A plain `Settings()` therefore
+    reports one bad risk limit and stays silent about every other broken value
+    in the file — which is one edit-run-edit cycle per mistake, in a file where
+    mistakes arrive in batches after a hand-merge. Supplying `risk` unvalidated
+    lets `Settings` reach its own fields.
+    """
+    problems: list[ConfigProblem] = []
+
+    try:
+        RiskLimits()
+    except ValidationError as exc:
+        problems += _problems_from(RiskLimits, exc)
+
+    try:
+        # `model_construct` skips validation deliberately: the RISK_ values were
+        # just checked on their own, and this stands in only so the nested
+        # factory cannot raise here and mask the rest.
+        Settings(risk=RiskLimits.model_construct())
+    except ValidationError as exc:
+        problems += _problems_from(Settings, exc)
+
+    # Deduplicated in first-seen order rather than through a set, so a report is
+    # stable between runs.
+    return list(dict.fromkeys(problems))
+
+
+def config_problem_summary() -> str | None:
+    """One line naming what will not load, or `None` when everything does.
+
+    Exists so that the tools an operator reaches for when nothing works —
+    `scripts/preflight.py`, `scripts/status.py` — can say *what* is wrong in one
+    sentence and point at `make check-env` for the rest, rather than doing what
+    they used to do, which was call `get_settings()` and die with the same
+    pydantic traceback they were being run to explain.
+    """
+    problems = config_problems()
+    if not problems:
+        return None
+    named = [p.env_var for p in problems if p.env_var]
+    if not named:
+        return "the configuration as a whole will not load"
+    return f"{', '.join(named)} will not load"
