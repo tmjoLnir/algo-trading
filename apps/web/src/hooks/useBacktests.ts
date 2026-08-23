@@ -16,12 +16,15 @@
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiGet, apiPost } from '@/api/client'
+import { buildRunExport, hasResultBody, runExportFilename } from '@/lib/backtestExport'
+import { saveJson } from '@/lib/download'
 import type {
   BacktestComparisonResponse,
   BacktestEquityCurveResponse,
   BacktestListResponse,
   BacktestOut,
   BacktestRequest,
+  BacktestTrade,
   BacktestTradesResponse,
 } from '@/api/types'
 
@@ -120,6 +123,25 @@ export function useBacktests(strategyId: string) {
 }
 
 /**
+ * The two heavy reads, as query descriptors rather than inline in a hook.
+ *
+ * Named here because two callers want the same request under the same key: the
+ * detail panel renders them, and the row's export writes them to a file. Sharing
+ * the key is the point — a download clicked while the panel is loading joins
+ * that request instead of making a second one, and one clicked just after it
+ * reads the cache.
+ */
+const curveQuery = (runId: string) => ({
+  queryKey: ['backtest-curve', runId],
+  queryFn: () => apiGet<BacktestEquityCurveResponse>(`/api/v1/backtests/${runId}/equity-curve`),
+})
+
+const tradesQuery = (runId: string) => ({
+  queryKey: ['backtest-trades', runId],
+  queryFn: () => apiGet<BacktestTradesResponse>(`/api/v1/backtests/${runId}/trades`),
+})
+
+/**
  * One run's equity curve.
  *
  * Its own request rather than a field on the run, because it is large — a
@@ -129,8 +151,7 @@ export function useBacktests(strategyId: string) {
  */
 export function useBacktestCurve(runId: string | null, enabled: boolean) {
   return useQuery<BacktestEquityCurveResponse>({
-    queryKey: ['backtest-curve', runId],
-    queryFn: () => apiGet<BacktestEquityCurveResponse>(`/api/v1/backtests/${runId}/equity-curve`),
+    ...curveQuery(runId ?? ''),
     enabled: Boolean(runId) && enabled,
   })
 }
@@ -145,8 +166,7 @@ export function useBacktestCurve(runId: string | null, enabled: boolean) {
  */
 export function useBacktestTrades(runId: string | null, enabled: boolean) {
   return useQuery<BacktestTradesResponse>({
-    queryKey: ['backtest-trades', runId],
-    queryFn: () => apiGet<BacktestTradesResponse>(`/api/v1/backtests/${runId}/trades`),
+    ...tradesQuery(runId ?? ''),
     enabled: Boolean(runId) && enabled,
   })
 }
@@ -186,6 +206,58 @@ export function useQueueBacktest() {
     mutationFn: (payload) => apiPost<BacktestOut>('/api/v1/backtests', payload),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['backtests'] })
+    },
+  })
+}
+
+/**
+ * Write one run to a `.json` file the reader keeps.
+ *
+ * A `useMutation` although it changes nothing on the server: it is an imperative
+ * action with a pending state and a failure worth showing, which is what the
+ * hook models, and modelling it as a query would mean a `useEffect` firing on a
+ * click (CLAUDE.md §4). Per row, so a slow export of one run does not grey out
+ * the button on the others.
+ *
+ * **Fetched through `fetchQuery`, not `apiGet`.** Same keys as the detail panel,
+ * so an open run's curve and trades are reused rather than re-fetched, a click
+ * during the panel's own load joins that request, and the copies are released by
+ * the cache's normal collection instead of being pinned here — which matters
+ * when a minute run's curve is hundreds of thousands of points.
+ *
+ * **Nothing is fetched for a run without a result.** `hasResultBody` decides
+ * from the status: the two endpoints answer a queued, running or failed run with
+ * an empty list rather than a 404, so asking would buy two requests and then
+ * record `[]` — claiming the run stored an empty result where it stored none.
+ *
+ * Not gated on write scope, deliberately. Reading a result is not an act, so a
+ * read-only session exports exactly like a full one (ADR 0009).
+ */
+export function useDownloadBacktest() {
+  const queryClient = useQueryClient()
+  return useMutation<string, Error, BacktestOut>({
+    mutationFn: async (run) => {
+      const [curve, trades] = hasResultBody(run)
+        ? await Promise.all([
+            queryClient.fetchQuery(curveQuery(run.id)),
+            queryClient.fetchQuery(tradesQuery(run.id)),
+          ])
+        : [null, null]
+      const filename = runExportFilename(run)
+      saveJson(
+        filename,
+        buildRunExport(run, {
+          curve: curve?.points ?? null,
+          // The server declares these as opaque JSON objects, so this cast is
+          // the same reading `BacktestDetail` applies to the same payload —
+          // see the note on `BacktestTrade` in `api/types.ts`.
+          trades: (trades?.trades as BacktestTrade[] | undefined) ?? null,
+          exportedAt: new Date().toISOString(),
+        }),
+      )
+      // The name it wrote. The row reports it, because a browser saving
+      // straight to a downloads folder gives no sign the click did anything.
+      return filename
     },
   })
 }

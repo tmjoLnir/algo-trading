@@ -78,7 +78,8 @@ export default function Backtests() {
           <div>
             <h2 className="text-sm font-semibold text-slate-300">Runs</h2>
             <p className="mt-0.5 text-xs text-slate-500">
-              Newest first. Select a row to open it; tick two or more finished runs to compare them.
+              Newest first. Select a row to open it; tick two or more finished runs to compare them;
+              export any one of them to a .json file with the button on its row.
               {runs.some((run) => run.status === 'queued' || run.status === 'running')
                 ? ' Updating while a run is in flight.'
                 : ''}
