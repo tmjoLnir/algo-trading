@@ -412,6 +412,66 @@ describe('the trades of a finished run', () => {
 })
 
 describe('the form', () => {
+  it('queues the strategy the picker is showing, without it being touched first', async () => {
+    // The regression this exists for: the picker's initial value was read from
+    // `runnable[0]` at *mount*, and this form mounts on the first render — before
+    // the strategies query has resolved, when that list is still empty. The state
+    // initialiser does not re-run when the data lands, so the select ended up
+    // holding `''` while displaying a strategy, and the button posted an empty
+    // `strategy_id`. The API answered `unknown strategy ''; registered:
+    // ['sma_crossover']`, which reads as a registry fault and is a form fault.
+    //
+    // Deliberately never touches the Strategy select: choosing anything fires
+    // `onChange` and repairs the state, which is why every other test here — each
+    // of which asserts some *other* field of the same POST — passed throughout.
+    const fetchMock = stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': { body: list([]) },
+      'POST /backtests': { body: run({ status: 'queued' }) },
+    })
+    renderPage()
+
+    fireEvent.change(await screen.findByPlaceholderText('SPY'), { target: { value: 'SPY' } })
+    fireEvent.click(screen.getByText('Queue backtest'))
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some((call) => call[1]?.method === 'POST')).toBe(true),
+    )
+    const post = fetchMock.mock.calls.find((call) => call[1]?.method === 'POST')
+    const body = JSON.parse(String(post?.[1]?.body))
+    expect(body.strategy_id).toBe('sma_crossover')
+  })
+
+  it('queues the strategy that was chosen, not the one it falls back to', async () => {
+    // The other half of the fix, and the thing a naive repair breaks: the
+    // fallback to the first runnable strategy must apply only while nothing
+    // valid has been chosen. An explicit choice has to survive every later
+    // render of this form — the strategies query refetches on window focus, so
+    // a fallback that reasserted itself would silently re-point a queued run at
+    // a strategy the person did not pick.
+    const second: StoredStrategyView = { ...STRATEGY, id: 'donchian', name: 'donchian' }
+    const fetchMock = stubRoutes({
+      ...baseRoutes(),
+      'GET /strategies': {
+        body: { strategies: [STRATEGY, second], available: [], never_run: [] },
+      },
+      'GET /backtests': { body: list([]) },
+      'POST /backtests': { body: run({ status: 'queued' }) },
+    })
+    renderPage()
+
+    fireEvent.change(await screen.findByPlaceholderText('SPY'), { target: { value: 'SPY' } })
+    fireEvent.change(screen.getByLabelText('Strategy'), { target: { value: 'donchian' } })
+    fireEvent.click(screen.getByText('Queue backtest'))
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some((call) => call[1]?.method === 'POST')).toBe(true),
+    )
+    const post = fetchMock.mock.calls.find((call) => call[1]?.method === 'POST')
+    const body = JSON.parse(String(post?.[1]?.body))
+    expect(body.strategy_id).toBe('donchian')
+  })
+
   it('offers only strategies a worker has run', async () => {
     // `backtest_runs.strategy_id` is a foreign key onto a table a worker writes,
     // so offering an unrun class would invite a 409.
