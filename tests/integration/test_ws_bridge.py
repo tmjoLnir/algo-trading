@@ -251,9 +251,15 @@ class TestALiveConnectionCanProveItself:
     def quick_liveness(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Production waits 20s before asking and 30s before giving up. Both are
         scaled down here so the round trip happens several times over inside a
-        test, rather than once inside half a minute of waiting."""
+        test, rather than once inside half a minute of waiting.
+
+        The gap between them stays wide on purpose. A ping every 0.5s of silence
+        is what the test is here to exercise; giving up at 3s rather than just
+        after leaves a loaded runner room to stall without inventing a dead
+        connection, and is still well inside the idle window below — so a pong
+        that genuinely stopped arriving fails this test with time to spare."""
         monkeypatch.setattr(atp_api.ws, "LIVENESS_PING_SECONDS", 0.5)
-        monkeypatch.setattr(atp_api.ws, "LIVENESS_TIMEOUT_SECONDS", 1.5)
+        monkeypatch.setattr(atp_api.ws, "LIVENESS_TIMEOUT_SECONDS", 3.0)
 
     async def test_an_idle_subscription_outlives_the_liveness_timeout(
         self, quick_liveness: None, client: Redis, publisher: Redis, bridge: RunningBridge
