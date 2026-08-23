@@ -83,6 +83,55 @@ SYMBOL_FILTERED = frozenset({"quotes", "bars"})
 #: other client. Dropping is cheap here precisely because the poll recovers it.
 SEND_TIMEOUT_SECONDS = 2.0
 
+#: How long the bridge waits for one message before going round the loop again.
+#:
+#: This exists because of how redis-py reads a subscription. `pubsub.listen()`
+#: issues a *blocking* read, and a blocking read carries no deadline of its own —
+#: so it falls back to the connection's `socket_timeout`, which
+#: `persistence.redis_client` sets to 5s for the good reason that a Redis which
+#: has stopped answering must fail a caller rather than hang it. On a subscription
+#: that combination is wrong: five seconds with nothing published is the normal
+#: state of a quiet channel, not a fault, and the blocking read cannot tell the
+#: difference. It raises `TimeoutError("Timeout reading from redis:6379")`, the
+#: bridge treats it as a dropped connection, and re-subscribes — every five
+#: seconds, forever, against a Redis that is perfectly healthy.
+#:
+#: Passing an explicit timeout takes the other branch of the same redis-py code:
+#: a caller-supplied deadline returns `None` on expiry instead of raising, which
+#: is the honest answer to "was anything published?" — no. So the idle case stops
+#: being an error without touching `socket_timeout`, which still bounds the
+#: subscribe and every other command on the shared client.
+#:
+#: One second is short enough that a dropped connection is still noticed
+#: promptly and long enough that a quiet overnight channel costs one wakeup a
+#: second, which is nothing next to the fan-out this process exists to do.
+IDLE_POLL_SECONDS = 1.0
+
+#: After this much total silence — no message, no pong — prove the connection is
+#: still there before trusting the next quiet second.
+#:
+#: Polling costs the one thing the blocking read gave away for free: an answer
+#: to "is this connection alive?". `socket_timeout` expiring used to force a
+#: re-subscribe every five seconds, which was the bug, but it also meant a
+#: connection that had silently stopped carrying data was rebuilt within ten
+#: seconds of dying. A poll that returns "nothing published" cannot tell a quiet
+#: market from a socket into a black hole — a peer that vanished without a FIN,
+#: a partition, a NAT table that dropped the mapping — and in that state reads
+#: return empty forever while TCP keepalive takes hours to notice.
+#:
+#: redis-py's own `health_check_interval` does not close this: it sends a PING
+#: but never requires the PONG, and swallows the reply before a caller can see
+#: it. So the check is made here, where the answer can be waited for. Trading
+#: does not depend on it — the worker publishes whether or not the API is
+#: listening — but a bridge that is quietly delivering nothing looks exactly
+#: like a market with nothing happening, and that is the failure this codebase
+#: is least able to notice from the outside (CLAUDE.md §5).
+LIVENESS_PING_SECONDS = 20.0
+
+#: Silence past this is a dropped connection, pong or no pong. Comfortably more
+#: than a local round trip, so a Redis merely under load is not written off.
+LIVENESS_TIMEOUT_SECONDS = 30.0
+
 
 class ConnectionManager:
     """Tracks connected clients and their subscriptions.
@@ -208,6 +257,19 @@ async def redis_bridge(
     rather than taking the bridge down. The only thing that publishes here is
     this platform, so one is a bug worth seeing — and worth seeing *without* an
     outage attached.
+
+    Reads poll with an explicit deadline rather than blocking, so that a channel
+    with nothing on it is not mistaken for a broken connection. That distinction
+    is the whole of `IDLE_POLL_SECONDS`, and getting it wrong is not a cosmetic
+    bug: every re-subscribe is a window in which the platform is publishing to
+    nobody, and pub/sub has no replay to make it up afterwards.
+
+    Silence is therefore not evidence of anything, which is why the connection
+    is asked directly once it has gone on long enough
+    (`LIVENESS_PING_SECONDS`). The two failures are opposites and both are
+    silent from the outside: treating a quiet market as a dead socket drops
+    messages nobody knows were sent, and treating a dead socket as a quiet
+    market delivers nothing while looking calm.
     """
     attempt = 0
     while True:
@@ -216,15 +278,42 @@ async def redis_bridge(
             await pubsub.subscribe(*channels)
             attempt = 0
             log.info("ws.bridge_subscribed", channels=list(channels))
-            async for raw in pubsub.listen():
-                if raw.get("type") != "message":
+            # Loop time rather than `Clock.now()`: this measures how long a
+            # socket has been silent, not when anything happened. It must be
+            # monotonic — a wall clock stepping backwards over an NTP correction
+            # would suppress the liveness check exactly when it is due — and it
+            # is never read by the domain, so §1.2 does not reach it.
+            clock = asyncio.get_running_loop().time
+            last_seen = clock()
+            awaiting_pong = False
+            while pubsub.subscribed:
+                raw = await pubsub.get_message(timeout=IDLE_POLL_SECONDS)
+                if raw is not None:
+                    # Anything at all — a published message or the pong from the
+                    # check below — proves the connection is still carrying data.
+                    last_seen = clock()
+                    awaiting_pong = False
+                    if raw.get("type") == "message":
+                        _dispatch(raw, connections)
                     continue
-                _dispatch(raw, connections)
-            # `listen()` on a live subscription blocks forever, so reaching here
-            # means the subscription ended under us. Raised rather than looped
-            # back to directly, because falling through would re-subscribe with
-            # the attempt counter reset and spin at full speed against whatever
-            # just dropped it.
+                # Nothing published inside the window. That is a quiet market,
+                # not a fault — unless it has been quiet for so long that a dead
+                # connection would look identical (`LIVENESS_PING_SECONDS`).
+                silent_for = clock() - last_seen
+                if silent_for >= LIVENESS_TIMEOUT_SECONDS:
+                    raise ConnectionError(
+                        f"no response from Redis for {silent_for:.0f}s on a live subscription"
+                    )
+                if silent_for >= LIVENESS_PING_SECONDS and not awaiting_pong:
+                    # Sent once per quiet stretch, not once per poll: the answer
+                    # resets `last_seen`, and until it arrives another ping adds
+                    # nothing but traffic.
+                    awaiting_pong = True
+                    await pubsub.ping()
+            # The loop above ends only when the subscription is gone from under
+            # us. Raised rather than looped back to directly, because falling
+            # through would re-subscribe with the attempt counter reset and spin
+            # at full speed against whatever just dropped it.
             raise ConnectionError("the Redis subscription ended")
         except asyncio.CancelledError:
             raise

@@ -166,6 +166,32 @@ Likely a retry without `client_order_id` reuse, or two workers running.
 3. Decide immediately: close manually or accept the position. Do not leave it.
 4. Afterwards: why was there no broker-side stop?
 
+## Dashboard stopped updating between polls (`ws.bridge_failed`)
+
+*Symptom:* `ws.bridge_failed error='Timeout reading from redis:6379'` in the API
+log; the dashboard still refreshes every 5 minutes but nothing moves in between.
+
+This warning means the API's Redis subscription dropped. **It is signal, not
+noise** — worth knowing because it used to be the opposite. Before #89 a quiet
+channel produced this line every 5 seconds around the clock on a perfectly
+healthy Redis, so anyone who worked here through that has learned to scroll past
+it. It no longer fires on an idle subscription.
+
+1. The trading loop does not depend on this. The worker publishes to Redis and
+   does not care whether the API is listening, and the dashboard's 5-minute
+   poll is the source of truth regardless — so this degrades freshness, it does
+   not stop trading and it does not lose an order.
+2. Check Redis is up and reachable *from the API container*: `docker compose
+   exec api redis-cli -u "$REDIS_URL" ping`. `/readyz` reports the same thing.
+3. One line followed by `ws.bridge_subscribed` is a blip that recovered on its
+   own — the bridge retries forever by design. A repeating pair with no other
+   Redis symptom is the connection dying under load; check `maxclients` and
+   memory on the Redis instance.
+4. Note what *was* missed. Pub/sub has no replay, so anything published while
+   the bridge was down reached no browser — including a halt. The poll fills the
+   book back in, but a halt banner that should have appeared at 14:31 will not
+   appear until the next poll.
+
 ## Dashboard shows "502 Bad Gateway"
 
 *Symptom:* the dashboard renders, and then, where the numbers should be,
