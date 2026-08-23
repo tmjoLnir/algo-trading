@@ -232,8 +232,16 @@ async def main(argv: list[str] | None = None) -> int:
     if start >= end:
         raise SystemExit(f"--start must be before --end ({start.date()} >= {end.date()})")
 
+    # `required=True` gets the flag onto the command line; it does not stop
+    # `--strategy ""`, which is what an unset shell variable expands to. Without
+    # this the registry reports a failed lookup and lists what is registered,
+    # which reads as "your strategy is missing" when nothing was named at all.
+    strategy_name = args.strategy.strip()
+    if not strategy_name:
+        raise SystemExit("--strategy is empty")
+
     try:
-        strategy_cls = registry.get(args.strategy)
+        strategy_cls = registry.get(strategy_name)
     except ATPError as exc:
         raise SystemExit(str(exc)) from None
 
@@ -301,7 +309,7 @@ async def main(argv: list[str] | None = None) -> int:
     # a message naming the flag, which is the better error for a CLI.
     engine = build_engine(
         BacktestRunSpec(
-            strategy_id=args.strategy,
+            strategy_id=strategy_name,
             symbols=tuple(symbols),
             start=start,
             end=end,

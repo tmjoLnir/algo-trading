@@ -146,6 +146,33 @@ class TestArgumentRefusals:
         with pytest.raises(SystemExit, match=r"unknown strategy 'nope'.*sma_crossover"):
             run(["--strategy", "nope", *BASE[2:]])
 
+    def test_an_empty_strategy_is_not_reported_as_an_unknown_one(self) -> None:
+        """`required=True` puts the flag on the command line; it does not stop
+        `--strategy ""`, which is what an unset shell variable expands to.
+
+        The registry answers a blank the same way it answers a typo — a failed
+        lookup listing everything registered — so an operator who passed nothing
+        was told their strategy was missing from the registry. Naming nothing
+        and naming the wrong thing are different mistakes.
+        """
+        with pytest.raises(SystemExit, match=r"--strategy is empty"):
+            run(["--strategy", "", *BASE[2:]])
+
+    def test_a_padded_strategy_name_is_stripped_before_it_is_looked_up(self) -> None:
+        """The refusal names `nope`, not `  nope  `, so the strip happens before
+        the registry sees it.
+
+        It has to happen before the *spec* too, and that is the less obvious
+        half: `build_engine` resolves `spec.strategy_id` against the registry a
+        second time, so a name stripped only for this function's own lookup
+        would pass here and then fail inside the engine — the same misleading
+        message, one layer deeper and past the point where a flag name could be
+        mentioned. That path needs settings and a database, so the spec itself
+        is asserted on the API's equivalent test rather than here.
+        """
+        with pytest.raises(SystemExit, match=r"unknown strategy 'nope'"):
+            run(["--strategy", "  nope  ", *BASE[2:]])
+
 
 class TestFormatting:
     def test_percentages_money_and_counts(self) -> None:
