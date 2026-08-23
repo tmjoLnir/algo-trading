@@ -101,7 +101,30 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
   const range = defaultRange()
   const queue = useQueueBacktest()
 
-  const [strategyId, setStrategyId] = useState(runnable[0]?.id ?? '')
+  // The *chosen* strategy, which is empty until somebody chooses one — not the
+  // strategy this form will queue. That distinction is the bug this shape fixes:
+  // `useState(runnable[0]?.id ?? '')` read the list at mount, and this form
+  // mounts on the page's first render, before the strategies query has resolved
+  // and while `runnable` is still `[]`. A state initialiser does not re-run when
+  // the data lands, so the value stayed `''` for the life of the form — and
+  // React, whose controlled `<select>` selects the first option when the value
+  // matches none of them, displayed a strategy that was not the one being sent.
+  // The button posted an empty `strategy_id` and the API answered `unknown
+  // strategy ''`, which reads as a registry fault and is a form fault.
+  //
+  // Derived at render rather than synced in an effect, deliberately: an effect
+  // would queue a second render in which the form still holds the stale value,
+  // and anything reading it in between — a submit — sees the wrong answer. This
+  // cannot be stale, because it is recomputed from the list it depends on.
+  const [chosenStrategyId, setChosenStrategyId] = useState('')
+  // The fallback applies only while the choice is not one of the offered rows,
+  // which covers both "nothing chosen yet" and a strategy that has left the
+  // list. An explicit, still-valid choice always wins — the strategies query
+  // refetches on window focus, and a fallback that reasserted itself there would
+  // re-point the run at a strategy nobody picked.
+  const strategyId = runnable.some((strategy) => strategy.id === chosenStrategyId)
+    ? chosenStrategyId
+    : (runnable[0]?.id ?? '')
   const [symbols, setSymbols] = useState('')
   const [start, setStart] = useState(range.start)
   const [end, setEnd] = useState(range.end)
@@ -190,7 +213,7 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
         <Field label="Strategy" hint={picked ? picked.class_name : undefined}>
           <select
             value={strategyId}
-            onChange={(event) => setStrategyId(event.target.value)}
+            onChange={(event) => setChosenStrategyId(event.target.value)}
             disabled={!mayAct}
             className={INPUT}
           >
