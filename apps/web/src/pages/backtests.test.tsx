@@ -467,6 +467,84 @@ describe('the trades of a finished run', () => {
 })
 
 describe('the form', () => {
+  it('trims the strategy id, because the server does', async () => {
+    // A `strategies` row carries whatever `Strategy.name` the worker booted
+    // with, so one can arrive padded. `POST /backtests` strips before both the
+    // registry lookup and the spec it stores, so sending the raw value is
+    // accepted at the door and then misses the foreign key onto
+    // `strategies.id` — reported as a strategy no worker has ever run, which is
+    // a sentence about the wrong thing.
+    const padded = { ...STRATEGY, id: '  sma_crossover  ' }
+    const fetchMock = stubRoutes({
+      'GET /auth/me': { body: { user: 'operator', scope: 'full' } },
+      'GET /strategies': { body: { strategies: [padded], available: [], never_run: [] } },
+      'GET /backtests': { body: list([]) },
+      'POST /backtests': { body: run({ status: 'queued' }) },
+    })
+    renderPage()
+
+    fireEvent.change(await screen.findByPlaceholderText('SPY'), { target: { value: 'SPY' } })
+    fireEvent.click(screen.getByText('Queue backtest'))
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some((call) => call[1]?.method === 'POST')).toBe(true),
+    )
+    const post = fetchMock.mock.calls.find((call) => call[1]?.method === 'POST')
+    expect(JSON.parse(String(post?.[1]?.body)).strategy_id).toBe('sma_crossover')
+  })
+
+  it('will not queue a strategy whose id is blank, and says why', async () => {
+    // The shape of "the strategy is right there and the server says it is
+    // empty": a row with a name to show and no id to send. The strategy is the
+    // one field on this form nobody types — it is derived from a list fetched at
+    // runtime — so it is the only one that can silently be empty. Posting it
+    // would spend a round trip to be told `strategy_id is empty`, which is true
+    // and unreadable next to a picker visibly showing a strategy.
+    const blank = { ...STRATEGY, id: '', name: 'sma_crossover' }
+    const fetchMock = stubRoutes({
+      'GET /auth/me': { body: { user: 'operator', scope: 'full' } },
+      'GET /strategies': { body: { strategies: [blank], available: [], never_run: [] } },
+      'GET /backtests': { body: list([]) },
+      'POST /backtests': { body: run({ status: 'queued' }) },
+    })
+    renderPage()
+
+    fireEvent.change(await screen.findByPlaceholderText('SPY'), { target: { value: 'SPY' } })
+
+    expect(await screen.findByText(/blank id, so there is nothing to queue/)).toBeTruthy()
+    expect(screen.getByText('Queue backtest')).toHaveProperty('disabled', true)
+
+    fireEvent.click(screen.getByText('Queue backtest'))
+    expect(fetchMock.mock.calls.some((call) => call[1]?.method === 'POST')).toBe(false)
+  })
+
+  it('treats a whitespace-only id as blank rather than sending it', async () => {
+    // `'  '` is not an id. The server would strip it to `''` and refuse; the
+    // difference is that here it is refused before the request, beside the
+    // control that produced it.
+    const whitespace = { ...STRATEGY, id: '   ' }
+    const fetchMock = stubRoutes({
+      'GET /auth/me': { body: { user: 'operator', scope: 'full' } },
+      'GET /strategies': { body: { strategies: [whitespace], available: [], never_run: [] } },
+      'GET /backtests': { body: list([]) },
+      'POST /backtests': { body: run({ status: 'queued' }) },
+    })
+    renderPage()
+
+    fireEvent.change(await screen.findByPlaceholderText('SPY'), { target: { value: 'SPY' } })
+
+    // The disabled button is the assertion, not the absent POST: a POST is
+    // fired asynchronously, so checking for its absence straight after a click
+    // passes whether or not the guard exists.
+    expect(await screen.findByText('Queue backtest')).toHaveProperty('disabled', true)
+    expect(screen.getByText(/blank id, so there is nothing to queue/)).toBeTruthy()
+
+    fireEvent.click(screen.getByText('Queue backtest'))
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some((call) => call[1]?.method === 'POST')).toBe(false),
+    )
+  })
+
   it('queues the strategy the picker is showing, without it being touched first', async () => {
     // The regression this exists for: the picker's initial value was read from
     // `runnable[0]` at *mount*, and this form mounts on the first render — before

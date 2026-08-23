@@ -23,6 +23,15 @@
  * refusal is shown verbatim, because it names the exact `backfill_bars.py`
  * command that fixes the common case. Duplicating those rules here would give
  * two answers to one question and the client's would be the one that drifts.
+ *
+ * **There is one deliberate exception, and it is a check on this form rather
+ * than a copy of a server rule.** The strategy is the only value here nobody
+ * types — it is derived from a list fetched at runtime — which makes it the only
+ * one that can be empty without anybody having done anything. The server's
+ * refusal for that case is `strategy_id is empty`: correct, and unreadable next
+ * to a picker visibly showing a strategy, because it describes the request and
+ * the fault is in the row. So a blank id is refused here, beside the control
+ * that produced it, and named as what it is.
  */
 
 import { cloneElement, useState } from 'react'
@@ -125,6 +134,24 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
   const strategyId = runnable.some((strategy) => strategy.id === chosenStrategyId)
     ? chosenStrategyId
     : (runnable[0]?.id ?? '')
+  // What actually gets posted, and the reason it is not just `strategyId`.
+  //
+  // **Trimmed, because the server trims.** `POST /backtests` strips the name
+  // before both the registry lookup and the spec it stores, so an id arriving
+  // with whitespace around it is accepted there and then fails the foreign key
+  // onto `strategies.id` — surfacing as a 409 about a strategy no worker has
+  // run, which is a sentence about the wrong thing. Sending what the server will
+  // use keeps the two ends agreeing. `symbols` two lines below has always been
+  // trimmed here for the same reason.
+  //
+  // **Checked for blank, because this is the one field on the form nobody
+  // types.** Every other value is either typed or picked from a constant; this
+  // one is derived from a list fetched at runtime, which makes it the only one
+  // that can silently be empty. A `strategies` row carries whatever
+  // `Strategy.name` the worker booted with, so a blank or whitespace-only name
+  // makes a row that shows a label in the picker and carries no id — the exact
+  // shape of "the strategy is right there and the server says it is empty".
+  const queueableStrategyId = strategyId.trim()
   const [symbols, setSymbols] = useState('')
   const [start, setStart] = useState(range.start)
   const [end, setEnd] = useState(range.end)
@@ -155,7 +182,7 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
   const submit = (event: React.FormEvent) => {
     event.preventDefault()
     queue.mutate({
-      strategy_id: strategyId,
+      strategy_id: queueableStrategyId,
       symbols: symbols
         .split(',')
         .map((symbol) => symbol.trim().toUpperCase())
@@ -395,7 +422,7 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
       <div className="mt-4 flex flex-wrap items-center gap-3">
         <button
           type="submit"
-          disabled={!mayAct || queue.isPending || !symbols.trim()}
+          disabled={!mayAct || queue.isPending || !symbols.trim() || !queueableStrategyId}
           className="rounded bg-sky-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-40"
         >
           {queue.isPending ? 'Queueing…' : 'Queue backtest'}
@@ -407,6 +434,17 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
           <span className="text-xs text-slate-500">
             This session is read-only. You can read every run below and compare them; queueing one
             is an act.
+          </span>
+        ) : !queueableStrategyId ? (
+          // A picker with rows in it and no id to send. Named here rather than
+          // left to the server, because the server can only say `strategy_id is
+          // empty` — true, and unreadable next to a picker visibly showing a
+          // strategy. The fault is in the row, and this says which row and what
+          // is wrong with it.
+          <span className="text-xs text-amber-300">
+            The selected strategy has a blank id, so there is nothing to queue. Its{' '}
+            <code className="text-amber-200">strategies</code> row was written from a strategy whose
+            name is empty — check the worker that created it.
           </span>
         ) : null}
 
