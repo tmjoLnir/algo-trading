@@ -376,6 +376,18 @@ staying out of the way of the server's validation:
   reads as that rather than as the quicker choice — and a run that used it is
   flagged on its row, because it invalidates everything else on it.
 
+- **A blank strategy id is refused here, not by the server.** The strategy is the
+  only value on this form nobody types — it is derived from the strategies list —
+  so it is the only one that can be empty without anybody having done anything. A
+  `strategies` row carries whatever `Strategy.name` the worker booted with, so a
+  blank name makes a row that shows a label in the picker and carries no id. The
+  server's own refusal for that, `strategy_id is empty`, is correct and unreadable
+  beside a picker visibly showing a strategy, because it describes the request
+  when the fault is in the row. The id is also trimmed before it is sent, because
+  the server strips it before both the registry lookup and the spec it stores —
+  sending the raw value is accepted at the door and then misses the foreign key
+  onto `strategies.id`, surfacing as a 409 about a strategy no worker has run.
+
 **It can only offer strategies a worker has actually run**, and that is the
 strategies page's gap met from the other side. `backtest_runs.strategy_id` is a
 foreign key onto `strategies`, a table the runner writes at its first session
