@@ -31,12 +31,20 @@ import type {
  *    actionable message on this screen into a dead end.
  * 5. **Read-only sessions can read and compare, and cannot queue.** ADR 0009 —
  *    authorisation is about the act.
+ * 6. **Any single run can be written to a file**, and the file says which run and
+ *    what state it was in. What it must never do is claim a result the run does
+ *    not have.
  */
 
 afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
+  // jsdom implements neither, so `captureDownloads` adds them. Removed rather
+  // than left behind: a test that forgot to install them would otherwise pass
+  // against another test's spy.
+  delete (URL as Partial<typeof URL>).createObjectURL
+  delete (URL as Partial<typeof URL>).revokeObjectURL
 })
 
 const SPEC: BacktestSpecView = {
@@ -186,6 +194,53 @@ function baseRoutes(scope: 'full' | 'read' = 'full') {
       body: { strategies: [STRATEGY], available: [], never_run: [] },
     },
   }
+}
+
+/**
+ * Catch the files the page hands to the browser.
+ *
+ * jsdom has no download machinery — no `URL.createObjectURL`, and an anchor
+ * click that would navigate rather than save — so the seam is stubbed at both
+ * ends: the blob is captured where it is created, and the name where it is
+ * clicked. Asserting on the bytes rather than on a spy call is the point, since
+ * what this feature promises is the *content* of a file.
+ *
+ * Read through a `FileReader` rather than `blob.text()`, which jsdom's `Blob`
+ * does not implement.
+ */
+function captureDownloads() {
+  const saved: { name: string; json: () => Promise<unknown> }[] = []
+  let pending: Blob | null = null
+
+  const readText = (blob: Blob) =>
+    new Promise<string>((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(String(reader.result))
+      reader.onerror = () => reject(reader.error)
+      reader.readAsText(blob)
+    })
+
+  URL.createObjectURL = vi.fn((blob: Blob) => {
+    pending = blob
+    return 'blob:stub'
+  })
+  URL.revokeObjectURL = vi.fn()
+  vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (
+    this: HTMLAnchorElement,
+  ) {
+    const blob = pending
+    saved.push({
+      name: this.download,
+      json: async () => JSON.parse(await readText(blob as Blob)) as unknown,
+    })
+  })
+
+  return saved
+}
+
+/** The export button on a row. One per run, addressed by the run's id. */
+function exportButton(runId = 'run-1') {
+  return screen.findByLabelText(`download run ${runId} as JSON`)
 }
 
 describe('a run that is waiting', () => {
@@ -823,5 +878,232 @@ describe('an empty list', () => {
     renderPage()
 
     expect(await screen.findByText(/older ones this page did not fetch/)).toBeTruthy()
+  })
+})
+
+describe('exporting a run', () => {
+  it('writes the run, its curve and its trades to a file named for it', async () => {
+    // The whole result in one file: what was asked for, what came back, the
+    // curve and every trade. A reader who keeps this can answer
+    // docs/BACKTESTING.md's checklist a year later without the platform.
+    const saved = captureDownloads()
+    stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': { body: list([run()]) },
+      'GET /backtests/run-1/equity-curve': {
+        body: { run_id: 'run-1', points: [['2024-01-02T00:00:00Z', '100000.00']] },
+      },
+      'GET /backtests/run-1/trades': {
+        body: {
+          run_id: 'run-1',
+          trades: [{ symbol: 'SPY', entry_price: '450.125', net_pnl: '-0.006', qty: '100' }],
+        },
+      },
+    })
+    renderPage()
+
+    fireEvent.click(await exportButton())
+
+    await waitFor(() => expect(saved.length).toBe(1))
+    expect(saved[0]?.name).toBe('backtest-sma_crossover-2026-08-20-run-1.json')
+
+    const file = (await saved[0]?.json()) as {
+      run: BacktestOut
+      equity_curve: string[][]
+      trades: { net_pnl: string }[]
+    }
+    expect(file.run.id).toBe('run-1')
+    expect(file.run.spec.timeframe).toBe('1d')
+    expect(file.run.metrics?.sharpe).toBe(1.21)
+    expect(file.equity_curve).toEqual([['2024-01-02T00:00:00Z', '100000.00']])
+    expect(file.trades[0]?.net_pnl).toBe('-0.006')
+  })
+
+  it('keeps every monetary figure a string', async () => {
+    // Rule §1.1 at the last place it can be broken. A price that went through a
+    // double on the way to disk is a wrong number in a file somebody trusts —
+    // and unlike a screen, a file has nothing beside it to check against.
+    const saved = captureDownloads()
+    stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': {
+        body: list([run({ spec: { ...SPEC, starting_cash: '100000.333333333333333333' } })]),
+      },
+      'GET /backtests/run-1/equity-curve': {
+        body: { run_id: 'run-1', points: [['2024-01-02T00:00:00Z', '100000.333333333333333333']] },
+      },
+      'GET /backtests/run-1/trades': {
+        body: { run_id: 'run-1', trades: [{ entry_price: '450.125' }] },
+      },
+    })
+    renderPage()
+
+    fireEvent.click(await exportButton())
+
+    await waitFor(() => expect(saved.length).toBe(1))
+    const file = (await saved[0]?.json()) as {
+      run: BacktestOut
+      equity_curve: string[][]
+      trades: { entry_price: string }[]
+    }
+    // Beyond a double's 15-17 significant digits: these digits cannot survive a
+    // parse, so their presence is the proof that nothing parsed them.
+    expect(file.run.spec.starting_cash).toBe('100000.333333333333333333')
+    expect(file.equity_curve[0]?.[1]).toBe('100000.333333333333333333')
+    expect(typeof file.trades[0]?.entry_price).toBe('string')
+  })
+
+  it('does not ask for a result a run has not produced', async () => {
+    // The two endpoints answer a queued run with an empty list rather than a
+    // 404, so asking would spend two requests to learn what the status already
+    // says — and would then record `[]`, claiming an empty result where there is
+    // none.
+    const saved = captureDownloads()
+    const fetchMock = stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': {
+        body: list([run({ status: 'queued', started_at: null, finished_at: null, metrics: null })]),
+      },
+    })
+    renderPage()
+
+    fireEvent.click(await exportButton())
+
+    await waitFor(() => expect(saved.length).toBe(1))
+    const urls = fetchMock.mock.calls.map(([input]) => String(input))
+    expect(urls.some((url) => url.includes('/equity-curve'))).toBe(false)
+    expect(urls.some((url) => url.includes('/trades'))).toBe(false)
+
+    const file = (await saved[0]?.json()) as { equity_curve: null; trades: null; run: BacktestOut }
+    expect(file.equity_curve).toBeNull()
+    expect(file.trades).toBeNull()
+    // Still worth keeping: it is the record of exactly what was asked for.
+    expect(file.run.status).toBe('queued')
+    expect(file.run.spec.symbols).toEqual(['SPY'])
+  })
+
+  it('exports a failed run as a failure rather than as an empty result', async () => {
+    // `RunRepository.fail` clears the curve and the trades — a partial curve
+    // under a failed status is a chart of two of the five years somebody asked
+    // about. The file has to say that, not show it as a run that traded nothing.
+    const saved = captureDownloads()
+    stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': {
+        body: list([run({ status: 'failed', error: 'no bars for SPY', metrics: null })]),
+      },
+    })
+    renderPage()
+
+    fireEvent.click(await exportButton())
+
+    await waitFor(() => expect(saved.length).toBe(1))
+    const file = (await saved[0]?.json()) as { trades: null; run: BacktestOut }
+    expect(file.run.error).toBe('no bars for SPY')
+    expect(file.trades).toBeNull()
+  })
+
+  it('confirms on the row that it wrote a file', async () => {
+    // A browser saving straight to a downloads folder shows nothing at all, and
+    // a button that answers a click with silence reads as broken. The name is
+    // the title, because it is what finds the file.
+    const saved = captureDownloads()
+    stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': { body: list([run()]) },
+      'GET /backtests/run-1/equity-curve': { body: { run_id: 'run-1', points: [] } },
+      'GET /backtests/run-1/trades': { body: { run_id: 'run-1', trades: [] } },
+    })
+    renderPage()
+
+    fireEvent.click(await exportButton())
+
+    const note = await screen.findByText('saved')
+    expect(note.getAttribute('title')).toBe('backtest-sma_crossover-2026-08-20-run-1.json')
+    expect(saved[0]?.name).toBe('backtest-sma_crossover-2026-08-20-run-1.json')
+  })
+
+  it('says so on the row when it could not export, and writes nothing', async () => {
+    // A failure path, because a button that silently does nothing is the worst
+    // outcome here: the reader believes they have the file.
+    const saved = captureDownloads()
+    stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': { body: list([run()]) },
+      'GET /backtests/run-1/equity-curve': {
+        status: 503,
+        body: { detail: 'the database is unreachable' },
+      },
+      'GET /backtests/run-1/trades': { body: { run_id: 'run-1', trades: [] } },
+    })
+    renderPage()
+
+    fireEvent.click(await exportButton())
+
+    expect(await screen.findByText('could not export')).toBeTruthy()
+    expect(saved.length).toBe(0)
+  })
+
+  it('exports one run without opening it or touching the others', async () => {
+    // The click must not bubble to the row: a detail panel springing open on
+    // every download would scroll the list out from under the next one. And the
+    // failure above belongs to its own row — this asserts the other button is
+    // still usable.
+    const saved = captureDownloads()
+    stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': { body: list([run(), run({ id: 'run-2' })]) },
+      'GET /backtests/run-2/equity-curve': { body: { run_id: 'run-2', points: [] } },
+      'GET /backtests/run-2/trades': { body: { run_id: 'run-2', trades: [] } },
+    })
+    renderPage()
+
+    fireEvent.click(await exportButton('run-2'))
+
+    await waitFor(() => expect(saved.length).toBe(1))
+    expect(saved[0]?.name).toBe('backtest-sma_crossover-2026-08-20-run-2.json')
+    // The detail panel renders this heading; the row click that would open it
+    // never happened.
+    expect(screen.queryByText('Metrics')).toBeNull()
+  })
+
+  it('lets a read-only session export', async () => {
+    // Reading a result and writing it to disk performs no act, so unlike the
+    // queue button this one is not gated on scope (ADR 0009).
+    const saved = captureDownloads()
+    stubRoutes({
+      ...baseRoutes('read'),
+      'GET /backtests': { body: list([run()]) },
+      'GET /backtests/run-1/equity-curve': { body: { run_id: 'run-1', points: [] } },
+      'GET /backtests/run-1/trades': { body: { run_id: 'run-1', trades: [] } },
+    })
+    renderPage()
+
+    const button = await exportButton()
+    expect(button).toHaveProperty('disabled', false)
+    fireEvent.click(button)
+
+    await waitFor(() => expect(saved.length).toBe(1))
+  })
+
+  it('records a finished run that took no trades as an empty result, not a missing one', async () => {
+    // `[]` and `null` are different facts and this is the one that is `[]`: the
+    // run stored a result and it is empty, which is what a strategy that never
+    // exited looks like.
+    const saved = captureDownloads()
+    stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': { body: list([run()]) },
+      'GET /backtests/run-1/equity-curve': { body: { run_id: 'run-1', points: [] } },
+      'GET /backtests/run-1/trades': { body: { run_id: 'run-1', trades: [] } },
+    })
+    renderPage()
+
+    fireEvent.click(await exportButton())
+
+    await waitFor(() => expect(saved.length).toBe(1))
+    const file = (await saved[0]?.json()) as { equity_curve: string[][]; trades: unknown[] }
+    expect(file.trades).toEqual([])
+    expect(file.equity_curve).toEqual([])
   })
 })

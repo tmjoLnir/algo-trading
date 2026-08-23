@@ -21,11 +21,20 @@
  * the spec is a decimal string and goes through `money.ts`. The two never mix —
  * see the header of `lib/stats.ts` for why that boundary is a compiler-enforced
  * one.
+ *
+ * Every row can also be written to a `.json` file, independently of every other
+ * — the run as the API served it, plus its equity curve and its trades. That is
+ * per row rather than one export of the whole list because what a reader wants
+ * to keep, diff or hand to a notebook is a *result*, and a list of forty of them
+ * with the curves attached is not a file anybody opens. `lib/backtestExport.ts`
+ * owns what goes in it.
  */
 
+import { ApiError } from '@/api/client'
 import { formatDateTime, formatMoney } from '@/lib/money'
 import { formatCount, formatStat, formatStatPercent, statTone } from '@/lib/stats'
-import { isInFlight } from '@/hooks/useBacktests'
+import { isInFlight, useDownloadBacktest } from '@/hooks/useBacktests'
+import { hasResultBody } from '@/lib/backtestExport'
 import type { BacktestOut } from '@/api/types'
 
 interface Props {
@@ -104,6 +113,67 @@ function Headline({ run }: { run: BacktestOut }) {
   )
 }
 
+/**
+ * Write this one run to a file.
+ *
+ * Its own component so the hook is per row: a slow export of a five-year minute
+ * run must not grey out the button on the thirty rows beside it, and a failure
+ * belongs on the row that failed rather than on the panel.
+ *
+ * Offered on every row, including the ones with nothing computed yet. A queued
+ * run's file is its spec and its status, which is a smaller thing than a result
+ * and still the answer to "what exactly did I ask for" — and the file says which
+ * it is, so nothing has to be inferred from its size. The title says so before
+ * the click rather than leaving it to be discovered after it.
+ *
+ * Not disabled for a read-only session, unlike the queue button on this screen:
+ * reading a result and writing it to disk performs no act (ADR 0009).
+ *
+ * **Both outcomes are stated on the row**, and the successful one is not
+ * redundant: a browser saving straight to a downloads folder shows nothing at
+ * all, and a button that answers a click with silence reads as broken. It says
+ * `saved` rather than the name, which does not fit a column this narrow — the
+ * name is the title, and it is the one thing needed to find the file.
+ */
+function ExportButton({ run }: { run: BacktestOut }) {
+  const download = useDownloadBacktest()
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => download.mutate(run)}
+        disabled={download.isPending}
+        aria-label={`download run ${run.id} as JSON`}
+        title={
+          hasResultBody(run)
+            ? 'Download this run as .json — the spec, the metrics, the equity curve and every trade.'
+            : 'Download this run as .json. It has no result yet, so the file carries the spec and the status.'
+        }
+        className="rounded border border-slate-700 px-2 py-1 text-[11px] font-medium text-slate-300 hover:border-slate-500 hover:text-slate-100 disabled:opacity-40"
+      >
+        {download.isPending ? 'saving…' : 'JSON'}
+      </button>
+      {download.error ? (
+        // On the row, because it is this run that could not be written and the
+        // others may have exported fine. The reason is in the title: it is the
+        // API's own words and too long for a column this narrow.
+        <div
+          className="mt-1 text-[11px] text-amber-400"
+          title={
+            download.error instanceof ApiError ? download.error.detail : String(download.error)
+          }
+        >
+          could not export
+        </div>
+      ) : download.data ? (
+        <div className="mt-1 text-[11px] text-emerald-500/80" title={download.data}>
+          saved
+        </div>
+      ) : null}
+    </>
+  )
+}
+
 function Header({ children, align = 'left' }: { children: string; align?: 'left' | 'right' }) {
   return (
     <th
@@ -140,6 +210,7 @@ export default function BacktestRunList({ runs, selected, onSelect, onToggleComp
             <Header>Status</Header>
             <Header>Result</Header>
             <Header align="right">Queued</Header>
+            <Header align="right">Export</Header>
           </tr>
         </thead>
         <tbody>
@@ -200,6 +271,15 @@ export default function BacktestRunList({ runs, selected, onSelect, onToggleComp
                 ) : isInFlight(run) ? (
                   <div className="text-slate-600">not finished</div>
                 ) : null}
+              </td>
+              {/* Stops the click here, like the compare cell: exporting a run is
+                  not asking to open it, and a panel that sprang open on every
+                  download would scroll the list out from under the next one. */}
+              <td
+                className="whitespace-nowrap px-3 py-2 text-right"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <ExportButton run={run} />
               </td>
             </tr>
           ))}

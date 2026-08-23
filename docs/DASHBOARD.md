@@ -420,6 +420,38 @@ from the order that closed each position, so a stop-out and a signal exit are to
 apart; that required the backtest engine to start setting `Order.purpose`, which
 it never had (ADR 0016).
 
+**Every run can be taken away as a file.** Each row carries a `JSON` button that
+writes that one run to `backtest-<strategy>-<queued date>-<run id>.json`: the run
+as the API served it — spec, metrics, warnings, all three timestamps — plus its
+equity curve and every trade. Four decisions in it are worth stating:
+
+- **Per run, not per list.** What a reader keeps, diffs or hands to a notebook is
+  a *result*. Forty of them with the curves attached is not a file anybody opens,
+  and a minute run's curve alone is hundreds of thousands of points.
+- **Assembled in the browser from the reads that already exist**, rather than
+  through a new export endpoint. Everything in the file is already served by the
+  list and the two the detail panel makes; a fifth endpoint would thicken an
+  `apps/api` that is meant to stay thin, and would still have to be fetched with
+  the session cookie and turned into a blob here — a plain `<a href>` does not
+  carry a credentialed cross-origin request. It goes through the same query keys
+  as the detail panel, so an open run's curve is reused and a click during its
+  load joins that request instead of making a second one.
+- **Nothing in it is parsed.** Every monetary figure — `starting_cash`, each
+  point on the curve, each price, fee and P&L on a trade — is a decimal string on
+  the wire and is copied untouched, so what lands on disk is what the engine
+  computed. The metric set stays float, because that is what it is.
+- **A missing result is `null`, an empty one is `[]`.** A queued or running run
+  has not produced a curve, and `RunRepository.fail` *clears* the curve and the
+  trades on failure — a partial curve under a failed status is a chart of two of
+  the five years somebody asked about. Those export as `null`, and the two
+  endpoints are not called at all. A finished run that closed no round trip
+  exports `[]`, because taking no trades is a result.
+
+The button is offered on unfinished runs too — that file is the spec and the
+status, which is still the record of exactly what was asked for — and it is not
+gated on write scope: reading a result and writing it to disk performs no act
+(ADR 0009).
+
 **Comparison marks no winner**, deliberately. Highlighting the best value per row
 would be this screen making exactly the choice its own overfitting warning asks a
 reader not to make on those numbers alone. It is a GET, so a read-only session can
