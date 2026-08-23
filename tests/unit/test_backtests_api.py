@@ -344,6 +344,46 @@ class TestRefusalsBeforeTheJobIsQueued:
         assert response.status_code == 400
         assert SHIPPED in response.json()["detail"]
 
+    async def test_naming_no_strategy_is_not_reported_as_an_unknown_one(
+        self, client: httpx.AsyncClient, runs: FakeBacktestRunRepository
+    ) -> None:
+        """A blank name and a wrong name are different mistakes, and only one of
+        them is about the registry.
+
+        `registry.get("")` answers both the same way — a failed lookup, plus
+        every registered name — so a caller that sent nothing was told what the
+        registry contains. The dashboard sent exactly that while its picker
+        seeded itself from a strategy list that had not loaded (#88), and the
+        refusal pointed every reader at the registry instead of at the request.
+
+        The assertion is that the registered names are *absent*: listing them
+        here is what made the two mistakes indistinguishable.
+        """
+        response = await client.post(BACKTESTS, json=a_request(strategy_id=""))
+
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert "strategy_id is empty" in detail
+        assert SHIPPED not in detail
+        assert "unknown strategy" not in detail
+        # And nothing was recorded for a request that never named a strategy.
+        assert runs.runs == {}
+
+    async def test_a_padded_name_is_the_same_request(
+        self, client: httpx.AsyncClient, runs: FakeBacktestRunRepository
+    ) -> None:
+        """Stripped like `symbols`, and for a sharper reason than tidiness:
+        `strategy_id` becomes a foreign key onto `strategies.id`, so padding
+        that survived this far would miss the row and be reported as a strategy
+        no worker has ever run — a 409 about the wrong thing entirely."""
+        response = await client.post(BACKTESTS, json=a_request(strategy_id=f"  {SHIPPED}  "))
+
+        assert response.status_code == 202
+        assert response.json()["spec"]["strategy_id"] == SHIPPED
+        # Stored stripped too, not merely accepted: the row is what the worker
+        # and every later reader resolve the strategy from.
+        assert [run.spec.strategy_id for run in runs.runs.values()] == [SHIPPED]
+
     async def test_params_the_strategy_rejects_are_a_400_now(
         self, client: httpx.AsyncClient
     ) -> None:
@@ -364,6 +404,8 @@ class TestRefusalsBeforeTheJobIsQueued:
         ("override", "expected"),
         [
             ({"symbols": []}, "symbols is empty"),
+            ({"strategy_id": ""}, "strategy_id is empty"),
+            ({"strategy_id": "   "}, "strategy_id is empty"),
             ({"timeframe": "3d"}, "timeframe must be one of"),
             ({"cost_model": "free"}, "cost_model must be one of"),
             ({"starting_cash": "0"}, "starting_cash must be positive"),

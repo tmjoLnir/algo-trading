@@ -385,8 +385,32 @@ def _validated_spec(payload: BacktestRequest) -> BacktestRunSpec:
     if payload.qty <= 0:
         raise _bad_request(f"qty must be positive, got {payload.qty}")
 
+    # Blank before unknown, and the order is the whole point of this check.
+    # `registry.get("")` reports a *failed lookup* and names everything that is
+    # registered — a refusal that describes the registry when what actually
+    # happened is that the caller named nothing. The dashboard sent exactly this
+    # for as long as its picker seeded itself from a strategy list that had not
+    # loaded yet (#88), and `unknown strategy ''; registered: [...]` sent every
+    # reader to the wrong layer to look for it.
+    #
+    # Every other caller of `registry.get` in this platform already guards its
+    # own blank and says what was blank in its own terms — `WORKER_STRATEGY is
+    # unset` in `worker.trading` and both preflights. Only the caller knows what
+    # the name came from, which is why the message lives here and not in the
+    # registry. This endpoint was the one that did not.
+    #
+    # Stripped and then used, exactly like `symbols` above — and used *for both*
+    # the lookup below and the spec, which is the part worth stating. Looking up
+    # the stripped name while storing the raw one would pass this validation and
+    # then miss the foreign key onto `strategies.id`, and a failed key there is
+    # reported as a strategy no worker has ever run: a 409 about the wrong thing,
+    # arriving after the request had already been accepted as valid.
+    strategy_id = payload.strategy_id.strip()
+    if not strategy_id:
+        raise _bad_request("strategy_id is empty")
+
     try:
-        strategy_cls = registry.get(payload.strategy_id)
+        strategy_cls = registry.get(strategy_id)
     except ATPError as exc:
         # Names the registered strategies, which is what makes a typo
         # self-correcting. The registry is populated by importing
@@ -402,7 +426,7 @@ def _validated_spec(payload: BacktestRequest) -> BacktestRunSpec:
         raise _bad_request(f"strategy rejected its params: {exc}") from None
 
     spec = BacktestRunSpec(
-        strategy_id=payload.strategy_id,
+        strategy_id=strategy_id,
         symbols=symbols,
         start=payload.start,
         end=payload.end,
