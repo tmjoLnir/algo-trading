@@ -1600,6 +1600,28 @@ wording if it is not the demonstration you want.
   writes are fabricated ones under reserved test tickers. It removes an obstacle
   to showing the line; it does not show it.
 
+  **Until #96 a queued run ignored the sizing method and the stop the request
+  chose.** `_spec_to_json` wrote nine of `BacktestRunSpec`'s fifteen fields, and
+  the six it dropped were `sizing_method`, `sizing_value` and the four `stop_*`
+  fields. Since the worker is handed a `run_id` and rebuilds the spec from that
+  column and nothing else, a run submitted from the Backtests tab as `risk_pct`
+  with an ATR stop *executed* as `fixed_qty` with no stop — the API validated
+  the stop config and then discarded it. Nothing failed: the result looked
+  exactly like a correct one, which is the same class of error as a backtest run
+  with no costs.
+
+  The CLI was never affected — `scripts/run_backtest.py` builds a spec in
+  process and hands it straight to `build_engine`, so it never crosses this
+  seam. Two things hid it from the tests: `FakeBacktestRunRepository` stores the
+  run object in memory, so every unit test of the queue bypassed the serialiser,
+  and the integration case named `test_the_spec_survives_the_config_column`
+  asserted five fields, all of which happened to be among the nine that
+  survived. Both are addressed, and the round trip is now asserted against
+  `dataclasses.fields`, so the next field added to the spec cannot be forgotten.
+
+  Runs queued before that fix still read as `fixed_qty` with no stop, which is
+  what they ran as — the ask was never recorded and cannot be recovered.
+
 - [ ] Live-vs-backtest comparison — @claude.
   Built as of #68: `GET /analytics/live-vs-backtest/{run_id}` serves the live
   metric set, the stored backtest's, the divergence between them, and the reasons

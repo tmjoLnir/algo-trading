@@ -21,6 +21,7 @@ what says the mirror is accurate.
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -221,11 +222,29 @@ class TestTheResultRoundTrips:
         unrepresentable as a binary float, so anything in this path that made it a
         number would show up here rather than as a slightly wrong return six
         months later.
+
+        The sizing and stop fields are asserted here because for a while they
+        were the ones that did *not* survive, under a test with this exact name:
+        `a_spec()` leaves them at their defaults, so every field this checked
+        happened to be one of the nine that made it. They are set explicitly
+        rather than by changing `a_spec`, which sixteen other cases use and
+        which several of them expect to be an unsized, unstopped run.
+        `tests/unit/test_backtest_run_spec.py` covers the serialisation itself;
+        what this adds is that the real column behaves like the pure functions.
         """
         runs, strategies = repo
         await _registered(strategies)
 
-        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        asked = dataclasses.replace(
+            a_spec(),
+            sizing_method="risk_pct",
+            sizing_value="0.01",
+            stop_type="atr",
+            stop_value="2.5",
+            stop_period=21,
+            stop_bars=7,
+        )
+        await runs.create(new_run("r1", asked, queued_at=T0))
         stored = await runs.get("r1")
 
         assert stored is not None
@@ -234,6 +253,9 @@ class TestTheResultRoundTrips:
         assert stored.spec.params == {"fast_period": 10, "slow_period": 30}
         assert stored.spec.cost_model == "alpaca_equities"
         assert stored.spec.qty == "100"
+        # The six that a run is sized and protected by, and that the worker
+        # rebuilds its engine from.
+        assert stored.spec == asked
 
     async def test_a_failure_clears_any_partial_result(
         self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
