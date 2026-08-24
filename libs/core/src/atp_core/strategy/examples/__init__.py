@@ -7,6 +7,13 @@ strategy" for one that is very much present. Anything resolving a strategy by
 name imports this package first.
 """
 
+from atp_core.strategy.examples.rsi_mean_reversion import (
+    RSI_MEAN_REVERSION_YAML,
+    rsi_mean_reversion,
+)
 from atp_core.strategy.examples.sma_crossover import SmaCrossover
 
-__all__ = ["SmaCrossover"]
+#: `rsi_mean_reversion` is exported for reach, not for registration: a rule set
+#: is a document rather than a class, and `compile_ruleset` deliberately does
+#: not register what it builds — see its docstring for why.
+__all__ = ["RSI_MEAN_REVERSION_YAML", "SmaCrossover", "rsi_mean_reversion"]

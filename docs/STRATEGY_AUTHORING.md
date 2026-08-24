@@ -79,6 +79,19 @@ The `close > SMA(200)` filter is doing real work: buying oversold conditions in
 a downtrend is buying things on their way to zero. Mean reversion needs a trend
 filter.
 
+**This example ships.** `atp_core.strategy.examples.rsi_mean_reversion()` returns
+it parsed and validated, from the same YAML printed above — so it can be
+compiled and backtested without retyping, and the page cannot drift from a spec
+that still validates. Note its warmup: 200 bars, driven by the trend filter
+rather than by the RSI(14) everyone thinks of as the strategy.
+
+Running it needs two things the spec cannot supply itself. A rule set is not in
+the registry, so `runner.build_engine` — which resolves strategies by name —
+cannot yet reach one; compile it and hand the strategy to the engine directly.
+And the run has to be configured with the ATR stop the `risk` block asks for,
+since a compiled rule set emits no protective level of its own: without it
+`risk_pct` refuses every entry at sizing, with a reason on the result.
+
 Validation rejects a rule set with no exit condition *and* no stop loss — it
 could never close a position.
 

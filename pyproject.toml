@@ -23,6 +23,7 @@ dev = [
   "mypy>=1.10",
   "types-python-dateutil",
   "types-python-jose",       # jose ships no stubs; without these mypy sees Any
+  "types-pyyaml>=6.0.12.20260815",  # ditto pyyaml, which parses shipped rule sets
   "pre-commit>=3.7",
 ]
 

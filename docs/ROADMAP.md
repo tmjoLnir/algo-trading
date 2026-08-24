@@ -858,10 +858,34 @@ above.
   is refused rather than modelled, since a strategy cannot read the clock
   (§1.5).
 
-  Unticked, on both of this phase's counts. Nothing has run a rule set on the
-  paper endpoint, which is the phase's *Verifiable:* line; and no rule set
-  ships in the repo yet, so the only specs that have executed are the fixtures
-  in `tests/unit/test_rule_compilation.py`.
+  Unticked, and the reasons have moved on since #93 wrote this. A reference
+  spec now does ship — `strategy/examples/rsi_mean_reversion.py` carries the
+  authoring guide's worked example as the YAML a reader would paste, and
+  `tests/unit/test_rsi_mean_reversion.py` runs it end to end: a 200-bar warmup,
+  an entry on the dip inside an uptrend, an exit on the bounce, and silence on
+  a downtrend where the RSI leg alone would have bought. So the sentence this
+  paragraph used to carry — that no rule set ships and only test fixtures have
+  executed — is no longer true.
+
+  Two things still stand between that and a tick, and the first is new
+  information rather than a restatement:
+
+  - **Nothing resolves a stored rule set into a run.** `runner.build_engine`
+    reaches a strategy through `registry.get(spec.strategy_id)`, and a rule set
+    is deliberately not registered (`compile_ruleset`'s docstring says why), so
+    `kind="ruleset"` rows have no path into a backtest. The storage column, the
+    API shape and the compiler all exist; the resolution step between them does
+    not. Seeding a rule-set row before that lands would put an entry in the
+    backtest picker that fails when chosen, which is why this change ships the
+    spec without seeding it.
+  - **Nothing has run a rule set on the paper endpoint**, which is this phase's
+    *Verifiable:* line and unchanged.
+
+  A run of this spec also has to be configured with the ATR stop the spec asks
+  for, because a compiled rule set emits no protective level of its own — the
+  gap #93 named, now with a concrete case: without that stop, `risk_pct` refuses
+  every entry at sizing, which `test_without_that_stop_every_entry_is_refused_at_sizing`
+  pins so the failure is a documented refusal rather than a surprise.
 - [ ] `StrategyRunner` live loop — @claude (wip #39).
   Implemented: `warmup`, `run`, `evaluate`, `on_fill_event` and `shutdown`, plus
   `LiveContext` — the live counterpart of `BacktestContext`, serving a strategy
