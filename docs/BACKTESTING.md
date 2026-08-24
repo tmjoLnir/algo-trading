@@ -302,6 +302,7 @@ one arbitrary day.
 ## Before believing a result
 
 - [ ] Ran with realistic costs
+- [ ] Beat `buy_and_hold` over the same bars, costs and sizing
 - [ ] ≥ 2 years, including a drawdown period
 - [ ] ≥ 100 trades
 - [ ] Walk-forward, not one in-sample fit
@@ -327,6 +328,16 @@ deliberate and both are about the *Overfitting* section above:
 
 Every comparison carries the warning in its own response, because the person
 reading a comparison table is the person about to promote something.
+
+**The comparison worth drawing first is against the benchmark.** `buy_and_hold`
+is a registered strategy like any other — run it over the same bars, the same
+costs and the same sizing, and compare the two runs. A return with nothing
+beside it is not evidence: 18% over a year is skill against a flat market and a
+bad year against one that returned 30%, and the number alone cannot tell you
+which. The benchmark is not exempt from next-bar fills, so it is a price you
+could actually have paid rather than a paper one — see
+`docs/STRATEGY_AUTHORING.md` on why that matters more for the baseline than for
+anything measured against it.
 
 ## Then paper trade it
 
