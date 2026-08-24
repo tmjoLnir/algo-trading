@@ -94,7 +94,7 @@ There is no "declarative mode" anywhere past this function.
 
 ```python
 spec = RuleSet.model_validate(yaml.safe_load(text))
-strategy = compile_ruleset(spec)      # a Strategy, not a special case
+strategy = compile_ruleset(spec)  # a Strategy, not a special case
 ```
 
 **Warmup.** `spec.required_warmup` walks every condition tree and takes the
