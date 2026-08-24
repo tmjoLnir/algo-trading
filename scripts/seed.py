@@ -164,10 +164,11 @@ def refusal(settings: Settings, *, allow_remote_database: bool) -> str | None:
 def seed_strategies() -> list[StrategyRecord]:
     """A row per registered strategy, on its own default parameters.
 
-    Every registered class rather than just `sma_crossover`, because the reason
-    a row is needed is the foreign key — and a class the picker cannot offer is
-    a class nobody can backtest, whichever one it is. Today that is a set of
-    one; when it is not, this needs no editing.
+    Every registered class rather than a named one, because the reason a row is
+    needed is the foreign key — and a class the picker cannot offer is a class
+    nobody can backtest, whichever one it is. Written when the registry held
+    only `sma_crossover` and unedited when `buy_and_hold` joined it, which was
+    the point.
 
     `universe` is left empty rather than filled with the seeded tickers. The
     column records the symbols a strategy is *configured* to trade, and writing

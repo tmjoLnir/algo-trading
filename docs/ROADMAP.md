@@ -260,6 +260,45 @@ that yet, so it stays **not shown**.
   queued run and this CLI cannot report different numbers for the same
   parameters.
 
+- [ ] `buy_and_hold` benchmark — @claude (wip #94).
+  The second registered strategy, and the one that makes the first one's number
+  mean something. Every item above this line produces a return; none of them
+  produces anything to read it against, and a return with nothing beside it is
+  not evidence — 18% over a year is skill against a flat market and a bad year
+  against one that returned 30%. `docs/BACKTESTING.md`'s "Before believing a
+  result" checklist was missing that comparison entirely; this diff adds the
+  line and the strategy that satisfies it.
+
+  Three decisions, each the version one line longer than the tempting one, and
+  each wrong in a way no result would show:
+
+  - **It fills at the second bar's open**, like every other strategy. A baseline
+    exempted from next-bar fills is measured at a price nobody could have paid,
+    and since it is what everything else is compared *against*, flattering it by
+    one bar's move understates the whole platform by that amount.
+  - **One attempt per symbol, not "enter whenever flat".** The shorter version
+    becomes buy → stopped out → buy again as soon as a stop is configured: a
+    re-entry system whose results depend on the stop, which is the opposite of a
+    fixed baseline.
+  - **It reads the position, not its own signals.** A signal is a request that
+    fills a bar later and can be refused. Counting emitted signals would have a
+    restarted runner double a position it already holds — and, in the case that
+    actually bites, buy back in after a restart followed by a stop-out.
+
+  Two properties are pinned by hand-computed arithmetic rather than by the code
+  agreeing with itself: the fill lands on the bar *after* the decision, and the
+  run earns exactly `qty × (last close − entry open) / starting equity` — the
+  market's return over the window it was actually in, which is the whole claim a
+  benchmark makes.
+
+  Unticked. It has run only over synthetic fixtures on `ZeroCostModel`; this
+  phase's end-to-end *Verifiable:* line is a strategy over real stored bars with
+  `alpaca_equities_default()` costs and a reconciling metrics report, which is
+  what `SmaCrossover` was ticked against and what this has not yet been. Running
+  it needs a seeded database, so the tick belongs to whoever runs
+  `scripts/run_backtest.py --strategy buy_and_hold` against one and reconciles
+  the report.
+
 *Verifiable:* a hand-computed 20-bar fixture matches the engine exactly.
 **Shown** — @claude (#25). `TestAgainstKnownFixture` in
 `tests/unit/test_backtest_engine.py`: 20 bars, entry signalled on bar 5 and

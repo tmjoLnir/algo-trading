@@ -7,6 +7,7 @@ strategy" for one that is very much present. Anything resolving a strategy by
 name imports this package first.
 """
 
+from atp_core.strategy.examples.buy_and_hold import BuyAndHold
 from atp_core.strategy.examples.sma_crossover import SmaCrossover
 
-__all__ = ["SmaCrossover"]
+__all__ = ["BuyAndHold", "SmaCrossover"]
