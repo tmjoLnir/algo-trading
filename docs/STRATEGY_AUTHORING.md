@@ -11,6 +11,32 @@ Two ways, same execution path.
 
 Start declarative. Reach for code when the rules stop expressing what you mean.
 
+Two reference strategies ship, and they are worth reading in this order:
+`buy_and_hold` is the shortest complete example and the benchmark every result
+is read against; `sma_crossover` is the template for a strategy that computes
+something.
+
+## The benchmark
+
+`buy_and_hold` buys once per symbol at the first decidable bar and never sells.
+Three things about it are load-bearing, and each is the version that is one line
+longer than the tempting one:
+
+- **It fills at the second bar's open**, like everything else. A baseline
+  exempted from next-bar fills would be measured at a price nobody could have
+  paid — and since every strategy is compared *against* it, flattering it by one
+  bar's move understates the whole platform by the same amount.
+- **One attempt per symbol, not "enter whenever flat".** With a stop configured,
+  the shorter version becomes buy → stopped out → buy again, a re-entry system
+  whose results depend on the stop. That is not a fixed baseline.
+- **It reads the position, not its own signals.** A signal is a request: it
+  fills a bar later and risk can refuse it. Counting emitted signals would have
+  a restarted runner double a position it already holds.
+
+It carries no stop and no target, so `risk_pct` cannot size it — there is no
+distance to risk against. Size a benchmark run with `equity_pct` or `fixed_qty`,
+and remember that a universe of *n* symbols gets *n* full-sized positions.
+
 ## The contract
 
 A strategy is a **pure decision function**. It receives market events and

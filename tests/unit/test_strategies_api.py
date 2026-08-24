@@ -21,7 +21,7 @@ the reason the endpoint returns both:
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
@@ -75,6 +75,19 @@ def a_strategy(
     )
 
 
+def available(body: dict[str, Any], name: str) -> dict[str, Any]:
+    """The `available` entry for one class, by name.
+
+    Addressed by name rather than by index because `available` is sorted and
+    the registry grows: `[0]` meant `sma_crossover` while it was the only class
+    registered and meant `buy_and_hold` the day a second one landed, which is a
+    test that silently changes its subject rather than failing.
+    """
+    entry = next((a for a in body["available"] if a["name"] == name), None)
+    assert entry is not None, f"{name} is registered but the endpoint did not report it"
+    return entry
+
+
 @pytest.fixture
 def strategies() -> FakeStrategyRepository:
     return FakeStrategyRepository()
@@ -125,9 +138,10 @@ class TestTheRegistry:
 
         body = (await client.get(STRATEGIES)).json()
 
-        assert body["never_run"] == [SHIPPED]
-        assert [a["name"] for a in body["available"]] == [SHIPPED]
-        assert body["available"][0]["has_run"] is False
+        registered = sorted(registry.all_strategies())
+        assert body["never_run"] == registered
+        assert [a["name"] for a in body["available"]] == registered
+        assert available(body, SHIPPED)["has_run"] is False
 
     @pytest.mark.asyncio
     async def test_a_class_a_worker_has_run_is_not_in_never_run(
@@ -137,8 +151,11 @@ class TestTheRegistry:
 
         body = (await client.get(STRATEGIES)).json()
 
-        assert body["never_run"] == []
-        assert body["available"][0]["has_run"] is True
+        # The one with a row drops out; every other registered class stays in,
+        # which is the contrast the field exists to draw.
+        assert body["never_run"] == sorted(set(registry.all_strategies()) - {SHIPPED})
+        assert SHIPPED not in body["never_run"]
+        assert available(body, SHIPPED)["has_run"] is True
 
     @pytest.mark.asyncio
     async def test_available_classes_carry_what_the_class_declares(
@@ -149,7 +166,7 @@ class TestTheRegistry:
         for every class with required params."""
         body = (await client.get(STRATEGIES)).json()
 
-        entry = body["available"][0]
+        entry = available(body, SHIPPED)
         assert entry["class_name"] == "SmaCrossover"
         assert entry["description"]
 
@@ -249,8 +266,9 @@ class TestTheStateFilter:
         body = (await client.get(f"{STRATEGIES}?state=paused")).json()
 
         assert body["strategies"] == []
-        assert body["never_run"] == []
-        assert body["available"][0]["has_run"] is True
+        assert body["never_run"] == sorted(set(registry.all_strategies()) - {SHIPPED})
+        assert SHIPPED not in body["never_run"]
+        assert available(body, SHIPPED)["has_run"] is True
 
     @pytest.mark.asyncio
     async def test_every_rung_of_the_ratchet_is_a_valid_filter(
