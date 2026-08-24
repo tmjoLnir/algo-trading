@@ -817,6 +817,51 @@ above.
   orders we believe are working, so the missing half now exists as an object —
   but nothing constructs one in the worker yet, so the scheduled job still has
   nothing to reach for.
+- [ ] Declarative rule sets compile and run — @claude (wip #93).
+  `compile_ruleset` and `RuleSet.required_warmup` were the two
+  `NotImplementedError` stubs standing between a fully specified, fully
+  validated rule DSL and one that could execute. The spec models had shipped;
+  nothing could turn one into a `Strategy`, so no rule set had ever been
+  backtested. Both are implemented, and what comes out is an ordinary
+  `Strategy` — the engine, the runner and live drive it through the path they
+  drive `SmaCrossover` through, with no branch anywhere downstream.
+
+  Three decisions are worth a reviewer's eye, because in each case the easier
+  version is the one that fails quietly rather than loudly:
+
+  - **Warmup is asked of `dispatch`, not assumed to be the period.** `rsi` and
+    `atr` need `period + 1` bars — Wilder's smoothing averages differences
+    between consecutive closes. Assuming the period is not an off-by-one in a
+    warmup count: the compiled strategy sizes its history window off the same
+    number, and a window fixed one bar short never grows, so `compute` answers
+    None for the *entire run* and the rule never fires. An empty result, from a
+    spec that reads like it should trade. `dispatch.min_bars` states the
+    minimum where a caller can read it rather than putting a second copy of
+    `ta`'s lengths in `rules.py` (ADR 0006). `StopSpec.period` goes through the
+    same call, so an ATR(50) stop asks for 51 bars rather than 50.
+  - **Conditions are three-valued.** An operand that cannot be computed yet is
+    unknown, not false. `none: [rsi(14) < 30]` means "not oversold"; collapsed
+    to two values it holds on the first bar of every run, on the grounds that a
+    number which does not exist is not below 30.
+  - **Anything unrunnable is refused at compile time.** An unknown indicator, a
+    missing period, `field:` other than `close`, extra indicator `params`, an
+    empty condition group, `flatten_at_close`. None of these crashes if waved
+    through — they produce a plausible equity curve answering a different
+    question, which is the one failure a backtest cannot survive.
+
+  Two gaps are stated rather than left to be found. The `risk` block is read
+  only for warmup: a compiled rule set emits no stop level of its own, because
+  the run's `stop_config` already derives one and a single level with two
+  sources is the divergence ADR 0006 exists to prevent — so wiring `spec.risk`
+  into a run's configuration is still manual, and a rule set sized by
+  `risk_pct` needs its stop passed to the run explicitly. And `flatten_at_close`
+  is refused rather than modelled, since a strategy cannot read the clock
+  (§1.5).
+
+  Unticked, on both of this phase's counts. Nothing has run a rule set on the
+  paper endpoint, which is the phase's *Verifiable:* line; and no rule set
+  ships in the repo yet, so the only specs that have executed are the fixtures
+  in `tests/unit/test_rule_compilation.py`.
 - [ ] `StrategyRunner` live loop — @claude (wip #39).
   Implemented: `warmup`, `run`, `evaluate`, `on_fill_event` and `shutdown`, plus
   `LiveContext` — the live counterpart of `BacktestContext`, serving a strategy

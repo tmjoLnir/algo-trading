@@ -85,6 +85,62 @@ could never close a position.
 **Security:** rule sets arrive over HTTP and are untrusted. They are interpreted
 over a validated tree. Never `eval()` one.
 
+## Rule compilation
+
+`compile_ruleset(spec)` turns a validated `RuleSet` into an ordinary `Strategy`.
+Nothing downstream knows the difference — the backtest engine, the paper runner
+and live all drive it through the same path they drive `SmaCrossover` through.
+There is no "declarative mode" anywhere past this function.
+
+```python
+spec = RuleSet.model_validate(yaml.safe_load(text))
+strategy = compile_ruleset(spec)      # a Strategy, not a special case
+```
+
+**Warmup.** `spec.required_warmup` walks every condition tree and takes the
+deepest requirement — not the sum, since two indicators read the same series.
+Three things add to an operand's own period:
+
+| | Costs |
+|---|---|
+| `offset: 3` | +3 bars — the SMA(20) of three bars ago spans 23 |
+| `crosses_above` / `crosses_below` | +1 bar — a crossing compares two bars |
+| `rsi`, `atr` | +1 bar — Wilder's smoothing averages *differences* |
+
+The `risk` block's ATR periods count too, and pick up that same Wilder bar. An
+ATR(50) stop under an SMA(5) entry needs 51 bars before it can place a level,
+and a warmup of 6 would spend the first 45 entries refused at sizing for want of
+a stop.
+
+The compiled strategy sizes its history window off the same number, so an
+understated warmup is not a cosmetic off-by-one: a window one bar short of what
+`rsi` needs answers nothing for the *whole run*, and the rule never fires once.
+
+**Three-valued conditions.** An operand that cannot be computed yet is
+`unknown`, not `false`. `none: [rsi(14) < 30]` reads as "not oversold", and
+collapsing an unknown RSI to false would make it hold on bar 1 of every run.
+Groups settle early where they can — one false child settles an `all`, one true
+child settles an `any` — and anything that is not definitely true produces no
+signal.
+
+**What compilation refuses.** A spec that asks for something the interpreter
+cannot execute fails to compile rather than running with the difference ignored:
+an unknown indicator, an indicator with no period, `field:` anything but
+`close` (dispatch computes on closes), extra indicator `params`, an empty
+condition group, and `flatten_at_close`. Each of these is silent otherwise — a
+full equity curve answering a question nobody asked.
+
+**What it does not do.** The `risk` block is not the strategy's, beyond warmup.
+A strategy never sizes a position and never places a protective level, which is
+why `Strategy` has no field for either; the sizer, `StopManager` and the run's
+`stop_config` own those. A compiled rule set emits no `stop_loss_price` of its
+own — deriving one here *as well* would give a single level two sources that
+could disagree. Passing `spec.risk` into a run's configuration is still manual.
+
+What it does own is every exit that is a matter of counting — the condition
+tree, `cooldown_bars`, `max_holding_bars`, `max_concurrent_positions`. Those
+need bars and positions and no price level at all.
+
 ## Workflow
 
 ```

@@ -28,6 +28,32 @@ if TYPE_CHECKING:
 #: unrecognised one is an error at the call site instead of a silent None.
 KNOWN_INDICATORS = frozenset({"sma", "ema", "rsi", "stddev", "atr"})
 
+#: Indicators whose first value needs one bar more than their period.
+#:
+#: Wilder's smoothing seeds off *differences* between consecutive bars, so an
+#: n-period average of them spans n+1 bars — `ta.rsi` and `ta.atr` both demand
+#: `period + 1` where `sma`, `ema` and `stddev` demand `period`. Same fact,
+#: stated where a caller sizing a window can read it.
+_NEEDS_A_PRIOR_BAR = frozenset({"rsi", "atr"})
+
+
+def min_bars(name: str, period: int) -> int:
+    """The shortest series `compute` can answer for.
+
+    A caller that sizes its own history window has to know this, and a caller
+    that guesses `period` gets None back forever from `rsi` and `atr` — not
+    during warmup, but for the whole run, because a window cut to exactly
+    `period` never grows. That failure is silent: the rule simply never fires,
+    and an empty result looks like a strategy that never signalled.
+
+    Lives here rather than in the caller for the reason at the top of this
+    module: `ta`'s minimum lengths are one fact, and a second copy of it is how
+    the backtest and the live runner come to disagree.
+    """
+    if name not in KNOWN_INDICATORS:
+        raise StrategyError(f"unknown indicator {name!r}")
+    return period + 1 if name in _NEEDS_A_PRIOR_BAR else period
+
 
 def compute(name: str, bars: list[Bar], period: int) -> float | None:
     """Dispatch a name from a rule spec onto `indicators.ta`.
