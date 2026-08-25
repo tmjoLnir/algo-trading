@@ -34,12 +34,13 @@ from atp_core.domain import (
     SignalAction,
     StrategyState,
 )
+from atp_core.errors import StrategyExistsError
 from atp_core.execution.idempotency import ENTRY, STOP_LOSS, UNKNOWN_PURPOSE
 from atp_core.persistence.db import create_engine, create_session_factory
 from atp_core.persistence.orders import PostgresOrderRepository
 from atp_core.persistence.signals import PostgresSignalRepository
 from atp_core.persistence.strategies import PostgresStrategyRepository
-from atp_core.strategy.ports import SignalOutcome, StrategyRecord
+from atp_core.strategy.ports import NewStrategy, SignalOutcome, StrategyRecord
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -91,6 +92,19 @@ def a_record(strategy_id: str = STRATEGY) -> StrategyRecord:
         class_name="SmaCrossover",
         params={"fast": 20, "slow": 50},
         universe=("SPY", "QQQ"),
+        timeframe="1d",
+    )
+
+
+def an_authored_ruleset(name: str = "authored_rules") -> NewStrategy:
+    """A declarative strategy as `POST /api/v1/strategies` would build one."""
+    return NewStrategy(
+        id=name,
+        name=name,
+        kind="ruleset",
+        description="buy the dip in an uptrend",
+        ruleset={"name": name, "universe": ["SPY"], "timeframe": "1d"},
+        universe=("SPY",),
         timeframe="1d",
     )
 
@@ -251,6 +265,114 @@ class TestTheStrategyRow:
                 assert (await strategies.get(STRATEGY)) is not None, rung
         finally:
             await engine.dispose()
+
+
+class TestAuthoringAStrategy:
+    """`create` — the write behind `POST /api/v1/strategies`.
+
+    Three properties, and none of them is observable without a database:
+
+    1. **The `ruleset` column can finally hold something.** `ensure` writes it as
+       a hard-coded `None` because `StrategyRecord` has no such field, so until
+       this method the platform's declarative half could only be reached by
+       writing SQL by hand.
+    2. **Uniqueness is the database's**, not a `SELECT` first. A check before an
+       insert is a race two requests can both win.
+    3. **The two writers do not fight.** A worker booting an authored strategy
+       calls `ensure`, which finds the row and moves only `updated_at` — so what
+       an author configured survives every restart.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_whole_row_including_the_rules_is_stored(self, repos: tuple) -> None:
+        strategies, _, _ = repos
+
+        created = await strategies.create(an_authored_ruleset())
+        read_back = await strategies.get_stored("authored_rules")
+
+        assert read_back is not None
+        assert read_back == created, "create must report the row a later read returns"
+        assert read_back.kind == "ruleset"
+        assert read_back.ruleset == {
+            "name": "authored_rules",
+            "universe": ["SPY"],
+            "timeframe": "1d",
+        }
+        assert read_back.class_name is None
+        # The ratchet's first rung, and the only one this path can write.
+        assert read_back.state == StrategyState.DRAFT
+        assert read_back.state in set(StrategyState), "the stored state must be a real rung"
+
+    @pytest.mark.asyncio
+    async def test_a_name_that_is_taken_is_refused_and_changes_nothing(self, repos: tuple) -> None:
+        """The constraint is what refuses this, so it holds against a row any
+        writer put there — a worker's first boot as much as another author's."""
+        strategies, _, _ = repos
+        await strategies.create(an_authored_ruleset())
+
+        with pytest.raises(StrategyExistsError):
+            await strategies.create(
+                NewStrategy(
+                    id="authored_rules",
+                    name="authored_rules",
+                    kind="ruleset",
+                    description="something else entirely",
+                    ruleset={"name": "authored_rules", "universe": ["QQQ"]},
+                )
+            )
+
+        survivor = await strategies.get_stored("authored_rules")
+        assert survivor is not None
+        assert survivor.description == "buy the dip in an uptrend"
+        assert len(await strategies.list_all()) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_worker_booting_it_does_not_overwrite_what_was_authored(
+        self, repos: tuple
+    ) -> None:
+        """The property that makes two writers on one table safe.
+
+        A compiled rule set reaches `StrategyRunner` as an ordinary `Strategy`,
+        so the row it ensures says `kind="coded"` and carries no rules. If
+        `ensure` wrote that over an authored row, running a rule set once would
+        erase the rule set.
+        """
+        strategies, _, _ = repos
+        await strategies.create(an_authored_ruleset())
+
+        await strategies.ensure(
+            StrategyRecord(
+                id="authored_rules",
+                name="authored_rules",
+                kind="coded",
+                class_name="RuleSet_authored_rules",
+                params={"whatever": 1},
+            )
+        )
+        after = await strategies.get_stored("authored_rules")
+
+        assert after is not None
+        assert after.kind == "ruleset"
+        assert after.ruleset is not None
+        assert after.params == {}
+
+    @pytest.mark.asyncio
+    async def test_a_signal_can_be_recorded_against_an_authored_strategy(
+        self, repos: tuple
+    ) -> None:
+        """The point of the row, reached from the authoring side for the first
+        time: `signals.strategy_id` is a foreign key, and a decision naming a
+        strategy with no row is refused outright."""
+        strategies, signals, _ = repos
+        await strategies.create(an_authored_ruleset())
+
+        await signals.save(
+            a_signal("sig-authored", strategy_id="authored_rules"),
+            SignalOutcome(acted_on=True),
+        )
+
+        recorded = await signals.recent(strategy_id="authored_rules")
+        assert [signal.id for signal, _ in recorded] == ["sig-authored"]
 
 
 class TestListingStrategies:

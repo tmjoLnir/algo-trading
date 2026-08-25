@@ -24,11 +24,11 @@ from pydantic import SecretStr
 from atp_api.auth import Scope, Session, hash_password
 from atp_api.deps import get_audit_sink, get_clock, get_current_session, get_kill_switch
 from atp_api.main import create_app
-from atp_core.audit.ports import Action, AuditEntry
+from atp_core.audit.ports import Action
 from atp_core.clock import SimulatedClock
 from atp_core.config import Settings, get_settings
 from atp_core.risk.killswitch import HaltReason, HaltScope
-from tests.fakes import FakeKillSwitch
+from tests.fakes import FakeKillSwitch, RecordingAuditSink
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -51,24 +51,6 @@ def pinned_settings() -> Settings:
     `_env_file=None` because a developer's own `.env` must never reach a test.
     """
     return Settings(ATP_RUN_MODE="backtest", _env_file=None)
-
-
-class RecordingAuditSink:
-    """An `AuditSink` that keeps what it was given."""
-
-    def __init__(self) -> None:
-        self.entries: list[AuditEntry] = []
-
-    async def record(self, entry: AuditEntry) -> None:
-        self.entries.append(entry)
-
-    async def recent(
-        self,
-        limit: int = 100,
-        before_id: int | None = None,
-        action: str | None = None,
-    ) -> list[tuple[int, AuditEntry]]:
-        return []
 
 
 def resume_settings(password: str = PASSWORD) -> Settings:

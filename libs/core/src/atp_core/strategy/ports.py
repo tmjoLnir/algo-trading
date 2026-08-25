@@ -33,7 +33,7 @@ identical to a strategy that had no ideas.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
@@ -117,6 +117,54 @@ class StoredStrategy:
 
 
 @dataclass(frozen=True, slots=True)
+class NewStrategy:
+    """A strategy as somebody authored it, before it has a row.
+
+    The third of three types over one table, and the split is by *who is the
+    authority on which column* rather than by convenience:
+
+    - `StrategyRecord` is what a booting worker knows — thin, because it must
+      not invent values for fields nothing running has an opinion about.
+    - `StoredStrategy` is the whole row, for a reader.
+    - This is the whole row **minus the columns the platform decides**, for an
+      author.
+
+    Two fields are absent for that reason and their absence is the design:
+
+    - **No `state`.** Every strategy starts on the ratchet's first rung; the
+      adapter writes `draft` and there is deliberately no field through which a
+      caller could ask for anything else. Promotion is its own endpoint with its
+      own preconditions (docs/SAFETY.md), and a create request that could name a
+      state would be the ratchet with its pawl removed — the same reasoning that
+      keeps a booting worker from writing itself onto a higher rung.
+    - **No timestamps.** The adapter stamps both from its own clock (rule §1.2),
+      so `created_at` records when the row was written rather than when a client
+      says it was.
+
+    `id` is the strategy's name, not a generated uuid, for the reason
+    `StrategyRecord.id` is: `Signal.strategy_id` carries `Strategy.name`
+    everywhere in the platform — a compiled rule set included, since
+    `compile_ruleset` copies the spec's name onto the class — so a row keyed on
+    anything else would leave every signal referencing a strategy that does not
+    exist.
+    """
+
+    id: str
+    name: str
+    kind: str  # "coded" | "ruleset"
+    description: str = ""
+    class_name: str | None = None
+    params: dict[str, object] = field(default_factory=dict)
+    #: The declarative spec, for a `ruleset` strategy — the field `StrategyRecord`
+    #: does not have and cannot be given, which is why authoring needed a type of
+    #: its own rather than a wider version of the one a worker writes.
+    ruleset: dict[str, object] | None = None
+    universe: tuple[str, ...] = ()
+    timeframe: str = "1d"
+    risk_config: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class SignalOutcome:
     """What became of a signal, recorded alongside it.
 
@@ -141,6 +189,27 @@ class SignalOutcome:
 
 class StrategyRepository(Protocol):
     """The `strategies` table — the row every signal and order points at."""
+
+    async def create(self, new: NewStrategy) -> StoredStrategy:
+        """Write the row for a strategy nobody has stored yet.
+
+        **Not an upsert, and that is the whole difference from `ensure`.** A
+        worker calls `ensure` because it does not know whether it has run
+        before and should not have to ask; an author knows perfectly well
+        whether they are creating something, and a create that quietly landed
+        on an existing row would overwrite a strategy somebody else is running
+        — silently, under the name every one of its signals carries.
+
+        Raises `StrategyExistsError` when the name is taken. That is the only
+        outcome other than the row, because a name is this table's primary key:
+        two strategies sharing one would not collide visibly, they would merge
+        their attribution.
+
+        Returns the row as written, `state` and timestamps included, so the
+        caller reports what the database holds rather than echoing back the
+        request it was handed.
+        """
+        ...
 
     async def ensure(self, record: StrategyRecord) -> None:
         """Make sure this strategy has a row, creating it if it does not.

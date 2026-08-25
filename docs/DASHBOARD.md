@@ -341,15 +341,25 @@ A filtered request still reports every available class, and `never_run` is still
 computed against the **unfiltered** table. Otherwise filtering to `paused` would
 report every active strategy as one nothing has ever loaded.
 
-**Only the read is built**, and here the reason is sharper than elsewhere.
-Create, edit, promote and pause are the promotion ratchet — draft → backtesting →
-paper → live. One of its two missing preconditions is now available and the other
-is not: `backtest_runs` has a reader as of the backtests page, so "a completed
-backtest on record" is answerable, but the audit trail's lifecycle verbs are still
-unwired (ADR 0010), so the entry naming a human cannot be written. An endpoint that promoted while silently skipping both would
-be the ratchet with its pawl removed, which is worse than no endpoint.
-`GET /strategies/{id}` and `GET /strategies/available` also stay stubs: the list
-above already carries both, and nothing calls either.
+**Creating is built; the rest of the ratchet is not.** `POST /api/v1/strategies`
+stores a strategy at `draft`, which is the rung a booting worker and
+`scripts/seed.py` already write and which authorises nothing. Every rung above it
+is a promotion, and promotion to `live` wants a completed backtest on record — now
+answerable, since `backtest_runs` has a reader — a minimum paper-trading period,
+which nothing yet records the start of, and a verb per transition. An endpoint
+that promoted while skipping a check it could not perform would be the ratchet
+with its pawl removed, which is worse than no endpoint, so edit, promote and
+pause stay stubs. `GET /strategies/{id}` and `GET /strategies/available` stay
+stubs for the duller reason: the list above already carries both, and nothing
+calls either.
+
+**There is no authoring form yet**, so the create endpoint is reached from a
+client rather than from this screen. What it is for is the declarative half of
+the platform: a rule set had no way into the database at all, and
+`POST /api/v1/backtests` has been able to run a stored one since #96. A creation
+is written to the audit trail against the session's user (`strategy_created`),
+because this is where a strategy's name — the key every later signal and order
+carries — comes into existence.
 
 ## The backtests page
 
@@ -388,12 +398,15 @@ staying out of the way of the server's validation:
   sending the raw value is accepted at the door and then misses the foreign key
   onto `strategies.id`, surfacing as a 409 about a strategy no worker has run.
 
-**It can only offer strategies a worker has actually run**, and that is the
-strategies page's gap met from the other side. `backtest_runs.strategy_id` is a
-foreign key onto `strategies`, a table the runner writes at its first session
-open — so a class that exists in the code and has never been loaded cannot be
-backtested. Offering it would produce a 409 for a choice this screen invited. The
-never-run names are listed outside the picker instead, with what to do about them.
+**It can only offer strategies that have a row**, and that is the strategies
+page's gap met from the other side. `backtest_runs.strategy_id` is a foreign key
+onto `strategies` — so a class that exists in the code and has no row cannot be
+backtested, and offering it would produce a 409 for a choice this screen invited.
+The never-run names are listed outside the picker instead, with what to do about
+them. Two things write that row now: a runner at its first session open, and
+`POST /api/v1/strategies`. So "has a row" no longer implies "a worker has run
+it" — a rule set authored through the API has never been near a worker and is a
+perfectly good thing to backtest, which is most of what a rule set is for.
 
 **A run has four states and each renders as itself.** A queued one says it is
 waiting rather than showing an elapsed time counted from a timestamp nobody

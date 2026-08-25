@@ -23,19 +23,22 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from atp_core.brokers.ports import AccountSnapshot
-from atp_core.domain import Fill, Order, OrderStatus, OrderType, Portfolio, Position
-from atp_core.errors import BrokerConnectionError, OrderRejectedError
+from atp_core.clock import SimulatedClock
+from atp_core.domain import Fill, Order, OrderStatus, OrderType, Portfolio, Position, StrategyState
+from atp_core.errors import BrokerConnectionError, OrderRejectedError, StrategyExistsError
 from atp_core.execution.ports import StoredBook
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
+from atp_core.strategy.ports import StoredStrategy
 
 if TYPE_CHECKING:
     from typing import Any
 
+    from atp_core.audit.ports import AuditEntry
     from atp_core.backtest.ports import BacktestProgress, StoredBacktestRun
     from atp_core.dashboard.snapshot import LiveSnapshot
     from atp_core.domain import Side, Signal
     from atp_core.execution.ports import EquityPoint
-    from atp_core.strategy.ports import SignalOutcome, StoredStrategy, StrategyRecord
+    from atp_core.strategy.ports import NewStrategy, SignalOutcome, StrategyRecord
 
 
 class FakeBroker:
@@ -410,6 +413,29 @@ class FakePortfolioRepository:
         return [p for p in self.equity_points if start <= p.ts <= end]
 
 
+class RecordingAuditSink:
+    """An `AuditSink` that keeps what it was given.
+
+    Never raises, like every real adapter: a failed audit write must not fail
+    the action it is recording (ADR 0010). A double that could refuse would test
+    a contract the port does not have.
+    """
+
+    def __init__(self) -> None:
+        self.entries: list[AuditEntry] = []
+
+    async def record(self, entry: AuditEntry) -> None:
+        self.entries.append(entry)
+
+    async def recent(
+        self,
+        limit: int = 100,
+        before_id: int | None = None,
+        action: str | None = None,
+    ) -> list[tuple[int, AuditEntry]]:
+        return []
+
+
 class FakeStrategyRepository:
     """In-memory `StrategyRepository`.
 
@@ -425,10 +451,49 @@ class FakeStrategyRepository:
         #: record a worker writes.
         self.rows: list[StoredStrategy] = []
         self.ensure_calls: list[str] = []
+        self.create_calls: list[str] = []
+        #: What `create` stamps its rows with. A pinned clock rather than the
+        #: wall one, so a test can assert on the timestamps it gets back — the
+        #: real adapter takes a `Clock` for the same reason (rule §1.2).
+        self.clock = SimulatedClock(datetime(2026, 3, 2, 14, 30, tzinfo=UTC))
         #: Set by a test to stand for a database that will not take the row. The
         #: runner must fail warmup rather than continue into an evaluation whose
         #: every write would be refused by a foreign key.
         self.ensure_error: Exception | None = None
+
+    async def create(self, new: NewStrategy) -> StoredStrategy:
+        """Append to `rows`, refusing a name that is already there.
+
+        Refuses against `rows` rather than `stored`, because that list is what
+        the table holds — the real adapter's uniqueness is a database
+        constraint over every row, whichever writer put it there, so a fake that
+        only noticed its own creates would let a test author a strategy on top of
+        a worker's.
+
+        Both timestamps are `created_at`, which is what the adapter writes and
+        what a row nobody has started looks like.
+        """
+        if any(row.id == new.id or row.name == new.name for row in self.rows):
+            raise StrategyExistsError(f"a strategy named {new.name!r} is already stored")
+        self.create_calls.append(new.id)
+        now = self.clock.now()
+        stored = StoredStrategy(
+            id=new.id,
+            name=new.name,
+            description=new.description,
+            kind=new.kind,
+            class_name=new.class_name,
+            params=dict(new.params),
+            ruleset=None if new.ruleset is None else dict(new.ruleset),
+            state=StrategyState.DRAFT.value,
+            universe=tuple(new.universe),
+            timeframe=new.timeframe,
+            risk_config=dict(new.risk_config),
+            created_at=now,
+            updated_at=now,
+        )
+        self.rows.append(stored)
+        return stored
 
     async def ensure(self, record: StrategyRecord) -> None:
         if self.ensure_error is not None:
