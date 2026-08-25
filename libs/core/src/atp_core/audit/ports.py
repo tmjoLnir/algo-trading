@@ -77,7 +77,7 @@ class Action:
     strategy promotion to live" — are not here yet because those handlers are
     still `NotImplementedError` stubs, and a constant for an event nothing emits
     is a claim the record does not support. They land with their handlers, which
-    is how `halt_engaged` arrived.
+    is how `halt_engaged` arrived and how `strategy_created` did.
     """
 
     LOGIN = "login"
@@ -119,6 +119,20 @@ class Action:
     #: same place: `scripts/halt.py clear` writes no row, so an absent entry
     #: means "not resumed *from the dashboard*", never "still halted".
     HALT_CLEARED = "halt_cleared"
+    #: A strategy was stored. The first of the lifecycle verbs, and it arrives
+    #: with `POST /api/v1/strategies` rather than ahead of it.
+    #:
+    #: Creating is the mildest act on the ratchet — the new row is `draft`, which
+    #: authorises nothing — and it is still worth a row, because this is where a
+    #: strategy's identity is minted. That name is the key every later signal and
+    #: order carries, the rules stored under it are what a backtest snapshots,
+    #: and nothing else in the platform records who decided any of it. The
+    #: promotion verbs that would sit beside this one are still absent for the
+    #: reason above: their handlers are stubs.
+    #:
+    #: Written *after* the row exists, like the two halt verbs, so an entry never
+    #: claims a strategy that was refused.
+    STRATEGY_CREATED = "strategy_created"
 
 
 class AuditSink(Protocol):

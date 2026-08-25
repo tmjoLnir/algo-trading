@@ -82,6 +82,19 @@ class InvalidRuleError(StrategyError):
     """A declarative rule spec failed validation."""
 
 
+class StrategyExistsError(StrategyError):
+    """A strategy is already stored under this name.
+
+    Its own type rather than a generic integrity failure, because the caller's
+    response differs: a duplicate name is the author's to fix and belongs in
+    front of them as a 409, while an integrity error nothing anticipated is a
+    bug and belongs in a log. Names are not incidental here — a strategy's name
+    IS its primary key, and every `Signal.strategy_id` carries it — so two
+    strategies sharing one would merge their attribution rather than collide
+    visibly.
+    """
+
+
 class BacktestError(ATPError): ...
 
 

@@ -113,11 +113,20 @@ stated above them.
 
 **Outstanding**
 
-- **Entirely read-only, and every write endpoint behind it is a stub**: `POST
-  /strategies`, `PATCH /strategies/{id}`, `POST /{id}/promote`, `POST
-  /{id}/pause`, `GET /{id}`, `GET /strategies/available`
-  (`strategies.py:225,238,249,257,275,282`). The page says so and explains why —
-  the promotion ratchet's preconditions cannot be checked yet.
+- **Still entirely read-only as a screen**, though the API is no longer:
+  `POST /strategies` is built and stores a strategy at `draft`. What is missing
+  here is the form — nothing on this tab posts one, so a rule set is authored
+  from a client. `PATCH /strategies/{id}`, `POST /{id}/promote`, `POST
+  /{id}/pause`, `GET /{id}` and `GET /strategies/available` remain stubs, the
+  first three because the promotion ratchet's preconditions still cannot be
+  checked and the last two because the list above already carries what they
+  would serve.
+- **A row no longer implies a worker ran it.** `has_run` on a registered class
+  and `last_started_at` on a stored row both read the same two facts — a row
+  exists, and `updated_at` — and an authored row has both from the moment it is
+  created. That was already true of every row `scripts/seed.py` writes; creation
+  makes it ordinary. Telling the two apart needs a `last_started_at` column that
+  only `ensure` bumps; docs/ROADMAP.md carries it.
 - ~~**The lifecycle vocabulary has drifted three ways.**~~ **Fixed (#76.)**
   `STRATEGY_STATES` offered `draft, backtest, paper, active, paused`; the domain
   enum `StrategyState` had `draft, backtesting, paper, live, paused, halted`;
@@ -310,7 +319,8 @@ the record.
 | `/orders` (GET) | built | Orders |
 | `/orders` (POST), `/{id}` (DELETE), `/cancel-all` | **stub** | none |
 | `/strategies` (GET) | built | Strategies |
-| `/strategies` writes, `/available`, `/{id}` | **stub** | none |
+| `/strategies` (POST) | built | none — no authoring form yet |
+| `/strategies` other writes, `/available`, `/{id}` | **stub** | none |
 | `/analytics/{performance,trades,attribution}` | built | Analytics |
 | `/analytics/live-vs-backtest/{run_id}` | built | Analytics |
 | `/analytics/reports/daily` | **stub** | none |

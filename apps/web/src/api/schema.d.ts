@@ -1101,10 +1101,31 @@ export interface paths {
         put?: never;
         /**
          * Create Strategy
-         * @description Validate before storing.
+         * @description Store a strategy, at `draft`.
          *
-         *     A `ruleset` is parsed through `RuleSet` here so a malformed rule fails at
-         *     creation with a clear message, not at 09:31 next Tuesday inside the worker.
+         *     Validate before storing. A `ruleset` is parsed through `RuleSet` *and
+         *     compiled* here, so a malformed rule fails at creation with a clear message
+         *     rather than at 09:31 next Tuesday inside the worker — and a coded strategy's
+         *     params are put through the class's own constructor for the same reason.
+         *
+         *     **The response is `StoredStrategyView`, the same shape `GET /strategies`
+         *     serves**, rather than an echo of the request. Two reasons, and the second is
+         *     the one that made it worth changing: what the caller asked for and what the
+         *     table now holds are not the same object — `state`, the timestamps, a coded
+         *     strategy's `class_name` and its defaulted `params` are all decided here — and
+         *     a create that echoed the request would report none of them. The shape it
+         *     replaced would also have served the raw `updated_at`, under exactly the name
+         *     the read view is careful not to use.
+         *
+         *     No `Location` header, deliberately: `GET /strategies/{id}` is still a stub,
+         *     and pointing a client at a `NotImplementedError` is worse than pointing it
+         *     nowhere. The whole row is in this body, which is what a client needs anyway.
+         *
+         *     409 on a name that is taken, and the name may well have been taken by
+         *     something nobody authored: a worker writes a row for whatever
+         *     `WORKER_STRATEGY` names at its first session open, and `scripts/seed.py`
+         *     writes one per registered class. The refusal says so, because "already
+         *     exists" about a strategy you have never created is otherwise a puzzle.
          */
         post: operations["create_strategy_api_v1_strategies_post"];
         delete?: never;
@@ -1127,8 +1148,10 @@ export interface paths {
          *     Still a stub, and now for a reason rather than by omission: the list above
          *     already carries this, marked with whether each class has ever run. A second
          *     endpoint serving the same registry would be a second thing to keep in step
-         *     with it, and nothing calls this one. It is the frontend's configuration-form
-         *     source, and there is no form — that lands with `POST /strategies`.
+         *     with it, and nothing calls this one. It was described as the frontend's
+         *     configuration-form source, waiting on `POST /strategies`; that endpoint is
+         *     now built and there is still no form — and when one is written it will read
+         *     `available[]`, which already carries every class with its `params_schema`.
          */
         get: operations["list_available_strategy_classes_api_v1_strategies_available_get"];
         put?: never;
@@ -1207,12 +1230,19 @@ export interface paths {
          *     a minimum paper-trading period, `ATP_ALLOW_LIVE_TRADING=true`, and an audit
          *     entry naming a human. See docs/SAFETY.md.
          *
-         *     Still a stub, and now for one missing precondition rather than two.
-         *     "A completed backtest on record" became checkable when `backtest_runs` got a
-         *     reader (ADR 0016). The audit trail's lifecycle verbs are still unwired (ADR
-         *     0010), so the entry naming a human cannot be written — and an endpoint that
-         *     promoted a strategy to live while silently skipping the record of who did it
-         *     would be this ratchet with its pawl removed.
+         *     Still a stub, and the reason has narrowed again. "A completed backtest on
+         *     record" became checkable when `backtest_runs` got a reader (ADR 0016). The
+         *     audit trail is no longer the blocker either: `create_strategy` above writes
+         *     a lifecycle verb naming the session's user, so the mechanism this needed —
+         *     a verb, an actor from the cookie rather than from the body, a sink that
+         *     never fails the action — is wired and demonstrated.
+         *
+         *     What is left is this endpoint's own work, and it is not small: a verb per
+         *     transition, the minimum paper-trading period measured against something
+         *     (nothing today records when a strategy reached `paper`), and the refusal to
+         *     move more than one rung at a time. An endpoint that promoted a strategy to
+         *     live while skipping a check it could not perform would be this ratchet with
+         *     its pawl removed, which is why it waits rather than shipping half.
          */
         post: operations["promote_strategy_api_v1_strategies__strategy_id__promote_post"];
         delete?: never;
@@ -2498,6 +2528,16 @@ export interface components {
          *     means. The same asymmetry: an existing row has only its timestamp bumped, at
          *     every worker boot. Serving it as `updated_at` would invite every reader to
          *     conclude somebody edited the strategy this morning.
+         *
+         *     **It reads `created_at` for a row no worker has ever started**, because that
+         *     is what the column holds — a create writes both at the same instant, and so
+         *     does a worker's first boot, and one column cannot tell them apart. That was
+         *     already true of every row `scripts/seed.py` writes, and authoring makes it
+         *     ordinary rather than a development-only case. Telling the two apart needs a
+         *     `last_started_at` column of its own, which `ensure` would bump and a create
+         *     would leave null; it is not in this change, and docs/ROADMAP.md carries it
+         *     so the gap is recorded rather than discovered by a reader believing a
+         *     timestamp.
          */
         StoredStrategyView: {
             /** Class Name */
@@ -2548,97 +2588,57 @@ export interface components {
             /** Strategies */
             strategies: components["schemas"]["StoredStrategyView"][];
         };
-        /** StrategyCreate */
+        /**
+         * StrategyCreate
+         * @description A strategy as an author sends it.
+         *
+         *     Three fields a reader might expect are deliberately absent, and each is
+         *     absent because the platform — not the caller — is the authority on it:
+         *
+         *     - **`id`** is the name. Not a generated uuid: `Signal.strategy_id` carries
+         *       `Strategy.name` everywhere, a compiled rule set included, so a row keyed on
+         *       anything else would leave every signal pointing at nothing.
+         *     - **`class_name`** is read off the registry for a coded strategy and is null
+         *       for a rule set. Accepting one would let a row claim a class it is not,
+         *       which the Strategies tab would then render as fact.
+         *     - **`state`** is `draft`, always. Promotion is a separate act with
+         *       preconditions this endpoint cannot check (docs/SAFETY.md), so there is no
+         *       field here to ask for a higher rung with.
+         *
+         *     `kind` is a `Literal` rather than a `str`, so an unknown one is a 422 naming
+         *     both. As a bare string it would reach a handler that has exactly two
+         *     branches and would have to invent a third refusal — the same reasoning that
+         *     types the `state` filter below as its enum.
+         */
         StrategyCreate: {
-            /** Class Name */
-            class_name?: string | null;
             /**
              * Description
              * @default
              */
             description: string;
-            /** Kind */
-            kind: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "coded" | "ruleset";
             /** Name */
             name: string;
-            /**
-             * Params
-             * @default {}
-             */
-            params: {
+            /** Params */
+            params?: {
                 [key: string]: unknown;
             };
-            /**
-             * Risk Config
-             * @default {}
-             */
-            risk_config: {
+            /** Risk Config */
+            risk_config?: {
                 [key: string]: unknown;
             };
             /** Ruleset */
             ruleset?: {
                 [key: string]: unknown;
             } | null;
-            /**
-             * Timeframe
-             * @default 1d
-             */
-            timeframe: string;
+            /** Timeframe */
+            timeframe?: string | null;
             /** Universe */
-            universe: string[];
-        };
-        /** StrategyOut */
-        StrategyOut: {
-            /** Class Name */
-            class_name?: string | null;
-            /**
-             * Created At
-             * Format: date-time
-             */
-            created_at: string;
-            /**
-             * Description
-             * @default
-             */
-            description: string;
-            /** Id */
-            id: string;
-            /** Kind */
-            kind: string;
-            /** Name */
-            name: string;
-            /**
-             * Params
-             * @default {}
-             */
-            params: {
-                [key: string]: unknown;
-            };
-            /**
-             * Risk Config
-             * @default {}
-             */
-            risk_config: {
-                [key: string]: unknown;
-            };
-            /** Ruleset */
-            ruleset?: {
-                [key: string]: unknown;
-            } | null;
-            /** State */
-            state: string;
-            /**
-             * Timeframe
-             * @default 1d
-             */
-            timeframe: string;
-            /** Universe */
-            universe: string[];
-            /**
-             * Updated At
-             * Format: date-time
-             */
-            updated_at: string;
+            universe?: string[];
         };
         /**
          * StrategyState
@@ -3934,7 +3934,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["StrategyOut"];
+                    "application/json": components["schemas"]["StoredStrategyView"];
                 };
             };
             /** @description Validation Error */
@@ -3987,7 +3987,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["StrategyOut"];
+                    "application/json": components["schemas"]["StoredStrategyView"];
                 };
             };
             /** @description Validation Error */
@@ -4024,7 +4024,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["StrategyOut"];
+                    "application/json": components["schemas"]["StoredStrategyView"];
                 };
             };
             /** @description Validation Error */
@@ -4057,7 +4057,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["StrategyOut"];
+                    "application/json": components["schemas"]["StoredStrategyView"];
                 };
             };
             /** @description Validation Error */
@@ -4091,7 +4091,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["StrategyOut"];
+                    "application/json": components["schemas"]["StoredStrategyView"];
                 };
             };
             /** @description Validation Error */

@@ -111,15 +111,36 @@ compiled and backtested without retyping, and the page cannot drift from a spec
 that still validates. Note its warmup: 200 bars, driven by the trend filter
 rather than by the RSI(14) everyone thinks of as the strategy.
 
-**A stored rule set can be queued like any other strategy** — once one is
-stored, which nothing can do yet: `POST /api/v1/strategies` is still a stub and
-`StrategyRecord`, the only thing a worker can write, has no `ruleset` field. The
-run side landed before the authoring side. `POST
-/api/v1/backtests` with its `strategy_id` copies the rules onto the run's own
-spec — a snapshot, not a reference — and `build_engine` compiles those rather
-than looking the name up in the registry. The copy is the point: a rule set is
-editable, so a run that recorded only the name would replay differently after an
-edit, with both results filed under one name.
+**A stored rule set can be queued like any other strategy**, and one can now be
+stored: `POST /api/v1/strategies` with `kind: ruleset` and the spec below as
+`ruleset` writes the row, at `draft`. (`StrategyRecord` — all a worker can write
+— still has no `ruleset` field and is not meant to; authoring goes through
+`NewStrategy`, which carries the whole row.) `POST /api/v1/backtests` with its
+`strategy_id` then copies the rules onto the run's own spec — a snapshot, not a
+reference — and `build_engine` compiles those rather than looking the name up in
+the registry. The copy is the point: a rule set is editable, so a run that
+recorded only the name would replay differently after an edit, with both results
+filed under one name.
+
+Five things the create endpoint refuses, each of which is otherwise a failure
+that arrives from somewhere else, later:
+
+- **a spec whose `name` is not the strategy's name.** `compile_ruleset` copies
+  `spec.name` onto the class, and every signal it emits stamps `strategy_id`
+  with it — so a row stored under a different name is not the row those signals
+  point at, and each one would fail its foreign key as it was recorded;
+- **a name a registered class already has.** `registry.register` refuses a
+  duplicate to keep results unambiguous; this is that rule across the two
+  namespaces. Both would file signals under one `strategy_id`;
+- **a universe that is not uppercase.** `_RuleSetStrategy.on_bar` matches
+  `bar.symbol` exactly and every stored bar is uppercase, so a spec on `spy`
+  compiles, runs, takes no trade and reports a flat curve;
+- **params sent alongside a rule set.** Its behaviour is the spec;
+- **a row-level `universe` or `timeframe` that contradicts the spec.** The spec
+  decides; omit them and they are read from it.
+
+Editing a stored rule set is not built — `PATCH /strategies/{id}` is still a
+stub — so a spec is currently changed by storing another under a new name.
 
 Four things the endpoint refuses up front rather than leaving to a job that
 fails minutes later in another process: a declarative row with no rules stored,

@@ -40,12 +40,14 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 
 from atp_core.domain import StrategyState
+from atp_core.errors import StrategyExistsError
 from atp_core.logging import get_logger
 from atp_core.persistence.db import session_scope
 from atp_core.persistence.models import StrategyRow
-from atp_core.strategy.ports import StoredStrategy, StrategyRecord
+from atp_core.strategy.ports import NewStrategy, StoredStrategy, StrategyRecord
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -89,6 +91,41 @@ def first_boot_values(record: StrategyRecord, now: datetime) -> dict[str, object
     }
 
 
+def authored_values(new: NewStrategy, now: datetime) -> dict[str, object]:
+    """The columns a create writes into `strategies`.
+
+    Pulled out of `create` for the reason `first_boot_values` is pulled out of
+    `ensure`: it can then be asserted without a database, and the defect that
+    function's docstring describes — a `state` no `StrategyState` contained,
+    invisible to mypy because `.values()` takes `Any` — is the same one this
+    dict is one typo away from.
+
+    **`state` is not a parameter.** `NewStrategy` has no such field, so the
+    ratchet's first rung is not a default a request can override; it is the only
+    value this function can produce. Promotion is a separate act with separate
+    preconditions (docs/SAFETY.md).
+
+    `created_at` and `updated_at` are the same instant, which is what a row that
+    exists and has never been started looks like. See `StoredStrategy` for what
+    `updated_at` means once a worker has booted it.
+    """
+    return {
+        "id": new.id,
+        "name": new.name,
+        "description": new.description,
+        "kind": new.kind,
+        "class_name": new.class_name,
+        "params": dict(new.params),
+        "ruleset": None if new.ruleset is None else dict(new.ruleset),
+        "state": StrategyState.DRAFT,
+        "universe": list(new.universe),
+        "timeframe": new.timeframe,
+        "risk_config": dict(new.risk_config),
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
 class PostgresStrategyRepository:
     """`StrategyRepository` over the `strategies` table."""
 
@@ -99,6 +136,40 @@ class PostgresStrategyRepository:
         # must stamp these rows with market time, not with the wall clock of the
         # machine doing the replaying.
         self._clock = clock
+
+    async def create(self, new: NewStrategy) -> StoredStrategy:
+        """Insert a row, refusing a name that is already stored.
+
+        A plain INSERT rather than the upsert `ensure` uses, and the contrast is
+        the point: `ensure` exists to be safe to call on every boot, so it
+        resolves a conflict by leaving the row alone. Here a conflict is the
+        answer — somebody is authoring a strategy under a name that already
+        names one, and quietly writing over it would replace a strategy that may
+        be running, under the identity every one of its signals carries.
+
+        The uniqueness is the database's rather than a `SELECT` first, because a
+        check before an insert is a race: two requests can both find the name
+        free. Translating every `IntegrityError` into that one refusal is safe
+        because of what this table constrains: a primary key, a unique name —
+        the same value, since a strategy's id is its name — and a CHECK on
+        `state` that this method cannot violate, because `authored_values` is
+        the only thing that decides it and it decides `draft`.
+        """
+        now = self._clock.now()
+        row = StrategyRow(**authored_values(new, now))
+        async with session_scope(self._session_factory) as session:
+            session.add(row)
+            try:
+                # Flushed explicitly so the conflict surfaces here, where it can
+                # be named, rather than out of `session_scope`'s commit as an
+                # `IntegrityError` the caller would have to interpret.
+                await session.flush()
+            except IntegrityError as exc:
+                log.info("strategy.duplicate", strategy=new.id)
+                raise StrategyExistsError(
+                    f"a strategy named {new.name!r} is already stored"
+                ) from exc
+        return _to_stored(row)
 
     async def ensure(self, record: StrategyRecord) -> None:
         """Create the row if it is absent; otherwise only bump `updated_at`.

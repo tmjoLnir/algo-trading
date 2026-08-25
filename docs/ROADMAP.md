@@ -927,15 +927,14 @@ above.
     symbols outside its universe, so such a run completes, takes no trades, and
     reports a flat curve indistinguishable from a strategy that never signalled.
 
-    Two things this did **not** close, and the first is larger than it looks.
-    **Nothing can create a rule-set row.** `POST /api/v1/strategies` is still a
-    `NotImplementedError` stub, `StrategyRecord` — the only thing `ensure`
-    accepts — has no `ruleset` field, and the adapter writes that column as a
-    hard-coded `None`. So the path from a stored rule set to a result is now
-    complete and nothing can put a rule set at the start of it: the run side
-    landed before the authoring side. Second, the `risk` block is still read
-    only for warmup, so a run of a rule set must be configured with the ATR stop
-    its own spec asks for or `risk_pct` refuses every entry at sizing.
+    Two things this did **not** close. ~~**Nothing can create a rule-set row.**~~
+    Closed by the strategy-creation item below: `POST /api/v1/strategies` stores
+    one, through a `NewStrategy` write type that carries the whole row rather
+    than the thin record `ensure` accepts. So the path from a rule set to a
+    result is complete at both ends for the first time. Second, the `risk` block
+    is still read only for warmup, so a run of a rule set must be configured with
+    the ATR stop its own spec asks for or `risk_pct` refuses every entry at
+    sizing.
   - **Nothing has run a rule set on the paper endpoint**, which is this phase's
     *Verifiable:* line and unchanged. That is what still holds the tick.
 
@@ -944,6 +943,69 @@ above.
   gap #93 named, now with a concrete case: without that stop, `risk_pct` refuses
   every entry at sizing, which `test_without_that_stop_every_entry_is_refused_at_sizing`
   pins so the failure is a documented refusal rather than a surprise.
+- [ ] Strategy creation endpoint — @claude.
+  **An item this phase was missing**, added in the PR that built it. Requirement
+  #1 is "strategy CRUD and lifecycle"; the roadmap tracked the listing screen
+  (Phase 5) and the rule-set compiler (above) and nothing tracked the write half
+  — which is how its absence came to be recorded as a *blocker* on another item
+  rather than as work.
+
+  `POST /api/v1/strategies` stores a coded strategy or a declarative rule set at
+  `draft`. `StrategyRepository` gained `create`, and `strategy/ports.py` a third
+  type over one table: `NewStrategy` is the whole row **minus the columns the
+  platform decides**, beside `StrategyRecord` (what a booting worker knows) and
+  `StoredStrategy` (what a reader needs). The split is by who is the authority
+  on which column, and it is what makes the ratchet a property of the type
+  rather than a check: there is no `state` field anywhere on the write path, so
+  nothing between the request and the INSERT could carry a rung above the first.
+
+  **Two writers on one table, and they do not fight.** A worker's `ensure` is an
+  upsert that touches only `updated_at` on a row it finds, so running an
+  authored strategy cannot overwrite what was authored — which matters most for
+  a rule set, since a compiled one reaches the runner as an ordinary `Strategy`
+  and the row it would ensure says `kind="coded"` and carries no rules. Pinned
+  against a real PostgreSQL rather than asserted.
+
+  **Most of the endpoint is refusals**, each of them a failure that otherwise
+  arrives later from another process. The three worth review: a spec whose name
+  disagrees with its row (the compiled class stamps `spec.name` on every signal,
+  so every decision it recorded would fail its foreign key); a rule set taking a
+  registered class's name (both would file signals under one `strategy_id`, with
+  their attribution silently merged); and a universe that is not uppercase
+  (matched against `bar.symbol` exactly, so it compiles, runs, takes no trade and
+  reports a flat curve). `risk_config` is refused rather than stored, because
+  nothing in the platform reads that column and a limit on screen that no order
+  is checked against is worse than no limit shown.
+
+  `strategy_created` is the audit trail's first lifecycle verb, landing with its
+  handler as ADR 0010 says these do. That removes one of the two reasons the
+  promote stub gives for staying a stub — the mechanism for an entry naming a
+  human is now wired and demonstrated — and leaves its own work: a verb per
+  transition, and a paper-trading period nothing yet records the start of.
+
+  **A gap this makes ordinary rather than introduces.** `last_started_at` on the
+  Strategies tab is `strategies.updated_at`, and a create writes it equal to
+  `created_at` — as does a worker's first boot, so one column cannot tell "never
+  started" from "started once, when it was made". Every row `scripts/seed.py`
+  writes has had that property all along; authoring makes it the common case,
+  and it also reaches `available[].has_run`, which is the field the Strategies
+  tab exists for. The fix is a `last_started_at` column only `ensure` bumps,
+  nullable, backfilled from `updated_at` — a migration, not a rename — and it is
+  deliberately not in this change: it touches the read model, the screen and the
+  generated types, and folding it into the authoring PR would put two reviews in
+  one diff.
+
+  Unticked, and not close. This phase's *Verifiable:* line is a week of paper
+  trading, and nothing here trades. What has been shown is 20 API tests over
+  ASGI and 4 against a real PostgreSQL in CI; what has not is a strategy created
+  through this endpoint being picked up by a worker, which is the whole point of
+  storing one and needs a running stack to demonstrate.
+
+  Still stubs, deliberately: `PATCH /strategies/{id}` (editing a live strategy
+  needs pausing it first, and pausing is a stub), `POST /{id}/promote`,
+  `POST /{id}/pause`, `GET /{id}`. There is **no authoring form** either — the
+  Strategies tab is still read-only, so a rule set is posted from a client. That
+  is the next piece of this item rather than a separate one.
 - [ ] `StrategyRunner` live loop — @claude (wip #39).
   Implemented: `warmup`, `run`, `evaluate`, `on_fill_event` and `shutdown`, plus
   `LiveContext` — the live counterpart of `BacktestContext`, serving a strategy

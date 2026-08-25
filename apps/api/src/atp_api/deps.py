@@ -226,18 +226,20 @@ async def get_strategy_repository(
     session_factory: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
     clock: Annotated[Clock, Depends(get_clock)],
 ) -> StrategyRepository:
-    """The `strategies` table — read here to say which strategies exist.
+    """The `strategies` table — read here to say which strategies exist, and
+    written in exactly one place.
 
-    Read-only from this process, like the book and the orders above. The runner
-    writes a row at every session open (`ensure`), and it is the only thing that
-    does: a strategy row edited from here while a worker held a different view
-    of it would be two answers to "what is this strategy", which is the problem
-    ADR 0007 solves for the book.
+    That place is `create`, and the exception is as narrow as the one
+    `get_backtest_repository` describes: this process inserts rows and updates
+    none. Editing is what ADR 0007's argument refuses — a strategy changed from
+    here while a worker held a different view of it would be two answers to
+    "what is this strategy" — and a row that does not yet exist has no worker
+    holding a view of it. The two writers stay disjoint afterwards by
+    construction: `ensure` touches nothing but `updated_at` on a row it finds,
+    so a worker booting an authored strategy cannot overwrite what was authored.
 
-    Takes the clock because the adapter stamps rows with it (rule §1.2). Nothing
-    this process calls writes, so it goes unused on every read — but a
-    constructor that quietly read the wall clock instead would be wrong the
-    moment anything here did write.
+    Takes the clock because the adapter stamps rows with it (rule §1.2) — no
+    longer only in theory, now that a create writes `created_at` through it.
     """
     return PostgresStrategyRepository(session_factory, clock)
 
