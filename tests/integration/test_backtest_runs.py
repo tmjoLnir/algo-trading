@@ -409,3 +409,42 @@ class TestReads:
 
         with pytest.raises(sqlalchemy.exc.IntegrityError):
             await runs.create(new_run("r1", a_spec(), queued_at=T0))
+
+
+class TestReadingOneStrategyInFull:
+    """`get_stored`, which the queue endpoint uses to ask whether a strategy is
+    declarative and to copy its rules onto the run.
+
+    Its unit callers all go through `FakeStrategyRepository`, so this is the only
+    thing that executes the query. `ruleset` comes back `None` here and that is
+    not a weak assertion — nothing in the platform can write that column yet
+    (`ensure` takes a `StrategyRecord`, which has no such field, and the adapter
+    stores a hard-coded `None`), so `None` is the only value a real row can
+    currently hold. The rules-carrying path is covered against the fake in
+    `tests/unit/test_backtests_api.py`.
+    """
+
+    async def test_it_returns_the_whole_row(
+        self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
+    ) -> None:
+        _, strategies = repo
+        await _registered(strategies)
+
+        stored = await strategies.get_stored(STRATEGY)
+
+        assert stored is not None
+        assert stored.id == STRATEGY
+        assert stored.kind == "coded"
+        assert stored.class_name == "SmaCrossover"
+        assert stored.params == {"fast_period": 10, "slow_period": 30}
+        assert stored.universe == ("SPY", "QQQ")
+        assert stored.ruleset is None
+
+    async def test_an_unknown_id_is_none_rather_than_an_error(
+        self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
+    ) -> None:
+        """The queue endpoint asks about every strategy it is given, including
+        coded ones that have a row and ones that have none. A raise here would
+        turn "this is not declarative" into a 500."""
+        _, strategies = repo
+        assert await strategies.get_stored("nothing_has_ever_run_this") is None

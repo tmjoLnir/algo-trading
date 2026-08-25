@@ -927,11 +927,15 @@ above.
     symbols outside its universe, so such a run completes, takes no trades, and
     reports a flat curve indistinguishable from a strategy that never signalled.
 
-    Two things this did **not** close. Seeding still does not happen, so no
-    rule-set row exists until somebody saves one through the API; and the
-    `risk` block is still read only for warmup, so a run of a rule set must be
-    configured with the ATR stop its own spec asks for or `risk_pct` refuses
-    every entry at sizing.
+    Two things this did **not** close, and the first is larger than it looks.
+    **Nothing can create a rule-set row.** `POST /api/v1/strategies` is still a
+    `NotImplementedError` stub, `StrategyRecord` — the only thing `ensure`
+    accepts — has no `ruleset` field, and the adapter writes that column as a
+    hard-coded `None`. So the path from a stored rule set to a result is now
+    complete and nothing can put a rule set at the start of it: the run side
+    landed before the authoring side. Second, the `risk` block is still read
+    only for warmup, so a run of a rule set must be configured with the ATR stop
+    its own spec asks for or `risk_pct` refuses every entry at sizing.
   - **Nothing has run a rule set on the paper endpoint**, which is this phase's
     *Verifiable:* line and unchanged. That is what still holds the tick.
 

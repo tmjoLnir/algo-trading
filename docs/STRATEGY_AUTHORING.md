@@ -111,7 +111,10 @@ compiled and backtested without retyping, and the page cannot drift from a spec
 that still validates. Note its warmup: 200 bars, driven by the trend filter
 rather than by the RSI(14) everyone thinks of as the strategy.
 
-**A stored rule set can be queued like any other strategy.** `POST
+**A stored rule set can be queued like any other strategy** — once one is
+stored, which nothing can do yet: `POST /api/v1/strategies` is still a stub and
+`StrategyRecord`, the only thing a worker can write, has no `ruleset` field. The
+run side landed before the authoring side. `POST
 /api/v1/backtests` with its `strategy_id` copies the rules onto the run's own
 spec — a snapshot, not a reference — and `build_engine` compiles those rather
 than looking the name up in the registry. The copy is the point: a rule set is
