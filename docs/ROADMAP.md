@@ -928,9 +928,9 @@ above.
     reports a flat curve indistinguishable from a strategy that never signalled.
 
     Two things this did **not** close. ~~**Nothing can create a rule-set row.**~~
-    Closed by the strategy-creation item below: `POST /api/v1/strategies` stores
-    one, through a `NewStrategy` write type that carries the whole row rather
-    than the thin record `ensure` accepts. So the path from a rule set to a
+    Closed by #97, the strategy-creation item below: `POST /api/v1/strategies`
+    stores one, through a `NewStrategy` write type that carries the whole row
+    rather than the thin record `ensure` accepts. So the path from a rule set to a
     result is complete at both ends for the first time. Second, the `risk` block
     is still read only for warmup, so a run of a rule set must be configured with
     the ATR stop its own spec asks for or `risk_pct` refuses every entry at
@@ -943,7 +943,7 @@ above.
   gap #93 named, now with a concrete case: without that stop, `risk_pct` refuses
   every entry at sizing, which `test_without_that_stop_every_entry_is_refused_at_sizing`
   pins so the failure is a documented refusal rather than a surprise.
-- [ ] Strategy creation endpoint — @claude.
+- [ ] Strategy creation endpoint — @claude (wip #97).
   **An item this phase was missing**, added in the PR that built it. Requirement
   #1 is "strategy CRUD and lifecycle"; the roadmap tracked the listing screen
   (Phase 5) and the rule-set compiler (above) and nothing tracked the write half
