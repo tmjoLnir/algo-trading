@@ -26,15 +26,17 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING
 
+from pydantic import ValidationError
+
 from atp_core.analytics.performance import PerformanceAnalyzer, TradeRecord
 from atp_core.backtest.costs import ZeroCostModel, alpaca_equities_default
 from atp_core.backtest.engine import BacktestConfig, BacktestEngine, RiskBasedSizer
 from atp_core.domain import OrderStatus, Timeframe
 from atp_core.domain.enums import StopType
-from atp_core.errors import ConfigError
+from atp_core.errors import ATPError, ConfigError
 from atp_core.risk.engine import RiskEngine, backtest_rules
 from atp_core.risk.stops import StopConfig
-from atp_core.strategy import registry
+from atp_core.strategy import RuleSet, compile_ruleset, registry
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -44,6 +46,7 @@ if TYPE_CHECKING:
     from atp_core.backtest.ports import BacktestRunSpec
     from atp_core.config import RiskLimits
     from atp_core.domain import Bar
+    from atp_core.strategy.base import Strategy
 
 #: Cost models a request may name, and what each builds.
 #:
@@ -216,6 +219,38 @@ def parse_spec_dates(spec: BacktestRunSpec) -> tuple[datetime, datetime]:
     return start, end
 
 
+def _resolve_strategy(spec: BacktestRunSpec) -> Strategy:
+    """The spec's strategy: a compiled rule set, or a registered class.
+
+    **The rule set wins when the spec carries one**, and it is deliberately not
+    a fallback for a name the registry does not know. A run that recorded rules
+    executed those rules; reaching for the registry as well would let a coded
+    strategy sharing the id decide what a stored run meant, which is the kind of
+    ambiguity `registry.register` refuses duplicate names to prevent.
+
+    `compile_ruleset` does not register what it builds, so the two paths cannot
+    collide — and this staying the single place a spec becomes a strategy is
+    what keeps a queued run and the CLI from reporting different numbers for the
+    same parameters.
+    """
+    if spec.ruleset is not None:
+        try:
+            return compile_ruleset(RuleSet.model_validate(spec.ruleset))
+        except ATPError as exc:
+            # `InvalidRuleError` is already an `ATPError`; this names where the
+            # spec came from, because by the time a worker reads it the rule set
+            # is a JSON blob in a column rather than something anyone is editing.
+            raise ConfigError(f"the run's stored rule set does not compile: {exc}") from exc
+        except ValidationError as exc:
+            raise ConfigError(f"the run's stored rule set is malformed: {exc}") from exc
+
+    strategy_cls = registry.get(spec.strategy_id)  # raises StrategyError if unknown
+    try:
+        return strategy_cls(dict(spec.params))
+    except Exception as exc:  # a strategy validates its own params at construction
+        raise ConfigError(f"strategy rejected its params: {exc}") from exc
+
+
 def build_engine(
     spec: BacktestRunSpec,
     *,
@@ -259,11 +294,7 @@ def build_engine(
     cash = _positive_decimal(spec.starting_cash, "starting_cash")
     method, value = resolve_sizing(spec)
 
-    strategy_cls = registry.get(spec.strategy_id)  # raises StrategyError if unknown
-    try:
-        strategy = strategy_cls(dict(spec.params))
-    except Exception as exc:  # a strategy validates its own params at construction
-        raise ConfigError(f"strategy rejected its params: {exc}") from exc
+    strategy = _resolve_strategy(spec)
 
     return BacktestEngine(
         strategy=strategy,

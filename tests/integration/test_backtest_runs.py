@@ -21,6 +21,7 @@ what says the mirror is accurate.
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -221,11 +222,29 @@ class TestTheResultRoundTrips:
         unrepresentable as a binary float, so anything in this path that made it a
         number would show up here rather than as a slightly wrong return six
         months later.
+
+        The sizing and stop fields are asserted here because for a while they
+        were the ones that did *not* survive, under a test with this exact name:
+        `a_spec()` leaves them at their defaults, so every field this checked
+        happened to be one of the nine that made it. They are set explicitly
+        rather than by changing `a_spec`, which sixteen other cases use and
+        which several of them expect to be an unsized, unstopped run.
+        `tests/unit/test_backtest_run_spec.py` covers the serialisation itself;
+        what this adds is that the real column behaves like the pure functions.
         """
         runs, strategies = repo
         await _registered(strategies)
 
-        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        asked = dataclasses.replace(
+            a_spec(),
+            sizing_method="risk_pct",
+            sizing_value="0.01",
+            stop_type="atr",
+            stop_value="2.5",
+            stop_period=21,
+            stop_bars=7,
+        )
+        await runs.create(new_run("r1", asked, queued_at=T0))
         stored = await runs.get("r1")
 
         assert stored is not None
@@ -234,6 +253,9 @@ class TestTheResultRoundTrips:
         assert stored.spec.params == {"fast_period": 10, "slow_period": 30}
         assert stored.spec.cost_model == "alpaca_equities"
         assert stored.spec.qty == "100"
+        # The six that a run is sized and protected by, and that the worker
+        # rebuilds its engine from.
+        assert stored.spec == asked
 
     async def test_a_failure_clears_any_partial_result(
         self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
@@ -387,3 +409,42 @@ class TestReads:
 
         with pytest.raises(sqlalchemy.exc.IntegrityError):
             await runs.create(new_run("r1", a_spec(), queued_at=T0))
+
+
+class TestReadingOneStrategyInFull:
+    """`get_stored`, which the queue endpoint uses to ask whether a strategy is
+    declarative and to copy its rules onto the run.
+
+    Its unit callers all go through `FakeStrategyRepository`, so this is the only
+    thing that executes the query. `ruleset` comes back `None` here and that is
+    not a weak assertion — nothing in the platform can write that column yet
+    (`ensure` takes a `StrategyRecord`, which has no such field, and the adapter
+    stores a hard-coded `None`), so `None` is the only value a real row can
+    currently hold. The rules-carrying path is covered against the fake in
+    `tests/unit/test_backtests_api.py`.
+    """
+
+    async def test_it_returns_the_whole_row(
+        self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
+    ) -> None:
+        _, strategies = repo
+        await _registered(strategies)
+
+        stored = await strategies.get_stored(STRATEGY)
+
+        assert stored is not None
+        assert stored.id == STRATEGY
+        assert stored.kind == "coded"
+        assert stored.class_name == "SmaCrossover"
+        assert stored.params == {"fast_period": 10, "slow_period": 30}
+        assert stored.universe == ("SPY", "QQQ")
+        assert stored.ruleset is None
+
+    async def test_an_unknown_id_is_none_rather_than_an_error(
+        self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
+    ) -> None:
+        """The queue endpoint asks about every strategy it is given, including
+        coded ones that have a row and ones that have none. A raise here would
+        turn "this is not declarative" into a 500."""
+        _, strategies = repo
+        assert await strategies.get_stored("nothing_has_ever_run_this") is None

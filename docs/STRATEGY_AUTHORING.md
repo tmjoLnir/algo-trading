@@ -111,12 +111,28 @@ compiled and backtested without retyping, and the page cannot drift from a spec
 that still validates. Note its warmup: 200 bars, driven by the trend filter
 rather than by the RSI(14) everyone thinks of as the strategy.
 
-Running it needs two things the spec cannot supply itself. A rule set is not in
-the registry, so `runner.build_engine` — which resolves strategies by name —
-cannot yet reach one; compile it and hand the strategy to the engine directly.
-And the run has to be configured with the ATR stop the `risk` block asks for,
-since a compiled rule set emits no protective level of its own: without it
-`risk_pct` refuses every entry at sizing, with a reason on the result.
+**A stored rule set can be queued like any other strategy** — once one is
+stored, which nothing can do yet: `POST /api/v1/strategies` is still a stub and
+`StrategyRecord`, the only thing a worker can write, has no `ruleset` field. The
+run side landed before the authoring side. `POST
+/api/v1/backtests` with its `strategy_id` copies the rules onto the run's own
+spec — a snapshot, not a reference — and `build_engine` compiles those rather
+than looking the name up in the registry. The copy is the point: a rule set is
+editable, so a run that recorded only the name would replay differently after an
+edit, with both results filed under one name.
+
+Four things the endpoint refuses up front rather than leaving to a job that
+fails minutes later in another process: a declarative row with no rules stored,
+params sent alongside one (a rule set takes none — its behaviour is the spec),
+rules that no longer compile, and a run whose symbols do not meet the rule set's
+`universe`. That last one matters more than it looks: a compiled rule set
+ignores symbols outside its universe, so such a run completes, takes no trades,
+and reports a flat curve indistinguishable from a strategy that never signalled.
+
+The run still has to be configured with the ATR stop the `risk` block asks for.
+A compiled rule set emits no protective level of its own, so without it
+`risk_pct` refuses every entry at sizing, with a reason on the result — the
+`risk` block is read for warmup and is not yet wired into a run's configuration.
 
 Validation rejects a rule set with no exit condition *and* no stop loss — it
 could never close a position.

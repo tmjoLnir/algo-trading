@@ -909,16 +909,35 @@ above.
   Two things still stand between that and a tick, and the first is new
   information rather than a restatement:
 
-  - **Nothing resolves a stored rule set into a run.** `runner.build_engine`
-    reaches a strategy through `registry.get(spec.strategy_id)`, and a rule set
-    is deliberately not registered (`compile_ruleset`'s docstring says why), so
-    `kind="ruleset"` rows have no path into a backtest. The storage column, the
-    API shape and the compiler all exist; the resolution step between them does
-    not. Seeding a rule-set row before that lands would put an entry in the
-    backtest picker that fails when chosen, which is why this change ships the
-    spec without seeding it.
+  - ~~**Nothing resolves a stored rule set into a run.**~~ Closed by #96.
+    `BacktestRunSpec` gained a `ruleset` field, `build_engine` compiles it when
+    present, and `POST /api/v1/backtests` copies a `kind="ruleset"` row's rules
+    onto the run. A **snapshot, not a reference**, and that is the decision to
+    review: a rule set is editable in the UI — that is what it is for — so a run
+    recording only `strategy_id` would replay differently the day somebody moved
+    a threshold, silently, with both numbers filed under one name. The id keeps
+    the foreign key and answers "which strategy is this a run of"; the snapshot
+    answers "what rules actually ran", and those stop being one question the
+    first time a rule set is edited.
+
+    Four refusals land at the door rather than minutes later on a row that says
+    `failed`: a declarative row with no rules, params sent alongside one, rules
+    that no longer compile, and a run whose symbols do not meet the rule set's
+    `universe`. The last is the valuable one — a compiled rule set ignores
+    symbols outside its universe, so such a run completes, takes no trades, and
+    reports a flat curve indistinguishable from a strategy that never signalled.
+
+    Two things this did **not** close, and the first is larger than it looks.
+    **Nothing can create a rule-set row.** `POST /api/v1/strategies` is still a
+    `NotImplementedError` stub, `StrategyRecord` — the only thing `ensure`
+    accepts — has no `ruleset` field, and the adapter writes that column as a
+    hard-coded `None`. So the path from a stored rule set to a result is now
+    complete and nothing can put a rule set at the start of it: the run side
+    landed before the authoring side. Second, the `risk` block is still read
+    only for warmup, so a run of a rule set must be configured with the ATR stop
+    its own spec asks for or `risk_pct` refuses every entry at sizing.
   - **Nothing has run a rule set on the paper endpoint**, which is this phase's
-    *Verifiable:* line and unchanged.
+    *Verifiable:* line and unchanged. That is what still holds the tick.
 
   A run of this spec also has to be configured with the ATR stop the spec asks
   for, because a compiled rule set emits no protective level of its own — the
@@ -1599,6 +1618,28 @@ wording if it is not the demonstration you want.
   *Verifiable:* line asks for **real backfilled** history, and the bars this seed
   writes are fabricated ones under reserved test tickers. It removes an obstacle
   to showing the line; it does not show it.
+
+  **Until #96 a queued run ignored the sizing method and the stop the request
+  chose.** `_spec_to_json` wrote nine of `BacktestRunSpec`'s fifteen fields, and
+  the six it dropped were `sizing_method`, `sizing_value` and the four `stop_*`
+  fields. Since the worker is handed a `run_id` and rebuilds the spec from that
+  column and nothing else, a run submitted from the Backtests tab as `risk_pct`
+  with an ATR stop *executed* as `fixed_qty` with no stop — the API validated
+  the stop config and then discarded it. Nothing failed: the result looked
+  exactly like a correct one, which is the same class of error as a backtest run
+  with no costs.
+
+  The CLI was never affected — `scripts/run_backtest.py` builds a spec in
+  process and hands it straight to `build_engine`, so it never crosses this
+  seam. Two things hid it from the tests: `FakeBacktestRunRepository` stores the
+  run object in memory, so every unit test of the queue bypassed the serialiser,
+  and the integration case named `test_the_spec_survives_the_config_column`
+  asserted five fields, all of which happened to be among the nine that
+  survived. Both are addressed, and the round trip is now asserted against
+  `dataclasses.fields`, so the next field added to the spec cannot be forgotten.
+
+  Runs queued before that fix still read as `fixed_qty` with no stop, which is
+  what they ran as — the ask was never recorded and cannot be recovered.
 
 - [ ] Live-vs-backtest comparison — @claude.
   Built as of #68: `GET /analytics/live-vs-backtest/{run_id}` serves the live

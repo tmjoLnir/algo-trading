@@ -210,6 +210,20 @@ def _spec_to_json(spec: BacktestRunSpec) -> dict[str, Any]:
     Timestamps as ISO-8601 and money as a string, which is what
     `BacktestRunSpec` already holds — the type exists so that this conversion is
     a serialisation rather than a decision (see its docstring).
+
+    **Every field, and that is the invariant rather than a detail.** This wrote
+    nine of the spec's fifteen for a while, and the six it dropped were
+    `sizing_method`, `sizing_value` and the four `stop_*` fields. Nothing failed
+    visibly: the API validated a `risk_pct` request with an ATR stop, wrote a
+    row that recorded neither, and the worker — which rebuilds the spec from
+    this column and nothing else — ran it as `fixed_qty` with no stop. A run
+    that silently ignores the sizing and the protection somebody chose is the
+    same class of error as a backtest with no costs, and it looks exactly like a
+    correct result.
+
+    So: a field on the spec is a field here. `test_backtest_run_spec.py` asserts
+    that against `dataclasses.fields`, which is what makes the next field
+    impossible to forget rather than merely unlikely.
     """
     return {
         "strategy_id": spec.strategy_id,
@@ -220,7 +234,14 @@ def _spec_to_json(spec: BacktestRunSpec) -> dict[str, Any]:
         "starting_cash": spec.starting_cash,
         "cost_model": spec.cost_model,
         "params": dict(spec.params),
+        "ruleset": dict(spec.ruleset) if spec.ruleset is not None else None,
         "qty": spec.qty,
+        "sizing_method": spec.sizing_method,
+        "sizing_value": spec.sizing_value,
+        "stop_type": spec.stop_type,
+        "stop_value": spec.stop_value,
+        "stop_period": spec.stop_period,
+        "stop_bars": spec.stop_bars,
     }
 
 
@@ -232,10 +253,26 @@ def _spec_from_json(strategy_id: str, config: dict[str, Any]) -> BacktestRunSpec
     is the authority; reading the JSON copy would be trusting the half nothing
     constrains.
 
-    Tolerant of a missing `params` or `qty` and not of a missing window: a run
+    Tolerant of a missing optional field and not of a missing window: a run
     whose dates cannot be read is a row this platform cannot describe, and
     inventing a window for it would produce a screen full of confident wrong
     dates.
+
+    **The defaults here are the ones a row written before a field existed
+    means.** Every one matches `BacktestRunSpec`'s own default, and each of
+    those was chosen so that an older row still reproduces: `fixed_qty` is what
+    every run was sized by before `sizing_method` existed, and an empty
+    `stop_type` arms only what the strategy itself asks for, which is what the
+    engine did unconditionally before stops were configurable.
+
+    One consequence is worth stating plainly, because someone will notice it.
+    Rows written while `_spec_to_json` was dropping these fields come back as
+    `fixed_qty` with no stop **even if the request that created them asked for
+    `risk_pct` and an ATR stop** — the ask was never recorded and cannot be
+    recovered. That is the honest reading rather than a lossy one: those runs
+    *executed* as `fixed_qty` with no stop, because the worker read the same
+    incomplete column. The row reproduces what ran, which is what a run record
+    is for.
     """
     return BacktestRunSpec(
         strategy_id=strategy_id,
@@ -246,7 +283,18 @@ def _spec_from_json(strategy_id: str, config: dict[str, Any]) -> BacktestRunSpec
         starting_cash=str(config.get("starting_cash", "0")),
         cost_model=str(config.get("cost_model", "alpaca_equities")),
         params=dict(config.get("params") or {}),
+        # `or None` rather than a plain get: a row that stored `{}` for a coded
+        # strategy and one that stored nothing mean the same thing, and an empty
+        # dict reaching `build_engine` would be read as "compile this rule set"
+        # and fail validation on a spec that has no rules.
+        ruleset=dict(config["ruleset"]) if config.get("ruleset") else None,
         qty=str(config.get("qty", "100")),
+        sizing_method=str(config.get("sizing_method", "fixed_qty")),
+        sizing_value=str(config.get("sizing_value", "")),
+        stop_type=str(config.get("stop_type", "")),
+        stop_value=str(config.get("stop_value", "")),
+        stop_period=int(config.get("stop_period", 14)),
+        stop_bars=int(config.get("stop_bars", 0)),
     )
 
 

@@ -440,6 +440,14 @@ class FakeStrategyRepository:
     async def get(self, strategy_id: str) -> StrategyRecord | None:
         return self.stored.get(strategy_id)
 
+    async def get_stored(self, strategy_id: str) -> StoredStrategy | None:
+        """One of `rows`, by id.
+
+        Reads the same list `list_all` does rather than a second store, so a
+        test cannot seed a strategy the list endpoint shows and this one denies.
+        """
+        return next((row for row in self.rows if row.id == strategy_id), None)
+
     async def list_all(self, *, state: str | None = None) -> list[StoredStrategy]:
         """Whatever a test seeded in `rows`, filtered and ordered as the real
         adapter orders it — newest first by `created_at`.

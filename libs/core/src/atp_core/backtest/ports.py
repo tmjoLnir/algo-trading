@@ -90,6 +90,18 @@ class BacktestRunSpec:
     cost_model: str
     #: Strategy parameters, as the strategy's own `params_schema` describes them.
     params: dict[str, object] = field(default_factory=dict)
+    #: The declarative rules this run executed, **snapshotted at queue time**.
+    #: None for a coded strategy, where `strategy_id` names a registered class
+    #: and this column cannot describe the logic.
+    #:
+    #: A copy rather than a reference, and that is the whole reason it is here.
+    #: A rule set is editable in the UI — that is what it is *for* — so a run
+    #: that recorded only `strategy_id` would report different numbers the next
+    #: time it was replayed, silently, on the day somebody adjusted a threshold.
+    #: `strategy_id` still carries the foreign key and answers "which strategy
+    #: is this a run of"; this answers "what rules actually ran", and those stop
+    #: being the same question the first time a rule set is edited.
+    ruleset: dict[str, object] | None = None
     #: Shares per entry under `fixed_qty` sizing, and the value every run stored
     #: before `sizing_method` existed was sized by. Kept rather than folded into
     #: `sizing_value` so those rows still deserialize and still reproduce: a
