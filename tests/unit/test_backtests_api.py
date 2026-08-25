@@ -37,13 +37,20 @@ from atp_api.deps import (
     get_backtest_repository,
     get_bar_repository,
     get_current_session,
+    get_strategy_repository,
 )
 from atp_api.main import create_app
 from atp_api.routers.backtests import MAX_COMPARE, MAX_SYMBOLS
 from atp_core.backtest.ports import BacktestProgress, BacktestQueueError, BacktestRunSpec
 from atp_core.domain import Bar, Timeframe
 from atp_core.persistence.backtests import new_run
-from tests.fakes import FakeBacktestQueue, FakeBacktestRunRepository
+from atp_core.strategy.examples import rsi_mean_reversion
+from atp_core.strategy.ports import StoredStrategy
+from tests.fakes import (
+    FakeBacktestQueue,
+    FakeBacktestRunRepository,
+    FakeStrategyRepository,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -60,6 +67,9 @@ END = datetime(2025, 1, 1, tzinfo=UTC)
 #: test asserting on the registry fails loudly if it stops being registered
 #: rather than passing vacuously.
 SHIPPED = "sma_crossover"
+
+#: The shipped rule set, stored as a `kind="ruleset"` row.
+RULES_ID = "rsi_mean_reversion"
 
 
 class FakeBarRepository:
@@ -141,13 +151,29 @@ def bars() -> FakeBarRepository:
 
 
 @pytest.fixture
+def strategies() -> FakeStrategyRepository:
+    """Empty by default, which is the shape a coded strategy has here.
+
+    `_validated_spec` only consults a row to ask whether it is declarative, so
+    no row means the registry path — which is every case in this file except the
+    rule-set ones, and is what those cases were already asserting before a row
+    was consulted at all.
+    """
+    return FakeStrategyRepository()
+
+
+@pytest.fixture
 def app(
-    runs: FakeBacktestRunRepository, queue: FakeBacktestQueue, bars: FakeBarRepository
+    runs: FakeBacktestRunRepository,
+    queue: FakeBacktestQueue,
+    bars: FakeBarRepository,
+    strategies: FakeStrategyRepository,
 ) -> FastAPI:
     application = create_app()
     application.dependency_overrides[get_backtest_repository] = lambda: runs
     application.dependency_overrides[get_backtest_queue] = lambda: queue
     application.dependency_overrides[get_bar_repository] = lambda: bars
+    application.dependency_overrides[get_strategy_repository] = lambda: strategies
     application.dependency_overrides[get_current_session] = lambda: Session(
         "test-operator", Scope.FULL
     )
@@ -757,3 +783,132 @@ class TestAuthorisation:
         assert (
             await client.get(f"{BACKTESTS}/compare", params={"run_ids": ["a"]})
         ).status_code == 200
+
+
+class TestQueueingARuleSet:
+    """A `kind="ruleset"` row reaches a run by having its rules copied onto it.
+
+    `strategy_id` still carries the foreign key and answers "which strategy is
+    this a run of". The snapshot answers "what rules actually ran", and those
+    stop being the same question the first time somebody edits a rule set.
+    """
+
+    def _stored(self, **overrides: Any) -> StoredStrategy:
+        fields: dict[str, Any] = {
+            "id": RULES_ID,
+            "name": RULES_ID,
+            "description": "",
+            "kind": "ruleset",
+            "class_name": None,
+            "params": {},
+            "ruleset": rsi_mean_reversion().model_dump(mode="json"),
+            "state": "draft",
+            "universe": ("SPY", "QQQ", "IWM"),
+            "timeframe": "1d",
+            "risk_config": {},
+            "created_at": T0,
+            "updated_at": T0,
+        }
+        fields.update(overrides)
+        return StoredStrategy(**fields)
+
+    async def test_the_rules_are_copied_onto_the_run(
+        self,
+        client: httpx.AsyncClient,
+        runs: FakeBacktestRunRepository,
+        strategies: FakeStrategyRepository,
+    ) -> None:
+        strategies.rows = [self._stored()]
+
+        response = await client.post(BACKTESTS, json=a_request(strategy_id=RULES_ID))
+
+        assert response.status_code == 202
+        stored_run = runs.runs[response.json()["id"]]
+        assert stored_run.spec.strategy_id == RULES_ID
+        assert stored_run.spec.ruleset == rsi_mean_reversion().model_dump(mode="json")
+
+    async def test_editing_the_strategy_afterwards_does_not_change_the_run(
+        self,
+        client: httpx.AsyncClient,
+        runs: FakeBacktestRunRepository,
+        strategies: FakeStrategyRepository,
+    ) -> None:
+        """The property the snapshot exists for.
+
+        A rule set is editable, so a run that recorded only `strategy_id` would
+        replay differently after an edit — two different results filed under one
+        name, with nothing to say which rules produced which.
+        """
+        strategies.rows = [self._stored()]
+        queued = (await client.post(BACKTESTS, json=a_request(strategy_id=RULES_ID))).json()
+
+        edited = rsi_mean_reversion().model_dump(mode="json")
+        edited["entry_long"]["all"][0]["right"]["value"] = "70"
+        strategies.rows = [self._stored(ruleset=edited)]
+
+        assert runs.runs[queued["id"]].spec.ruleset == rsi_mean_reversion().model_dump(mode="json")
+
+    async def test_a_coded_strategy_records_no_rules(
+        self, client: httpx.AsyncClient, runs: FakeBacktestRunRepository
+    ) -> None:
+        """The registry path, unchanged. `None` rather than `{}`, so nothing
+        downstream reads an empty dict as "compile this"."""
+        queued = (await client.post(BACKTESTS, json=a_request())).json()
+        assert runs.runs[queued["id"]].spec.ruleset is None
+
+    async def test_a_declarative_row_with_no_rules_is_refused(
+        self, client: httpx.AsyncClient, strategies: FakeStrategyRepository
+    ) -> None:
+        """Nothing can run it, and the registry cannot stand in: a `ruleset` row
+        exists because there is no class of that name."""
+        strategies.rows = [self._stored(ruleset=None)]
+
+        response = await client.post(BACKTESTS, json=a_request(strategy_id=RULES_ID))
+
+        assert response.status_code == 400
+        assert "no rules recorded" in response.json()["detail"]
+
+    async def test_params_sent_for_a_rule_set_are_refused_not_ignored(
+        self, client: httpx.AsyncClient, strategies: FakeStrategyRepository
+    ) -> None:
+        """A caller who sent params believes they do something."""
+        strategies.rows = [self._stored()]
+
+        response = await client.post(
+            BACKTESTS, json=a_request(strategy_id=RULES_ID, params={"fast_period": 5})
+        )
+
+        assert response.status_code == 400
+        assert "takes no params" in response.json()["detail"]
+
+    async def test_symbols_outside_the_universe_are_refused_up_front(
+        self, client: httpx.AsyncClient, strategies: FakeStrategyRepository, bars: FakeBarRepository
+    ) -> None:
+        """Otherwise the run completes, takes no trades, and reports a flat
+        curve — indistinguishable from a strategy that never signalled, which is
+        the least legible result this platform can produce."""
+        strategies.rows = [self._stored(ruleset=rsi_mean_reversion().model_dump(mode="json"))]
+        bars.series["TSLA"] = [a_bar("TSLA")]
+
+        response = await client.post(
+            BACKTESTS, json=a_request(strategy_id=RULES_ID, symbols=["TSLA"])
+        )
+
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert "outside" in detail
+        assert "TSLA" in detail
+
+    async def test_stored_rules_that_cannot_compile_are_a_400_not_a_failed_run(
+        self, client: httpx.AsyncClient, strategies: FakeStrategyRepository
+    ) -> None:
+        """The same argument the coverage check makes: a refusal here beats a row
+        that says `failed` four minutes later from another process."""
+        broken = rsi_mean_reversion().model_dump(mode="json")
+        broken["entry_long"]["all"][0]["left"]["indicator"] = "vwap"
+        strategies.rows = [self._stored(ruleset=broken)]
+
+        response = await client.post(BACKTESTS, json=a_request(strategy_id=RULES_ID))
+
+        assert response.status_code == 400
+        assert "does not compile" in response.json()["detail"]

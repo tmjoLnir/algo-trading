@@ -909,16 +909,31 @@ above.
   Two things still stand between that and a tick, and the first is new
   information rather than a restatement:
 
-  - **Nothing resolves a stored rule set into a run.** `runner.build_engine`
-    reaches a strategy through `registry.get(spec.strategy_id)`, and a rule set
-    is deliberately not registered (`compile_ruleset`'s docstring says why), so
-    `kind="ruleset"` rows have no path into a backtest. The storage column, the
-    API shape and the compiler all exist; the resolution step between them does
-    not. Seeding a rule-set row before that lands would put an entry in the
-    backtest picker that fails when chosen, which is why this change ships the
-    spec without seeding it.
+  - ~~**Nothing resolves a stored rule set into a run.**~~ Closed by #96.
+    `BacktestRunSpec` gained a `ruleset` field, `build_engine` compiles it when
+    present, and `POST /api/v1/backtests` copies a `kind="ruleset"` row's rules
+    onto the run. A **snapshot, not a reference**, and that is the decision to
+    review: a rule set is editable in the UI — that is what it is for — so a run
+    recording only `strategy_id` would replay differently the day somebody moved
+    a threshold, silently, with both numbers filed under one name. The id keeps
+    the foreign key and answers "which strategy is this a run of"; the snapshot
+    answers "what rules actually ran", and those stop being one question the
+    first time a rule set is edited.
+
+    Four refusals land at the door rather than minutes later on a row that says
+    `failed`: a declarative row with no rules, params sent alongside one, rules
+    that no longer compile, and a run whose symbols do not meet the rule set's
+    `universe`. The last is the valuable one — a compiled rule set ignores
+    symbols outside its universe, so such a run completes, takes no trades, and
+    reports a flat curve indistinguishable from a strategy that never signalled.
+
+    Two things this did **not** close. Seeding still does not happen, so no
+    rule-set row exists until somebody saves one through the API; and the
+    `risk` block is still read only for warmup, so a run of a rule set must be
+    configured with the ATR stop its own spec asks for or `risk_pct` refuses
+    every entry at sizing.
   - **Nothing has run a rule set on the paper endpoint**, which is this phase's
-    *Verifiable:* line and unchanged.
+    *Verifiable:* line and unchanged. That is what still holds the tick.
 
   A run of this spec also has to be configured with the ATR stop the spec asks
   for, because a compiled rule set emits no protective level of its own — the

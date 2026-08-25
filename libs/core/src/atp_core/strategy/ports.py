@@ -160,6 +160,21 @@ class StrategyRepository(Protocol):
         """The stored identity, or None if this strategy has no row yet."""
         ...
 
+    async def get_stored(self, strategy_id: str) -> StoredStrategy | None:
+        """One row in full, or None.
+
+        The counterpart of `get`, which answers with the thin `StrategyRecord` a
+        worker writes and which deliberately carries no `ruleset` — so `get`
+        cannot tell a caller what a declarative strategy actually says. Reading
+        one used to mean `list_all` and a filter, which loads the whole table to
+        answer about a single row.
+
+        The caller this exists for is the backtest queue endpoint: it snapshots
+        a rule set into the run's spec, so that the run records the rules it
+        executed rather than a name whose rules can be edited afterwards.
+        """
+        ...
+
     async def list_all(self, *, state: str | None = None) -> list[StoredStrategy]:
         """Every stored strategy, newest first, optionally filtered by state.
 

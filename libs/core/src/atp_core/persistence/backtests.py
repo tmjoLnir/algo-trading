@@ -234,6 +234,7 @@ def _spec_to_json(spec: BacktestRunSpec) -> dict[str, Any]:
         "starting_cash": spec.starting_cash,
         "cost_model": spec.cost_model,
         "params": dict(spec.params),
+        "ruleset": dict(spec.ruleset) if spec.ruleset is not None else None,
         "qty": spec.qty,
         "sizing_method": spec.sizing_method,
         "sizing_value": spec.sizing_value,
@@ -282,6 +283,11 @@ def _spec_from_json(strategy_id: str, config: dict[str, Any]) -> BacktestRunSpec
         starting_cash=str(config.get("starting_cash", "0")),
         cost_model=str(config.get("cost_model", "alpaca_equities")),
         params=dict(config.get("params") or {}),
+        # `or None` rather than a plain get: a row that stored `{}` for a coded
+        # strategy and one that stored nothing mean the same thing, and an empty
+        # dict reaching `build_engine` would be read as "compile this rule set"
+        # and fail validation on a spec that has no rules.
+        ruleset=dict(config["ruleset"]) if config.get("ruleset") else None,
         qty=str(config.get("qty", "100")),
         sizing_method=str(config.get("sizing_method", "fixed_qty")),
         sizing_value=str(config.get("sizing_value", "")),

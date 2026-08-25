@@ -50,6 +50,7 @@ FULLY_SPECIFIED = BacktestRunSpec(
     starting_cash="250000.55",
     cost_model="zero",
     params={"fast_period": 10, "slow_period": 30},
+    ruleset={"name": "a_rule_set", "universe": ["SPY"]},
     qty="42",
     sizing_method="risk_pct",
     sizing_value="0.01",

@@ -39,9 +39,15 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import status as http_status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
-from atp_api.deps import get_backtest_queue, get_backtest_repository, get_bar_repository, get_clock
+from atp_api.deps import (
+    get_backtest_queue,
+    get_backtest_repository,
+    get_bar_repository,
+    get_clock,
+    get_strategy_repository,
+)
 from atp_core.backtest.ports import (
     STATUS_DONE,
     BacktestQueue,
@@ -66,8 +72,9 @@ from atp_core.domain import Timeframe
 from atp_core.errors import ATPError
 from atp_core.logging import get_logger
 from atp_core.persistence.backtests import new_run
+from atp_core.strategy import RuleSet, compile_ruleset, registry
 from atp_core.strategy import examples as _examples  # noqa: F401 — populates the registry
-from atp_core.strategy import registry
+from atp_core.strategy.ports import StoredStrategy, StrategyRepository
 
 log = get_logger(__name__)
 
@@ -342,14 +349,75 @@ def _not_found(run_id: str) -> HTTPException:
     )
 
 
-def _validated_spec(payload: BacktestRequest) -> BacktestRunSpec:
+def _validated_ruleset(
+    strategy_id: str, stored: StoredStrategy | None, payload: BacktestRequest
+) -> dict[str, object] | None:
+    """The rules to snapshot onto the spec, or None for the registry path.
+
+    Every refusal here is one the alternative answers minutes later from another
+    process, as a row that says `failed` — the same argument `_require_coverage`
+    makes, applied to the rules instead of the bars.
+
+    The universe check is the one worth arguing for. A compiled rule set ignores
+    symbols outside its own `universe`, so a run whose symbols do not meet it
+    completes, takes no trades, and reports a flat curve — indistinguishable
+    from a strategy that never signalled, which is exactly the failure
+    `_RuleSetStrategy.on_bar` warns about in its docstring. Refusing it up front
+    turns the platform's least legible result into a sentence.
+    """
+    if stored is None or stored.kind != "ruleset":
+        return None
+
+    if not stored.ruleset:
+        # A row that says it is declarative and carries no rules. Nothing can
+        # run it, and the registry cannot stand in: a `ruleset` row exists
+        # *because* there is no class of that name.
+        raise _bad_request(
+            f"{strategy_id!r} is stored as a rule set but has no rules recorded. "
+            "It cannot be run until its spec is saved."
+        )
+
+    if payload.params:
+        # Not ignored: a caller who sent params believes they do something.
+        raise _bad_request(
+            f"{strategy_id!r} is a rule set and takes no params, got "
+            f"{sorted(payload.params)}. Its behaviour is the stored spec."
+        )
+
+    try:
+        spec = RuleSet.model_validate(stored.ruleset)
+        compile_ruleset(spec)
+    except ATPError as exc:
+        raise _bad_request(f"the stored rule set does not compile: {exc}") from None
+    except ValidationError as exc:
+        raise _bad_request(f"the stored rule set is malformed: {exc}") from None
+
+    requested = {s.strip().upper() for s in payload.symbols if s.strip()}
+    if not requested & set(spec.universe):
+        raise _bad_request(
+            f"{strategy_id!r} trades {sorted(spec.universe)} and this run asks for "
+            f"{sorted(requested)}. A rule set takes no trades in a symbol outside "
+            "its universe, so this run would report a flat curve and no orders."
+        )
+
+    return dict(stored.ruleset)
+
+
+def _validated_spec(
+    payload: BacktestRequest, stored: StoredStrategy | None = None
+) -> BacktestRunSpec:
     """The request as a spec, or a 400 explaining what is wrong with it.
 
-    Everything checkable without touching the database is checked here. The
-    strategy is *constructed* rather than merely looked up, because a strategy
-    validates its params in its constructor — so an impossible parameter pair is
-    a 400 on the request rather than a run that fails immediately and needs a
-    human to read a stack trace to find out why.
+    The strategy is *constructed* rather than merely looked up, because a
+    strategy validates its params in its constructor — so an impossible
+    parameter pair is a 400 on the request rather than a run that fails
+    immediately and needs a human to read a stack trace to find out why.
+
+    `stored` is the `strategies` row, when there is one. It decides which of two
+    strategies this is: a `ruleset` row's rules are **compiled here and copied
+    into the spec**, so the run records what it executed rather than a name
+    whose rules can be edited the following week. Anything else takes the
+    registry path unchanged, which is every coded strategy.
     """
     symbols = tuple(dict.fromkeys(s.strip().upper() for s in payload.symbols if s.strip()))
     if not symbols:
@@ -409,21 +477,23 @@ def _validated_spec(payload: BacktestRequest) -> BacktestRunSpec:
     if not strategy_id:
         raise _bad_request("strategy_id is empty")
 
-    try:
-        strategy_cls = registry.get(strategy_id)
-    except ATPError as exc:
-        # Names the registered strategies, which is what makes a typo
-        # self-correcting. The registry is populated by importing
-        # `strategy.examples` at the top of this module — without that line this
-        # would refuse every strategy with total confidence.
-        raise _bad_request(str(exc)) from None
+    ruleset = _validated_ruleset(strategy_id, stored, payload)
+    if ruleset is None:
+        try:
+            strategy_cls = registry.get(strategy_id)
+        except ATPError as exc:
+            # Names the registered strategies, which is what makes a typo
+            # self-correcting. The registry is populated by importing
+            # `strategy.examples` at the top of this module — without that line
+            # this would refuse every strategy with total confidence.
+            raise _bad_request(str(exc)) from None
 
-    try:
-        strategy_cls(dict(payload.params))
-    except ATPError as exc:
-        raise _bad_request(f"strategy rejected its params: {exc}") from None
-    except (TypeError, ValueError) as exc:
-        raise _bad_request(f"strategy rejected its params: {exc}") from None
+        try:
+            strategy_cls(dict(payload.params))
+        except ATPError as exc:
+            raise _bad_request(f"strategy rejected its params: {exc}") from None
+        except (TypeError, ValueError) as exc:
+            raise _bad_request(f"strategy rejected its params: {exc}") from None
 
     spec = BacktestRunSpec(
         strategy_id=strategy_id,
@@ -436,6 +506,7 @@ def _validated_spec(payload: BacktestRequest) -> BacktestRunSpec:
         starting_cash=str(payload.starting_cash),
         cost_model=payload.cost_model,
         params=dict(payload.params),
+        ruleset=ruleset,
         qty=str(payload.qty),
         sizing_method=payload.sizing_method,
         # Str, not float, for the reason `starting_cash` is one: this crosses a
@@ -494,6 +565,7 @@ async def run_backtest(
     runs: Annotated[RunRepository, Depends(get_backtest_repository)],
     queue: Annotated[BacktestQueue, Depends(get_backtest_queue)],
     bars: Annotated[BarRepository, Depends(get_bar_repository)],
+    strategies: Annotated[StrategyRepository, Depends(get_strategy_repository)],
     clock: Annotated[Clock, Depends(get_clock)],
 ) -> BacktestOut:
     """Queue a run. Returns immediately with status `queued`.
@@ -513,7 +585,7 @@ async def run_backtest(
     does not exist yet — and the `Location`-shaped answer is the run id in the
     body, which the client polls.
     """
-    spec = _validated_spec(payload)
+    spec = _validated_spec(payload, await strategies.get_stored(payload.strategy_id.strip()))
     await _require_coverage(bars, spec)
 
     now = clock.now()

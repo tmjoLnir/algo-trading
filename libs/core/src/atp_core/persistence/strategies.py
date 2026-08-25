@@ -130,6 +130,14 @@ class PostgresStrategyRepository:
             ).scalar_one_or_none()
         return None if row is None else _to_record(row)
 
+    async def get_stored(self, strategy_id: str) -> StoredStrategy | None:
+        """One row in full, or None. `get`'s query with `list_all`'s mapping."""
+        async with session_scope(self._session_factory) as session:
+            row = (
+                await session.execute(select(StrategyRow).where(StrategyRow.id == strategy_id))
+            ).scalar_one_or_none()
+        return None if row is None else _to_stored(row)
+
     async def list_all(self, *, state: str | None = None) -> list[StoredStrategy]:
         """Every stored strategy, newest first.
 
