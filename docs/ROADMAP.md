@@ -2358,7 +2358,7 @@ has met a database holding a real strategy's history.
   a broker as of now. That is the opposite of the posture everything else here
   takes, it is not something the backup tooling can fix, and it is now step 4 of
   the restore procedure and a paragraph in docs/DEPLOYMENT.md.
-- [ ] Deployment target chosen; secrets manager — @claude (wip #50, #51).
+- [ ] Deployment target chosen; secrets manager — @claude (wip #50, #51, #100).
   **The deployment *shape* is chosen and recorded. No host has been selected,
   and nothing is deployed.** ADR 0011: one always-on VM per run mode in a
   US-East region, the existing compose stack, reached over a private network,
@@ -2573,6 +2573,24 @@ has met a database holding a real strategy's history.
   the TLS this recommends. Fixing it means deciding which proxy's headers to
   trust, which is a security change rather than a deployment one. SECURITY.md
   lists it and docs/DEPLOYMENT.md explains it.
+
+  **The specification now has a survey against it** — @claude (#100),
+  docs/HOSTING.md. Still not a choice, and the box does not move for it: what
+  landed is which offerings can satisfy DEPLOYMENT.md's table and what each of
+  the rest fails on, so that whoever picks a machine picks it with the tradeoffs
+  in front of them. Three findings are worth having here rather than only there.
+  **The database cannot be split onto a free managed tier to shrink the VM**:
+  Neon ships Apache-2 `timescaledb`, whose missing native compression fails the
+  initial migration on `add_compression_policy`, and Supabase cannot enable the
+  extension on new PG17+ projects at all — so ADR 0011's constraint 3 is not
+  negotiable by re-arranging the deployment. **The only free tier that clears
+  the RAM floor is ARM64**, which the spec's x86-64 row does not allow; every
+  image in the stack publishes an `arm64` manifest and nothing in the tree pins
+  a platform, but that is evidence rather than a build anyone has run, and
+  changing the row is an amendment to ADR 0011 rather than a docs edit. And
+  **free is enough to earn the paper week** but not the second host
+  docs/SAFETY.md layer 3 wants for live, which puts the first real bill after
+  the demonstration rather than before it.
 - [x] Dashboard served as a built bundle rather than a dev server — @claude (#46).
   `infra/docker/web.Dockerfile` gained a `prod` stage: the `npm run build`
   output served by nginx, with `/api`, `/ws` and the health probes proxied so

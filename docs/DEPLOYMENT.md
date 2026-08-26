@@ -16,6 +16,9 @@ are allowed to deploy.
 > deployed by hand — and deliberately did not pick a machine or a vendor. The
 > table below is the specification to buy against, not a description of
 > something that exists. Nothing in this repository has been deployed anywhere.
+> [HOSTING.md](HOSTING.md) surveys what can satisfy the table — including what
+> is available at zero cost, and what each free tier fails on — without
+> choosing either.
 >
 > **Tailscale is not the host.** It is the access layer: a VPN that puts the
 > dashboard on a private network instead of a public address. Whatever host is
@@ -212,7 +215,8 @@ holds the key.
 Both are separate installs, neither is a daemon:
 
 ```bash
-# sops — one binary
+# sops — one binary. `.linux.arm64` if the host is not x86-64, which is the one
+# asset in this document that is architecture-specific (see HOSTING.md).
 curl -fsSLo /usr/local/bin/sops \
   https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64
 chmod +x /usr/local/bin/sops
