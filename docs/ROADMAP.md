@@ -1840,6 +1840,40 @@ wording if it is not the demonstration you want.
   Runs queued before that fix still read as `fixed_qty` with no stop, which is
   what they ran as — the ask was never recorded and cannot be recovered.
 
+  **And until #104 the screen could not say what a run had been refused.**
+  `result_to_storage` returned metrics, the curve and the trades;
+  `BacktestResult.warnings` — every per-order refusal the engine booked, the
+  coverage shortfalls `_validate` returns, `refusal_summary`'s counting line,
+  and the cost and sizing caveats `run_spec` appends — was assembled on every
+  queued run and then dropped. The API filled the hole by recomputing warnings
+  at read time from the metric set (`suspicious`), which catches the two
+  thresholds docs/BACKTESTING.md names and nothing that is not a function of the
+  metrics.
+
+  Same seam as #96 and the same shape of failure: what the worker computed and
+  what the row keeps had come apart, and nothing failed. A `buy_and_hold` run
+  over twenty symbols whose every entry was refused at sizing reported
+  `total_return` 0.0, `max_drawdown` 0.0 and `num_trades` 0 — an all-zero metric
+  set that is identical whether a strategy was refused everything or never
+  signalled — and the tab showed one line, "only 0 trades". The refusals were
+  invisible by construction, because they are not in the metrics.
+
+  A `warnings` column now takes them, written in the same `UPDATE` as the rest
+  of the result and cleared with it on failure, and `all_warnings` serves the
+  derived caveats ahead of the stored ones so `run_spec`'s refusal summary is
+  still the last line. Runs stored before it hold `null` rather than `[]` and
+  serve exactly what they served before: the warnings were computed and dropped,
+  and an empty list would claim they finished clean.
+
+  **The other half of that seam is still open and is parked, not forgotten.**
+  The nine money and count fields `to_report()` produces — ending equity, the
+  realised/unrealised split, open positions, the fill counts, fees — are still
+  stored nowhere, so this tab shows a `buy_and_hold` return of 202.8% with no
+  way to say that none of it is realised and twenty positions are still open.
+  Split off from #104 deliberately: it needs a schema decision about how money
+  crosses this API, a migration, an OpenAPI change and `make gen-types`, where
+  the warnings fix needed one JSON column. Written up in `docs/PARKING_LOT.md`.
+
 - [ ] Live-vs-backtest comparison — @claude.
   Built as of #68: `GET /analytics/live-vs-backtest/{run_id}` serves the live
   metric set, the stored backtest's, the divergence between them, and the reasons

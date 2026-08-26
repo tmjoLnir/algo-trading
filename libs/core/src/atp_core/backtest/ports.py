@@ -177,6 +177,12 @@ class StoredBacktestRun:
     #: analytics path (`PerformanceAnalyzer.build_trades`), so a backtested
     #: trade and a live one are the same shape and can be put side by side.
     trades: list[dict[str, object]] | None = None
+    #: What the run itself said about its own result — refusals, coverage
+    #: shortfalls, the caveats `run_spec` attaches. **None on a run stored
+    #: before this column existed**, which is not the same as `[]`: the older
+    #: row never recorded them, and reading its emptiness as "nothing was wrong"
+    #: is the claim this whole field exists to stop being made silently.
+    warnings: list[str] | None = None
 
     @property
     def is_in_flight(self) -> bool:
@@ -256,6 +262,7 @@ class BacktestRunRepository(Protocol):
         metrics: dict[str, float],
         equity_curve: list[list[str]],
         trades: list[dict[str, object]],
+        warnings: list[str],
     ) -> None:
         """Store a completed run's results and mark it done.
 

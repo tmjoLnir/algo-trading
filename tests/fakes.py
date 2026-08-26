@@ -771,6 +771,7 @@ class FakeBacktestRunRepository:
         metrics: dict[str, float],
         equity_curve: list[list[str]],
         trades: list[dict[str, object]],
+        warnings: list[str],
     ) -> None:
         run = self._in_flight(run_id)
         if run is not None:
@@ -780,6 +781,7 @@ class FakeBacktestRunRepository:
                 metrics=metrics,
                 equity_curve=equity_curve,
                 trades=trades,
+                warnings=warnings,
                 error=None,
                 finished_at=at,
             )
@@ -798,6 +800,7 @@ class FakeBacktestRunRepository:
             error=error,
             metrics=None,
             equity_curve=None,
+            warnings=None,
             trades=None,
             finished_at=at,
         )

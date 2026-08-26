@@ -110,15 +110,21 @@ async def run_backtest_task(ctx: dict[str, Any], run_id: str) -> dict[str, Any]:
             log.exception("backtest.crashed", run_id=run_id)
             raise
 
-        metrics, curve, trades = result_to_storage(result)
+        metrics, curve, trades, warnings = result_to_storage(result)
         await runs.finish(
-            run_id, at=clock.now(), metrics=metrics, equity_curve=curve, trades=trades
+            run_id,
+            at=clock.now(),
+            metrics=metrics,
+            equity_curve=curve,
+            trades=trades,
+            warnings=warnings,
         )
         log.info(
             "backtest.done",
             run_id=run_id,
             bars=len(curve),
             trades=len(trades),
+            warnings=len(warnings),
             total_return=str(result.total_return),
         )
         return {"run_id": run_id, "status": "done", "trades": len(trades)}

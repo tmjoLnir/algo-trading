@@ -440,9 +440,23 @@ principle as not polling a hidden tab, on a different axis: do not ask a questio
 whose answer cannot have changed.
 
 **The caveats are above the numbers, not below them.** A run's `warnings` come
-from the server — too few trades, an implausible Sharpe, in docs/BACKTESTING.md's
-own words — because a number a reader has already seen is a number they have
-already believed.
+from the server, because a number a reader has already seen is a number they
+have already believed. Two sources, concatenated in that order:
+
+- **Derived on every read** from the metric set — too few trades, an implausible
+  Sharpe, in docs/BACKTESTING.md's own words. Recomputed rather than stored, so
+  a threshold this project revises applies to runs already on record.
+- **Recorded by the run itself** and stored on the row: orders refused before
+  reaching the market, symbols whose history started late, costs switched off,
+  a flat share count. None of these is a function of the metrics, and the first
+  is invisible in them — a run refused everything and a run that never signalled
+  report the same zeros. Serving only the derived half is what made a fully
+  refused run indistinguishable from an idle one on this screen.
+
+The run's own list ends with the refusal summary, so that line sits nearest the
+numbers it qualifies. A run stored before the column existed has `null` rather
+than `[]` and serves only the derived half — it never recorded the rest, and an
+empty list would claim it finished clean.
 
 The metric set goes through `src/lib/stats.ts`, not `money.ts`, including the five
 metrics denominated in account currency. `compute_all` computes those in float
@@ -464,6 +478,14 @@ it never had (ADR 0016).
 writes that one run to `backtest-<strategy>-<queued date>-<run id>.json`: the run
 as the API served it — spec, metrics, warnings, all three timestamps — plus its
 equity curve and every trade. Four decisions in it are worth stating:
+
+What it does **not** carry is the run's money: `ending_equity`, the realised and
+unrealised split, the open-position count, the fill counts and the fees. Those
+are on `BacktestResult.to_report()` and reach the CLI's `--out`, and the queued
+path has never stored them, so neither this screen nor its export can show that
+a return is unbanked. Known, deliberate, and written up in
+`docs/PARKING_LOT.md` — not a gap in the exporter, which copies verbatim what it
+is served.
 
 - **Per run, not per list.** What a reader keeps, diffs or hands to a notebook is
   a *result*. Forty of them with the curves attached is not a file anybody opens,
