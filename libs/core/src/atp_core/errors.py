@@ -42,6 +42,17 @@ class StaleDataError(DataError):
     """The latest quote is older than the freshness budget. Do not trade on it."""
 
 
+class UnadjustedDataError(DataError):
+    """Bars were supplied without the adjusted closes a backtest prices off.
+
+    Raised rather than falling back to the raw close, because the fallback is
+    silent and its symptom is a plausible number: an unapplied 4:1 split reads
+    as a position losing 75% overnight, and an unapplied 1:8 reverse split reads
+    as one earning 700%. Neither announces itself in a result — see CLAUDE.md §5
+    and docs/adr/0017-backtests-price-off-adjusted-closes.md.
+    """
+
+
 # ── broker ──────────────────────────────────────────────────────────────────
 class BrokerError(ATPError): ...
 

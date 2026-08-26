@@ -63,6 +63,9 @@ def bar(index: int, close: float, *, symbol: str = "SPY") -> Bar:
         low=price - Decimal(1),
         close=price,
         volume=Decimal(1_000_000),
+        # No corporate actions in a synthetic series, so the adjusted close is the
+        # close. The engine refuses a series with none of them (CLAUDE.md §5).
+        adj_close=price,
     )
 
 

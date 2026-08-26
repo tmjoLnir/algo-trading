@@ -15,8 +15,10 @@ rules, and the tests below that assert the gate is *reached* still do.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
@@ -41,7 +43,7 @@ from atp_core.domain import (
     SignalAction,
     Timeframe,
 )
-from atp_core.errors import DataGapError, LookaheadError
+from atp_core.errors import DataGapError, LookaheadError, UnadjustedDataError
 from atp_core.execution.idempotency import ENTRY, EXIT, STOP_LOSS, TAKE_PROFIT
 from atp_core.risk.engine import RiskDecision
 from atp_core.strategy.base import Strategy
@@ -72,6 +74,11 @@ def bar(
         low=Decimal(str(low)),
         close=Decimal(str(close)),
         volume=Decimal(str(volume)),
+        # A synthetic series has no corporate actions, so the adjusted close is
+        # the close — what an `--adjusted` backfill stores for a symbol that never
+        # split. Present rather than null because the engine prices off adjusted
+        # closes and refuses a series that has none (CLAUDE.md §5).
+        adj_close=Decimal(str(close)),
     )
 
 
@@ -848,3 +855,151 @@ class TestProgressReporting:
 
         with pytest.raises(RuntimeError, match="reporter is broken"):
             eng.run({"TEST": ramp(5)})
+
+
+#: A 1:8 reverse split at bar 5, in the shape the vendor stores it: raw prices
+#: as traded on the day, and an `adj_close` that is continuous across the
+#: action. Bars 0–4 are quoted pre-split at an eighth of the adjusted price;
+#: bars 5–9 are quoted post-split, so raw and adjusted agree.
+#:
+#: The adjusted series is the boring one on purpose — bar i is worth 100 + i,
+#: flat within the bar, so every fill price and every mark below is readable
+#: straight off the index.
+def split_bars(count: int = 10, *, split_at: int = 5, factor: int = 8) -> list[Bar]:
+    series = []
+    for index in range(count):
+        adjusted = Decimal(100 + index)
+        raw = adjusted if index >= split_at else adjusted / factor
+        series.append(
+            Bar(
+                symbol="TEST",
+                ts=START + timedelta(days=index),
+                timeframe=Timeframe.D1,
+                open=raw,
+                high=raw,
+                low=raw,
+                close=raw,
+                volume=Decimal(1_000_000),
+                adj_close=adjusted,
+            )
+        )
+    return series
+
+
+def _quoted_at(price: Decimal) -> dict[str, Decimal]:
+    """The OHLC of a flat candle quoted at `price`. `split_bars` makes every bar
+    flat within itself, so re-quoting one is four fields with the same value."""
+    return {"open": price, "high": price, "low": price, "close": price}
+
+
+class TestCorporateActions:
+    """A split must not be readable as a return.
+
+    This is the bug the platform shipped with: GE's 1:8 reverse split on
+    2021-08-02 octupled its raw price overnight, and a `buy_and_hold` run over
+    twenty symbols booked it as a single +51.16% day — twenty-eight standard
+    deviations of that run's own daily volatility, and the largest move in six
+    years by a factor of four. Nothing in the result said so. It is the quietest
+    way a backtest becomes fiction, which is why the engine now refuses to price
+    off raw closes at all (CLAUDE.md §5, docs/adr/0017).
+    """
+
+    def test_a_reverse_split_earns_the_market_and_not_the_factor(self) -> None:
+        """Hand-computed. 100 shares, no costs, 100,000 starting cash:
+
+            bar 0  strategy says ENTER_LONG
+            bar 1  fills at the adjusted open = 101   cash 100,000 - 10,100 = 89,900
+            bar 5  the raw price octuples; the adjusted price does not
+            bar 9  still held, marked at the adjusted close = 109 → 10,900
+
+        Ending equity = 89,900 + 10,900 = 100,800, a return of 0.008 — which is
+        exactly `qty x (last close - entry open) / starting equity`, the market's
+        move over the window it was held.
+
+        Pricing the same bars raw would buy at 12.625 for 1,262.50 and mark the
+        position at 109 anyway, for an ending equity of 109,637.50 and a return
+        of 0.096375: twelve times the truth, all of it the split factor.
+        """
+        bars = split_bars()
+
+        # The fixture is only a test of anything if the discontinuity is really
+        # in it: bar 4 is quoted at an eighth of bar 5 on the same true price.
+        assert bars[4].close * 8 == Decimal("104")
+        assert bars[5].close == Decimal("105")
+
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        result = engine(strategy).run({"TEST": bars})
+
+        (entry,) = result.orders
+        assert entry.avg_fill_price == Decimal("101")  # adjusted open, not 12.625
+        assert entry.filled_qty == Decimal(100)
+
+        assert result.portfolio.cash == Decimal("89900")
+        assert result.portfolio.equity == Decimal("100800")
+        assert result.total_return == Decimal("0.008")
+
+    def test_the_equity_curve_has_no_step_where_the_split_is(self) -> None:
+        """The symptom a reader would actually have seen. Once held, the curve
+        moves by `qty x 1` a bar because the adjusted price does — including
+        across bar 5, where the raw series jumps by a factor of eight."""
+        result = engine(ScriptedStrategy({0: SignalAction.ENTER_LONG})).run({"TEST": split_bars()})
+        curve = [equity for _, equity in result.equity_curve]
+
+        # Bars 1..9 are held, so each step is 100 shares x one unit of price.
+        steps = {b - a for a, b in pairwise(curve[1:])}
+        assert steps == {Decimal(100)}
+
+        # And the bar the split lands on is not special in any way.
+        assert curve[5] - curve[4] == Decimal(100)
+
+    def test_a_forward_split_is_not_a_crash_either(self) -> None:
+        """The mirror, and the more common one: AAPL's 4:1 in August 2020 would
+        read as a position losing 75% overnight. `factor=4` here quotes bars 0–4
+        at four times the adjusted price rather than an eighth of it."""
+        bars = split_bars(factor=1)  # adjusted == raw, then re-quote the front
+        bars = [
+            candle if index >= 5 else replace(candle, **_quoted_at(candle.adj_close * 4))
+            for index, candle in enumerate(bars)
+        ]
+        result = engine(ScriptedStrategy({0: SignalAction.ENTER_LONG})).run({"TEST": bars})
+
+        assert result.total_return == Decimal("0.008")
+        steps = {b - a for a, b in pairwise([e for _, e in result.equity_curve][1:])}
+        assert steps == {Decimal(100)}
+
+    def test_bars_with_no_adjusted_close_are_refused(self) -> None:
+        """A raw-only backfill leaves the column unset. Running anyway is what
+        produced the bug, so the run stops rather than falling back."""
+        bars = [replace(candle, adj_close=None) for candle in split_bars()]
+
+        with pytest.raises(UnadjustedDataError, match="TEST"):
+            engine(ScriptedStrategy({0: SignalAction.ENTER_LONG})).run({"TEST": bars})
+
+    def test_the_refusal_names_the_backfill_that_fixes_it(self) -> None:
+        bars = [replace(candle, adj_close=None) for candle in split_bars()]
+
+        with pytest.raises(UnadjustedDataError, match="--raw-only"):
+            engine(ScriptedStrategy({})).run({"TEST": bars})
+
+    def test_one_unadjusted_symbol_refuses_the_whole_run(self) -> None:
+        """Not just its own series. A universe where nineteen symbols are
+        adjusted and one is not produces a result that is right about nineteen
+        of them, which is indistinguishable from being right."""
+        clean = [replace(c, symbol="OK") for c in split_bars()]
+        dirty = [replace(c, symbol="BAD", adj_close=None) for c in split_bars()]
+
+        with pytest.raises(UnadjustedDataError, match="BAD"):
+            engine(ScriptedStrategy({}), symbols=["OK", "BAD"]).run({"OK": clean, "BAD": dirty})
+
+    def test_an_already_adjusted_series_is_priced_unchanged(self) -> None:
+        """Most symbols in most windows have no corporate action, so their
+        stored `adj_close` equals their close. That path must not move a price."""
+        flat = [
+            bar(i, open_=100 + i, high=101.5 + i, low=99 + i, close=100.5 + i) for i in range(10)
+        ]
+        assert all(candle.is_adjusted for candle in flat)
+
+        result = engine(ScriptedStrategy({0: SignalAction.ENTER_LONG})).run({"TEST": flat})
+
+        (entry,) = result.orders
+        assert entry.avg_fill_price == Decimal("101")  # bar 1's open, untouched

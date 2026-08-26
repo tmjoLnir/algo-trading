@@ -27,7 +27,7 @@ fix it here in the PR that discovered it.
 
 ## Where this stands
 
-**19 of 47 items ticked — and the other 28 are not a measure of what is
+**20 of 48 items ticked — and the other 28 are not a measure of what is
 unbuilt.** Reading them as one is the specific mistake this section exists to
 prevent. Twenty of the twenty-eight sit in Phases 4 and 5, whose *Verifiable:*
 lines both come down to the same event: a strategy trading the paper account for
@@ -37,12 +37,12 @@ a week. The code is written and tested. The week has not happened.
 |---|---:|---:|---|
 | 0 — Foundations | 4 / 4 | 0 | — |
 | 1 — Data | 3 / 5 | 2 | A forced disconnect against the live stream, and a quote proving its own age |
-| 2 — Backtesting | 5 / 6 | 1 | `buy_and_hold` over real stored bars |
+| 2 — Backtesting | 6 / 7 | 1 | `buy_and_hold` over real stored bars |
 | 3 — Risk | 2 / 4 | 2 | A strategy that tries to breach every limit, refused by name |
 | 4 — Execution & paper trading | 0 / 10 | 10 | **The paper week.** A strategy trades the paper account for a week and reconciles clean |
 | 5 — Dashboard & analytics | 0 / 10 | 10 | **The same paper week**, read back through the screens and the analytics |
 | 6 — Production readiness | 5 / 8 | 3 | A scrape from a real deployment, a restore actually performed, a host to deploy to |
-| **Total** | **19 / 47** | **28** | |
+| **Total** | **20 / 48** | **28** | |
 
 The twenty-eight open items are in three different states, and the difference
 matters more than the count:
@@ -260,6 +260,39 @@ that yet, so it stays **not shown**.
   fill expires rather than resting into an unrelated later bar. When a bar's
   range spans both stop and target the stop is taken, since the bar cannot say
   which came first.
+- [x] Backtests price off adjusted closes — @claude (#103).
+  `BacktestEngine.run` converts every bar into adjusted space before the first
+  mark, and refuses a run whose bars carry no `adj_close` instead of pricing it
+  raw. Missing from this file until now, which is its own small failure: the
+  rule has been in `CLAUDE.md` §5, `docs/DATA.md` and `Bar`'s docstring since
+  the beginning, the Alpaca provider has always paid for a second pass to fill
+  the column, and `upsert_bars` has always COALESCEd it so a raw refetch cannot
+  erase it — and nothing read it. A roadmap with no line for a rule that is
+  stated three times and implemented nowhere is how that survives.
+
+  Found by running the `buy_and_hold` item below over real bars. That run
+  reported 331.7% over six years and contained a single **+51.16%** day: GE's
+  1:8 reverse split on 2021-08-02, where the raw price octupled overnight and
+  the held share count did not divide. Twenty-eight standard deviations of the
+  run's own daily volatility, four times the largest genuine move in the
+  window, and nothing in the result said so.
+
+  The conversion scales the whole candle by `adj_close / close`, not just the
+  close, because the engine reads six price fields and a run that marks at an
+  adjusted close while filling at a raw open is wrong by the split factor;
+  volume divides by the same factor so the participation cap stays a fraction
+  of the bar's real notional. A missing `adj_close` refuses the whole run —
+  `--raw-only` leaves the column unset, and the silent fallback is what
+  produced the bug. Reasoning, and the live-warmup defect this does *not*
+  fix, in `docs/adr/0017-backtests-price-off-adjusted-closes.md`.
+
+  Ticked against this phase's *Verifiable:* line, which is what it is:
+  hand-computed fixtures in `TestCorporateActions` put a 1:8 reverse split and
+  a 4:1 forward split mid-window and pin the run to the market's own return
+  (0.008, or `qty x (last close - entry open) / equity`) rather than to the
+  split factor — 0.096375 on the same bars priced raw, twelve times the truth.
+  Six of the seven fail with the conversion removed.
+
 - [x] Cost and slippage models — @claude (#26, #27).
   `PerShareCostModel.commission` and `SpreadSlippageModel.slippage` are
   implemented; `ZeroCostModel`, `CompositeCostModel` and

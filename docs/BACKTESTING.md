@@ -30,7 +30,9 @@ tomorrow's close:
   2019. Use point-in-time data.
 - **Index membership as of today.** See survivorship, below.
 - **Adjusted prices for signal generation** where the adjustment factor depends
-  on a split that had not happened yet.
+  on a split that had not happened yet. Its mirror — raw prices, where the split
+  *has* happened — is bias 6 below, and is the one that has actually bitten this
+  platform.
 
 ### 2. Survivorship bias
 
@@ -80,6 +82,32 @@ Defences:
 Commission, spread, borrow on shorts, slippage, taxes. A strategy edging 3bps
 per trade at 20 trades a day needs to clear ~250% a year in costs. Never
 evaluate with `ZeroCostModel` — it exists for testing engine mechanics only.
+
+### 6. Unadjusted corporate actions
+
+Rarer than the five above and more total when it happens. A split changes the
+price and the share count on the same morning; raw prices carry only half of
+that, so a backtest holding a fixed quantity through one reads the price change
+as performance.
+
+The engine handles this for you: `BacktestEngine.run` converts every bar into
+adjusted space before the first mark, scaling open, high, low and close by
+`adj_close / close` and volume by its inverse (`Bar.adjusted`). Bars with no
+`adj_close` — what a `--raw-only` backfill leaves behind — refuse the run with
+`UnadjustedDataError` rather than being priced raw. See
+`docs/adr/0017-backtests-price-off-adjusted-closes.md`.
+
+What that prevents, from the run that motivated it: a `buy_and_hold` over
+twenty large caps priced off raw closes reported 331.7% over six years, of
+which a single day was **+51.16%** — GE's 1:8 reverse split on 2021-08-02,
+booked as an 8x gain, twenty-eight standard deviations of that run's own daily
+volatility. A 4:1 forward split is the same defect pointing the other way and
+is easier to miss, because a position that appears to lose 75% overnight looks
+like a bad day rather than an impossible one.
+
+If you load bars yourself rather than through `scripts/run_backtest.py`, the
+conversion still happens inside the engine — but the bars you supply have to
+carry `adj_close`.
 
 ## Running one
 
@@ -322,7 +350,8 @@ one arbitrary day.
       (`GET /api/v1/backtests/{id}/trades`, or open the run on the Backtests tab)
 - [ ] Equity curve is not one lucky trade with noise around it
 - [ ] Results survive ±20% parameter perturbation
-- [ ] Data checked for gaps and unadjusted splits
+- [ ] Data checked for gaps — an unadjusted split is refused by the engine
+      rather than left for this checklist (bias 6 above)
 
 ## Comparing runs
 
