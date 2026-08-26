@@ -12,12 +12,64 @@ work, in the same diff — see `CLAUDE.md` §6. Conventions:
 |---|---|
 | `- [ ] item` | Not started, unclaimed |
 | `- [ ] item — @who (wip #12)` | Claimed and in progress, so nobody duplicates it |
+| `- [ ] item — @who` | Built and unticked: waiting on the phase's *Verifiable:* line, not on code |
 | `- [x] item — @who (#12)` | Done, demonstrated, and merged in that PR |
+
+The third row was added after six Phase 5 items had been sitting in that state
+with no way to say so. It is not a softer tick and must not be used as one: it
+means the work is finished and the demonstration is not, which is a different
+sentence from "nearly done".
 
 A box is ticked only when the phase's *Verifiable:* line has actually been shown
 — not when the code compiles, and not when the tests pass in isolation. If an
 item turns out to be wrong, in the wrong phase, or ticked when it should not be,
 fix it here in the PR that discovered it.
+
+## Where this stands
+
+**19 of 47 items ticked — and the other 28 are not a measure of what is
+unbuilt.** Reading them as one is the specific mistake this section exists to
+prevent. Twenty of the twenty-eight sit in Phases 4 and 5, whose *Verifiable:*
+lines both come down to the same event: a strategy trading the paper account for
+a week. The code is written and tested. The week has not happened.
+
+| Phase | Ticked | Open | What the open items are waiting on |
+|---|---:|---:|---|
+| 0 — Foundations | 4 / 4 | 0 | — |
+| 1 — Data | 3 / 5 | 2 | A forced disconnect against the live stream, and a quote proving its own age |
+| 2 — Backtesting | 5 / 6 | 1 | `buy_and_hold` over real stored bars |
+| 3 — Risk | 2 / 4 | 2 | A strategy that tries to breach every limit, refused by name |
+| 4 — Execution & paper trading | 0 / 10 | 10 | **The paper week.** A strategy trades the paper account for a week and reconciles clean |
+| 5 — Dashboard & analytics | 0 / 10 | 10 | **The same paper week**, read back through the screens and the analytics |
+| 6 — Production readiness | 5 / 8 | 3 | A scrape from a real deployment, a restore actually performed, a host to deploy to |
+| **Total** | **19 / 47** | **28** | |
+
+The twenty-eight open items are in three different states, and the difference
+matters more than the count:
+
+| State | Count | Means |
+|---|---:|---|
+| Claimed, in progress (`wip`) | 21 | Somebody is on it, or has been |
+| Built, awaiting the phase line | 6 | All Phase 5. Code merged, screen shipped, nothing left but the demonstration |
+| Unclaimed | 1 | **Daily report** (Phase 5) — the only item in this file nobody has started |
+
+Two things a reader should take from this rather than from the counts:
+
+- **Phase 4 and Phase 5 being at zero is one fact, not twenty.** Both phases
+  hinge on the paper week; neither has an item blocked on anything else. A
+  reader who wants to know what is genuinely missing should look at the three
+  Phase 6 items and the one unclaimed Phase 5 item, which is the whole of it.
+- **A tick here is expensive on purpose.** Phase 1 is the only phase whose
+  *Verifiable:* line has been shown against live data, and it took real egress,
+  real credentials and a real hypertable to earn three boxes. That is the
+  standard the other phases are held to, and it is why the count looks worse
+  than the codebase is.
+
+This section is derived from the boxes below and will lie the moment it drifts
+from them, which is the failure `CLAUDE.md` §6 is about.
+`tests/unit/test_roadmap_summary.py` parses both and fails when they disagree,
+so updating an item without updating this table breaks the build rather than
+the record.
 
 ## Phase 0 — Foundations (skeleton is here)
 - [x] Repo structure, tooling, docs, CI (#1, #2)
