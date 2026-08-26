@@ -91,6 +91,9 @@ def bar(
         low=Decimal(str(low)),
         close=Decimal(str(close)),
         volume=Decimal(str(volume)),
+        # No corporate actions in a synthetic series, so the adjusted close is the
+        # close. The engine refuses a series with none of them (CLAUDE.md §5).
+        adj_close=Decimal(str(close)),
     )
 
 

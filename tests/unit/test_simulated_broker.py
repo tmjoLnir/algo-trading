@@ -44,6 +44,9 @@ def bar(
         low=Decimal(low),
         close=Decimal(c),
         volume=Decimal(volume),
+        # No corporate actions in a synthetic series, so the adjusted close is the
+        # close. The engine refuses a series with none of them (CLAUDE.md §5).
+        adj_close=Decimal(c),
     )
 
 
@@ -95,6 +98,13 @@ class TestAgreementWithTheBacktestEngine:
     run and a `SimulatedBroker` over the *same* bars and compares the fills
     that come out, so the claim is pinned by behaviour rather than by an
     import.
+
+    The bars carry `adj_close == close`, which is not incidental. ADR 0017 has
+    the engine price off adjusted closes while the simulator, modelling a venue,
+    stays on raw ones — so the two agree exactly on a series with no corporate
+    action, which is every series a simulator is driven with. A fixture spanning
+    a split would be comparing two different price spaces and failing for a
+    reason that is not drift.
     """
 
     @pytest.mark.asyncio

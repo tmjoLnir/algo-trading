@@ -87,6 +87,10 @@ def bars(count: int = BARS, *, symbol: str = "SPY") -> list[Bar]:
                 low=base - Decimal("1"),
                 close=base + Decimal("0.5"),
                 volume=Decimal("5000000"),
+                # A synthetic series has no corporate actions, so the adjusted
+                # close is the close. Present rather than null because the engine
+                # prices off adjusted closes and refuses a series without them.
+                adj_close=base + Decimal("0.5"),
             )
         )
     return series

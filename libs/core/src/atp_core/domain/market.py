@@ -6,7 +6,7 @@ All immutable. All prices `Decimal` (rule §1.1), all timestamps tz-aware UTC
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
@@ -81,6 +81,74 @@ class Bar:
         from datetime import timedelta
 
         return self.ts + timedelta(seconds=self.timeframe.seconds)
+
+    @property
+    def is_adjusted(self) -> bool:
+        """True when this bar's prices already sit in adjusted space.
+
+        The marker is `adj_close == close`, which is what `adjusted()` leaves
+        behind and what a symbol with no corporate actions has anyway. It makes
+        the conversion idempotent, so a series can be adjusted twice without
+        being scaled twice.
+        """
+        return self.adj_close is not None and self.adj_close == self.close
+
+    def adjusted(self) -> Bar:
+        """This bar with every price moved into split/dividend-adjusted space.
+
+        **The whole candle moves, not just the close.** Swapping `close` for
+        `adj_close` at each read site would leave a backtest marking positions
+        at adjusted prices while filling them at raw opens — a mismatch of the
+        split factor between two numbers that must be in the same currency, and
+        one that gets worse the further back the bar is. Scaling O/H/L/C by the
+        single factor `adj_close / close` keeps the candle internally consistent
+        and continuous across the corporate action, which is the whole point.
+
+        Volume moves the other way, because a split changes the share count as
+        well as the price: a 4:1 split quarters the price and quadruples the
+        shares, so dividing by the same factor holds the bar's traded notional
+        fixed. The backtest caps fills at a fraction of bar volume, and a
+        participation limit measured in pre-split shares against post-split
+        prices is wrong by exactly the split ratio.
+
+        Raises `ValueError` when `adj_close` is unset — the caller decides what
+        an unadjusted series means, and for a backtest the answer is to refuse
+        the run (`errors.UnadjustedDataError`). Defaulting it to `close` here
+        would reintroduce the silent fallback this method exists to remove.
+
+        Ordering is preserved: `Decimal` multiplication is correctly rounded and
+        therefore monotonic, so `low <= open,close <= high` still holds of the
+        result and `__post_init__` cannot reject what this returns.
+        """
+        if self.adj_close is None:
+            raise ValueError(
+                f"{self.symbol} @ {self.ts} has no adj_close, so it cannot be adjusted; "
+                f"backfill the range without --raw-only"
+            )
+        if self.close <= 0:
+            raise ValueError(
+                f"cannot adjust {self.symbol} @ {self.ts}: the close is {self.close}, "
+                f"so the adjustment factor is undefined"
+            )
+        if self.is_adjusted:
+            return self
+
+        factor = self.adj_close / self.close
+        return replace(
+            self,
+            open=self.open * factor,
+            high=self.high * factor,
+            low=self.low * factor,
+            close=self.close * factor,
+            volume=self.volume / factor,
+            # Its own close rather than the vendor's figure, so the result
+            # satisfies `is_adjusted` exactly. The two differ only in the last
+            # places of `Decimal`'s 28 significant digits, and carrying a
+            # close that is a hair away from `adj_close` would make a second
+            # `adjusted()` call scale the bar a second time.
+            adj_close=self.close * factor,
+            vwap=None if self.vwap is None else self.vwap * factor,
+        )
 
     @property
     def typical_price(self) -> Decimal:

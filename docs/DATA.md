@@ -192,7 +192,18 @@ Splits and dividends change historical prices and share counts. Applied
 pre-open by a scheduled job.
 
 An unapplied 4:1 split makes a position look like it lost 75% overnight — which
-will trip stops and the daily loss limit on a day when nothing happened.
+will trip stops and the daily loss limit on a day when nothing happened. A
+reverse split is the same defect with the sign flipped and is far worse,
+because it reads as a profit: GE's 1:8 on 2021-08-02 octupled its raw price
+overnight.
+
+**Backtests do not rely on that job.** `BacktestEngine.run` converts every bar
+into adjusted space itself, scaling the whole candle by `adj_close / close` and
+volume by its inverse, so a replay is continuous across an action whenever it
+was run. Bars with no `adj_close` refuse the run rather than being priced raw —
+see `docs/adr/0017-backtests-price-off-adjusted-closes.md`. This is why the
+`--raw-only` backfill is a realtime-path convenience and not a way to save a
+pass when filling history you intend to backtest.
 
 ## Backfill
 

@@ -46,7 +46,13 @@ from atp_core.domain import (
     TimeInForce,
 )
 from atp_core.domain.enums import StopType
-from atp_core.errors import ATPError, BacktestError, DataGapError, LookaheadError
+from atp_core.errors import (
+    ATPError,
+    BacktestError,
+    DataGapError,
+    LookaheadError,
+    UnadjustedDataError,
+)
 from atp_core.execution.idempotency import ENTRY, EXIT, STOP_LOSS, TAKE_PROFIT, TIME_EXIT
 from atp_core.execution.matching import intended_price
 from atp_core.indicators import dispatch
@@ -519,8 +525,17 @@ class BacktestEngine:
         `bars` is symbol → chronologically sorted bars. Validate before starting:
         gaps, duplicate timestamps and unsorted input each produce plausible but
         wrong results, so fail loudly (`DataGapError`) rather than proceeding.
+
+        The run then prices off **adjusted** closes throughout (`_to_adjusted`),
+        so every number it reports is in adjusted space. Bars carrying no
+        `adj_close` are refused (`UnadjustedDataError`) rather than priced raw.
         """
         coverage = self._validate(bars)
+        # Every price below this line is in adjusted space. Done once, here,
+        # rather than at each read site: the engine marks, fills, sizes, stops
+        # and computes indicators off six different fields, and a conversion
+        # applied at five of them is a bug nobody would find.
+        bars = self._to_adjusted(bars)
 
         warmup = (
             self.config.warmup_bars
@@ -735,6 +750,42 @@ class BacktestEngine:
             *_coverage_warning("have no bars until after", self.config.start, starts_late),
             *_coverage_warning("stop supplying bars before", self.config.end, ends_early),
         ]
+
+    @staticmethod
+    def _to_adjusted(bars: dict[str, list[Bar]]) -> dict[str, list[Bar]]:
+        """The same series with every candle moved into adjusted space.
+
+        **This is what stops a corporate action being read as a return.** Raw
+        closes are the prices as traded, so a split lands in them as a
+        discontinuity: the price of GE octupled overnight on 2021-08-02 for a
+        1:8 reverse split, and a backtest holding a fixed share count through
+        it books an 8x gain that never happened. Adjusted closes are continuous
+        across the action, which is why CLAUDE.md §5 says to backtest on them
+        and trade on raw.
+
+        A missing `adj_close` refuses the whole run rather than falling back to
+        the raw close for that symbol. The fallback is the more helpful-looking
+        option and it is the one that produced the bug: it completes, it
+        reports, and the only trace is a number in the equity curve that looks
+        like a very good day. `_refuse_holes` takes the same position about a
+        gap, and for the same reason — the message names the backfill that
+        fixes it, because that is the next thing anyone does with this error.
+        """
+        unadjusted = sorted(
+            symbol
+            for symbol, series in bars.items()
+            if any(candle.adj_close is None for candle in series)
+        )
+        if unadjusted:
+            shown = ", ".join(unadjusted[:8])
+            more = "" if len(unadjusted) <= 8 else f", and {len(unadjusted) - 8} more"
+            raise UnadjustedDataError(
+                f"{len(unadjusted)} symbol(s) have bars with no adj_close, and a backtest "
+                f"prices off adjusted closes (CLAUDE.md §5): {shown}{more}. A raw-only "
+                f"backfill leaves the column unset — refill without --raw-only: "
+                f"scripts/backfill_bars.py --symbols {','.join(unadjusted[:8])}"
+            )
+        return {symbol: [candle.adjusted() for candle in series] for symbol, series in bars.items()}
 
     def _refuse_holes(self, symbol: str, timestamps: list[datetime]) -> None:
         """Raise on an interior hole — bars either side of a stretch, none inside.
