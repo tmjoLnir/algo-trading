@@ -22,17 +22,27 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from atp_core.clock import TradingCalendar
+from atp_core.clock import SimulatedClock, TradingCalendar
+from atp_core.domain import Order, OrderType, Portfolio, Position, Side
+from atp_core.execution.reconciliation import Reconciler
+from atp_core.risk.killswitch import HaltReason
 from atp_worker.scheduler import (
     MAX_SLEEP_SECONDS,
+    SCHEDULE,
     SESSION_SCAN_DAYS,
+    SessionJobs,
+    _job_name,
+    build_schedule,
     next_due,
+    reconcile_with_broker,
     run_scheduler,
 )
+from tests.fakes import FakeBroker, FakeKillSwitch
 
 if TYPE_CHECKING:
     from datetime import date
@@ -219,9 +229,9 @@ class TestRunning:
         assert max(clock.sleeps) <= MAX_SLEEP_SECONDS
 
     async def test_an_unimplemented_job_is_tried_once_and_left_alone(self) -> None:
-        """Five of the six entries in `SCHEDULE` are still stubs. Retrying them
-        every interval would bury the log in one repeated traceback — and this
-        is not a failure, it is a job nobody has built."""
+        """Three of the four entries in `SCHEDULE` are still stubs. Retrying
+        them every interval would bury the log in one repeated traceback — and
+        this is not a failure, it is a job nobody has built."""
         calls: list[int] = []
 
         async def not_built() -> None:
@@ -287,3 +297,143 @@ class TestRunning:
         assert calls, "the job never ran"
         assert calls[0] >= ORDINARY_OPEN
         assert CAL.is_open(calls[0])
+
+
+# ── the session-bound half ──────────────────────────────────────────────────
+
+
+def _session(
+    broker: FakeBroker,
+    switch: FakeKillSwitch,
+    portfolio: Portfolio,
+    orders: list[Order] | None = None,
+) -> SessionJobs:
+    """A `SessionJobs` over the **real** `Reconciler`.
+
+    A fake reconciler would let this suite assert that the job called something,
+    which is not the property worth holding. What matters is that a divergence
+    ends with trading halted, and that is the reconciler's own behaviour — so it
+    is the reconciler that runs here, over a fake venue.
+    """
+    held = orders if orders is not None else []
+    return SessionJobs(
+        reconciler=Reconciler(broker, switch, SimulatedClock(MIDSESSION)),  # type: ignore[arg-type]
+        portfolio=portfolio,
+        open_orders=lambda: list(held),
+    )
+
+
+def _book(**holdings: float) -> Portfolio:
+    portfolio = Portfolio(cash=Decimal("100000"), starting_equity=Decimal("100000"))
+    for symbol, qty in holdings.items():
+        position = portfolio.position(symbol)
+        position.qty = Decimal(str(qty))
+        position.avg_entry_price = Decimal("100")
+        position.last_price = Decimal("100")
+    return portfolio
+
+
+class TestBuildingTheSchedule:
+    def test_without_a_session_nothing_reconciles(self) -> None:
+        """A worker with no strategy holds no book and has no venue to compare
+        it against. An entry failing every five minutes for want of either would
+        be indistinguishable in the log from a venue that had gone away."""
+        names = [_job_name(e) for e in build_schedule(None)]
+
+        assert "reconcile_with_broker" not in names
+        assert names == [_job_name(e) for e in SCHEDULE]
+
+    def test_a_session_adds_the_five_minute_check(self) -> None:
+        session = _session(FakeBroker(), FakeKillSwitch(), _book())
+        schedule = build_schedule(session)
+        reconcile = schedule[0]
+
+        assert _job_name(reconcile) == "reconcile_with_broker"
+        assert reconcile["trigger"] == "interval"
+        assert reconcile["minutes"] == 5
+        assert reconcile["market_hours_only"] is True
+
+    def test_the_bound_job_is_still_named_in_the_log(self) -> None:
+        """`functools.partial` carries no `__name__`. A scheduler that called
+        every bound job "partial" would name nothing in the one log line an
+        operator reads to see which responsibilities are running."""
+        session = _session(FakeBroker(), FakeKillSwitch(), _book())
+
+        assert _job_name(build_schedule(session)[0]) == "reconcile_with_broker"
+
+    def test_a_bound_job_schedules_like_any_other(self) -> None:
+        """`next_due` reaches for `entry["job"].__name__` on its error paths, so
+        a partial must not be the thing that breaks scheduling arithmetic."""
+        session = _session(FakeBroker(), FakeKillSwitch(), _book())
+        due = next_due(build_schedule(session)[0], MIDSESSION, CAL)
+
+        assert due == MIDSESSION + timedelta(minutes=5)
+
+
+class TestReconcileWithBroker:
+    async def test_a_matching_book_does_not_halt(self) -> None:
+        broker = FakeBroker()
+        broker.positions["SPY"] = Position(
+            symbol="SPY", qty=Decimal(100), avg_entry_price=Decimal("100")
+        )
+        switch = FakeKillSwitch()
+
+        await reconcile_with_broker(_session(broker, switch, _book(SPY=100)))
+
+        assert switch.is_engaged() is False
+
+    async def test_a_divergence_halts_trading(self) -> None:
+        """The whole point, and the reason `halt_on_mismatch` is left at its
+        default here. Sizing orders against a position we believe is 100 shares
+        when it is 1,000 is how a small bug becomes a large loss, and it
+        compounds with every subsequent order (docs/SAFETY.md layer 7)."""
+        broker = FakeBroker()
+        broker.positions["SPY"] = Position(
+            symbol="SPY", qty=Decimal(1000), avg_entry_price=Decimal("100")
+        )
+        switch = FakeKillSwitch()
+
+        await reconcile_with_broker(_session(broker, switch, _book(SPY=100)))
+
+        assert switch.is_engaged() is True
+        assert switch.engagements[-1][1] == HaltReason.RECONCILIATION_MISMATCH.value
+
+    async def test_it_does_not_raise_on_a_divergence(self) -> None:
+        """The driver reschedules a job that raised, but it also logs it as a
+        failure. A halt is this job succeeding — it found what it was looking
+        for — and reporting it as an error would put a traceback in the log
+        every five minutes for as long as the halt stands."""
+        broker = FakeBroker()
+        broker.positions["QQQ"] = Position(
+            symbol="QQQ", qty=Decimal(10), avg_entry_price=Decimal("100")
+        )
+
+        await reconcile_with_broker(_session(broker, FakeKillSwitch(), _book()))
+
+    async def test_open_orders_are_read_at_each_run_not_at_wiring(self) -> None:
+        """`SessionJobs.open_orders` is a callable for exactly this. A list
+        captured when the worker booted would report every order placed since as
+        an orphan, and orphans halt."""
+        broker = FakeBroker()
+        switch = FakeKillSwitch()
+        held: list[Order] = []
+        session = SessionJobs(
+            reconciler=Reconciler(broker, switch, SimulatedClock(MIDSESSION)),  # type: ignore[arg-type]
+            portfolio=_book(),
+            open_orders=lambda: list(held),
+        )
+
+        placed = broker._accept(
+            Order(
+                symbol="SPY",
+                side=Side.BUY,
+                qty=Decimal(10),
+                order_type=OrderType.LIMIT,
+                limit_price=Decimal("99"),
+            )
+        )
+        held.append(placed)
+
+        await reconcile_with_broker(session)
+
+        assert switch.is_engaged() is False, "a known order was reported as an orphan"
