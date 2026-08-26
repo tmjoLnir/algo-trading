@@ -115,13 +115,15 @@ class TestTheForeignKey:
     async def test_a_run_naming_an_unregistered_strategy_is_refused(
         self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
     ) -> None:
-        """The realistic failure, not a hypothetical one.
+        """A run can never name a strategy the table does not hold.
 
-        A strategy class is registered at import time; a `strategies` row is
-        written by a worker at its first session open. With `WORKER_STRATEGY`
-        empty by default, "the class exists and no row does" is the ordinary state
-        of a fresh install — so this is the constraint `POST /backtests` turns
-        into a 409 pointing at the Strategies tab.
+        The constraint that makes `backtest_runs.strategy_id` mean something: a
+        result filed under a name nothing else in the platform knows cannot be
+        joined to a signal, an order or a live record. `POST /backtests` keeps
+        the ordinary case away from it — a registered class with no row is given
+        one before the run is written, and a name the registry does not have is
+        a 400 at the door — so what lands here is the last line of defence
+        rather than the everyday state of a fresh install it used to be.
         """
         runs, _ = repo
 

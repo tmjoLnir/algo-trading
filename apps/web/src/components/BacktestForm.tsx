@@ -4,12 +4,17 @@
  * The only control in this app that starts work, and the only form of any kind.
  * Three things about it are deliberate:
  *
- * - **It offers only strategies a worker has actually run.** A backtest's
- *   `strategy_id` is a foreign key onto `strategies`, a table written by the
- *   runner at its first session open — so a class that exists in the code and has
- *   never been loaded cannot be backtested, and offering it would produce a 409
- *   for a choice this screen invited. The `never_run` names are listed *outside*
- *   the picker instead, with what to do about it.
+ * - **It offers every strategy this platform has**, which for most of this
+ *   form's life it did not. A backtest's `strategy_id` is a foreign key onto
+ *   `strategies` — a table written by the runner at its first session open — so
+ *   the picker was built from that table alone, and a class that existed in the
+ *   code and had never been loaded was left out because queueing it produced a
+ *   409. That made the list an accident of which strategies had happened
+ *   through a *trading* worker or the seed script, usually one, on a screen
+ *   whose whole subject is comparing strategies. `POST /backtests` now writes
+ *   the row for a registered class when it queues the first run, so the picker
+ *   is the union of the stored rows and the registry, and a never-run choice
+ *   says so beneath the control rather than being hidden by it.
  * - **Cash and quantity are typed as text, never as numbers.** `<input
  *   type="number">` hands back a JavaScript number, and a starting cash that had
  *   been through IEEE 754 would propagate into every figure the run reports
@@ -44,14 +49,14 @@ import {
   TIMEFRAMES,
   useQueueBacktest,
 } from '@/hooks/useBacktests'
-import type { AvailableStrategyView, StoredStrategyView } from '@/api/types'
+import type { StrategyChoice } from '@/hooks/useStrategies'
+import type { AvailableStrategyView } from '@/api/types'
 
 interface Props {
-  /** Strategies with a `strategies` row — the only ones that can be queued. */
-  runnable: StoredStrategyView[]
-  /** Registered classes, for the params hint and the never-run notice. */
+  /** Every strategy that can be queued — stored rows and registered classes. */
+  choices: StrategyChoice[]
+  /** Registered classes, for the picked strategy's declared params. */
   available: AvailableStrategyView[]
-  neverRun: string[]
   /** False for a read-only session: queueing work is an act (ADR 0009). */
   mayAct: boolean
 }
@@ -106,15 +111,15 @@ const INPUT =
   'rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-slate-100 ' +
   'placeholder:text-slate-600 disabled:opacity-50'
 
-export default function BacktestForm({ runnable, available, neverRun, mayAct }: Props) {
+export default function BacktestForm({ choices, available, mayAct }: Props) {
   const range = defaultRange()
   const queue = useQueueBacktest()
 
   // The *chosen* strategy, which is empty until somebody chooses one — not the
   // strategy this form will queue. That distinction is the bug this shape fixes:
-  // `useState(runnable[0]?.id ?? '')` read the list at mount, and this form
+  // `useState(choices[0]?.id ?? '')` read the list at mount, and this form
   // mounts on the page's first render, before the strategies query has resolved
-  // and while `runnable` is still `[]`. A state initialiser does not re-run when
+  // and while `choices` is still `[]`. A state initialiser does not re-run when
   // the data lands, so the value stayed `''` for the life of the form — and
   // React, whose controlled `<select>` selects the first option when the value
   // matches none of them, displayed a strategy that was not the one being sent.
@@ -131,9 +136,9 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
   // list. An explicit, still-valid choice always wins — the strategies query
   // refetches on window focus, and a fallback that reasserted itself there would
   // re-point the run at a strategy nobody picked.
-  const strategyId = runnable.some((strategy) => strategy.id === chosenStrategyId)
+  const strategyId = choices.some((choice) => choice.id === chosenStrategyId)
     ? chosenStrategyId
-    : (runnable[0]?.id ?? '')
+    : (choices[0]?.id ?? '')
   // What actually gets posted, and the reason it is not just `strategyId`.
   //
   // **Trimmed, because the server trims.** `POST /backtests` strips the name
@@ -168,10 +173,27 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
   const [stopPeriod, setStopPeriod] = useState('14')
   const [costModel, setCostModel] = useState<string>(COST_MODELS[0].value)
 
-  // The picked strategy's own declaration of what it takes. Shown rather than
-  // rendered as a form: nothing here builds inputs from a JSON Schema, and
-  // pretending to would mean silently dropping the fields it could not handle.
-  const picked = available.find((entry) => entry.name === strategyId)
+  // The chosen row, and the class it declares. Both are looked up by the
+  // *trimmed* id for the reason the id is trimmed at all: a stored row carries
+  // whatever `Strategy.name` the worker booted with, so it can arrive padded,
+  // and a padded lookup would report the strategy has no class and no params.
+  //
+  // `available` is the registry's own declaration of what the class takes.
+  // Shown rather than rendered as a form: nothing here builds inputs from a
+  // JSON Schema, and pretending to would mean silently dropping the fields it
+  // could not handle.
+  const chosen = choices.find((choice) => choice.id === strategyId)
+  const picked = available.find((entry) => entry.name === queueableStrategyId)
+  // What the hint under the picker says. The class name is the useful half —
+  // two strategies can share a class through their params — and a strategy with
+  // no `strategies` row gets the other half too: it has never been loaded by a
+  // worker, which is worth knowing before reading a result and is not a reason
+  // it cannot be run. The row it needs is written by the run that needs it.
+  const strategyHint = chosen
+    ? [chosen.className, chosen.stored ? null : 'no worker has run this yet']
+        .filter(Boolean)
+        .join(' · ') || undefined
+    : undefined
   const sizingUnit = SIZING_METHODS.find((option) => option.value === sizingMethod)?.unit ?? 'value'
   const stopUnit = STOP_TYPES.find((option) => option.value === stopType)?.unit ?? 'value'
   // A time stop counts bars rather than measuring a distance, so its number
@@ -212,23 +234,21 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
     })
   }
 
-  if (runnable.length === 0) {
+  if (choices.length === 0) {
+    // Both halves of the response are empty, which is a different sentence from
+    // the one this panel used to say. A registered class needs no database row
+    // to be offered here, so "nothing to run" no longer means "nothing has been
+    // run" — it means the code registers nothing and the table holds nothing,
+    // and on a running API the first of those is the one to doubt: the registry
+    // is populated by importing the strategy modules, so a process that never
+    // imported them reports an empty platform with total confidence.
     return (
       <div className="rounded border border-slate-800 bg-slate-900/20 px-4 py-6 text-sm text-slate-400">
-        <p>No strategy can be backtested yet.</p>
+        <p>No strategy to backtest.</p>
         <p className="mt-1 text-xs text-slate-500">
-          A run is recorded against a row in <code className="text-slate-400">strategies</code>,
-          which a worker writes the first time it loads a strategy.{' '}
-          {neverRun.length > 0 ? (
-            <>
-              <span className="text-amber-300">{neverRun.join(', ')}</span>{' '}
-              {neverRun.length === 1 ? 'exists' : 'exist'} in the code and{' '}
-              {neverRun.length === 1 ? 'has' : 'have'} never run — set{' '}
-              <code className="text-slate-400">WORKER_STRATEGY</code> and start the worker once.
-            </>
-          ) : (
-            'Start a worker with WORKER_STRATEGY set.'
-          )}
+          This form offers every strategy class the code registers, plus every row stored in{' '}
+          <code className="text-slate-400">strategies</code>. Both are empty — check the Strategies
+          tab, which reads the same response.
         </p>
       </div>
     )
@@ -237,16 +257,16 @@ export default function BacktestForm({ runnable, available, neverRun, mayAct }: 
   return (
     <form onSubmit={submit} className="rounded border border-slate-800 bg-slate-900/20 p-4">
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <Field label="Strategy" hint={picked ? picked.class_name : undefined}>
+        <Field label="Strategy" hint={strategyHint}>
           <select
             value={strategyId}
             onChange={(event) => setChosenStrategyId(event.target.value)}
             disabled={!mayAct}
             className={INPUT}
           >
-            {runnable.map((strategy) => (
-              <option key={strategy.id} value={strategy.id}>
-                {strategy.name}
+            {choices.map((choice) => (
+              <option key={choice.id} value={choice.id}>
+                {choice.name}
               </option>
             ))}
           </select>

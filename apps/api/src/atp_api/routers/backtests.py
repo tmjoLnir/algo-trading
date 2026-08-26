@@ -25,6 +25,18 @@ each was blocked on this file existing:
 queued**, including whether the history exists. A run that fails four minutes in
 because a symbol has no bars is a worse answer than a 400, and it is the single
 most likely way a queued backtest fails.
+
+**Any strategy the code registers can be backtested**, whether or not a worker
+has ever loaded it. `backtest_runs.strategy_id` is a foreign key onto
+`strategies`, so a run needs a row there — and for a registered class this
+endpoint now writes that row itself (`_store_registered_class`) instead of
+refusing with a 409 about a table the requester has no way to write. What that
+refusal actually asked of somebody wanting to backtest `buy_and_hold` was to
+configure a *trading* worker with broker credentials, or to run the development
+seed script, neither of which a backtest needs; the dashboard's picker could
+then only offer the strategies that had been through one of those, which on most
+installs is one. The registry is the list of strategies this platform has, and
+it is now the list this endpoint accepts.
 """
 
 from __future__ import annotations
@@ -42,12 +54,15 @@ from fastapi import status as http_status
 from pydantic import BaseModel, Field, ValidationError
 
 from atp_api.deps import (
+    CurrentUser,
+    get_audit_sink,
     get_backtest_queue,
     get_backtest_repository,
     get_bar_repository,
     get_clock,
     get_strategy_repository,
 )
+from atp_core.audit.ports import Action, AuditEntry, AuditSink
 from atp_core.backtest.ports import (
     STATUS_DONE,
     BacktestQueue,
@@ -69,12 +84,12 @@ from atp_core.backtest.runner import (
 from atp_core.clock import Clock
 from atp_core.data.ports import BarRepository
 from atp_core.domain import Timeframe
-from atp_core.errors import ATPError
+from atp_core.errors import ATPError, StrategyExistsError
 from atp_core.logging import get_logger
 from atp_core.persistence.backtests import new_run
 from atp_core.strategy import RuleSet, compile_ruleset, registry
 from atp_core.strategy import examples as _examples  # noqa: F401 — populates the registry
-from atp_core.strategy.ports import StoredStrategy, StrategyRepository
+from atp_core.strategy.ports import NewStrategy, StoredStrategy, StrategyRepository
 
 log = get_logger(__name__)
 
@@ -559,6 +574,101 @@ async def _require_coverage(bars: BarRepository, spec: BacktestRunSpec) -> None:
         raise _bad_request(backfill_hint(missing, spec.start))
 
 
+async def _store_registered_class(
+    strategies: StrategyRepository,
+    strategy_id: str,
+    audit: AuditSink,
+    actor: str,
+    clock: Clock,
+) -> None:
+    """Give a registered class the `strategies` row a run has to point at.
+
+    **This is what lets the Backtests tab offer every strategy the code has**,
+    rather than only the ones a worker has happened to load. A run's
+    `strategy_id` is a foreign key onto `strategies`, and until now the only
+    things that wrote that table were a booting worker and `scripts/seed.py` —
+    so backtesting a strategy required first configuring a *trading* worker with
+    broker credentials a backtest does not need, or running a development seed
+    against production. A class that exists, compiles and is registered was
+    unbacktestable for a reason that has nothing to do with backtesting, and the
+    picker's only honest response was to hide it.
+
+    The row this writes is the one an author would have created through
+    `POST /strategies`, and deliberately not a wider one:
+
+    - **`params` are the class's declared defaults, never this run's.** A
+      backtest's `params` belong to the run — sweeping them is the point of
+      having them — and copying them here would record the strategy as
+      configured with whatever the last person happened to try. The defaults are
+      what the class actually runs on when nobody supplies any
+      (`registry.default_params`), and writing `{}` instead would record a
+      strategy configured with nothing.
+    - **`universe` is empty and `timeframe` is the column's default.** The
+      symbols and the timeframe in the request are the *run's*. A row claiming
+      the strategy trades them is a statement about live configuration that
+      nobody made, and it is the one a worker would overwrite nothing with —
+      `ensure` leaves an existing row alone.
+    - **`state` is `draft`**, because `NewStrategy` has no field through which
+      anything could ask for another rung. Queueing a backtest authorises
+      nothing; it is the ratchet's first rung, which is where a booting worker
+      and the seed script already leave a strategy.
+
+    Called only when the strategy has no row at all, so an existing one is never
+    touched — in particular `updated_at`, which the API serves as
+    `last_started_at`, keeps meaning "a worker last started this" rather than
+    "somebody queued a backtest".
+
+    `StrategyExistsError` is not an error here. It means another writer — a
+    worker booting, a second queue request — won the race between the read that
+    found no row and this insert, and the outcome that mattered is that the row
+    exists. Swallowing it is safe because `create` refuses on the name alone,
+    so the row it lost to is a row for this same strategy.
+    """
+    try:
+        strategy_cls = registry.get(strategy_id)
+    except ATPError:
+        # Unreachable through the endpoint: `_validated_spec` has already
+        # refused a name that is neither stored nor registered, with a 400 that
+        # names the registry. Guarded anyway rather than raising out of a
+        # helper whose job is to be safe to call.
+        return
+
+    try:
+        stored = await strategies.create(
+            NewStrategy(
+                id=strategy_id,
+                name=strategy_id,
+                kind="coded",
+                # The author's own words or nothing, exactly as `POST /strategies`
+                # writes it: the class's `description` is already served in
+                # `available[]`, and a copy here is a second, staler one.
+                description="",
+                class_name=strategy_cls.__name__,
+                params=registry.default_params(strategy_cls),
+            )
+        )
+    except StrategyExistsError:
+        log.info("backtest.strategy_row_raced", strategy=strategy_id)
+        return
+
+    # After the row exists, never before — the same ordering `create_strategy`
+    # uses, so an entry never claims a strategy that was refused. This is a
+    # strategy's identity being minted, which is the thing `STRATEGY_CREATED`
+    # records; `detail["via"]` says which endpoint did it, because a row that
+    # appeared without anybody visiting the Strategies tab is otherwise a
+    # puzzle.
+    await audit.record(
+        AuditEntry(
+            at=clock.now(),
+            actor=actor,
+            action=Action.STRATEGY_CREATED,
+            target=stored.id,
+            detail={"kind": stored.kind, "via": "backtest"},
+        )
+    )
+    log.info("strategy.created", strategy=stored.id, kind=stored.kind, actor=actor, via="backtest")
+
+
 @router.post("", response_model=BacktestOut, status_code=202)
 async def run_backtest(
     payload: BacktestRequest,
@@ -566,7 +676,9 @@ async def run_backtest(
     queue: Annotated[BacktestQueue, Depends(get_backtest_queue)],
     bars: Annotated[BarRepository, Depends(get_bar_repository)],
     strategies: Annotated[StrategyRepository, Depends(get_strategy_repository)],
+    audit: Annotated[AuditSink, Depends(get_audit_sink)],
     clock: Annotated[Clock, Depends(get_clock)],
+    actor: CurrentUser,
 ) -> BacktestOut:
     """Queue a run. Returns immediately with status `queued`.
 
@@ -584,9 +696,25 @@ async def run_backtest(
     202, not 201. Nothing has been created that the caller asked for — the result
     does not exist yet — and the `Location`-shaped answer is the run id in the
     body, which the client polls.
+
+    **A registered class with no `strategies` row gets one here**, between the
+    validation and the run that references it — see `_store_registered_class`
+    for why that is this endpoint's job and not a worker's. The row is a side
+    effect of queueing, so it is written after every refusal this handler can
+    raise and before the only thing that depends on it.
     """
-    spec = _validated_spec(payload, await strategies.get_stored(payload.strategy_id.strip()))
+    stored = await strategies.get_stored(payload.strategy_id.strip())
+    spec = _validated_spec(payload, stored)
     await _require_coverage(bars, spec)
+
+    # After the request is known to be runnable, and before the run that
+    # references it. A registered class with no row is the ordinary state of
+    # every strategy nobody has pointed a worker at, and it is not a reason to
+    # refuse a backtest — see `_store_registered_class`. Deliberately *after*
+    # the coverage check, so a request that is going to be refused for missing
+    # history does not leave a strategy behind as a side effect.
+    if stored is None:
+        await _store_registered_class(strategies, spec.strategy_id, audit, actor, clock)
 
     now = clock.now()
     run = new_run(str(uuid.uuid4()), spec, queued_at=now)
@@ -594,18 +722,20 @@ async def run_backtest(
     try:
         await runs.create(run)
     except Exception as exc:
-        # A foreign key refusing an unregistered strategy lands here: the
-        # registry knows the class and `strategies` has no row for it because no
-        # worker has ever loaded it. That is a real and confusing state, and it
-        # is exactly what the strategies page exists to show — so the message
-        # says which half is missing rather than reporting a constraint name.
+        # A foreign key refusing the run's strategy lands here. It used to be
+        # the ordinary case — the registry knew the class and `strategies` had
+        # no row for it — and is not any more: a registered class is given its
+        # row a few lines above. What reaches this now is the row failing to be
+        # written or having gone away underneath the request, so the message
+        # says that rather than sending a reader to configure a worker they do
+        # not need.
         log.warning("backtest.create_failed", strategy=spec.strategy_id, error=str(exc))
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT,
             detail=(
                 f"could not record a run for {spec.strategy_id!r}. A backtest needs a "
-                "row in `strategies`, which a worker writes the first time it loads "
-                "the strategy — see the Strategies tab for what has and has not run."
+                "row in `strategies`, and this request could not write or find one — "
+                "see the Strategies tab for what is stored."
             ),
         ) from exc
 

@@ -9,6 +9,14 @@
  * thing they configured had ever been picked up. "I wrote a strategy and
  * nothing is happening" had no answer anywhere in this UI.
  *
+ * **A row is no longer proof a worker ran anything**, which is why the registry
+ * table says "stored" where it used to say "a worker has run this". Four things
+ * write that table now — a worker at a session open, `POST /strategies`,
+ * `scripts/seed.py`, and the first backtest queued for a registered class — and
+ * only the first is a worker running the strategy. The absence of a row still
+ * means exactly what it always did, so the amber notice above, which is what
+ * this screen is for, is unaffected.
+ *
  * Two labels on this page are deliberately not the column names behind them,
  * because the columns mean less than they say:
  *
@@ -191,7 +199,13 @@ function AvailableRow({ entry }: { entry: AvailableStrategyView }) {
       </td>
       <td className="px-3 py-2 text-left text-xs">
         {entry.has_run ? (
-          <span className="text-emerald-400">a worker has run this</span>
+          // "Stored", not "a worker has run this", which it said until the
+          // Backtests tab could offer a class nobody had run: a row is written
+          // by the first of a worker boot, a create, `scripts/seed.py` and a
+          // queued backtest, and only the first of those is a worker running
+          // anything. The stronger claim was the more useful sentence and it
+          // stopped being true.
+          <span className="text-emerald-400">stored</span>
         ) : (
           // The row this panel exists for.
           <span className="text-amber-400">never run</span>
@@ -251,16 +265,17 @@ export default function Strategies() {
           ⚠ {neverRun.join(', ')} {neverRun.length === 1 ? 'exists' : 'exist'} in the code and{' '}
           {neverRun.length === 1 ? 'has' : 'have'} never been run by a worker.
           <span className="mt-1 block text-xs text-amber-200/70">
-            A strategy only gets a row here once a worker loads it.{' '}
-            <code className="text-amber-100">WORKER_STRATEGY</code> is empty by default, so on a
-            fresh install this is expected rather than a fault.
+            A strategy gets a row here the first time a worker loads it, an author creates it, or a
+            backtest is queued for it. <code className="text-amber-100">WORKER_STRATEGY</code> is
+            empty by default, so on a fresh install this is expected rather than a fault — and these
+            are still backtestable: the Backtests tab offers them and stores the row itself.
           </span>
         </p>
       ) : null}
 
       <Panel
-        title="Strategies a worker has run"
-        subtitle="One row per strategy the runner has registered at a session open."
+        title="Stored strategies"
+        subtitle="One row per strategy something has written: a worker at a session open, an author creating one, or the first backtest queued for it."
         control={
           <div>
             <label className="sr-only" htmlFor="state-filter">
@@ -283,9 +298,7 @@ export default function Strategies() {
       >
         {strategies.length === 0 ? (
           <p className="px-4 py-6 text-center text-sm text-slate-500">
-            {state
-              ? `No strategy is in the "${state}" state.`
-              : 'No worker has registered a strategy yet.'}
+            {state ? `No strategy is in the "${state}" state.` : 'No strategy has been stored yet.'}
             <span className="mt-1 block text-xs">
               This is the table a worker writes to at every session open — an empty one means
               nothing has run, not that nothing exists. What exists is below.
@@ -329,7 +342,7 @@ export default function Strategies() {
                 <tr className="bg-slate-900/60">
                   <Header>Class</Header>
                   <Header>Description</Header>
-                  <Header>Has it run?</Header>
+                  <Header>Stored?</Header>
                 </tr>
               </thead>
               <tbody>

@@ -1769,6 +1769,22 @@ wording if it is not the demonstration you want.
   writes are fabricated ones under reserved test tickers. It removes an obstacle
   to showing the line; it does not show it.
 
+  **And the rest of it is gone as of `POST /backtests` writing that row
+  itself.** The seed script closed the clean-database case for development; what
+  it could not close was the shape of the picker anywhere else. A strategy was
+  offered only if something had already written its row, so the list was an
+  accident of deployment — on the tab whose subject is comparing strategies,
+  typically one strategy — and `buy_and_hold`, the baseline the phase's own
+  numbers are read against, was usually not on it. The endpoint now writes the
+  row for a registered class when it queues that class's first run: the same row
+  an author would create through `POST /strategies` and the same one the seed
+  writes, at `draft`, on the class's declared defaults, claiming no universe, and
+  never touching a row that already exists. The picker is the union of the stored
+  rows and the registry. A `strategies` row is therefore no longer evidence that
+  a worker ran anything — the Strategies tab says *stored* where it said "a
+  worker has run this" — while the absence of one still means exactly what it
+  did, which is what that tab exists to show.
+
   **Until #96 a queued run ignored the sizing method and the stop the request
   chose.** `_spec_to_json` wrote nine of `BacktestRunSpec`'s fifteen fields, and
   the six it dropped were `sizing_method`, `sizing_value` and the four `stop_*`

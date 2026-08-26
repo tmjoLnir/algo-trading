@@ -55,6 +55,74 @@ export const STRATEGY_STATES: readonly { value: StrategyState | ''; label: strin
   })),
 ]
 
+/** One row of a strategy picker: something a backtest can name. */
+export interface StrategyChoice {
+  /** What `POST /backtests` receives as `strategy_id`. */
+  id: string
+  name: string
+  /** The Python class, or null for a stored rule set — there is no class. */
+  className: string | null
+  /**
+   * Whether a `strategies` row exists for it.
+   *
+   * False means the code registers the class and nothing has ever loaded it,
+   * which is the ordinary state of every strategy nobody has pointed a worker
+   * at. It is offered anyway: `POST /backtests` writes the row when it queues
+   * the first run, so the only thing this flag changes is what the form says
+   * about the strategy — not whether it can be run.
+   */
+  stored: boolean
+}
+
+/**
+ * Every strategy this platform can backtest, from both halves of the response.
+ *
+ * **The two halves are one list here and two lists on the Strategies tab**, and
+ * the difference is what each screen is for. That screen exists to show the
+ * *gap* — a class the code has that no worker has loaded. This one has to name
+ * something to run, and a registered class is runnable whether or not anybody
+ * has run it before, so hiding the never-run half made the picker a list of
+ * accidents: whichever strategies had happened to go through a worker or the
+ * seed script. On most installs, one.
+ *
+ * Keyed on the **trimmed** id, which is what the form sends and what the server
+ * resolves against — a stored row carries whatever `Strategy.name` the worker
+ * booted with, so it can arrive padded, and keying on the raw value would offer
+ * `sma_crossover` twice: once from the row and once from the registry.
+ *
+ * A stored row wins over the registry entry of the same name, because it is the
+ * fuller answer: it carries the id the run must point at, and for a rule set
+ * there is no registry entry at all.
+ *
+ * Sorted by name. The registry is a dict and the table is ordered by creation,
+ * so an unsorted union would move rows around between reads for no reason a
+ * reader could see.
+ */
+export function strategyChoices(data: StrategiesResponse | undefined): StrategyChoice[] {
+  const byId = new Map<string, StrategyChoice>()
+
+  for (const row of data?.strategies ?? []) {
+    byId.set(row.id.trim(), {
+      id: row.id,
+      name: row.name,
+      className: row.class_name,
+      stored: true,
+    })
+  }
+
+  for (const entry of data?.available ?? []) {
+    if (byId.has(entry.name.trim())) continue
+    byId.set(entry.name.trim(), {
+      id: entry.name,
+      name: entry.name,
+      className: entry.class_name,
+      stored: false,
+    })
+  }
+
+  return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name))
+}
+
 export function useStrategies(state: string) {
   return useQuery<StrategiesResponse>({
     queryKey: ['strategies', state],
