@@ -2439,7 +2439,8 @@ has met a database holding a real strategy's history.
   already gives for that screen, which until now was advice for a symptom the
   stack could not produce. CI asserts it as behaviour rather than as YAML: a
   malformed risk limit is written into `.env`, and the job fails if the api
-  container is `running` while nothing answers on 8000. It also now requires
+  container has never exited while nothing answers on 8000 — see the correction
+  below, which is what that assertion says now. It also now requires
   every container with a healthcheck to report `healthy` — the previous step
   read `.State`, which is `running` for a container that has been unhealthy for
   hours, and would have passed this bug at every stage.
@@ -2591,6 +2592,28 @@ has met a database holding a real strategy's history.
   **free is enough to earn the paper week** but not the second host
   docs/SAFETY.md layer 3 wants for live, which puts the first real bill after
   the demonstration rather than before it.
+
+  **A third conclusion of the restart-policy item was wrong, and `claude/main`
+  found it by going red** — @claude. The CI step above asserted "a config the
+  API cannot start with leaves the container not `running`", and that is not a
+  property the corrected behaviour has. The fix makes the API *crash-loop*: the
+  foreground import raises, PID 1 exits, `restart: unless-stopped` starts it
+  again. `docker compose ps` therefore reads `restarting` for most of that cycle
+  and `running` for the fraction of a second the import takes before it fails,
+  so a single sample after a fixed `sleep 25` was a coin weighted heavily enough
+  to pass for months. Run 32956727804 landed in the window and reported `Up Less
+  than a second (health: starting)` — on a tree byte-identical to one CI had
+  already passed, which is what makes it a defect in the assertion rather than
+  in the stack.
+
+  The step now polls the **restart count**, which is what this item's own
+  paragraph above claimed the fix produced and what docs/RUNBOOK.md tells an
+  operator to look for. It is the exact discriminator rather than a
+  probabilistic one: the regression — a `--reload` parent idling over a dead
+  child — never exits, so its count stays 0 for as long as anyone waits, while
+  the corrected behaviour reaches 1 within a second or two. Nothing was relaxed
+  to get green; the check that catches the original bug still catches it, and
+  the `/healthz` precondition that stops the step proving nothing is untouched.
 - [x] Dashboard served as a built bundle rather than a dev server — @claude (#46).
   `infra/docker/web.Dockerfile` gained a `prod` stage: the `npm run build`
   output served by nginx, with `/api`, `/ws` and the health probes proxied so
