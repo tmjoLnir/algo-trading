@@ -708,7 +708,26 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Cancel All Orders */
+        /**
+         * Cancel All Orders
+         * @description Cancel every working order, or every one for `symbol`.
+         *
+         *     Through `OrderRouter.cancel_all` rather than a loop written here. That
+         *     method is the tested home for the two things this must get right — asking
+         *     the venue what is open instead of trusting our cache, and attempting every
+         *     order before reporting a failure, so one stubborn cancel does not abandon
+         *     the other nine.
+         *
+         *     The router is built with **no quotes**, which would deny every order on
+         *     `StaleDataRule` if the chain were consulted. It is not: cancelling places
+         *     nothing, so `RiskEngine.validate` is never reached. Passing an empty map
+         *     rather than reading the cache says that at the call site instead of leaving
+         *     a reader to work out which rules a cancel runs.
+         *
+         *     **This does not close positions.** Cancelling a protective stop leaves the
+         *     position it was protecting naked, which is why the runbook's emergency path
+         *     is `POST /risk/flatten-all` — that one cancels *and* closes, in that order.
+         */
         post: operations["cancel_all_orders_api_v1_orders_cancel_all_post"];
         delete?: never;
         options?: never;
@@ -726,7 +745,27 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Cancel Order */
+        /**
+         * Cancel Order
+         * @description Cancel one working order.
+         *
+         *     `order_id` is matched against the venue's id **or** our `client_order_id`,
+         *     because both are things a human legitimately has in front of them: the
+         *     order table shows ours, an Alpaca screen shows theirs, and refusing the one
+         *     someone is holding is a way to make an operator retype an id during an
+         *     incident.
+         *
+         *     Resolved from `BrokerPort.get_open_orders()` rather than from our own table,
+         *     which is the argument `OrderRouter.cancel_all` makes and it applies here
+         *     with more force: the broker is the truth and our state a cache
+         *     (docs/ARCHITECTURE.md), and after a restart the orders missing from the
+         *     cache are exactly the ones most likely to still be working.
+         *
+         *     404 when nothing working matches. That covers both "no such order" and
+         *     "already terminal", and the two are deliberately not distinguished: an order
+         *     that filled while the operator was deciding is not an error to explain, and
+         *     the honest answer to "cancel this" is that there is nothing to cancel.
+         */
         delete: operations["cancel_order_api_v1_orders__order_id__delete"];
         options?: never;
         head?: never;
@@ -803,6 +842,26 @@ export interface paths {
         /**
          * Close Position
          * @description Flatten one position at market. Audit-logged.
+         *
+         *     Through `OrderRouter.flatten`, which builds a market order and submits it
+         *     down the same nine-rule chain a strategy's order takes. ADR 0005 has no
+         *     exemption for this and says why: "manual orders in particular are the most
+         *     common reason to need limits, not a reason to skip them". The emergency path
+         *     that *does* go around the chain is `POST /risk/flatten-all`, and it is a
+         *     different act with a different door on it.
+         *
+         *     **A refusal is a 200, not an error**, and the distinction is the point.
+         *     Six of the nine rules can refuse an exit — the kill switch among them — and
+         *     the response says which one did. HTTP-erroring would collapse "the platform
+         *     considered this and said no, because trading is halted" into the same shape
+         *     as "the symbol was misspelt", when the first is a decision the operator must
+         *     read and the second is a typo. `submitted` is the field to branch on; the
+         *     dashboard shows `refused_by` beside the reason.
+         *
+         *     The book is the stored one (`PortfolioRepository.latest`), marked off the
+         *     quote cache. If a position is unmarked because no quote is cached for it,
+         *     the chain refuses by name rather than valuing it at zero — see
+         *     `execution.marked_book`.
          */
         post: operations["close_position_api_v1_positions__symbol__close_post"];
         delete?: never;
@@ -856,6 +915,25 @@ export interface paths {
          *     Both proofs, not either. The phrase shows the caller knows what this does;
          *     the password shows they are the person entitled to do it. A copied session
          *     cookie satisfies neither on its own.
+         *
+         *     **This is the one path in the platform that reaches a venue without passing
+         *     the risk chain**, and ADR 0005 names it as such rather than leaving it to be
+         *     discovered: `BrokerPort.close_all_positions()` is correct here precisely
+         *     because it does not build an `OrderRequest` from our book. This is the case
+         *     where our view of the book is the thing you have lost confidence in, so a
+         *     request derived from it is a request derived from the problem. Everything
+         *     else that closes a position — `POST /positions/{symbol}/close` included —
+         *     goes through `OrderRouter.flatten` and can be refused by a rule.
+         *
+         *     The venue cancels resting orders as part of the same call
+         *     (`cancel_orders=true`), which is not a detail to leave to the adapter's
+         *     docstring: flattening without it leaves a stop working against a position
+         *     that no longer exists, and it opens the other side the moment it fires.
+         *
+         *     A partial flatten is an error, not a success with a smaller number. Alpaca
+         *     answers 207 with a per-symbol status array, and the adapter raises if any
+         *     symbol came back non-200 — so a 502 here means *some positions may still be
+         *     open*, and says so.
          */
         post: operations["flatten_all_api_v1_risk_flatten_all_post"];
         delete?: never;

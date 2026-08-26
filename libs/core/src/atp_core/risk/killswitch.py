@@ -431,12 +431,17 @@ class RedisKillSwitch:
         return [_decode(v) for v in _sync(self._client.mget(keys)) if v is not None]
 
 
-def flatten_all_positions() -> None:
-    """Emergency liquidation: cancel every open order, close every position.
-
-    Separate from `engage()` on purpose. Halting stops *new* risk; flattening
-    *realises* existing P&L and is not always the right response to a problem —
-    a data outage means stop trading, not dump the book into a market you
-    currently cannot see. Requires explicit human action.
-    """
-    raise NotImplementedError("see docs/RUNBOOK.md 'Emergency flatten'")
+# `flatten_all_positions()` used to stand here as a stub, and is deliberately
+# gone rather than filled in. The act now exists as
+# `POST /api/v1/risk/flatten-all`, which is where ADR 0005 puts it: the carve-out
+# it defends is a *human* calling `BrokerPort.close_all_positions()` behind a
+# typed confirmation, a step-up password and an audit row, and it ends "no
+# automated path may call either method". A module-level function in the risk
+# layer is reachable by every automated path there is, and a second door to an
+# irreversible act is worth less than the one door that carries the proofs.
+#
+# What kept the two apart is unchanged and still true: halting stops *new* risk,
+# flattening *realises* existing P&L, and a data outage means stop trading — not
+# dump the book into a market you currently cannot see. That is why the endpoint
+# is separate from `engage()` rather than a flag on it, and why it reports
+# whether the platform was halted when it ran instead of assuming it was.

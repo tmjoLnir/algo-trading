@@ -30,7 +30,7 @@ from atp_core.brokers import AlpacaBroker, BrokerPort, SimulatedBroker
 from atp_core.clock import Clock, SystemClock, TradingCalendar
 from atp_core.config import Settings, get_settings
 from atp_core.dashboard.ports import SnapshotStore
-from atp_core.data.ports import BarRepository
+from atp_core.data.ports import BarRepository, QuoteCache
 from atp_core.domain.enums import RunMode
 from atp_core.errors import MissingBrokerCredentialsError
 from atp_core.execution.ports import OrderRepository, PortfolioRepository
@@ -41,6 +41,7 @@ from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.dashboard import RedisSnapshotStore
 from atp_core.persistence.orders import PostgresOrderRepository
 from atp_core.persistence.positions import PostgresPortfolioRepository
+from atp_core.persistence.quotes import RedisQuoteCache
 from atp_core.persistence.signals import PostgresSignalRepository
 from atp_core.persistence.strategies import PostgresStrategyRepository
 from atp_core.risk.killswitch import KillSwitch
@@ -122,6 +123,22 @@ async def get_redis(request: Request) -> Redis:
     """The shared async Redis client, opened by `lifespan`."""
     client: Redis = _from_state(request, "redis", "Redis")
     return client
+
+
+async def get_quote_cache(
+    redis: Annotated[Redis, Depends(get_redis)],
+) -> QuoteCache:
+    """The latest quote per symbol, written by the worker's ingestor.
+
+    The API reads it and never writes it. Two callers so far and both are about
+    the same thing — establishing that a price is current enough to act on:
+    marking the stored book before an operator closes a position, and answering
+    `StaleDataRule` for the order that closes it. A quote's age is the whole
+    point of the cache (`data/ports.py`), which is why this is not served out of
+    the dashboard snapshot instead: that carries one `last_data_at` for the
+    whole book, and staleness is a per-symbol fact.
+    """
+    return RedisQuoteCache(redis)
 
 
 async def get_kill_switch(request: Request) -> KillSwitch:

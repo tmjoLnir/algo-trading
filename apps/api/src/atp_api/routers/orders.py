@@ -1,13 +1,16 @@
 """Order endpoints.
 
-The read is built; the writes are not, and the split is worth stating because
-it is not arbitrary. `GET` serves the order table, which is a display of
-something the runner already decided and stored. Every other handler here
-*places* something, and there is exactly one path from an intent to a venue —
-`RiskEngine.validate` then `execution.router.OrderRouter.submit` (rule §1.5).
-Wiring that path through this process is its own piece of work with its own
-failure paths and its own audit trail (ADR 0010), and it is not made smaller by
-being started halfway.
+The read and both cancels are built; `POST /orders` is not, and the line between
+them is the one rule §1.5 draws. Cancelling *withdraws* an intent: it consults
+no risk rule, because there is no order to judge — `OrderRouter.cancel_all` asks
+the venue what is open and retracts it. `POST /orders` *places* one, and there is
+exactly one path from an intent to a venue — `RiskEngine.validate` then
+`OrderRouter.submit`. That path now exists in this process (`atp_api.execution`)
+and `POST /positions/{symbol}/close` is the first handler to use it, so what is
+left here is not the wiring: it is a manual order's own decisions — what sizing
+a hand-typed quantity is checked against, and what a stop attached to it means
+when no strategy owns the position afterwards. Nothing on a screen asks for one
+yet, and it is not made smaller by being started halfway.
 
 **Why this read exists when the dashboard already shows working orders.** The
 live dashboard shows what is working *now*, from the snapshot the worker
@@ -32,10 +35,24 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import status as http_status
 from pydantic import BaseModel
 
-from atp_api.deps import CurrentUser, get_order_repository
+from atp_api.deps import (
+    CurrentUser,
+    get_audit_sink,
+    get_broker,
+    get_calendar,
+    get_clock,
+    get_kill_switch,
+    get_order_repository,
+)
+from atp_api.execution import build_router
+from atp_core.audit.ports import Action, AuditEntry, AuditSink
+from atp_core.brokers import BrokerPort
+from atp_core.clock import Clock, TradingCalendar
 from atp_core.config import Settings, get_settings
 from atp_core.domain import Order, OrderStatus
+from atp_core.errors import ATPError
 from atp_core.execution.ports import OrderRepository
+from atp_core.risk.killswitch import KillSwitch
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -227,10 +244,150 @@ async def submit_manual_order(payload: ManualOrderRequest, actor: CurrentUser) -
 
 
 @router.delete("/{order_id}")
-async def cancel_order(order_id: str, actor: CurrentUser) -> dict[str, object]:
-    raise NotImplementedError
+async def cancel_order(
+    order_id: str,
+    actor: CurrentUser,
+    broker: Annotated[BrokerPort, Depends(get_broker)],
+    audit: Annotated[AuditSink, Depends(get_audit_sink)],
+    clock: Annotated[Clock, Depends(get_clock)],
+) -> dict[str, object]:
+    """Cancel one working order.
+
+    `order_id` is matched against the venue's id **or** our `client_order_id`,
+    because both are things a human legitimately has in front of them: the
+    order table shows ours, an Alpaca screen shows theirs, and refusing the one
+    someone is holding is a way to make an operator retype an id during an
+    incident.
+
+    Resolved from `BrokerPort.get_open_orders()` rather than from our own table,
+    which is the argument `OrderRouter.cancel_all` makes and it applies here
+    with more force: the broker is the truth and our state a cache
+    (docs/ARCHITECTURE.md), and after a restart the orders missing from the
+    cache are exactly the ones most likely to still be working.
+
+    404 when nothing working matches. That covers both "no such order" and
+    "already terminal", and the two are deliberately not distinguished: an order
+    that filled while the operator was deciding is not an error to explain, and
+    the honest answer to "cancel this" is that there is nothing to cancel.
+    """
+    try:
+        working = await broker.get_open_orders()
+    except ATPError as exc:
+        # Distinct from the refusal below and worth its own reply: we never
+        # established what is working, so nothing can be said about this order
+        # at all — including that it does not exist.
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"could not read the venue's open orders: {exc}. Nothing was cancelled, "
+                "and whether this order is still working is unknown."
+            ),
+        ) from exc
+
+    target = next(
+        (o for o in working if order_id in {o.broker_order_id, o.client_order_id}),
+        None,
+    )
+    if target is None or target.broker_order_id is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"no working order at the venue matches {order_id!r} — it may have "
+                "filled, been cancelled already, or never reached the broker"
+            ),
+        )
+
+    try:
+        await broker.cancel_order(target.broker_order_id)
+    except ATPError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"the venue refused to cancel {target.symbol} order "
+                f"{target.broker_order_id}: {exc}. It is still working."
+            ),
+        ) from exc
+
+    # After the venue confirms, never before: a row claiming a cancel that did
+    # not take has a reader stop looking for an order that is still live.
+    await audit.record(
+        AuditEntry(
+            at=clock.now(),
+            actor=actor,
+            action=Action.ORDER_CANCELLED,
+            target=target.symbol,
+            detail={
+                "broker_order_id": target.broker_order_id,
+                "client_order_id": target.client_order_id,
+                "qty": str(target.qty),
+                "filled_qty": str(target.filled_qty),
+                "purpose": target.purpose,
+            },
+        )
+    )
+    return {
+        "cancelled": True,
+        "symbol": target.symbol,
+        "broker_order_id": target.broker_order_id,
+        "client_order_id": target.client_order_id,
+    }
 
 
 @router.post("/cancel-all")
-async def cancel_all_orders(actor: CurrentUser, symbol: str | None = None) -> dict[str, int]:
-    raise NotImplementedError
+async def cancel_all_orders(
+    actor: CurrentUser,
+    broker: Annotated[BrokerPort, Depends(get_broker)],
+    kill_switch: Annotated[KillSwitch, Depends(get_kill_switch)],
+    clock: Annotated[Clock, Depends(get_clock)],
+    calendar: Annotated[TradingCalendar, Depends(get_calendar)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    audit: Annotated[AuditSink, Depends(get_audit_sink)],
+    symbol: str | None = None,
+) -> dict[str, int]:
+    """Cancel every working order, or every one for `symbol`.
+
+    Through `OrderRouter.cancel_all` rather than a loop written here. That
+    method is the tested home for the two things this must get right — asking
+    the venue what is open instead of trusting our cache, and attempting every
+    order before reporting a failure, so one stubborn cancel does not abandon
+    the other nine.
+
+    The router is built with **no quotes**, which would deny every order on
+    `StaleDataRule` if the chain were consulted. It is not: cancelling places
+    nothing, so `RiskEngine.validate` is never reached. Passing an empty map
+    rather than reading the cache says that at the call site instead of leaving
+    a reader to work out which rules a cancel runs.
+
+    **This does not close positions.** Cancelling a protective stop leaves the
+    position it was protecting naked, which is why the runbook's emergency path
+    is `POST /risk/flatten-all` — that one cancels *and* closes, in that order.
+    """
+    router_ = build_router(
+        broker=broker,
+        kill_switch=kill_switch,
+        clock=clock,
+        calendar=calendar,
+        settings=settings,
+        quotes={},
+    )
+    try:
+        cancelled = await router_.cancel_all(symbol)
+    except ATPError as exc:
+        # `cancel_all` raises only once it has attempted every order, so some
+        # may well have gone through. 502 with the detail, rather than a count
+        # that would imply the rest are still working when they are not.
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=f"{exc} — re-read the order book before assuming anything is still working",
+        ) from exc
+
+    await audit.record(
+        AuditEntry(
+            at=clock.now(),
+            actor=actor,
+            action=Action.ORDER_CANCELLED,
+            target=symbol,
+            detail={"scope": symbol or "all", "cancelled": cancelled},
+        )
+    )
+    return {"cancelled": cancelled}
