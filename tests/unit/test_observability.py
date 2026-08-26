@@ -37,7 +37,7 @@ from atp_core.metrics import get_registry
 from atp_core.risk.killswitch import HaltReason, HaltScope, RedisKillSwitch
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 
 @pytest.fixture(autouse=True)
@@ -52,7 +52,9 @@ def _fresh_registry() -> None:
 
 
 @pytest.fixture
-def configured_logging(capsys: pytest.CaptureFixture[str]) -> Callable[[], list[dict[str, Any]]]:
+def configured_logging(
+    capsys: pytest.CaptureFixture[str],
+) -> Iterator[Callable[[], list[dict[str, Any]]]]:
     """Configure real structlog JSON logging; return a reader for what it wrote.
 
     The configuration is process-global and is restored afterwards, so this
@@ -203,7 +205,7 @@ class TestTheRiskEngineIsCounted:
             def check(self, order: Any, portfolio: Any, limits: Any) -> RiskDecision:
                 return RiskDecision.deny("always_denies", "no")
 
-        engine = RiskEngine(RiskLimits(), rules=[AlwaysDenies()])  # type: ignore[list-item]
+        engine = RiskEngine(RiskLimits(), rules=[AlwaysDenies()])
         engine.validate(object(), object())  # type: ignore[arg-type]
 
         assert value("atp_risk_checks_total", outcome="denied") == 1
@@ -239,7 +241,7 @@ class TestTheRiskEngineIsCounted:
             order_type=OrderType.MARKET,
             strategy_id="s",
         )
-        RiskEngine(RiskLimits(), rules=[Shrinks()]).validate(order, object())  # type: ignore[arg-type,list-item]
+        RiskEngine(RiskLimits(), rules=[Shrinks()]).validate(order, object())  # type: ignore[arg-type]
 
         assert value("atp_risk_checks_total", outcome="shrunk") == 1
         assert value("atp_risk_checks_total", outcome="approved") == 0
@@ -429,5 +431,5 @@ def _ingestor() -> Any:
         quote_cache=Nothing(),  # type: ignore[arg-type]
         bar_repo=Nothing(),  # type: ignore[arg-type]
         provider=Nothing(),  # type: ignore[arg-type]
-        publisher=Nothing(),  # type: ignore[arg-type]
+        publisher=Nothing(),
     )

@@ -28,10 +28,10 @@ import importlib.util
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
-from sqlalchemy import CheckConstraint
+from sqlalchemy import CheckConstraint, Table
 
 from atp_core.domain import StrategyState
 from atp_core.persistence.models import StrategyRow
@@ -55,7 +55,10 @@ def quoted(sql: str) -> set[str]:
 
 def state_check() -> CheckConstraint:
     """The `strategies.state` CHECK, from the model's own table definition."""
-    checks = [c for c in StrategyRow.__table__.constraints if isinstance(c, CheckConstraint)]
+    # `__table__` is declared `FromClause` on the declarative base; the mapped
+    # class always carries a `Table`, which is what holds the constraints.
+    table = cast("Table", StrategyRow.__table__)
+    checks = [c for c in table.constraints if isinstance(c, CheckConstraint)]
     named = [c for c in checks if c.name == "ck_strategies_state"]
     assert named, "strategies has no state CHECK constraint"
     return named[0]

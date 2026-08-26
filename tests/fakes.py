@@ -311,7 +311,7 @@ class FakeKillSwitch:
         #: banner to have something to render; the engagement list above is a
         #: record of calls rather than of state, and the two are separate
         #: because a test usually cares about exactly one of them.
-        self.halts: list[object] = []
+        self.halts: list[HaltRecord] = []
         #: The halt in force per (scope, target), which is what makes the
         #: idempotence above observable.
         self._records: dict[tuple[str, str | None], HaltRecord] = {}
@@ -363,7 +363,7 @@ class FakeKillSwitch:
         self.engaged = False
         return self._records.pop((str(scope), target), None)
 
-    def active_halts(self) -> list[object]:
+    def active_halts(self) -> list[HaltRecord]:
         return list(self.halts)
 
 

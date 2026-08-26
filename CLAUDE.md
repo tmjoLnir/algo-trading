@@ -81,7 +81,7 @@ make revision m="add orders table"
 make test         # pytest + vitest
 make test-unit    # pytest tests/unit -q   (fast; run this constantly)
 make lint         # ruff check + ruff format --check + eslint
-make typecheck    # mypy libs apps && tsc --noEmit
+make typecheck    # mypy libs apps tests && tsc --noEmit
 make fmt          # ruff format + prettier
 make check        # lint + typecheck + test  ← must pass before you push
 ```

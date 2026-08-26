@@ -18,9 +18,10 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from atp_core.channels import CHANNEL_BARS, CHANNEL_QUOTES
 from atp_core.clock import SimulatedClock
 from atp_core.data.ports import FeedReconnected
-from atp_core.data.stream import CHANNEL_BARS, CHANNEL_QUOTES, StreamIngestor
+from atp_core.data.stream import StreamIngestor
 from atp_core.domain import Bar, Quote, Timeframe, Trade
 from atp_core.errors import DataError, DataGapError
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope

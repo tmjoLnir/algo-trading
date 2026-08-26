@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -56,6 +57,10 @@ from atp_core.risk.engine import RiskEngine, backtest_rules, default_rules
 from atp_core.risk.rules import DailyLossLimitRule, TradingHoursRule, position_size
 from atp_core.strategy import examples as _examples  # noqa: F401 — populates the registry
 from atp_core.strategy import registry
+from tests.fakes import FakeKillSwitch
+
+if TYPE_CHECKING:
+    from atp_core.backtest.engine import BacktestResult
 
 T0 = datetime(2024, 1, 2, tzinfo=UTC)
 SHIPPED = "sma_crossover"
@@ -134,7 +139,7 @@ class TestTheChainAReplayCanEvaluate:
         live = {
             rule.name
             for rule in default_rules(
-                kill_switch=_NeverEngaged(),
+                kill_switch=FakeKillSwitch(),
                 clock=SimulatedClock(T0),
                 calendar=TradingCalendar(),
                 last_tick_at=lambda _symbol: T0,
@@ -272,6 +277,7 @@ class TestSizingReachesTheBacktest:
         refused = [o for o in result.orders if o.rejected_by == SIZING]
         assert refused
         assert all(o.status is OrderStatus.REJECTED_RISK for o in refused)
+        assert refused[0].reject_reason is not None
         assert "needs a stop" in refused[0].reject_reason
 
     def test_equity_pct_sizes_off_the_book_rather_than_a_constant(self) -> None:
@@ -368,23 +374,7 @@ class TestSpecCompatibility:
             )
 
 
-class _NeverEngaged:
-    """Only to enumerate `default_rules`' names — never used to run a chain."""
-
-    def is_engaged(self, strategy_id: str | None = None, symbol: str | None = None) -> bool:
-        return False
-
-    def engage(self, *args: object, **kwargs: object) -> object:  # pragma: no cover
-        raise NotImplementedError
-
-    def clear(self, *args: object, **kwargs: object) -> object:  # pragma: no cover
-        raise NotImplementedError
-
-    def active_halts(self) -> list[object]:  # pragma: no cover
-        return []
-
-
-def _clean_result() -> object:
+def _clean_result() -> BacktestResult:
     from atp_core.backtest.engine import BacktestConfig, BacktestResult
 
     return BacktestResult(

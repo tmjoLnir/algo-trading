@@ -122,7 +122,9 @@ class TestTheCounter:
 
 class TestWhoIsCounted:
     @staticmethod
-    def request_from(headers: dict[str, str], client: tuple[str, int] | None = ("10.0.0.1", 1)):
+    def request_from(
+        headers: dict[str, str], client: tuple[str, int] | None = ("10.0.0.1", 1)
+    ) -> tuple[httpx.Request, dict[str, Any]]:
         scope: dict[str, Any] = {
             "type": "http",
             "method": "POST",

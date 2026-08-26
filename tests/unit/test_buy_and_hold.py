@@ -138,7 +138,7 @@ def run_backtest(bars: list[Bar], *, symbol: str = "SPY", qty: Decimal = QTY) ->
         strategy=BuyAndHold(),
         config=config,
         cost_model=ZeroCostModel(),
-        risk_engine=_AllowAllRisk(),
+        risk_engine=_AllowAllRisk(),  # type: ignore[arg-type]  # a narrower surface than the class; see the double's docstring
         position_sizer=FixedQtySizer(qty),
     ).run({symbol: bars})
 

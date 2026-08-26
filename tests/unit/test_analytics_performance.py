@@ -32,6 +32,7 @@ from atp_core.analytics.performance import (
     UNATTRIBUTED,
     UNKNOWN_EXIT,
     PerformanceAnalyzer,
+    TradeRecord,
     comparability_warnings,
     infer_periods_per_year,
 )
@@ -252,7 +253,7 @@ class TestAFillThroughZero:
     """
 
     @pytest.fixture
-    def flipped(self, analyzer: PerformanceAnalyzer) -> list:
+    def flipped(self, analyzer: PerformanceAnalyzer) -> list[TradeRecord]:
         return analyzer.build_trades(
             [
                 order(Side.BUY, "100", ENTRY, [(at(0), "100", "100", "1")]),
@@ -261,23 +262,25 @@ class TestAFillThroughZero:
             ]
         )
 
-    def test_both_sides_of_the_flip_are_trades(self, flipped: list) -> None:
+    def test_both_sides_of_the_flip_are_trades(self, flipped: list[TradeRecord]) -> None:
         assert [t.side for t in flipped] == ["long", "short"]
         assert [t.qty for t in flipped] == [Decimal("100"), Decimal("200")]
 
-    def test_the_closing_half_pairs_with_the_original_entry(self, flipped: list) -> None:
+    def test_the_closing_half_pairs_with_the_original_entry(
+        self, flipped: list[TradeRecord]
+    ) -> None:
         long_trade = flipped[0]
         assert long_trade.entry_price == Decimal("100")
         assert long_trade.exit_price == Decimal("110")
         assert long_trade.gross_pnl == Decimal("1000")
 
-    def test_the_opening_half_becomes_the_new_position(self, flipped: list) -> None:
+    def test_the_opening_half_becomes_the_new_position(self, flipped: list[TradeRecord]) -> None:
         short_trade = flipped[1]
         assert short_trade.entry_price == Decimal("110")
         assert short_trade.exit_price == Decimal("105")
         assert short_trade.gross_pnl == Decimal("1000")
 
-    def test_the_flipping_fees_are_split_pro_rata(self, flipped: list) -> None:
+    def test_the_flipping_fees_are_split_pro_rata(self, flipped: list[TradeRecord]) -> None:
         """One commission, one execution, two trades that share it by quantity.
 
         100 of 300 closes the long, so a third of the 3 goes there — 1, plus
@@ -286,12 +289,14 @@ class TestAFillThroughZero:
         assert flipped[0].fees == Decimal("2")
         assert flipped[1].fees == Decimal("4")
 
-    def test_no_pnl_is_created_or_destroyed(self, flipped: list) -> None:
+    def test_no_pnl_is_created_or_destroyed(self, flipped: list[TradeRecord]) -> None:
         """The total is the one thing a matching convention must never change."""
         assert sum(t.gross_pnl for t in flipped) == Decimal("2000")
         assert sum(t.fees for t in flipped) == Decimal("6")
 
-    def test_a_reversal_is_a_signal_exit_not_an_unknown_one(self, flipped: list) -> None:
+    def test_a_reversal_is_a_signal_exit_not_an_unknown_one(
+        self, flipped: list[TradeRecord]
+    ) -> None:
         """The closing leg's purpose is `entry` — the strategy decided to reverse.
 
         Reporting that as `unknown` would be a worse answer than the one
@@ -512,7 +517,7 @@ class TestExcursions:
 
 class TestAttribution:
     @pytest.fixture
-    def trades(self, analyzer: PerformanceAnalyzer) -> list:
+    def trades(self, analyzer: PerformanceAnalyzer) -> list[TradeRecord]:
         return analyzer.build_trades(
             [
                 # A winner stopped out of, and a loser taken at target — so the
@@ -524,13 +529,13 @@ class TestAttribution:
             ]
         )
 
-    def test_by_strategy(self, analyzer: PerformanceAnalyzer, trades: list) -> None:
+    def test_by_strategy(self, analyzer: PerformanceAnalyzer, trades: list[TradeRecord]) -> None:
         rows = {r.key: r for r in analyzer.attribution(trades, "strategy")}
         assert rows["a"].net_pnl == Decimal("-100")
         assert rows["b"].net_pnl == Decimal("300")
 
     def test_by_exit_reason_is_the_one_worth_reading(
-        self, analyzer: PerformanceAnalyzer, trades: list
+        self, analyzer: PerformanceAnalyzer, trades: list[TradeRecord]
     ) -> None:
         """The grouping this whole item exists for.
 
@@ -542,17 +547,21 @@ class TestAttribution:
         assert rows["stop_loss"].net_pnl == Decimal("-100")
         assert rows["take_profit"].net_pnl == Decimal("300")
 
-    def test_rows_are_ordered_best_first(self, analyzer: PerformanceAnalyzer, trades: list) -> None:
+    def test_rows_are_ordered_best_first(
+        self, analyzer: PerformanceAnalyzer, trades: list[TradeRecord]
+    ) -> None:
         rows = analyzer.attribution(trades, "strategy")
         assert [r.key for r in rows] == ["b", "a"]
 
-    def test_win_rate_is_per_group(self, analyzer: PerformanceAnalyzer, trades: list) -> None:
+    def test_win_rate_is_per_group(
+        self, analyzer: PerformanceAnalyzer, trades: list[TradeRecord]
+    ) -> None:
         rows = {r.key: r for r in analyzer.attribution(trades, "strategy")}
         assert rows["a"].win_rate == 0.0
         assert rows["b"].win_rate == 1.0
 
     def test_contribution_is_denominated_in_absolute_pnl(
-        self, analyzer: PerformanceAnalyzer, trades: list
+        self, analyzer: PerformanceAnalyzer, trades: list[TradeRecord]
     ) -> None:
         """Shares of the *net* misbehave exactly when a reader needs them.
 
@@ -566,7 +575,7 @@ class TestAttribution:
         assert rows["a"].contribution_pct == pytest.approx(-25.0)
 
     def test_by_hour_and_weekday_group_on_the_entry(
-        self, analyzer: PerformanceAnalyzer, trades: list
+        self, analyzer: PerformanceAnalyzer, trades: list[TradeRecord]
     ) -> None:
         """When does this strategy find trades worth taking?
 
@@ -577,7 +586,9 @@ class TestAttribution:
         assert hours == {"14", "16"}  # entries at 14:30 and 16:30 UTC
         assert {r.key for r in analyzer.attribution(trades, "weekday")} == {"Monday"}
 
-    def test_an_unknown_dimension_raises(self, analyzer: PerformanceAnalyzer, trades: list) -> None:
+    def test_an_unknown_dimension_raises(
+        self, analyzer: PerformanceAnalyzer, trades: list[TradeRecord]
+    ) -> None:
         """Not an empty list.
 
         A report silently grouped by nothing looks like a period with no trades,
@@ -681,7 +692,7 @@ class TestInferringTheSamplingRate:
 
 class TestMetrics:
     @pytest.fixture
-    def trades(self, analyzer: PerformanceAnalyzer) -> list:
+    def trades(self, analyzer: PerformanceAnalyzer) -> list[TradeRecord]:
         return analyzer.build_trades(
             [
                 order(Side.BUY, "10", ENTRY, [(at(0), "10", "100", "0")]),
@@ -692,7 +703,7 @@ class TestMetrics:
         )
 
     def test_it_runs_through_the_backtests_own_functions(
-        self, analyzer: PerformanceAnalyzer, trades: list
+        self, analyzer: PerformanceAnalyzer, trades: list[TradeRecord]
     ) -> None:
         """ADR 0006's reasoning again: one implementation, so the two compare.
 
@@ -717,14 +728,14 @@ class TestMetrics:
         assert got == expected
 
     def test_win_rate_and_trade_count_come_from_the_trades(
-        self, analyzer: PerformanceAnalyzer, trades: list
+        self, analyzer: PerformanceAnalyzer, trades: list[TradeRecord]
     ) -> None:
         metrics = analyzer.metrics(trades, [(at(0), Decimal("100000"))])
         assert metrics.num_trades == 2
         assert metrics.win_rate == 0.5
 
     def test_holding_period_is_the_mean_over_trades(
-        self, analyzer: PerformanceAnalyzer, trades: list
+        self, analyzer: PerformanceAnalyzer, trades: list[TradeRecord]
     ) -> None:
         metrics = analyzer.metrics(trades, [(at(0), Decimal("100000"))])
         assert metrics.avg_holding_period_hours == 24.0
@@ -1080,7 +1091,9 @@ class TestTheAnnualisationBasis:
         """
         from atp_core.backtest import engine
 
-        assert engine.periods_per_year_for is periods_per_year_for
+        # Reaching through a re-export is the assertion, not an accident:
+        # `engine` is not the defining module and must not re-export this.
+        assert engine.periods_per_year_for is periods_per_year_for  # type: ignore[attr-defined]
 
     def test_every_metric_has_a_basis(self) -> None:
         """An unlabelled row in a divergence table is what the label prevents."""

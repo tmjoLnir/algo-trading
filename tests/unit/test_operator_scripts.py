@@ -201,7 +201,7 @@ class TestCheckAlertsArguments:
         assert chosen == [Severity.INFO, Severity.CRITICAL]
 
     def test_it_reports_the_transports_the_factory_would_build(self) -> None:
-        settings = Settings(  # type: ignore[call-arg]
+        settings = Settings(
             ALERT_NTFY_TOPIC="atp-abc123",
             ALERT_TELEGRAM_TOKEN="123:AAF",
             ALERT_TELEGRAM_CHAT_ID="9876",
@@ -212,7 +212,7 @@ class TestCheckAlertsArguments:
         """It is not one for `build_alert_sink` either, and a checker that
         disagreed with the factory would report a transport that cannot
         deliver — the exact belief this script exists to correct."""
-        settings = Settings(ALERT_TELEGRAM_TOKEN="123:AAF")  # type: ignore[call-arg]
+        settings = Settings(ALERT_TELEGRAM_TOKEN="123:AAF")
         assert check_alerts._configured_transports(settings) == []
 
     def test_nothing_configured_is_not_a_success(self) -> None:
@@ -377,7 +377,7 @@ class TestHashPasswordOutput:
         env = tmp_path / ".env"
         env.write_text(self._emitted_line(monkeypatch, capsys) + "\n", encoding="utf-8")
 
-        settings = Settings(_env_file=env)  # type: ignore[call-arg]
+        settings = Settings(_env_file=env)
 
         assert verify_password("operator-password", settings.api_password_hash.get_secret_value())
 

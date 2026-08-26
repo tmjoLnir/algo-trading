@@ -224,7 +224,7 @@ def engine(
         strategy=strategy,
         config=config,
         cost_model=ZeroCostModel(),
-        risk_engine=risk if risk is not None else _AllowAllRisk(),
+        risk_engine=risk if risk is not None else _AllowAllRisk(),  # type: ignore[arg-type]  # a narrower surface than the class; see the double's docstring
         position_sizer=FixedQtySizer(qty),
     )
 
@@ -848,7 +848,7 @@ class TestProgressReporting:
         """
         eng = engine(ScriptedStrategy({}))
 
-        def boom(done: int, total: int) -> None:
+        def boom(bars_done: int, bars_total: int) -> None:
             raise RuntimeError("reporter is broken")
 
         eng.on_progress = boom
@@ -886,10 +886,16 @@ def split_bars(count: int = 10, *, split_at: int = 5, factor: int = 8) -> list[B
     return series
 
 
-def _quoted_at(price: Decimal) -> dict[str, Decimal]:
-    """The OHLC of a flat candle quoted at `price`. `split_bars` makes every bar
-    flat within itself, so re-quoting one is four fields with the same value."""
-    return {"open": price, "high": price, "low": price, "close": price}
+def _adjusted(candle: Bar) -> Decimal:
+    """`split_bars` sets one on every bar; the domain type allows `None`."""
+    assert candle.adj_close is not None
+    return candle.adj_close
+
+
+def _quoted_at(candle: Bar, price: Decimal) -> Bar:
+    """`candle` re-quoted at `price`. `split_bars` makes every bar flat within
+    itself, so re-quoting one is four fields with the same value."""
+    return replace(candle, open=price, high=price, low=price, close=price)
 
 
 class TestCorporateActions:
@@ -958,7 +964,7 @@ class TestCorporateActions:
         at four times the adjusted price rather than an eighth of it."""
         bars = split_bars(factor=1)  # adjusted == raw, then re-quote the front
         bars = [
-            candle if index >= 5 else replace(candle, **_quoted_at(candle.adj_close * 4))
+            candle if index >= 5 else _quoted_at(candle, _adjusted(candle) * 4)
             for index, candle in enumerate(bars)
         ]
         result = engine(ScriptedStrategy({0: SignalAction.ENTER_LONG})).run({"TEST": bars})

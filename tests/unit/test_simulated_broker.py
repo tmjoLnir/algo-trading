@@ -401,6 +401,7 @@ class TestAccounting:
         filled = sim.on_bar(bar(1, o="110", h="112", low="109", c="111"))
 
         # Slippage is adverse on both sides: a sell fills below the open.
+        assert filled[0].avg_fill_price is not None
         assert filled[0].avg_fill_price < Decimal("110")
 
     @pytest.mark.asyncio
@@ -422,8 +423,8 @@ class TestAccounting:
 
         positions = await sim.get_positions()
         assert positions[0].qty == Decimal("200")
-        order = (await sim.get_open_orders() or [None])[0]
-        assert order is None  # both tranches filled, so it left the book
+        # Both tranches filled, so the order left the book.
+        assert await sim.get_open_orders() == []
 
 
 class TestCancellation:

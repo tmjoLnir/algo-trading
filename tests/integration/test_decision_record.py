@@ -66,12 +66,14 @@ async def clean_decision_tables(migrated_db: str) -> AsyncIterator[str]:
     yield migrated_db
 
 
+Repos = tuple[PostgresStrategyRepository, PostgresSignalRepository, PostgresOrderRepository]
+"""The three repositories a decision spans, as the `repos` fixture yields them."""
+
+
 @pytest.fixture
 async def repos(
     clean_decision_tables: str,
-) -> AsyncIterator[
-    tuple[PostgresStrategyRepository, PostgresSignalRepository, PostgresOrderRepository]
-]:
+) -> AsyncIterator[Repos]:
     engine = create_engine(clean_decision_tables)
     try:
         factory = create_session_factory(engine)
@@ -165,7 +167,7 @@ def an_order(
 
 class TestTheStrategyRow:
     @pytest.mark.asyncio
-    async def test_it_is_created_and_read_back(self, repos: tuple) -> None:
+    async def test_it_is_created_and_read_back(self, repos: Repos) -> None:
         strategies, _, _ = repos
 
         await strategies.ensure(a_record())
@@ -178,7 +180,7 @@ class TestTheStrategyRow:
         assert stored.universe == ("SPY", "QQQ")
 
     @pytest.mark.asyncio
-    async def test_ensuring_twice_does_not_duplicate_or_reset(self, repos: tuple) -> None:
+    async def test_ensuring_twice_does_not_duplicate_or_reset(self, repos: Repos) -> None:
         """`warmup` calls this at every session open.
 
         The upsert deliberately touches only `updated_at`, because the row is
@@ -199,13 +201,13 @@ class TestTheStrategyRow:
         assert stored.params == {"fast": 20, "slow": 50}
 
     @pytest.mark.asyncio
-    async def test_a_strategy_with_no_row_reads_as_none(self, repos: tuple) -> None:
+    async def test_a_strategy_with_no_row_reads_as_none(self, repos: Repos) -> None:
         strategies, _, _ = repos
         assert await strategies.get("never_registered") is None
 
     @pytest.mark.asyncio
     async def test_the_database_refuses_a_state_that_is_not_a_rung(
-        self, clean_decision_tables: str, repos: tuple
+        self, clean_decision_tables: str, repos: Repos
     ) -> None:
         """The guardrail that was missing, tested where it lives.
 
@@ -240,7 +242,7 @@ class TestTheStrategyRow:
 
     @pytest.mark.asyncio
     async def test_every_rung_of_the_enum_is_storable(
-        self, clean_decision_tables: str, repos: tuple
+        self, clean_decision_tables: str, repos: Repos
     ) -> None:
         """The other half, and the one a too-tight constraint would break.
 
@@ -284,7 +286,7 @@ class TestAuthoringAStrategy:
     """
 
     @pytest.mark.asyncio
-    async def test_the_whole_row_including_the_rules_is_stored(self, repos: tuple) -> None:
+    async def test_the_whole_row_including_the_rules_is_stored(self, repos: Repos) -> None:
         strategies, _, _ = repos
 
         created = await strategies.create(an_authored_ruleset())
@@ -304,7 +306,7 @@ class TestAuthoringAStrategy:
         assert read_back.state in set(StrategyState), "the stored state must be a real rung"
 
     @pytest.mark.asyncio
-    async def test_a_name_that_is_taken_is_refused_and_changes_nothing(self, repos: tuple) -> None:
+    async def test_a_name_that_is_taken_is_refused_and_changes_nothing(self, repos: Repos) -> None:
         """The constraint is what refuses this, so it holds against a row any
         writer put there — a worker's first boot as much as another author's."""
         strategies, _, _ = repos
@@ -328,7 +330,7 @@ class TestAuthoringAStrategy:
 
     @pytest.mark.asyncio
     async def test_a_worker_booting_it_does_not_overwrite_what_was_authored(
-        self, repos: tuple
+        self, repos: Repos
     ) -> None:
         """The property that makes two writers on one table safe.
 
@@ -358,7 +360,7 @@ class TestAuthoringAStrategy:
 
     @pytest.mark.asyncio
     async def test_a_signal_can_be_recorded_against_an_authored_strategy(
-        self, repos: tuple
+        self, repos: Repos
     ) -> None:
         """The point of the row, reached from the authoring side for the first
         time: `signals.strategy_id` is a foreign key, and a decision naming a
@@ -384,7 +386,7 @@ class TestListingStrategies:
     """
 
     @pytest.mark.asyncio
-    async def test_the_whole_row_comes_back(self, repos: tuple) -> None:
+    async def test_the_whole_row_comes_back(self, repos: Repos) -> None:
         """`StrategyRecord` is deliberately thin because a worker writes it;
         `StoredStrategy` is what a reader needs."""
         strategies, _, _ = repos
@@ -405,7 +407,7 @@ class TestListingStrategies:
 
     @pytest.mark.asyncio
     async def test_a_second_boot_moves_only_the_timestamp(
-        self, clean_decision_tables: str, repos: tuple
+        self, clean_decision_tables: str, repos: Repos
     ) -> None:
         """What `last_started_at` on the screen actually reports.
 
@@ -436,7 +438,7 @@ class TestListingStrategies:
         assert second.params == first.params
 
     @pytest.mark.asyncio
-    async def test_the_state_filter_narrows_the_list(self, repos: tuple) -> None:
+    async def test_the_state_filter_narrows_the_list(self, repos: Repos) -> None:
         strategies, _, _ = repos
         await strategies.ensure(a_record("one"))
         await strategies.ensure(a_record("two"))
@@ -445,7 +447,7 @@ class TestListingStrategies:
         assert await strategies.list_all(state=StrategyState.PAUSED) == []
 
     @pytest.mark.asyncio
-    async def test_nothing_stored_is_an_empty_list(self, repos: tuple) -> None:
+    async def test_nothing_stored_is_an_empty_list(self, repos: Repos) -> None:
         """A worker that has never booted has written no rows — the default
         posture of this platform rather than a fault."""
         strategies, _, _ = repos
@@ -454,7 +456,7 @@ class TestListingStrategies:
 
 class TestTheSignalRecord:
     @pytest.mark.asyncio
-    async def test_a_decision_round_trips(self, repos: tuple) -> None:
+    async def test_a_decision_round_trips(self, repos: Repos) -> None:
         strategies, signals, _ = repos
         await strategies.ensure(a_record())
 
@@ -467,7 +469,7 @@ class TestTheSignalRecord:
         assert outcome.acted_on is True
 
     @pytest.mark.asyncio
-    async def test_indicator_values_survive_as_strings(self, repos: tuple) -> None:
+    async def test_indicator_values_survive_as_strings(self, repos: Repos) -> None:
         """Rule §1.1 through a JSON column.
 
         An SMA of closes is denominated in dollars, and JSON has only binary
@@ -483,7 +485,7 @@ class TestTheSignalRecord:
         assert stored.indicators == {"sma_fast": "101.25", "sma_slow": "100.10"}
 
     @pytest.mark.asyncio
-    async def test_a_refusal_keeps_the_rule_that_refused_it(self, repos: tuple) -> None:
+    async def test_a_refusal_keeps_the_rule_that_refused_it(self, repos: Repos) -> None:
         """A signal the risk engine blocked is what you want when asking why a
         strategy underperformed its backtest."""
         strategies, signals, _ = repos
@@ -504,7 +506,7 @@ class TestTheSignalRecord:
         assert outcome.rejection_reason == "daily loss limit reached"
 
     @pytest.mark.asyncio
-    async def test_re_saving_updates_the_outcome_and_not_the_decision(self, repos: tuple) -> None:
+    async def test_re_saving_updates_the_outcome_and_not_the_decision(self, repos: Repos) -> None:
         """One decision whose fate became known, not two decisions."""
         strategies, signals, _ = repos
         await strategies.ensure(a_record())
@@ -522,7 +524,7 @@ class TestTheSignalRecord:
         assert stored.action is SignalAction.ENTER_LONG
 
     @pytest.mark.asyncio
-    async def test_a_signal_naming_a_strategy_with_no_row_is_refused(self, repos: tuple) -> None:
+    async def test_a_signal_naming_a_strategy_with_no_row_is_refused(self, repos: Repos) -> None:
         """The foreign key doing its job.
 
         The alternative — a nullable column and a signal pointing nowhere — is
@@ -536,7 +538,7 @@ class TestTheSignalRecord:
             )
 
     @pytest.mark.asyncio
-    async def test_recent_is_newest_first_and_between_is_oldest_first(self, repos: tuple) -> None:
+    async def test_recent_is_newest_first_and_between_is_oldest_first(self, repos: Repos) -> None:
         """A feed is read backwards; a period report is read forwards."""
         strategies, signals, _ = repos
         await strategies.ensure(a_record())
@@ -553,7 +555,7 @@ class TestTheSignalRecord:
         assert oldest == ["sig-0", "sig-1", "sig-2"]
 
     @pytest.mark.asyncio
-    async def test_between_includes_both_bounds(self, repos: tuple) -> None:
+    async def test_between_includes_both_bounds(self, repos: Repos) -> None:
         strategies, signals, _ = repos
         await strategies.ensure(a_record())
         await signals.save(a_signal("sig-a", ts=T0), SignalOutcome(acted_on=True))
@@ -575,7 +577,7 @@ class TestTheRejectionsQuery:
     """
 
     @pytest.mark.asyncio
-    async def test_it_returns_refusals_newest_first(self, repos: tuple) -> None:
+    async def test_it_returns_refusals_newest_first(self, repos: Repos) -> None:
         strategies, signals, _ = repos
         await strategies.ensure(a_record())
         await signals.save(
@@ -592,7 +594,7 @@ class TestTheRejectionsQuery:
         assert [s.id for s, _ in found] == ["new", "old"]
 
     @pytest.mark.asyncio
-    async def test_an_acted_on_signal_is_not_a_refusal(self, repos: tuple) -> None:
+    async def test_an_acted_on_signal_is_not_a_refusal(self, repos: Repos) -> None:
         strategies, signals, _ = repos
         await strategies.ensure(a_record())
         await signals.save(a_signal("done"), SignalOutcome(acted_on=True))
@@ -600,7 +602,7 @@ class TestTheRejectionsQuery:
         assert await signals.rejections() == []
 
     @pytest.mark.asyncio
-    async def test_no_action_is_excluded_in_sql(self, repos: tuple) -> None:
+    async def test_no_action_is_excluded_in_sql(self, repos: Repos) -> None:
         """The exclusion that keeps phantom rejections off the screen.
 
         A HOLD is stored with a non-null rejection field and `acted_on=False`,
@@ -626,7 +628,7 @@ class TestTheRejectionsQuery:
         assert [s.id for s, _ in found] == ["real"]
 
     @pytest.mark.asyncio
-    async def test_a_refusal_older_than_the_limit_is_still_found(self, repos: tuple) -> None:
+    async def test_a_refusal_older_than_the_limit_is_still_found(self, repos: Repos) -> None:
         """The property the method exists for, proved in SQL.
 
         A strategy blocked last week that has since emitted hundreds of holds is
@@ -653,7 +655,7 @@ class TestTheRejectionsQuery:
         assert [s.id for s, _ in await signals.recent(limit=5)] != ["ancient"]
 
     @pytest.mark.asyncio
-    async def test_it_filters_by_rule_and_by_strategy(self, repos: tuple) -> None:
+    async def test_it_filters_by_rule_and_by_strategy(self, repos: Repos) -> None:
         strategies, signals, _ = repos
         await strategies.ensure(a_record())
         await strategies.ensure(a_record("other"))
@@ -670,7 +672,7 @@ class TestTheRejectionsQuery:
         assert [s.id for s, _ in await signals.rejections(strategy_id="other")] == ["b"]
 
     @pytest.mark.asyncio
-    async def test_it_filters_by_since(self, repos: tuple) -> None:
+    async def test_it_filters_by_since(self, repos: Repos) -> None:
         strategies, signals, _ = repos
         await strategies.ensure(a_record())
         await signals.save(
@@ -687,7 +689,7 @@ class TestTheRejectionsQuery:
         assert [s.id for s, _ in found] == ["new"]
 
     @pytest.mark.asyncio
-    async def test_the_rule_survives_its_own_column(self, repos: tuple) -> None:
+    async def test_the_rule_survives_its_own_column(self, repos: Repos) -> None:
         """`rejected_by` is a column as of `f4d2e8b1a075`, not a prefix.
 
         It used to be packed into `rejection_reason` as `"[rule] reason"` and
@@ -713,7 +715,7 @@ class TestTheRejectionsQuery:
 
 class TestTheOrderJoin:
     @pytest.mark.asyncio
-    async def test_an_order_stores_the_decision_that_caused_it(self, repos: tuple) -> None:
+    async def test_an_order_stores_the_decision_that_caused_it(self, repos: Repos) -> None:
         """The columns that were hardcoded `None`."""
         strategies, signals, orders = repos
         await strategies.ensure(a_record())
@@ -727,7 +729,7 @@ class TestTheOrderJoin:
         assert restored[0].signal_id == "sig-1"
 
     @pytest.mark.asyncio
-    async def test_an_order_naming_a_signal_nobody_recorded_is_refused(self, repos: tuple) -> None:
+    async def test_an_order_naming_a_signal_nobody_recorded_is_refused(self, repos: Repos) -> None:
         """The intended outcome, not a regression.
 
         A null was how this gap stayed invisible; an integrity error is the
@@ -740,7 +742,7 @@ class TestTheOrderJoin:
             await orders.save(an_order(signal_id="never-recorded"), run_mode=RunMode.PAPER)
 
     @pytest.mark.asyncio
-    async def test_an_order_with_no_strategy_is_still_storable(self, repos: tuple) -> None:
+    async def test_an_order_with_no_strategy_is_still_storable(self, repos: Repos) -> None:
         """A manual order from the dashboard has neither, and both are nullable."""
         _, _, orders = repos
 
@@ -756,7 +758,7 @@ class TestTheOrderJoin:
 
 class TestThePurposeColumn:
     @pytest.mark.asyncio
-    async def test_it_round_trips(self, repos: tuple) -> None:
+    async def test_it_round_trips(self, repos: Repos) -> None:
         _, _, orders = repos
 
         await orders.save(
@@ -769,7 +771,7 @@ class TestThePurposeColumn:
 
     @pytest.mark.asyncio
     async def test_a_row_written_before_the_column_reads_as_unknown(
-        self, clean_decision_tables: str, repos: tuple
+        self, clean_decision_tables: str, repos: Repos
     ) -> None:
         """Migration `c3f8b2d5e714` left existing rows null, deliberately.
 
@@ -795,7 +797,7 @@ class TestThePurposeColumn:
 
 class TestReadingHistory:
     @pytest.mark.asyncio
-    async def test_only_orders_that_moved_quantity_come_back(self, repos: tuple) -> None:
+    async def test_only_orders_that_moved_quantity_come_back(self, repos: Repos) -> None:
         """An order that never filled belongs to the signal record, not a trade."""
         _, _, orders = repos
         await orders.save(
@@ -817,7 +819,7 @@ class TestReadingHistory:
         assert [o.client_order_id for o in restored] == ["filled"]
 
     @pytest.mark.asyncio
-    async def test_a_cancelled_order_that_filled_first_is_not_dropped(self, repos: tuple) -> None:
+    async def test_a_cancelled_order_that_filled_first_is_not_dropped(self, repos: Repos) -> None:
         """Filtered on `filled_qty`, not on status.
 
         A partial fill nobody accounted for is a position the reconstruction
@@ -837,7 +839,7 @@ class TestReadingHistory:
         assert restored[0].filled_qty == Decimal("40")
 
     @pytest.mark.asyncio
-    async def test_the_other_run_modes_orders_are_not_included(self, repos: tuple) -> None:
+    async def test_the_other_run_modes_orders_are_not_included(self, repos: Repos) -> None:
         """Paper and live share a table, and mixing them mixes two accounts."""
         _, _, orders = repos
         await orders.save(
@@ -854,7 +856,7 @@ class TestReadingHistory:
         assert [o.client_order_id for o in restored] == ["paper"]
 
     @pytest.mark.asyncio
-    async def test_until_bounds_the_read_at_the_end(self, repos: tuple) -> None:
+    async def test_until_bounds_the_read_at_the_end(self, repos: Repos) -> None:
         _, _, orders = repos
         await orders.save(
             an_order(client_order_id="early", strategy_id=None, signal_id=None),
@@ -875,7 +877,7 @@ class TestReadingHistory:
         assert [o.client_order_id for o in restored] == ["early"]
 
     @pytest.mark.asyncio
-    async def test_oldest_first_by_decision_instant(self, repos: tuple) -> None:
+    async def test_oldest_first_by_decision_instant(self, repos: Repos) -> None:
         """The order the FIFO matcher wants.
 
         An entry decided before an exit is the entry that exit closes, even on
@@ -898,7 +900,7 @@ class TestReadingHistory:
         assert [o.client_order_id for o in restored] == ["o0", "o1", "o2"]
 
     @pytest.mark.asyncio
-    async def test_filtering_by_strategy(self, repos: tuple) -> None:
+    async def test_filtering_by_strategy(self, repos: Repos) -> None:
         strategies, signals, orders = repos
         await strategies.ensure(a_record("alpha"))
         await strategies.ensure(a_record("beta"))

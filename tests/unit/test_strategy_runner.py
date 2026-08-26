@@ -339,9 +339,9 @@ def build(
         symbols=[SYMBOL],
         router=router,  # type: ignore[arg-type]
         stop_manager=StopManager(),
-        kill_switch=switch,  # type: ignore[arg-type]
-        bar_repo=FakeBarRepo({SYMBOL: bars or [bar(0)]}),  # type: ignore[arg-type]
-        quote_cache=FakeQuoteCache(),  # type: ignore[arg-type]
+        kill_switch=switch,
+        bar_repo=FakeBarRepo({SYMBOL: bars or [bar(0)]}),
+        quote_cache=FakeQuoteCache(),
         clock=SimulatedClock(START),
         calendar=FakeCalendar(),  # type: ignore[arg-type]
         reconciler=reconciler,  # type: ignore[arg-type]
@@ -350,11 +350,11 @@ def build(
         timeframe=Timeframe.D1,
         run_mode=RunMode.PAPER,
         order_repo=order_repo or FakeOrderRepository(),  # type: ignore[arg-type]
-        portfolio_repo=portfolio_repo or FakePortfolioRepository(),  # type: ignore[arg-type]
-        strategy_repo=strategy_repo or FakeStrategyRepository(),  # type: ignore[arg-type]
-        signal_repo=signal_repo or FakeSignalRepository(),  # type: ignore[arg-type]
-        snapshot_store=snapshot_store,  # type: ignore[arg-type]
-        publisher=publisher,  # type: ignore[arg-type]
+        portfolio_repo=portfolio_repo or FakePortfolioRepository(),
+        strategy_repo=strategy_repo or FakeStrategyRepository(),
+        signal_repo=signal_repo or FakeSignalRepository(),
+        snapshot_store=snapshot_store,
+        publisher=publisher,
         signal_limit=signal_limit,
         sleep=sleep,
     )

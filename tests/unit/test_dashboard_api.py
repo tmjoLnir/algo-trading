@@ -74,7 +74,7 @@ class RaisingKillSwitch(FakeKillSwitch):
     possible thing to show a human when the truth is unknown.
     """
 
-    def active_halts(self) -> list[object]:
+    def active_halts(self) -> list[HaltRecord]:
         raise ConnectionError("redis is down")
 
 

@@ -24,7 +24,7 @@ from atp_core.clock import SimulatedClock, TradingCalendar
 from atp_core.config import RiskLimits
 from atp_core.domain import Order, Portfolio, Side
 from atp_core.errors import ConfigError, RiskLimitBreachedError
-from atp_core.risk.engine import RiskDecision, RiskEngine, default_rules
+from atp_core.risk.engine import RiskDecision, RiskEngine, RiskRule, default_rules
 from atp_core.risk.rules import (
     BuyingPowerRule,
     DailyLossLimitRule,
@@ -39,6 +39,7 @@ from atp_core.risk.rules import (
     reduces_position,
 )
 from atp_core.strategy.rules import PositionSizeSpec
+from tests.fakes import FakeKillSwitch
 
 OPEN_HOURS = datetime(2024, 1, 2, 15, 0, tzinfo=UTC)  # 10:00 New York, a Tuesday
 CLOSED = datetime(2024, 1, 2, 2, 0, tzinfo=UTC)  # 21:00 New York the evening before
@@ -82,23 +83,15 @@ def order(
     )
 
 
-class FakeSwitch:
-    def __init__(self, engaged: bool = False) -> None:
-        self.engaged = engaged
-
-    def is_engaged(self, strategy_id: str | None = None, symbol: str | None = None) -> bool:
-        return self.engaged
-
-
 class TestRiskRules:
     def test_kill_switch_blocks_everything(self) -> None:
-        rule = KillSwitchRule(switch=FakeSwitch(engaged=True))
+        rule = KillSwitchRule(switch=FakeKillSwitch(engaged=True))
         decision = rule.check(order(), portfolio(), limits())
         assert not decision.approved
         assert decision.rule == "kill_switch"
 
     def test_kill_switch_allows_when_clear(self) -> None:
-        rule = KillSwitchRule(switch=FakeSwitch(engaged=False))
+        rule = KillSwitchRule(switch=FakeKillSwitch(engaged=False))
         assert rule.check(order(), portfolio(), limits()).approved
 
     def test_max_position_counts_existing_holding(self) -> None:
@@ -246,7 +239,7 @@ class TestRiskRules:
 
     def test_max_open_positions_blocks_a_new_symbol_at_the_limit(self) -> None:
         holdings = {f"S{i}": (10.0, 100.0) for i in range(3)}
-        book = portfolio(cash=100_000, **holdings)  # type: ignore[arg-type]
+        book = portfolio(cash=100_000, **holdings)
         capped = limits(max_open_positions=3)
         denied = MaxOpenPositionsRule().check(order(symbol="NEW"), book, capped)
         assert not denied.approved
@@ -297,9 +290,9 @@ class TestReducesPosition:
 
 
 class TestChain:
-    def _rules(self, engaged: bool = False) -> list[object]:
+    def _rules(self, engaged: bool = False) -> list[RiskRule]:
         return default_rules(
-            kill_switch=FakeSwitch(engaged),
+            kill_switch=FakeKillSwitch(engaged),
             clock=SimulatedClock(OPEN_HOURS),
             calendar=TradingCalendar(),
             last_tick_at=lambda _s: OPEN_HOURS,
@@ -307,7 +300,7 @@ class TestChain:
 
     def _anchored_rules(
         self, engaged: bool = False, anchor: Decimal = Decimal(100_000)
-    ) -> list[object]:
+    ) -> list[RiskRule]:
         rules = self._rules(engaged)
         for rule in rules:
             if isinstance(rule, DailyLossLimitRule):
@@ -316,7 +309,7 @@ class TestChain:
 
     def _chain(self, engaged: bool = False, *, anchored: bool = True) -> RiskEngine:
         rules = self._anchored_rules(engaged) if anchored else self._rules(engaged)
-        return RiskEngine(limits(), rules=rules)  # type: ignore[arg-type]
+        return RiskEngine(limits(), rules=rules)
 
     def test_the_chain_refuses_entries_until_the_day_is_anchored(self) -> None:
         """Not an oversight — the point. A chain assembled and left unanchored
@@ -449,7 +442,7 @@ class TestChain:
         # Anchor the day to the book itself unless the case is about the loss
         # limit, so that every other case breaches exactly one thing.
         rules = self._anchored_rules(anchor=anchor if anchor is not None else book.equity)
-        engine = RiskEngine(rule_limits, rules=rules)  # type: ignore[arg-type]
+        engine = RiskEngine(rule_limits, rules=rules)
         decision = engine.validate(placed, book)
         assert not decision.approved
         assert decision.rule == rule_name, f"blamed {decision.rule!r}, expected {rule_name!r}"
@@ -492,7 +485,7 @@ class TestChain:
             if isinstance(rule, DailyLossLimitRule):
                 rule.anchor(Decimal(1_000_000))  # a catastrophic day
 
-        engine = RiskEngine(limits(), rules=rules)  # type: ignore[arg-type]
+        engine = RiskEngine(limits(), rules=rules)
         exit_order = order(side=Side.SELL, qty=500)
         assert reduces_position(exit_order, book)
         assert engine.validate(exit_order, book).approved

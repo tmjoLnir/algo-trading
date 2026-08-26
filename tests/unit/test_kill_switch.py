@@ -325,7 +325,7 @@ class TestAnnouncements:
                 raise ConnectionError("pub/sub is down")
 
         broken = Unpublishable()
-        ks._client = broken  # type: ignore[attr-defined]
+        ks._client = broken
 
         record = ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
 

@@ -40,7 +40,7 @@ class RecordingSink:
 
     async def recent(
         self, limit: int = 100, before_id: int | None = None, action: str | None = None
-    ):
+    ) -> list[tuple[int, AuditEntry]]:
         return list(enumerate(self.entries))
 
     def actions(self) -> list[str]:
@@ -59,7 +59,7 @@ class RefusingSink:
 
     async def recent(
         self, limit: int = 100, before_id: int | None = None, action: str | None = None
-    ):
+    ) -> list[tuple[int, AuditEntry]]:
         return []
 
 
