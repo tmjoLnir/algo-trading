@@ -80,6 +80,7 @@ class PostgresBacktestRunRepository:
                     metrics=run.metrics,
                     equity_curve=run.equity_curve,
                     trades=run.trades,
+                    warnings=run.warnings,
                     error=run.error,
                     queued_at=run.queued_at,
                     started_at=run.started_at,
@@ -115,11 +116,16 @@ class PostgresBacktestRunRepository:
         metrics: dict[str, float],
         equity_curve: list[list[str]],
         trades: list[dict[str, object]],
+        warnings: list[str],
     ) -> None:
         """Store the results and mark the run done, in one statement.
 
-        One `UPDATE` rather than three, so there is no instant at which this row
+        One `UPDATE` rather than four, so there is no instant at which this row
         says `done` and carries only some of its result.
+
+        `warnings` is written even when empty, and the empty list is the point:
+        it is this run saying it had nothing to warn about, which a NULL from
+        before the column existed does not say.
         """
         async with session_scope(self._session_factory) as session:
             await session.execute(
@@ -130,6 +136,7 @@ class PostgresBacktestRunRepository:
                     metrics=metrics,
                     equity_curve=equity_curve,
                     trades=trades,
+                    warnings=warnings,
                     error=None,
                     finished_at=at,
                 )
@@ -153,6 +160,10 @@ class PostgresBacktestRunRepository:
                     metrics=None,
                     equity_curve=None,
                     trades=None,
+                    # Cleared with the rest: the caveats belonged to a result
+                    # this run no longer has, and `error` is the sentence that
+                    # replaces all of them.
+                    warnings=None,
                     finished_at=at,
                 )
             )
@@ -310,6 +321,7 @@ def _to_stored(row: BacktestRunRow) -> StoredBacktestRun:
         metrics=dict(row.metrics) if row.metrics is not None else None,
         equity_curve=list(row.equity_curve) if row.equity_curve is not None else None,
         trades=list(row.trades) if row.trades is not None else None,
+        warnings=list(row.warnings) if row.warnings is not None else None,
     )
 
 

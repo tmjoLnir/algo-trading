@@ -490,7 +490,7 @@ class TestTheStartupSweep:
     async def test_it_leaves_a_finished_run_alone(self, runs: FakeBacktestRunRepository) -> None:
         await queued(runs)
         await runs.mark_running(RUN_ID, at=T0)
-        await runs.finish(RUN_ID, at=T0, metrics={}, equity_curve=[], trades=[])
+        await runs.finish(RUN_ID, at=T0, metrics={}, equity_curve=[], trades=[], warnings=[])
 
         assert await sweep_interrupted(runs, T0 + timedelta(days=1), at=T0) == []
         assert runs.runs[RUN_ID].status == "done"
@@ -540,3 +540,89 @@ class TestWarningsTravelWithTheResult:
         result = run_spec(a_spec(), {"SPY": bars()}, limits=get_settings().risk)
 
         assert "no pre-trade risk rules" not in " ".join(result.warnings)
+
+
+class TestTheRunKeepsItsWarnings:
+    """What the run said about itself has to reach the row.
+
+    Everything here was computed on every queued run before this existed and
+    then dropped: `result_to_storage` returned metrics, curve and trades, and
+    `BacktestResult.warnings` went nowhere. The API filled the hole by deriving
+    warnings from the metric set on read, which can only ever produce the two
+    caveats that *are* functions of the metrics.
+
+    The gap that matters is the first test below. A run whose every order was
+    refused has the same all-zero metric set as one that never signalled, so
+    nothing derived from metrics can tell them apart — and they call for
+    opposite responses.
+    """
+
+    async def test_a_run_whose_orders_were_all_refused_says_so_on_the_row(
+        self, ctx: dict[str, Any], runs: FakeBacktestRunRepository
+    ) -> None:
+        """`risk_pct` sizing with no stop anywhere: the exact shape of the run
+        that motivated this. Every entry is refused for want of a distance to
+        measure risk against, and the result is all zeros."""
+        await queued(runs, sizing_method="risk_pct", sizing_value="0.01")
+
+        await run_backtest_task(ctx, RUN_ID)
+
+        stored = runs.runs[RUN_ID]
+        assert stored.metrics is not None
+        assert stored.metrics["num_trades"] == 0  # indistinguishable from idle
+        assert stored.warnings is not None
+        assert any("refused before reaching the market" in w for w in stored.warnings)
+        assert any("position_sizing" in w for w in stored.warnings)
+
+    async def test_the_zero_cost_caveat_is_stored_rather_than_only_printed(
+        self, ctx: dict[str, Any], runs: FakeBacktestRunRepository
+    ) -> None:
+        """A queued run has no terminal, so this is the only place it can land."""
+        await queued(runs, cost_model="zero")
+
+        await run_backtest_task(ctx, RUN_ID)
+
+        stored = runs.runs[RUN_ID]
+        assert stored.warnings is not None
+        assert any("NOT evidence" in w for w in stored.warnings)
+
+    async def test_the_fixed_qty_caveat_travels_with_the_return_it_qualifies(
+        self, ctx: dict[str, Any], runs: FakeBacktestRunRepository
+    ) -> None:
+        await queued(runs)  # a_spec sizes by a flat share count
+
+        await run_backtest_task(ctx, RUN_ID)
+
+        stored = runs.runs[RUN_ID]
+        assert stored.warnings is not None
+        assert any("sized at 10 shares" in w for w in stored.warnings)
+
+    async def test_they_are_written_in_the_same_call_as_the_rest_of_the_result(
+        self, ctx: dict[str, Any], runs: FakeBacktestRunRepository
+    ) -> None:
+        """Not a second `UPDATE`. A `done` row carrying metrics and no warnings
+        would claim a clean result it never had."""
+        await queued(runs, cost_model="zero")
+
+        await run_backtest_task(ctx, RUN_ID)
+
+        stored = runs.runs[RUN_ID]
+        assert stored.status == "done"
+        assert stored.metrics is not None
+        assert stored.equity_curve is not None
+        assert stored.trades is not None
+        assert stored.warnings is not None
+
+    async def test_a_failed_run_keeps_none_of_them(
+        self, ctx: dict[str, Any], runs: FakeBacktestRunRepository
+    ) -> None:
+        """Cleared with the rest of the result. They caveated a result this run
+        does not have, and `error` is the sentence that replaces them."""
+        await queued(runs, symbols=("NOPE",))
+
+        await run_backtest_task(ctx, RUN_ID)
+
+        stored = runs.runs[RUN_ID]
+        assert stored.status == "failed"
+        assert stored.error is not None
+        assert stored.warnings is None

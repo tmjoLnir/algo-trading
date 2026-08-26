@@ -76,10 +76,10 @@ from atp_core.backtest.runner import (
     DEFAULT_COST_MODEL,
     SIZING_METHODS,
     STOP_TYPES,
+    all_warnings,
     backfill_hint,
     missing_coverage,
     resolve_stop_config,
-    suspicious,
 )
 from atp_core.clock import Clock
 from atp_core.data.ports import BarRepository
@@ -326,9 +326,10 @@ def _to_view(run: StoredBacktestRun, progress: BacktestProgressView | None = Non
         started_at=run.started_at,
         finished_at=run.finished_at,
         progress=progress,
-        # Only for a finished run. A queued one has no metrics to be suspicious
-        # of, and a failed one has an `error`, which is the more useful sentence.
-        warnings=suspicious(run.metrics) if run.status == STATUS_DONE and run.metrics else [],
+        # Only for a finished run. A queued one has nothing to say about itself
+        # yet, and a failed one has an `error`, which is the more useful
+        # sentence than any caveat about a result it does not have.
+        warnings=all_warnings(run.warnings, run.metrics) if run.status == STATUS_DONE else [],
     )
 
 

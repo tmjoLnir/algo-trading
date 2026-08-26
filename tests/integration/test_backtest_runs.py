@@ -281,6 +281,84 @@ class TestTheResultRoundTrips:
         assert stored.trades is None
 
 
+class TestWarningsRoundTrip:
+    """The `warnings` column, against the real thing (migration `a9f37c14e6b2`).
+
+    Everything the run recorded about itself used to stop at
+    `result_to_storage`, which returned three columns and dropped the fourth.
+    The distinction these pin is NULL versus `[]`: a row from before the column
+    existed did not record its warnings, and one that finished clean did — and
+    only the second is entitled to be read as "nothing was wrong".
+    """
+
+    async def test_a_finished_run_stores_what_it_recorded(
+        self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
+    ) -> None:
+        runs, strategies = repo
+        await _registered(strategies)
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+
+        await runs.finish(
+            "r1",
+            at=T0,
+            metrics={"sharpe": 1.0},
+            equity_curve=[],
+            trades=[],
+            warnings=["20 of 20 orders were refused", "zero-cost model"],
+        )
+        stored = await runs.get("r1")
+
+        assert stored is not None
+        assert stored.warnings == ["20 of 20 orders were refused", "zero-cost model"]
+
+    async def test_a_clean_run_stores_an_empty_list_not_a_null(
+        self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
+    ) -> None:
+        """The whole point of the column. `[]` is this run saying it had nothing
+        to warn about; NULL says nobody ever asked."""
+        runs, strategies = repo
+        await _registered(strategies)
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+
+        await runs.finish("r1", at=T0, metrics={}, equity_curve=[], trades=[], warnings=[])
+        stored = await runs.get("r1")
+
+        assert stored is not None
+        assert stored.warnings == []
+        assert stored.warnings is not None
+
+    async def test_a_queued_run_has_none_yet(
+        self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
+    ) -> None:
+        runs, strategies = repo
+        await _registered(strategies)
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+
+        stored = await runs.get("r1")
+
+        assert stored is not None
+        assert stored.warnings is None
+
+    async def test_a_failure_clears_them_with_the_rest_of_the_result(
+        self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
+    ) -> None:
+        """They caveated a result this run no longer has. A run that failed
+        halfway leaving "sized at 10 shares" on the row would be describing a
+        return nobody can read."""
+        runs, strategies = repo
+        await _registered(strategies)
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        await runs.mark_running("r1", at=T0)
+
+        await runs.fail("r1", at=T0, error="the worker stopped")
+        stored = await runs.get("r1")
+
+        assert stored is not None
+        assert stored.status == "failed"
+        assert stored.warnings is None
+        assert stored.metrics is None
+
+
 class TestConditionalTransitions:
     """The `WHERE status IN (...)` clauses, against the real thing.
 
@@ -295,7 +373,9 @@ class TestConditionalTransitions:
         runs, strategies = repo
         await _registered(strategies)
         await runs.create(new_run("r1", a_spec(), queued_at=T0))
-        await runs.finish("r1", at=T0, metrics={"sharpe": 1.0}, equity_curve=[], trades=[])
+        await runs.finish(
+            "r1", at=T0, metrics={"sharpe": 1.0}, equity_curve=[], trades=[], warnings=[]
+        )
 
         await runs.mark_running("r1", at=T0 + timedelta(hours=1))
         stored = await runs.get("r1")
@@ -315,7 +395,12 @@ class TestConditionalTransitions:
         await runs.fail("r1", at=T0, error="interrupted — the worker stopped")
 
         await runs.finish(
-            "r1", at=T0 + timedelta(hours=1), metrics={"sharpe": 9.9}, equity_curve=[], trades=[]
+            "r1",
+            at=T0 + timedelta(hours=1),
+            metrics={"sharpe": 9.9},
+            equity_curve=[],
+            trades=[],
+            warnings=[],
         )
         stored = await runs.get("r1")
 
@@ -386,7 +471,7 @@ class TestReads:
 
         await runs.create(new_run("finished", a_spec(), queued_at=T0))
         await runs.mark_running("finished", at=T0)
-        await runs.finish("finished", at=T0, metrics={}, equity_curve=[], trades=[])
+        await runs.finish("finished", at=T0, metrics={}, equity_curve=[], trades=[], warnings=[])
 
         stale = await runs.stale_running(older_than=T0 + timedelta(hours=1))
 

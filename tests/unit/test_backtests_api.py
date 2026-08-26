@@ -24,6 +24,7 @@ What is worth holding here, in the order it matters:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -779,7 +780,12 @@ class TestReadingRuns:
         await runs.create(new_run("r1", a_spec(), queued_at=T0))
         await queue.report(BacktestProgress("r1", bars_done=500, bars_total=500, at=T0))
         await runs.finish(
-            "r1", at=T0, metrics={"sharpe": 1.2, "num_trades": 40}, equity_curve=[], trades=[]
+            "r1",
+            at=T0,
+            metrics={"sharpe": 1.2, "num_trades": 40},
+            equity_curve=[],
+            trades=[],
+            warnings=[],
         )
 
         body = (await client.get(f"{BACKTESTS}/r1")).json()
@@ -798,7 +804,12 @@ class TestReadingRuns:
         """
         await runs.create(new_run("r1", a_spec(), queued_at=T0))
         await runs.finish(
-            "r1", at=T0, metrics={"sharpe": 6.0, "num_trades": 4}, equity_curve=[], trades=[]
+            "r1",
+            at=T0,
+            metrics={"sharpe": 6.0, "num_trades": 4},
+            equity_curve=[],
+            trades=[],
+            warnings=[],
         )
 
         warnings = (await client.get(f"{BACKTESTS}/r1")).json()["warnings"]
@@ -812,10 +823,141 @@ class TestReadingRuns:
         """The converse. A warning on every run would be a warning nobody reads."""
         await runs.create(new_run("r1", a_spec(), queued_at=T0))
         await runs.finish(
-            "r1", at=T0, metrics={"sharpe": 1.1, "num_trades": 120}, equity_curve=[], trades=[]
+            "r1",
+            at=T0,
+            metrics={"sharpe": 1.1, "num_trades": 120},
+            equity_curve=[],
+            trades=[],
+            warnings=[],
         )
 
         assert (await client.get(f"{BACKTESTS}/r1")).json()["warnings"] == []
+
+
+class TestWarningsTheRunItselfProduced:
+    """The stored half of `warnings`, and why serving only the derived half was
+    not enough.
+
+    `suspicious` reads the metric set, so it can say a result rests on too few
+    trades or an implausible Sharpe. It cannot say that every order was refused
+    before reaching the market, that a symbol had no history for the first
+    eighteen months, or that the costs were switched off — none of those is a
+    function of the metrics, and the first is invisible in them by construction:
+    a run refused everything and a run that never signalled produce the same
+    zeros.
+    """
+
+    async def test_what_the_run_recorded_is_served(
+        self, client: httpx.AsyncClient, runs: FakeBacktestRunRepository
+    ) -> None:
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        await runs.finish(
+            "r1",
+            at=T0,
+            metrics={"sharpe": 1.1, "num_trades": 120},
+            equity_curve=[],
+            trades=[],
+            warnings=["20 of 20 orders were refused before reaching the market"],
+        )
+
+        warnings = (await client.get(f"{BACKTESTS}/r1")).json()["warnings"]
+
+        assert warnings == ["20 of 20 orders were refused before reaching the market"]
+
+    async def test_both_halves_are_served_together(
+        self, client: httpx.AsyncClient, runs: FakeBacktestRunRepository
+    ) -> None:
+        """Concatenated, not substituted. They answer different questions: what
+        the run did, and how far to trust the statistics it produced."""
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        await runs.finish(
+            "r1",
+            at=T0,
+            metrics={"sharpe": 6.0, "num_trades": 4},
+            equity_curve=[],
+            trades=[],
+            warnings=["zero-cost model: this result is NOT evidence about this strategy"],
+        )
+
+        warnings = (await client.get(f"{BACKTESTS}/r1")).json()["warnings"]
+
+        assert any("NOT evidence" in w for w in warnings)  # stored
+        assert any("only 4 trades" in w for w in warnings)  # derived
+        assert any("bug until proven otherwise" in w for w in warnings)  # derived
+
+    async def test_the_refusal_summary_stays_the_last_line(
+        self, client: httpx.AsyncClient, runs: FakeBacktestRunRepository
+    ) -> None:
+        """`run_spec` ends its list with the refusal summary on purpose, and
+        docs/BACKTESTING.md promises it will be last. The derived caveats go
+        ahead of the stored ones so that promise survives the merge — rendered
+        above the numbers, last is the line nearest the return it qualifies."""
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        await runs.finish(
+            "r1",
+            at=T0,
+            metrics={"sharpe": 1.0, "num_trades": 2},
+            equity_curve=[],
+            trades=[],
+            warnings=["zero-cost model", "refused before reaching the market"],
+        )
+
+        warnings = (await client.get(f"{BACKTESTS}/r1")).json()["warnings"]
+
+        assert "only 2 trades" in warnings[0]  # derived, first
+        assert warnings[1] == "zero-cost model"  # the run's own, in its order
+        assert warnings[-1] == "refused before reaching the market"
+
+    async def test_a_run_stored_before_the_column_existed_is_unchanged(
+        self, client: httpx.AsyncClient, runs: FakeBacktestRunRepository
+    ) -> None:
+        """NULL is not `[]`. An older row never recorded its warnings, and
+        reading its emptiness as "nothing was wrong" is the claim this column
+        exists to stop being made. It serves exactly what it served before."""
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        await runs.finish(
+            "r1",
+            at=T0,
+            metrics={"sharpe": 6.0, "num_trades": 4},
+            equity_curve=[],
+            trades=[],
+            warnings=[],
+        )
+        runs.runs["r1"] = replace(runs.runs["r1"], warnings=None)
+
+        warnings = (await client.get(f"{BACKTESTS}/r1")).json()["warnings"]
+
+        assert any("only 4 trades" in w for w in warnings)
+        assert any("bug until proven otherwise" in w for w in warnings)
+        assert len(warnings) == 2
+
+    async def test_a_clean_run_is_still_not_caveated(
+        self, client: httpx.AsyncClient, runs: FakeBacktestRunRepository
+    ) -> None:
+        """The converse, still. A warning on every run is a warning nobody
+        reads, and an empty stored list must not become one."""
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        await runs.finish(
+            "r1",
+            at=T0,
+            metrics={"sharpe": 1.1, "num_trades": 120},
+            equity_curve=[],
+            trades=[],
+            warnings=[],
+        )
+
+        assert (await client.get(f"{BACKTESTS}/r1")).json()["warnings"] == []
+
+    async def test_a_failed_run_carries_its_error_instead(
+        self, client: httpx.AsyncClient, runs: FakeBacktestRunRepository
+    ) -> None:
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        await runs.fail("r1", at=T0, error="no stored bars for NOPE")
+
+        body = (await client.get(f"{BACKTESTS}/r1")).json()
+
+        assert body["warnings"] == []
+        assert "no stored bars" in body["error"]
 
 
 class TestTradesAndCurve:
@@ -829,6 +971,7 @@ class TestTradesAndCurve:
             metrics={"sharpe": 1.0, "num_trades": 1},
             equity_curve=[[T0.isoformat(), "100500.25"]],
             trades=[{"symbol": "SPY", "net_pnl": "500.25", "exit_reason": "stop_loss"}],
+            warnings=[],
         )
 
         trades = (await client.get(f"{BACKTESTS}/r1/trades")).json()
@@ -845,7 +988,9 @@ class TestTradesAndCurve:
         """A `done` run that took no trades is a result. The 404 is reserved for
         a run that does not exist, which is a different sentence."""
         await runs.create(new_run("r1", a_spec(), queued_at=T0))
-        await runs.finish("r1", at=T0, metrics={"num_trades": 0}, equity_curve=[], trades=[])
+        await runs.finish(
+            "r1", at=T0, metrics={"num_trades": 0}, equity_curve=[], trades=[], warnings=[]
+        )
 
         response = await client.get(f"{BACKTESTS}/r1/trades")
 
@@ -867,6 +1012,7 @@ class TestComparing:
                 metrics={"sharpe": sharpe, "num_trades": 50},
                 equity_curve=[],
                 trades=[],
+                warnings=[],
             )
 
     async def test_metrics_are_pivoted_by_metric_then_run(
@@ -981,7 +1127,9 @@ class TestAuthorisation:
         about halting."""
         app.dependency_overrides[get_current_session] = lambda: Session("reader", Scope.READ)
         await runs.create(new_run("a", a_spec(), queued_at=T0))
-        await runs.finish("a", at=T0, metrics={"sharpe": 1.0}, equity_curve=[], trades=[])
+        await runs.finish(
+            "a", at=T0, metrics={"sharpe": 1.0}, equity_curve=[], trades=[], warnings=[]
+        )
 
         assert (await client.get(BACKTESTS)).status_code == 200
         assert (

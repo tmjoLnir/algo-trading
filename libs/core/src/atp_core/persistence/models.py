@@ -292,9 +292,10 @@ class BacktestRunRow(Base):
     time, which is what this table's original shape forced, would make every
     run's reported duration include however long the queue was backed up.
 
-    `metrics`, `equity_curve` and `trades` are written together or not at all: a
-    `done` row whose metrics landed and whose curve did not would claim a result
-    it cannot show.
+    `metrics`, `equity_curve`, `trades` and `warnings` are written together or
+    not at all: a `done` row whose metrics landed and whose curve did not would
+    claim a result it cannot show, and one whose warnings did not land would
+    claim a clean result it never had.
     """
 
     __tablename__ = "backtest_runs"
@@ -319,6 +320,13 @@ class BacktestRunRow(Base):
     #: from orders this database holds while a backtest's orders exist only
     #: inside the run that produced them.
     trades: Mapped[JsonList | None] = mapped_column(JSON, nullable=True)
+    #: What the run said about itself: refusals, coverage shortfalls, the cost
+    #: and sizing caveats `run_spec` attaches. Stored rather than recomputed
+    #: because most of them are not recoverable from `metrics` — a run whose
+    #: every order was refused has the same all-zero metric set as one that
+    #: never signalled, and only this column tells them apart (migration
+    #: `a9f37c14e6b2`).
+    warnings: Mapped[JsonList | None] = mapped_column(JSON, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     #: Null until a worker claims it. A queued run has not started.

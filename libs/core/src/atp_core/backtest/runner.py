@@ -352,12 +352,20 @@ def run_spec(
 
 def result_to_storage(
     result: BacktestResult,
-) -> tuple[dict[str, float], list[list[str]], list[dict[str, object]]]:
-    """A finished run as the three JSON columns that hold it.
+) -> tuple[dict[str, float], list[list[str]], list[dict[str, object]], list[str]]:
+    """A finished run as the four JSON columns that hold it.
 
-    Returned as one tuple because the three are written in one transaction: a
+    Returned as one tuple because the four are written in one transaction: a
     `done` run whose metrics landed and whose equity curve did not would be a row
     claiming a result it cannot show.
+
+    **`warnings` is the run's own account of itself**, and it is here rather
+    than recomputed on read because most of it is not a function of the metrics.
+    `suspicious` can see that a result has too few trades; it cannot see that
+    every order was refused before reaching the market, that four symbols had no
+    history until eighteen months in, or that the costs were switched off — and
+    an all-zero metric set looks the same whether a strategy was refused
+    everything or never had an idea.
 
     **Trades come from the same fold the live analytics use.**
     `PerformanceAnalyzer.build_trades` over the engine's own orders, rather than
@@ -370,7 +378,7 @@ def result_to_storage(
     metrics = _jsonable_metrics(result.metrics)
     curve = [[ts.isoformat(), str(equity)] for ts, equity in result.equity_curve]
     trades = [_jsonable_trade(trade) for trade in PerformanceAnalyzer().build_trades(result.orders)]
-    return metrics, curve, trades
+    return metrics, curve, trades, list(result.warnings)
 
 
 def jsonable(value: object) -> object:
@@ -474,6 +482,34 @@ def suspicious(metrics: dict[str, float]) -> list[str]:
             "otherwise. Check fill timing first, then data alignment"
         )
     return notes
+
+
+def all_warnings(stored: list[str] | None, metrics: dict[str, float] | None) -> list[str]:
+    """Everything a finished run has to say about itself, in reading order.
+
+    Two sources, and they answer different questions. `stored` is what the run
+    *did* — orders refused, symbols whose history started late, costs switched
+    off — recorded while it ran because none of it survives in the metric set.
+    `suspicious` is how far to trust the statistics, and is derived from those
+    statistics on every read so that a threshold this project revises applies to
+    runs already on record.
+
+    Concatenated rather than merged, and **the derived ones go first**. That is
+    not cosmetic: `run_spec` ends `stored` with the refusal summary on purpose —
+    "the line that says how much of the run above actually happened", which
+    docs/BACKTESTING.md promises will be the last one — and appending to it
+    would put a note about sample size between that line and the return it
+    qualifies. Rendered above the numbers, last is nearest.
+
+    It also reads in the right order: the statistical caveat states the symptom,
+    and the run's own account of itself explains it.
+
+    **A `stored` of None is not an empty run.** It is a row written before the
+    column existed, whose warnings were computed and dropped; it gets exactly
+    what it got before this function, and claims nothing about having been
+    clean.
+    """
+    return [*suspicious(metrics or {}), *(stored or [])]
 
 
 def missing_coverage(bars: dict[str, list[Bar]], symbols: tuple[str, ...]) -> list[str]:
