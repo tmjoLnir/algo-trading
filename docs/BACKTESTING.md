@@ -125,14 +125,25 @@ A run left behind by a worker that was killed is marked **interrupted** the next
 time one starts, rather than sitting at `running` forever — the worst outcome this
 path can produce, and the one nothing else would ever correct.
 
-**On a clean database the queued path needs one thing first.**
+**On a clean database the queued path needs nothing but bars.**
 `backtest_runs.strategy_id` is a foreign key onto `strategies`, and for a long
 time the only writer of that table was `StrategyRunner.warmup` at a live session
 open — so the tab's picker was empty, `POST /backtests` answered 409, and
 queueing a backtest meant configuring a *trading* worker with broker credentials
-that a backtest does not need. `make seed` writes those rows (plus some
-fabricated bars under reserved test tickers, see docs/DATA.md). The CLI never
-needed it: it stores no run, so it has no foreign key to satisfy.
+that a backtest does not need. `make seed` writes those rows for development
+(plus some fabricated bars under reserved test tickers, see docs/DATA.md), and
+`POST /backtests` now writes one itself for any registered class it is queueing
+the first run of: the row an author would have created, at `draft`, with the
+class's declared defaults and no universe. A registry the API can see is a
+strategy the API can backtest. The CLI never needed any of it: it stores no run,
+so it has no foreign key to satisfy.
+
+What that row is *not* is a record of configuration. The run's params, symbols
+and timeframe stay on the run — sweeping params over one strategy is what a
+backtest's `params` are for, and a row claiming the strategy trades what the
+last run happened to ask for would be a statement about live configuration that
+nobody made. An existing row is never touched, so a worker's universe, params
+and `last_started_at` are safe from anybody queueing a backtest.
 
 Bars come from the database, not the vendor: a backtest has to be reproducible,
 and re-fetching means today's answer can differ from yesterday's because the

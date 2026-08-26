@@ -361,6 +361,12 @@ export interface paths {
          *     202, not 201. Nothing has been created that the caller asked for — the result
          *     does not exist yet — and the `Location`-shaped answer is the run id in the
          *     body, which the client polls.
+         *
+         *     **A registered class with no `strategies` row gets one here**, between the
+         *     validation and the run that references it — see `_store_registered_class`
+         *     for why that is this endpoint's job and not a worker's. The row is a side
+         *     effect of queueing, so it is written after every refusal this handler can
+         *     raise and before the only thing that depends on it.
          */
         post: operations["run_backtest_api_v1_backtests_post"];
         delete?: never;

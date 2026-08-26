@@ -33,6 +33,7 @@ import pytest
 
 from atp_api.auth import Scope, Session
 from atp_api.deps import (
+    get_audit_sink,
     get_backtest_queue,
     get_backtest_repository,
     get_bar_repository,
@@ -41,15 +42,19 @@ from atp_api.deps import (
 )
 from atp_api.main import create_app
 from atp_api.routers.backtests import MAX_COMPARE, MAX_SYMBOLS
+from atp_core.audit.ports import Action
 from atp_core.backtest.ports import BacktestProgress, BacktestQueueError, BacktestRunSpec
 from atp_core.domain import Bar, Timeframe
+from atp_core.errors import StrategyExistsError
 from atp_core.persistence.backtests import new_run
+from atp_core.strategy import registry
 from atp_core.strategy.examples import rsi_mean_reversion
 from atp_core.strategy.ports import StoredStrategy
 from tests.fakes import (
     FakeBacktestQueue,
     FakeBacktestRunRepository,
     FakeStrategyRepository,
+    RecordingAuditSink,
 )
 
 if TYPE_CHECKING:
@@ -163,17 +168,24 @@ def strategies() -> FakeStrategyRepository:
 
 
 @pytest.fixture
+def audit() -> RecordingAuditSink:
+    return RecordingAuditSink()
+
+
+@pytest.fixture
 def app(
     runs: FakeBacktestRunRepository,
     queue: FakeBacktestQueue,
     bars: FakeBarRepository,
     strategies: FakeStrategyRepository,
+    audit: RecordingAuditSink,
 ) -> FastAPI:
     application = create_app()
     application.dependency_overrides[get_backtest_repository] = lambda: runs
     application.dependency_overrides[get_backtest_queue] = lambda: queue
     application.dependency_overrides[get_bar_repository] = lambda: bars
     application.dependency_overrides[get_strategy_repository] = lambda: strategies
+    application.dependency_overrides[get_audit_sink] = lambda: audit
     application.dependency_overrides[get_current_session] = lambda: Session(
         "test-operator", Scope.FULL
     )
@@ -317,6 +329,198 @@ class TestQueueingARun:
 
         assert response.status_code == 400
         assert expected in response.json()["detail"]
+
+
+class TestTheStrategyRowARunPointsAt:
+    """Every registered class is backtestable, run by a worker or not.
+
+    A run's `strategy_id` is a foreign key onto `strategies`, and the only
+    things that ever wrote that table were a booting worker and the development
+    seed script. So this endpoint refused a class the code registers, compiles
+    and can run — with a 409 asking for a *trading* worker and broker
+    credentials a backtest does not need — and the dashboard's picker, which can
+    only offer what the endpoint will accept, showed whatever had happened to go
+    through one of those. Usually one strategy.
+
+    What is asserted here is the row's *content* as much as its existence. It is
+    written on somebody's behalf without them asking for it, so it must not
+    claim anything nobody said: not this run's params, not this run's symbols,
+    and not a rung above `draft`.
+    """
+
+    async def test_a_class_no_worker_has_run_is_stored_and_queued(
+        self,
+        client: httpx.AsyncClient,
+        runs: FakeBacktestRunRepository,
+        queue: FakeBacktestQueue,
+        strategies: FakeStrategyRepository,
+    ) -> None:
+        """The case the 409 used to be, and the whole point of the change."""
+        assert await strategies.get_stored(SHIPPED) is None
+
+        response = await client.post(BACKTESTS, json=a_request())
+
+        assert response.status_code == 202, response.text
+        assert strategies.create_calls == [SHIPPED]
+        assert list(runs.runs) == [response.json()["id"]]
+        assert queue.enqueued == [response.json()["id"]]
+
+    async def test_the_row_records_the_class_and_its_declared_defaults(
+        self, client: httpx.AsyncClient, strategies: FakeStrategyRepository
+    ) -> None:
+        """`params` are what the class runs on when nobody supplies any.
+
+        Not `{}`, which would record a strategy configured with nothing when
+        what it actually runs is a 20/50 crossover — the argument
+        `registry.default_params` exists for.
+        """
+        await client.post(BACKTESTS, json=a_request())
+
+        stored = await strategies.get_stored(SHIPPED)
+        assert stored is not None
+        assert stored.kind == "coded"
+        assert stored.class_name == "SmaCrossover"
+        assert stored.params == registry.default_params(registry.get(SHIPPED))
+        assert stored.ruleset is None
+        # The ratchet's first rung. Queueing a backtest authorises nothing.
+        assert stored.state == "draft"
+
+    async def test_the_row_does_not_claim_this_run_as_configuration(
+        self, client: httpx.AsyncClient, strategies: FakeStrategyRepository
+    ) -> None:
+        """The run's params, symbols and timeframe belong to the run.
+
+        Copying them onto the strategy would state, in the table a worker and
+        the Strategies tab both read as configuration, that somebody chose to
+        trade QQQ on 1h with a 5/40 crossover. Nobody did — they asked for one
+        backtest, and sweeping params over a strategy is what a backtest's own
+        `params` are *for*.
+        """
+        response = await client.post(
+            BACKTESTS,
+            json=a_request(
+                symbols=["QQQ"], timeframe="1h", params={"fast_period": 5, "slow_period": 40}
+            ),
+        )
+
+        assert response.status_code == 202, response.text
+        stored = await strategies.get_stored(SHIPPED)
+        assert stored is not None
+        assert stored.universe == ()
+        assert stored.timeframe == "1d"
+        assert stored.params == registry.default_params(registry.get(SHIPPED))
+        # And the run itself carries every one of them.
+        spec = response.json()["spec"]
+        assert (spec["symbols"], spec["timeframe"], spec["params"]["fast_period"]) == (
+            ["QQQ"],
+            "1h",
+            5,
+        )
+
+    async def test_an_existing_row_is_left_exactly_as_it_was(
+        self, client: httpx.AsyncClient, strategies: FakeStrategyRepository
+    ) -> None:
+        """A worker's row is configuration this endpoint does not own.
+
+        Nothing is written when a row is already there — not even a touch of
+        `updated_at`, which the API serves as `last_started_at` and which would
+        then report that a worker started a strategy nobody started.
+        """
+        strategies.rows = [
+            StoredStrategy(
+                id=SHIPPED,
+                name=SHIPPED,
+                description="the one a worker booted",
+                kind="coded",
+                class_name="SmaCrossover",
+                params={"fast_period": 5, "slow_period": 40},
+                ruleset=None,
+                state="paper",
+                universe=("SPY",),
+                timeframe="1h",
+                risk_config={},
+                created_at=T0 - timedelta(days=30),
+                updated_at=T0 - timedelta(days=1),
+            )
+        ]
+
+        response = await client.post(BACKTESTS, json=a_request())
+
+        assert response.status_code == 202
+        assert strategies.create_calls == []
+        assert strategies.ensure_calls == []
+        (stored,) = strategies.rows
+        assert (stored.state, stored.params, stored.universe, stored.timeframe) == (
+            "paper",
+            {"fast_period": 5, "slow_period": 40},
+            ("SPY",),
+            "1h",
+        )
+        assert stored.updated_at == T0 - timedelta(days=1)
+
+    async def test_a_row_written_by_somebody_else_first_is_not_a_failed_run(
+        self,
+        client: httpx.AsyncClient,
+        runs: FakeBacktestRunRepository,
+        strategies: FakeStrategyRepository,
+    ) -> None:
+        """The race between the read that found no row and the insert.
+
+        A worker booting, or a second queue request for the same strategy, gets
+        there first. The outcome that mattered — the row exists — is the one
+        that happened, and `create` refuses on the name alone, so the row it
+        lost to is a row for this same strategy.
+        """
+        strategies.create_error = StrategyExistsError("a strategy named 'sma_crossover' is stored")
+
+        response = await client.post(BACKTESTS, json=a_request())
+
+        assert response.status_code == 202, response.text
+        assert list(runs.runs) == [response.json()["id"]]
+
+    async def test_the_new_row_is_audited_against_the_session(
+        self, client: httpx.AsyncClient, audit: RecordingAuditSink
+    ) -> None:
+        """A strategy's identity is being minted, and this is the only record of
+        who decided it — from the cookie rather than from the body (ADR 0008).
+
+        `via` is on the entry because a row that appeared without anybody
+        visiting the Strategies tab is otherwise a puzzle.
+        """
+        await client.post(BACKTESTS, json=a_request())
+
+        assert len(audit.entries) == 1
+        entry = audit.entries[0]
+        assert entry.action == Action.STRATEGY_CREATED
+        assert entry.actor == "test-operator"
+        assert entry.target == SHIPPED
+        assert entry.detail["via"] == "backtest"
+
+    async def test_a_run_that_is_refused_leaves_no_strategy_behind(
+        self, client: httpx.AsyncClient, strategies: FakeStrategyRepository, bars: FakeBarRepository
+    ) -> None:
+        """The row is a side effect of queueing, so it waits until every refusal
+        this handler can raise has had its chance. Missing history is the likely
+        one, and a strategy stored by a request that was turned away would be a
+        row nobody asked for and nothing points at."""
+        bars.series = {}
+
+        response = await client.post(BACKTESTS, json=a_request())
+
+        assert response.status_code == 400
+        assert strategies.create_calls == []
+        assert strategies.rows == []
+
+    async def test_a_name_nothing_registers_is_still_a_400(
+        self, client: httpx.AsyncClient, strategies: FakeStrategyRepository
+    ) -> None:
+        """Unchanged, and the boundary of what this stores: a row is written for
+        a class the registry has, never for a name a request invented."""
+        response = await client.post(BACKTESTS, json=a_request(strategy_id="not_a_strategy"))
+
+        assert response.status_code == 400
+        assert "unknown strategy" in response.json()["detail"]
+        assert strategies.create_calls == []
 
 
 class TestRefusalsBeforeTheJobIsQueued:

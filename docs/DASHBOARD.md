@@ -307,7 +307,10 @@ and the strategy classes the code registers, in one response.
 
 **The gap between those two lists is why the page exists.** A class is
 registered at import time; a `strategies` row is written by the runner at its
-first session open. `WORKER_STRATEGY` is empty by default, so a platform with
+first session open — or by a create, by `scripts/seed.py`, or by the first
+backtest queued for the class, which is why the registry table says *stored*
+rather than "a worker has run this". The absence of a row is the half that still
+means exactly one thing. `WORKER_STRATEGY` is empty by default, so a platform with
 strategies in it and nothing running is the ordinary state of a fresh install —
 and no screen could say so. "I wrote a strategy and nothing is happening" had no
 answer anywhere in this UI. The response carries `never_run` computed
@@ -396,17 +399,29 @@ staying out of the way of the server's validation:
   when the fault is in the row. The id is also trimmed before it is sent, because
   the server strips it before both the registry lookup and the spec it stores —
   sending the raw value is accepted at the door and then misses the foreign key
-  onto `strategies.id`, surfacing as a 409 about a strategy no worker has run.
+  onto `strategies.id`, surfacing as a 409 about a row that could not be found.
 
-**It can only offer strategies that have a row**, and that is the strategies
-page's gap met from the other side. `backtest_runs.strategy_id` is a foreign key
-onto `strategies` — so a class that exists in the code and has no row cannot be
-backtested, and offering it would produce a 409 for a choice this screen invited.
-The never-run names are listed outside the picker instead, with what to do about
-them. Two things write that row now: a runner at its first session open, and
-`POST /api/v1/strategies`. So "has a row" no longer implies "a worker has run
-it" — a rule set authored through the API has never been near a worker and is a
-perfectly good thing to backtest, which is most of what a rule set is for.
+**It offers every strategy the platform has**, stored or merely registered, and
+for most of this screen's life it did not. `backtest_runs.strategy_id` is a
+foreign key onto `strategies`, and the picker was built from that table alone —
+so a class that existed in the code and had never been loaded was left out,
+because queueing it produced a 409 for a choice the screen had invited. What
+that actually asked of somebody wanting to backtest `buy_and_hold` was to
+configure a *trading* worker with broker credentials a backtest does not need,
+or to run the development seed script; the list was then an accident of which
+strategies had been through one of those, usually one, on the tab whose subject
+is comparing strategies.
+
+`POST /api/v1/backtests` writes the row itself now, for a registered class it is
+queueing the first run of — the same row an author would have created, at
+`draft`, carrying the class's declared defaults and claiming no universe. So the
+picker is the union of the stored rows and the registry, and a choice with no
+row says "no worker has run this yet" beneath the control rather than being
+hidden by it. Four things write that table now — a runner at its first session
+open, `POST /api/v1/strategies`, `scripts/seed.py` and a queued backtest — so
+"has a row" does not imply "a worker has run it", and the strategies page says
+*stored* where it used to say a worker had run something. The gap that page
+exists to show is unchanged: no row still means nothing has ever loaded it.
 
 **A run has four states and each renders as itself.** A queued one says it is
 waiting rather than showing an elapsed time counted from a timestamp nobody

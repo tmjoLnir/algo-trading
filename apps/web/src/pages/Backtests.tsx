@@ -14,12 +14,16 @@
  *   seconds and then never again, so `useBacktests` derives the interval from the
  *   data and stops the timer entirely once every run is terminal. A tab left open
  *   on finished runs makes no requests.
- * - **It can only offer strategies a worker has run.** `backtest_runs.strategy_id`
- *   is a foreign key onto `strategies`, written by the runner at its first
- *   session open — so the picker is built from that table, and the registered
- *   classes that have never run are named separately with what to do about them.
- *   This is the same gap the Strategies tab exists to show, met from the other
- *   side.
+ * - **It offers every strategy the platform has**, stored or merely
+ *   registered. `backtest_runs.strategy_id` is a foreign key onto `strategies`,
+ *   which for a long time meant the picker could only list what the runner had
+ *   written at a session open — so backtesting a class the code ships required
+ *   first configuring a *trading* worker, and the tab that exists to compare
+ *   strategies usually had one to compare. `POST /backtests` writes that row
+ *   itself now, so both selects here read the union of the two halves the
+ *   strategies response carries. The gap between them is still worth seeing and
+ *   is still the Strategies tab's subject; it is not a reason to hide a
+ *   strategy from the screen that runs them.
  *
  * What this screen made possible elsewhere, now that a backtest can be stored:
  * `/analytics/live-vs-backtest` got its second operand and is now an endpoint —
@@ -36,7 +40,7 @@ import BacktestDetail from '@/components/BacktestDetail'
 import BacktestForm from '@/components/BacktestForm'
 import BacktestRunList from '@/components/BacktestRunList'
 import { useBacktests } from '@/hooks/useBacktests'
-import { useStrategies } from '@/hooks/useStrategies'
+import { strategyChoices, useStrategies } from '@/hooks/useStrategies'
 import { useSession } from '@/api/session'
 
 export default function Backtests() {
@@ -50,6 +54,9 @@ export default function Backtests() {
   const strategies = useStrategies('')
   const query = useBacktests(strategyFilter)
 
+  // Both selects on this page name a strategy, so both read one list: the
+  // stored rows and the registered classes, keyed on what the server resolves.
+  const choices = strategyChoices(strategies.data)
   const runs = query.data?.runs ?? []
   const openRun = runs.find((run) => run.id === openRunId) ?? null
 
@@ -61,9 +68,8 @@ export default function Backtests() {
   return (
     <div className="space-y-4">
       <BacktestForm
-        runnable={strategies.data?.strategies ?? []}
+        choices={choices}
         available={strategies.data?.available ?? []}
-        neverRun={strategies.data?.never_run ?? []}
         mayAct={mayAct}
       />
 
@@ -96,9 +102,9 @@ export default function Backtests() {
               className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-300"
             >
               <option value="">Every strategy</option>
-              {(strategies.data?.strategies ?? []).map((strategy) => (
-                <option key={strategy.id} value={strategy.id}>
-                  {strategy.name}
+              {choices.map((choice) => (
+                <option key={choice.id} value={choice.id}>
+                  {choice.name}
                 </option>
               ))}
             </select>

@@ -25,16 +25,23 @@ hard-coded `None`. So the run side landed before the authoring side, and the
 platform's whole declarative half was reachable only by writing SQL by hand.
 `NewStrategy` is the write type that closes it (`strategy/ports.py`).
 
-Creating a **coded** strategy's row is the smaller half and still worth having:
-that row is the foreign key `backtest_runs.strategy_id` needs, so its absence is
-the 409 `POST /backtests` answers on a clean database — the one that made
-queueing a backtest require configuring a *trading* worker first.
+Creating a **coded** strategy's row is the smaller half and is now the smaller
+half in a second sense: that row is the foreign key `backtest_runs.strategy_id`
+needs, and its absence used to be the 409 `POST /backtests` answered on a clean
+database — the one that made queueing a backtest require configuring a *trading*
+worker first. That endpoint writes the row itself now, so creating a coded
+strategy here is for putting a *description*, a universe and non-default params
+on the record before anything runs, rather than for unblocking a backtest.
 
 **What the reads answer, that nothing else does.** Two questions, and the second
 is the one worth building for:
 
-- Which strategies has a worker actually run? That is the `strategies` table,
-  written by `StrategyRepository.ensure` at every session open.
+- Which strategies are stored? That is the `strategies` table — written by
+  `StrategyRepository.ensure` at every session open, by the create below, by
+  `scripts/seed.py`, and by `POST /backtests` for a registered class it is
+  queueing the first run of. A worker's boot is only the first of the four, so
+  a row is no longer evidence that anything has *run* the strategy; the absence
+  of one still means nothing has.
 - Which strategy classes exist in the code but have *never* run? That is the
   registry minus the table, and it is invisible everywhere else. `WORKER_STRATEGY`
   is empty by default, so "I wrote a strategy and nothing is happening" is the
@@ -217,8 +224,18 @@ class AvailableStrategyView(BaseModel):
     #: JSON Schema for `params`. Served because it is the class's own statement
     #: of what it can be configured with; nothing renders a form from it yet.
     params_schema: dict[str, Any] = Field(default_factory=dict)
-    #: True when a worker has registered a row for this name. False means the
-    #: class exists and nothing has ever loaded it.
+    #: True when a `strategies` row exists for this name — written by a worker
+    #: at a session open, by `POST /strategies`, by `scripts/seed.py`, or by the
+    #: first backtest queued for the class. False is the sharper half and the
+    #: reason this field exists: the class is in the code and nothing has ever
+    #: stored it, which is the ordinary state of a fresh install.
+    #:
+    #: Named for the question it used to answer exactly — "has a worker run
+    #: this?" — which it stopped answering when a queued backtest began writing
+    #: the row a run's foreign key needs. Kept rather than renamed, because the
+    #: name is in the generated client types and the field's *useful* direction
+    #: is unchanged; the dashboard labels a true as "stored" rather than as a
+    #: worker having run anything.
     has_run: bool
 
 
@@ -595,9 +612,10 @@ async def create_strategy(
             status_code=http_status.HTTP_409_CONFLICT,
             detail=(
                 f"a strategy named {new.name!r} is already stored. A worker writes a "
-                "row the first time it loads a strategy and `scripts/seed.py` writes "
-                "one per registered class, so the name may be taken by something you "
-                "did not create — see the Strategies tab"
+                "row the first time it loads a strategy, `scripts/seed.py` writes one "
+                "per registered class, and queueing a backtest writes one for the "
+                "class it runs — so the name may be taken by something you did not "
+                "create — see the Strategies tab"
             ),
         ) from exc
 

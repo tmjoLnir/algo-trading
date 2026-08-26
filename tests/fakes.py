@@ -535,6 +535,11 @@ class FakeStrategyRepository:
         #: runner must fail warmup rather than continue into an evaluation whose
         #: every write would be refused by a foreign key.
         self.ensure_error: Exception | None = None
+        #: Set by a test to stand for a row that appeared between a caller's read
+        #: and its write — a worker booting, or a second request for the same
+        #: strategy. `rows` alone cannot express it: a row this fake can see is
+        #: one `get_stored` would already have returned.
+        self.create_error: Exception | None = None
 
     async def create(self, new: NewStrategy) -> StoredStrategy:
         """Append to `rows`, refusing a name that is already there.
@@ -548,6 +553,8 @@ class FakeStrategyRepository:
         Both timestamps are `created_at`, which is what the adapter writes and
         what a row nobody has started looks like.
         """
+        if self.create_error is not None:
+            raise self.create_error
         if any(row.id == new.id or row.name == new.name for row in self.rows):
             raise StrategyExistsError(f"a strategy named {new.name!r} is already stored")
         self.create_calls.append(new.id)

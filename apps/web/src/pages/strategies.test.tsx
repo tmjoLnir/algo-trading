@@ -141,7 +141,7 @@ describe('a strategy nothing has run', () => {
     stub(200, response())
     renderPage()
 
-    await screen.findByText('Strategies a worker has run')
+    await screen.findByText('Stored strategies')
     expect(screen.queryByText(/never been run by a worker/)).toBeNull()
   })
 
@@ -167,7 +167,7 @@ describe('an empty table', () => {
     stub(200, response({ strategies: [], never_run: ['sma_crossover'] }))
     renderPage()
 
-    expect(await screen.findByText(/No worker has registered a strategy yet/)).toBeTruthy()
+    expect(await screen.findByText(/No strategy has been stored yet/)).toBeTruthy()
     expect(
       screen.getByText(/an empty one means nothing has run, not that nothing exists/),
     ).toBeTruthy()
@@ -257,7 +257,7 @@ describe('the page', () => {
   it('asks for every state by default', async () => {
     const fetchMock = stub(200, response())
     renderPage()
-    await screen.findByText('Strategies a worker has run')
+    await screen.findByText('Stored strategies')
 
     const url = String(fetchMock.mock.calls[0]?.[0])
     expect(url).not.toContain('state=')

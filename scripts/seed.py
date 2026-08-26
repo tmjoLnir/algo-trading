@@ -4,13 +4,20 @@ little synthetic bar history so the dashboard has something to render.
 
     uv run python scripts/seed.py          # or: make seed
 
-**The strategy rows are the point.** `backtest_runs.strategy_id` is a foreign
-key onto `strategies`, and until now the only thing that ever wrote that table
-was `StrategyRunner.warmup` at a live session open. So on a clean database the
-Backtests tab offered nothing to run and `POST /api/v1/backtests` answered 409 —
-which made queueing a backtest require configuring a *trading* worker with
+**The strategy rows were the point.** `backtest_runs.strategy_id` is a foreign
+key onto `strategies`, and for a long time the only thing that ever wrote that
+table was `StrategyRunner.warmup` at a live session open. So on a clean database
+the Backtests tab offered nothing to run and `POST /api/v1/backtests` answered
+409 — which made queueing a backtest require configuring a *trading* worker with
 broker credentials first. A backtest needs stored bars and nothing else, and
-this is what closes that gap.
+this is what closed that gap.
+
+`POST /api/v1/backtests` now writes the same row itself for any registered class
+it is queueing the first run of, so this half of the seed is no longer what
+stands between a clean database and a backtest. It is still worth writing: the
+Strategies tab has stored rows to show without anything having run, and the rows
+are here before the bars rather than as a side effect of using the app. The bars
+are what a development database cannot get anywhere else.
 
 The bars are a convenience beside it, and they are **fabricated** — a driftless
 random walk written under NASDAQ's reserved test tickers, never under a real

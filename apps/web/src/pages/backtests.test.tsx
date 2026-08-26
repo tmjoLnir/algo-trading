@@ -23,9 +23,12 @@ import type {
  * 2. **A caveat travels with the result.** A number a reader has already seen is a
  *    number they have already believed, so the server's warnings are rendered
  *    above the metrics, not below them.
- * 3. **A strategy no worker has run cannot be queued**, because
- *    `backtest_runs.strategy_id` is a foreign key onto a table a worker writes —
- *    and offering it would produce a 409 for a choice this screen invited.
+ * 3. **Every strategy the platform has is offered**, whether a worker has run it
+ *    or not. `backtest_runs.strategy_id` is a foreign key onto a table a worker
+ *    writes, which used to mean this picker listed only what had already been
+ *    through one — an accident of deployment, on the screen whose subject is
+ *    comparing strategies. The API writes that row when it queues the first run,
+ *    so the picker is the union of the stored rows and the registered classes.
  * 4. **A refusal is shown verbatim.** The API's 400 for missing history names the
  *    exact `backfill_bars.py` command; paraphrasing it would turn the one
  *    actionable message on this screen into a dead end.
@@ -175,6 +178,11 @@ function stubRoutes(
  */
 async function openRun(day = '2024-01-01') {
   fireEvent.click(await screen.findByText(day))
+}
+
+/** The labels a `<select>` offers, in order. */
+function optionsOf(select: HTMLElement) {
+  return [...select.querySelectorAll('option')].map((option) => option.textContent)
 }
 
 function renderPage() {
@@ -605,38 +613,111 @@ describe('the form', () => {
     expect(body.strategy_id).toBe('donchian')
   })
 
-  it('offers only strategies a worker has run', async () => {
-    // `backtest_runs.strategy_id` is a foreign key onto a table a worker writes,
-    // so offering an unrun class would invite a 409.
-    stubRoutes({
+  it('offers a registered class no worker has run, and queues it', async () => {
+    // The defect this replaces: the picker was built from the `strategies`
+    // table alone, so it listed whichever strategies had happened through a
+    // *trading* worker or the seed script — usually one — on the screen whose
+    // whole subject is comparing strategies. `POST /backtests` writes the row a
+    // run needs when it queues the first one, so a class the code registers is
+    // offered and runnable before anything has ever loaded it.
+    const fetchMock = stubRoutes({
       ...baseRoutes(),
       'GET /strategies': {
         body: {
           strategies: [],
           available: [
             {
-              name: 'sma_crossover',
-              class_name: 'SmaCrossover',
+              name: 'buy_and_hold',
+              class_name: 'BuyAndHold',
               description: '',
               params_schema: {},
               has_run: false,
             },
           ],
-          never_run: ['sma_crossover'],
+          never_run: ['buy_and_hold'],
+        },
+      },
+      'GET /backtests': { body: list([]) },
+      'POST /backtests': { body: run({ status: 'queued' }) },
+    })
+    renderPage()
+
+    const picker = await screen.findByLabelText('Strategy')
+    expect(optionsOf(picker)).toEqual(['buy_and_hold'])
+    // Said beside the control rather than in place of it: that a worker has
+    // never loaded this strategy is worth knowing before reading a result, and
+    // is not a reason it cannot be run.
+    expect(screen.getByText(/BuyAndHold · no worker has run this yet/)).toBeTruthy()
+
+    fireEvent.change(await screen.findByPlaceholderText('SPY'), { target: { value: 'SPY' } })
+    fireEvent.click(screen.getByText('Queue backtest'))
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some((call) => call[1]?.method === 'POST')).toBe(true),
+    )
+    const post = fetchMock.mock.calls.find((call) => call[1]?.method === 'POST')
+    expect(JSON.parse(String(post?.[1]?.body)).strategy_id).toBe('buy_and_hold')
+  })
+
+  it('names a strategy once when it is in both halves of the response', async () => {
+    // A stored row and a registered class are the same strategy seen from two
+    // sides — `available[].has_run` is exactly that join — so a union that
+    // offered both would ask somebody to choose between one strategy and
+    // itself. The stored row wins: it carries the id a run must point at.
+    stubRoutes({
+      ...baseRoutes(),
+      'GET /strategies': {
+        body: {
+          strategies: [STRATEGY],
+          available: [
+            {
+              name: 'sma_crossover',
+              class_name: 'SmaCrossover',
+              description: '',
+              params_schema: {},
+              has_run: true,
+            },
+            {
+              name: 'buy_and_hold',
+              class_name: 'BuyAndHold',
+              description: '',
+              params_schema: {},
+              has_run: false,
+            },
+          ],
+          never_run: ['buy_and_hold'],
         },
       },
       'GET /backtests': { body: list([]) },
     })
     renderPage()
 
-    expect(await screen.findByText(/No strategy can be backtested yet/)).toBeTruthy()
-    // And it says what to do about it, rather than leaving a disabled form:
-    // the class exists, so the fix is to give a worker the strategy once.
-    // Awaited, not `getByText`: before the strategies query resolves the panel
-    // renders its generic sentence, which contains the same word inside a longer
-    // string. The `<code>` element only appears once the never-run list arrives.
-    expect(await screen.findByText('WORKER_STRATEGY')).toBeTruthy()
-    expect(screen.getByText('sma_crossover')).toBeTruthy()
+    expect(optionsOf(await screen.findByLabelText('Strategy'))).toEqual([
+      'buy_and_hold',
+      'sma_crossover',
+    ])
+    // And the filter over the runs reads the same list, so a strategy queued
+    // from the form can be filtered to afterwards.
+    expect(optionsOf(screen.getByLabelText('Filter by strategy'))).toEqual([
+      'Every strategy',
+      'buy_and_hold',
+      'sma_crossover',
+    ])
+  })
+
+  it('says there is nothing to run only when both halves are empty', async () => {
+    // Which is now a different sentence from "nothing has been run": a
+    // registered class needs no row to be offered, so an empty picker means the
+    // code registers nothing *and* the table holds nothing.
+    stubRoutes({
+      ...baseRoutes(),
+      'GET /strategies': { body: { strategies: [], available: [], never_run: [] } },
+      'GET /backtests': { body: list([]) },
+    })
+    renderPage()
+
+    expect(await screen.findByText(/No strategy to backtest/)).toBeTruthy()
+    expect(screen.getByText(/every strategy class the code registers/)).toBeTruthy()
   })
 
   it('shows the API refusal verbatim, including the backfill command', async () => {
