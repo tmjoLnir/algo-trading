@@ -184,11 +184,18 @@ separately from the tab's own refresh.
 
 **Outstanding**
 
-- No position actions. `GET /positions/{symbol}`, `POST /{symbol}/close` and
-  `PATCH /{symbol}/stop` are all stubs (`positions.py:133,139,153`), so closing
-  a position or moving a stop is a broker-UI action today.
-- No flatten-all. `/risk/flatten-all` is stubbed (`risk.py:127`);
-  `docs/RUNBOOK.md` sends you to the broker's own UI.
+- No position actions **on the screen**. `POST /{symbol}/close` is built and
+  goes through the risk chain, but nothing renders a control for it, so closing
+  a position is a `curl` or a broker-UI action today. `GET /positions/{symbol}`
+  and `PATCH /{symbol}/stop` are still stubs (`positions.py`), the second
+  deliberately: replacing a stop is two orders, and a half-built version leaves
+  positions unprotected in a way the operator cannot see.
+- Flatten-all is built, and still has no control. `/risk/flatten-all` cancels
+  resting orders and closes the book, behind the confirmation phrase and a
+  step-up password; `docs/RUNBOOK.md` carries the `curl`. A button for it is a
+  deliberate open question rather than an oversight — the one control on the
+  dashboard today is HALT, and putting an irreversible liquidation next to it is
+  a design decision nobody has made.
 
 ## 5. Orders — `/orders`
 
@@ -227,9 +234,16 @@ blank, the same admission `purpose` makes on rows that predate its own column.
 
 **Outstanding**
 
-- Read-only. `POST /orders`, `DELETE /orders/{id}` and `POST /orders/cancel-all`
-  are stubs (`orders.py:213,218,223`) — no manual order, no cancel from the UI.
-  `ManualOrderRequest` is in the OpenAPI document with nothing serving it.
+- Read-only **on the screen**. `DELETE /orders/{id}` and
+  `POST /orders/cancel-all` are built — cancelling withdraws intent and consults
+  no risk rule, which is why they landed ahead of `POST /orders` — but the table
+  renders no control for either, so a cancel is a `curl` today.
+- `POST /orders` is still a stub, and `ManualOrderRequest` is still in the
+  OpenAPI document with nothing serving it. The wiring is no longer what is
+  missing: `atp_api.execution` assembles the router and
+  `POST /positions/{symbol}/close` places orders through it. What is missing is
+  a manual order's own decisions — what a hand-typed quantity is sized against,
+  and what a stop attached to it means when no strategy owns the position.
 
 ## 6. Analytics — `/analytics`
 
@@ -252,17 +266,20 @@ labelled as such.
 
 ## 7. Audit — `/audit`
 
-**The screen is very nearly the finding.** The audit trail records seven verbs:
-five about who was signed in — `login`, `login_failed`, `logout`,
-`rate_limited`, `forbidden` — and two about the book, `halt_engaged` (#70) and
-`halt_cleared` (#75), each of which arrived with the endpoint that emits it.
-Nothing else is recorded, because the class docstring's rule is that a constant
-for an event nothing emits is a claim the record does not support, and the
-remaining handlers are still stubs.
+**The screen was very nearly the finding.** The audit trail records eleven
+verbs: five about who was signed in — `login`, `login_failed`, `logout`,
+`rate_limited`, `forbidden` — two about the kill switch, `halt_engaged` (#70)
+and `halt_cleared` (#75), one about authoring, `strategy_created`, and three
+about closing out: `order_cancelled`, `position_closed` and `flatten_all`. Each
+arrived with the endpoint that emits it, because the class docstring's rule is
+that a constant for an event nothing emits is a claim the record does not
+support. `POST /orders` and strategy promotion are still stubs, so there is
+still no verb for either.
 
-So the tab is a sign-in log with the kill switch's two events in it. "Who
-stopped trading" and "who started it again" are both answerable — and only for
-the API's own halts: `scripts/halt.py` has no session to attribute a row to, and
+So the tab is a sign-in log with the kill switch's two events and the close-out
+verbs in it. "Who stopped trading", "who started it again" and "who liquidated
+the book" are all answerable — and only for the API's own actions:
+`scripts/halt.py` has no session to attribute a row to, and
 the automated triggers inside the risk layer announce themselves through alerts
 and logs instead. An absent row means "not halted *from the dashboard*", never
 "not halted". "Who promoted this strategy to live" and "which order did we send
@@ -315,9 +332,11 @@ the record.
 | `/dashboard/live`, `/equity-curve` | built | Dashboard |
 | `/dashboard/health` | **stub** | none (unused) |
 | `/positions` | built | Positions |
-| `/positions/{symbol}`, `/close`, `/stop` | **stub** | none |
+| `/positions/{symbol}/close` | built | none |
+| `/positions/{symbol}`, `/{symbol}/stop` | **stub** | none |
 | `/orders` (GET) | built | Orders |
-| `/orders` (POST), `/{id}` (DELETE), `/cancel-all` | **stub** | none |
+| `/orders/{id}` (DELETE), `/cancel-all` | built | none |
+| `/orders` (POST) | **stub** | none |
 | `/strategies` (GET) | built | Strategies |
 | `/strategies` (POST) | built | none — no authoring form yet |
 | `/strategies` other writes, `/available`, `/{id}` | **stub** | none |
@@ -332,17 +351,21 @@ the record.
 | `/risk/resume` | built (#75) | Halt banner |
 | `/risk/limits`, `/risk/status` | built (#75) | Strategies |
 | `/risk/rejections` | built (#77) | Strategies |
-| `/risk/flatten-all` | **stub** | none |
+| `/risk/flatten-all` | built | none |
 
 ## Cross-cutting
 
 - **Two live write paths, and they are the same one.** Of four mutations in the
   whole app — halt, resume, queue a backtest, log in/out — only the kill switch
-  touches trading, and now in both directions (#70, #75). The point still
-  standing is how narrow the surface is: nothing in the app can place an order,
-  close a position, or move a stop. What the app *reads* about risk is no longer
-  narrow, which is the asymmetry to keep in mind — the limits panel will show a
-  breach it offers no control to act on beyond halting.
+  touches trading, and now in both directions (#70, #75). That is a statement
+  about the *app*, and it still holds: nothing the browser renders can place an
+  order, close a position, or move a stop.
+
+  It is no longer a statement about the *API*. Closing one position, cancelling
+  orders and flattening the book are all built and all reachable by `curl`, so
+  the asymmetry has moved rather than gone: the limits panel shows a breach it
+  offers no control to act on beyond halting, while the controls that would act
+  on it exist one layer down with no screen in front of them.
 - **One built endpoint has no reader** (`market-data/calendar`), and has been
   reader-less for phases. `live-vs-backtest` was the other and now has the
   Analytics tab's fourth panel. `/risk/limits` is a
