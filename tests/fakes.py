@@ -24,8 +24,22 @@ from typing import TYPE_CHECKING
 
 from atp_core.brokers.ports import AccountSnapshot
 from atp_core.clock import SimulatedClock
-from atp_core.domain import Fill, Order, OrderStatus, OrderType, Portfolio, Position, StrategyState
-from atp_core.errors import BrokerConnectionError, OrderRejectedError, StrategyExistsError
+from atp_core.domain import (
+    Fill,
+    Order,
+    OrderStatus,
+    OrderType,
+    Portfolio,
+    Position,
+    Side,
+    StrategyState,
+)
+from atp_core.errors import (
+    BrokerConnectionError,
+    BrokerError,
+    OrderRejectedError,
+    StrategyExistsError,
+)
 from atp_core.execution.ports import StoredBook
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
 from atp_core.strategy.ports import StoredStrategy
@@ -36,7 +50,7 @@ if TYPE_CHECKING:
     from atp_core.audit.ports import AuditEntry
     from atp_core.backtest.ports import BacktestProgress, StoredBacktestRun
     from atp_core.dashboard.snapshot import LiveSnapshot
-    from atp_core.domain import Side, Signal
+    from atp_core.domain import Signal
     from atp_core.execution.ports import EquityPoint
     from atp_core.strategy.ports import NewStrategy, SignalOutcome, StrategyRecord
 
@@ -52,6 +66,11 @@ class FakeBroker:
         self.accepted: dict[str, Order] = {}
         self.positions: dict[str, Position] = {}
         self.cancelled: list[str] = []
+        #: Symbols passed to `close_position`, and `"*"` for each
+        #: `close_all_positions`. Empty is the assertion an `OrderRouter`
+        #: test makes: ADR 0005's bypass is these two methods, and no
+        #: automated path may reach them.
+        self.close_calls: list[str] = []
         self.submit_calls: list[str] = []
         self.market_open = True
 
@@ -65,6 +84,13 @@ class FakeBroker:
         self.accept_on_timeout = False
         #: Reads fail too — an adapter cannot look up what it cannot reach.
         self.reads_fail = False
+        #: Symbols an emergency flatten fails to close, standing in for the
+        #: non-200 entries in Alpaca's 207 response.
+        self.flatten_fails: list[str] = []
+        #: Venue order ids whose cancel is refused. Distinct from
+        #: `reads_fail`: the lookup succeeds and the retraction does not,
+        #: which is the case where an order is known to still be working.
+        self.cancel_refuses: set[str] = set()
 
         self._next_id = 0
 
@@ -113,6 +139,8 @@ class FakeBroker:
 
     async def cancel_order(self, broker_order_id: str) -> None:
         self._guard_reads()
+        if broker_order_id in self.cancel_refuses:
+            raise BrokerError(f"fake broker refused to cancel {broker_order_id}")
         self.cancelled.append(broker_order_id)
         for held in self.accepted.values():
             if held.broker_order_id == broker_order_id and not held.is_complete:
@@ -133,10 +161,57 @@ class FakeBroker:
         return [p for p in self.positions.values() if not p.is_flat]
 
     async def close_position(self, symbol: str) -> Order:
-        raise NotImplementedError("the router flattens through submit(), never through here")
+        """The venue closing a position on its own, around our book.
+
+        Both this and `close_all_positions` used to raise, to catch an
+        `OrderRouter` reaching the venue without passing `validate()`. They are
+        implemented now because the path ADR 0005 carves out for them exists —
+        `POST /api/v1/risk/flatten-all` — and a fake that refuses it cannot test
+        it. The guard did not go away: it moved into `close_calls`, which the
+        router's own tests assert stays empty, so the bypass is now something a
+        test states rather than something a fake booby-traps.
+        """
+        self._guard_reads()
+        self.close_calls.append(symbol)
+        position = self.positions.get(symbol)
+        if position is None or position.is_flat:
+            raise BrokerError(f"fake broker had no position in {symbol} to close")
+        return self._close(position)
 
     async def close_all_positions(self) -> list[Order]:
-        raise NotImplementedError("emergency flatten is a runbook path, not a router path")
+        """Emergency flatten, with the venue's own ordering.
+
+        Cancels resting orders first, as Alpaca's `cancel_orders=true` does and
+        for its reason: a stop left working against a position that no longer
+        exists opens the other side the moment it fires.
+
+        `flatten_fails` stands in for Alpaca's 207 — a per-symbol status array
+        where some symbols did not close. The adapter raises rather than
+        returning a shorter list, because a flatten that silently left one
+        position open is the worst outcome this call has.
+        """
+        self._guard_reads()
+        self.close_calls.append("*")
+        for order in list(self.accepted.values()):
+            if not order.is_complete and order.broker_order_id is not None:
+                await self.cancel_order(order.broker_order_id)
+        if self.flatten_fails:
+            raise BrokerError(f"fake broker could not flatten {', '.join(self.flatten_fails)}")
+        return [self._close(p) for p in list(self.positions.values()) if not p.is_flat]
+
+    def _close(self, position: Position) -> Order:
+        """The order the venue reports for a position it closed itself."""
+        qty = abs(position.qty)
+        order = Order(
+            symbol=position.symbol,
+            side=Side.SELL if position.qty > 0 else Side.BUY,
+            qty=qty,
+            order_type=OrderType.MARKET,
+            purpose="flatten",
+        )
+        self._accept(order)
+        self.positions.pop(position.symbol, None)
+        return order
 
     async def is_market_open(self) -> bool:
         self._guard_reads()

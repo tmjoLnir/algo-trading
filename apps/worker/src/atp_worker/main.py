@@ -51,7 +51,7 @@ from atp_core.persistence.strategies import PostgresStrategyRepository
 from atp_core.risk.killswitch import HaltReason, HaltScope, RedisKillSwitch
 from atp_worker import trading
 from atp_worker.metrics_server import start_metrics_server
-from atp_worker.scheduler import run_scheduler
+from atp_worker.scheduler import SessionJobs, build_schedule, run_scheduler
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine, Mapping
@@ -154,7 +154,11 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
         publisher = RedisEventPublisher(redis)
         snapshot_store = RedisSnapshotStore(redis)
 
-        responsibilities: dict[str, Responsibility] = {"scheduler": run_scheduler}
+        responsibilities: dict[str, Responsibility] = {}
+        #: Bound after the trading decision below, because what the scheduler
+        #: runs depends on it: reconciliation needs the runner's live book, and
+        #: a worker that is not trading has none.
+        session_jobs: SessionJobs | None = None
 
         if symbols:
             ingestor = StreamIngestor(
@@ -215,6 +219,17 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
             # Positions are left open with their broker-side stops intact, which
             # is what makes a deploy a restart rather than a liquidation.
             stack.push_async_callback(runner.shutdown)
+
+            # `runner.open_orders` rather than a snapshot of it: the five-minute
+            # check must ask what is working *now*, or every order placed since
+            # the wiring would reconcile as an orphan.
+            session_jobs = SessionJobs(
+                reconciler=reconciler,
+                portfolio=portfolio,
+                open_orders=lambda: runner.open_orders,
+            )
+
+        responsibilities["scheduler"] = lambda: run_scheduler(schedule=build_schedule(session_jobs))
 
         if decision.enabled and settings.is_live:
             log.critical("worker.trading_live", msg=decision.reason)

@@ -543,9 +543,20 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   `DATA_FEED_LOST` is wired from the stream consumer and `BROKER_UNREACHABLE`
   from the order router (#33), leaving the daily loss limit, reconciliation
   mismatch, rate-limit storm and repeated unhandled exceptions to the runner and
-  the reconciler. `RISK.md`'s `flatten_all_positions` remains a stub,
-  deliberately separate because halting stops new risk while flattening realises
-  P&L into a market you may not be able to see.
+  the reconciler. Reconciliation mismatch is wired as of the reconciliation item
+  in Phase 4 — the 5-minute job now exists and engages through the reconciler —
+  leaving three.
+
+  `RISK.md`'s `flatten_all_positions` is **no longer a stub and no longer a
+  function**. The act it described exists as `POST /api/v1/risk/flatten-all`,
+  which is where ADR 0005 puts it: the carve-out that ADR defends is a *human*
+  calling `BrokerPort.close_all_positions()` behind a typed confirmation, a
+  step-up password and an audit row, and it ends "no automated path may call
+  either method". A module-level function in the risk layer is reachable by
+  every automated path there is. What kept it separate from `engage()` is
+  unchanged and still true — halting stops new risk, flattening realises P&L
+  into a market you may not be able to see — which is why the endpoint reports
+  whether the platform was halted when it ran rather than assuming it was.
 
   **The operator path was its own gap and this file did not name it.** This item
   built the mechanism and Phase 5 built the screen; nobody owned the wire
@@ -558,6 +569,20 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   that point — `/risk/resume` was a stub wanting a step-up password no screen
   asked for. It is built now (#75), with the same caveat and for the same
   reason: fakes and an ASGI transport, never a real Redis from a real browser.
+
+  **The same gap held the close-out path, and this file did not name that
+  either.** `POST /risk/flatten-all` authenticated, demanded the confirmation
+  phrase and the step-up password, and then raised — so the runbook's "Emergency
+  flatten" sent an operator at an endpoint that could not flatten anything, and
+  said nothing about it. docs/FIRST_PAPER_RUN.md was the only document honest
+  about it. Closed now, together with `POST /positions/{symbol}/close`,
+  `DELETE /orders/{id}` and `POST /orders/cancel-all`, and the split between
+  them is ADR 0005's: the three ordinary ones go through `OrderRouter` and can
+  be refused by a rule, and only `/flatten-all` reaches the venue around the
+  chain. Both operator documents now describe what the endpoints actually do,
+  including that a refused close is a `200` an operator has to read. Same
+  caveat as the halt path above and for the same reason: fakes and an ASGI
+  transport, never a real venue.
 
   **The read half followed in the same PR.** `/risk/limits` serves the
   configured ceilings from config alone — no store, so it answers during the
@@ -838,24 +863,33 @@ above.
   it — which is the honest state, and why docs/RUNBOOK.md has the operator
   reconcile *before* clearing the halt.
 
-  Unticked, and the blocker is worth stating precisely because it is not the
-  usual one. `scheduler.reconcile_with_broker` is already on the 5-minute
-  schedule layer 7 asks for and stays a `NotImplementedError` stub: it can
-  build a broker and a kill switch from settings, but it has nothing to
-  *compare them against*. That is now a wiring gap rather than a missing
-  component: #44 gives `PositionSnapshotRow` a reader, so a scheduled job could
-  load the last snapshot — but a snapshot is not the live book, and reconciling
-  the venue against a minute-old copy would report every fill in between as a
-  mismatch. It needs the runner's own portfolio, which means the runner
-  handing it over rather than the scheduler fetching it. Reconciling against an
-  empty portfolio would report every real position as `missing_position` and
-  halt on the first run, so the job is left honestly unbuilt; the scheduler
-  already treats a stub as unbuilt rather than failed.
+  **The schedule is wired now**, and it was the last structural gap in layer 7.
+  This module's own docstring has always said reconciliation runs "at startup,
+  on a schedule, and after any reconnect"; two of those three were built — the
+  runner reconciles in `warmup`, and `trading.consume_trade_updates` does it
+  again whenever the trade-updates socket returns — and the middle one was a
+  `NotImplementedError` stub. Between a clean start and the next reconnect,
+  nothing checked the book at all, which is precisely the failure mode
+  docs/SAFETY.md names for this layer: "reconciliation itself is not running".
 
-  #39 builds the `StrategyRunner` that owns a live `Portfolio` and the set of
-  orders we believe are working, so the missing half now exists as an object —
-  but nothing constructs one in the worker yet, so the scheduled job still has
-  nothing to reach for.
+  The blocker was never a missing component; it was that the job had nothing to
+  *compare against*. A snapshot loaded from Postgres is not the live book, and
+  reconciling the venue against a minute-old copy reports every fill in between
+  as a mismatch — a halt caused by reading rather than by drift. It needed the
+  runner's own portfolio, handed over rather than fetched. That is
+  `scheduler.SessionJobs`: the runner's `Portfolio` by reference, and
+  `open_orders` as a *callable* so each run asks what is working now rather than
+  reporting every order placed since the wiring as an orphan. `build_schedule`
+  adds the entry only when this worker is actually trading, so a worker with no
+  strategy configured no longer carries a job that would fail every five minutes
+  for want of a book.
+
+  Still unticked, and this does not change why: Phase 4 has no line short of the
+  paper week, and nothing here has met a real venue. What a mismatch does when
+  it finds one is now pinned by tests over the real `Reconciler` — a divergence
+  halts, and it halts without raising, because a job that reported its own
+  success as a failure would put a traceback in the log every five minutes for
+  as long as the halt stood.
 - [ ] Declarative rule sets compile and run — @claude (wip #93).
   `compile_ruleset` and `RuleSet.required_warmup` were the two
   `NotImplementedError` stubs standing between a fully specified, fully
@@ -1275,8 +1309,10 @@ FIRST_PAPER_RUN.md's "how to stop" said the dashboard HALT button did not exist
 and `/risk/halt` raised `NotImplementedError` — both closed in #70 and #75, so
 an operator reading it under pressure believed they had one stopping mechanism
 when they had two. `status.py` said there was no order or position repository
-(#44). `/risk/flatten-all` really is still a stub and the text now says exactly
-how far it gets before raising.
+(#44). `/risk/flatten-all` really was still a stub at that point, and the text
+was corrected to say exactly how far it got before raising — the honest state
+then. It is built now (see the kill-switch item in Phase 3), and both operator
+documents were corrected again in the same diff that built it.
 
 And one real defect, found by running the new script: `ALERT_NTFY_TOPIC`,
 `ALERT_NTFY_TOKEN` and `ALERT_TELEGRAM_TOKEN` were plain `str` while every other

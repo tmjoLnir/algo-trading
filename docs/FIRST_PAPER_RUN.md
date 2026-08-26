@@ -50,11 +50,13 @@ shutdown: it does *not* halt, and it deliberately leaves positions open with
 their broker-side stops intact, because liquidating on every restart would turn
 a deploy into a taxable event.
 
-**3. Flatten** — there is still no operator path for this.
-`/api/v1/risk/flatten-all` authenticates, demands the confirmation phrase and a
-step-up password, and then raises `NotImplementedError`; the dashboard has no
-control for it. Use Alpaca's own web UI. Halting is not flattening: halting
-stops new risk, flattening realises P&L into whatever the market is offering.
+**3. Flatten** — `POST /api/v1/risk/flatten-all`, with the confirmation phrase
+and the step-up password. It cancels resting orders and closes every position at
+the venue. Halt first: this does not halt, and the runner can re-enter within a
+tick. Halting is not flattening — halting stops new risk, flattening realises
+P&L into whatever the market is offering. The dashboard still has no control for
+it, so this is a `curl` (docs/RUNBOOK.md 'Emergency flatten' has the command)
+and Alpaca's own web UI remains the path that works when this platform does not.
 
 Layer 8 of `SAFETY.md` applies here and is outside this codebase: **set position
 and loss limits in Alpaca's own controls too.** They are the only limits that

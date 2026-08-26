@@ -19,6 +19,7 @@ from atp_api.auth import authenticate
 from atp_api.deps import (
     CurrentUser,
     get_audit_sink,
+    get_broker,
     get_calendar,
     get_clock,
     get_kill_switch,
@@ -28,11 +29,13 @@ from atp_api.deps import (
 )
 from atp_api.routers.dashboard import day_pnl_since_open
 from atp_core.audit.ports import Action, AuditEntry, AuditSink
+from atp_core.brokers import BrokerPort
 from atp_core.clock import Clock, TradingCalendar
 from atp_core.config import RiskLimits, Settings, get_settings
 from atp_core.dashboard import LiveSnapshot, SnapshotStore
 from atp_core.dashboard.snapshot import RATIO_PLACES
 from atp_core.domain import RunMode
+from atp_core.errors import ATPError
 from atp_core.execution.ports import PortfolioRepository
 from atp_core.logging import get_logger
 from atp_core.risk.killswitch import HaltReason, HaltScope, KillSwitch
@@ -172,6 +175,12 @@ class ResumedView(BaseModel):
     engaged_at: datetime | None = None
     engaged_by: str | None = None
     detail: str | None = None
+
+
+#: The phrase `POST /risk/flatten-all` will not act without. Long, upper-case
+#: and unguessable-by-accident on purpose: it is not a password, it is proof
+#: the caller has read what this does. docs/RUNBOOK.md quotes it verbatim.
+FLATTEN_CONFIRMATION = "FLATTEN ALL POSITIONS"
 
 
 class FlattenAllRequest(BaseModel):
@@ -873,6 +882,8 @@ async def flatten_all(
     settings: Annotated[Settings, Depends(get_settings)],
     audit: Annotated[AuditSink, Depends(get_audit_sink)],
     clock: Annotated[Clock, Depends(get_clock)],
+    broker: Annotated[BrokerPort, Depends(get_broker)],
+    kill_switch: Annotated[KillSwitch, Depends(get_kill_switch)],
 ) -> dict[str, object]:
     """Liquidate everything at market.
 
@@ -883,11 +894,120 @@ async def flatten_all(
     Both proofs, not either. The phrase shows the caller knows what this does;
     the password shows they are the person entitled to do it. A copied session
     cookie satisfies neither on its own.
+
+    **This is the one path in the platform that reaches a venue without passing
+    the risk chain**, and ADR 0005 names it as such rather than leaving it to be
+    discovered: `BrokerPort.close_all_positions()` is correct here precisely
+    because it does not build an `OrderRequest` from our book. This is the case
+    where our view of the book is the thing you have lost confidence in, so a
+    request derived from it is a request derived from the problem. Everything
+    else that closes a position — `POST /positions/{symbol}/close` included —
+    goes through `OrderRouter.flatten` and can be refused by a rule.
+
+    The venue cancels resting orders as part of the same call
+    (`cancel_orders=true`), which is not a detail to leave to the adapter's
+    docstring: flattening without it leaves a stop working against a position
+    that no longer exists, and it opens the other side the moment it fires.
+
+    A partial flatten is an error, not a success with a smaller number. Alpaca
+    answers 207 with a per-symbol status array, and the adapter raises if any
+    symbol came back non-200 — so a 502 here means *some positions may still be
+    open*, and says so.
     """
     await _require_step_up(
         payload.password, actor, settings, audit, clock, "/api/v1/risk/flatten-all"
     )
-    raise NotImplementedError
+    if payload.confirm != FLATTEN_CONFIRMATION:
+        # 400, not 403. The caller proved who they are a line ago; what they
+        # have not done is demonstrate they know what they are asking for.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"nothing was flattened: `confirm` must be exactly "
+                f"{FLATTEN_CONFIRMATION!r}. The book is untouched."
+            ),
+        )
+
+    # Not a precondition, and deliberately not enforced as one. ADR 0005
+    # describes this as "a human acting around a platform they have already
+    # halted", and an operator who has not halted is about to watch the runner
+    # re-enter within a tick. Refusing would be the wrong cure: the one moment
+    # this endpoint exists for is the one where an extra step is most expensive.
+    # So it is reported, loudly, and returned to the caller.
+    halted = await asyncio.to_thread(kill_switch.is_engaged)
+    if not halted:
+        log.critical(
+            "risk.flatten_all_while_trading",
+            actor=actor,
+            msg="flattening a platform that is not halted — the runner may re-enter",
+        )
+
+    try:
+        closed = await broker.close_all_positions()
+    except ATPError as exc:
+        # The adapter raises if *any* symbol came back non-200, so this covers
+        # a partial flatten as well as a total failure. Neither may be reported
+        # as success, and neither may be reported as "nothing happened".
+        log.critical(
+            "risk.flatten_all_failed",
+            actor=actor,
+            error=str(exc),
+            effect="one or more positions may still be open",
+        )
+        await audit.record(
+            AuditEntry(
+                at=clock.now(),
+                actor=actor,
+                action=Action.FLATTEN_ALL,
+                detail={"succeeded": False, "was_halted": halted, "error": str(exc)},
+            )
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"the flatten did not complete: {exc}. One or more positions may still "
+                "be open — read the book from the broker's own UI before retrying."
+            ),
+        ) from exc
+
+    # After the venue acted, never before. This is the one row in the platform
+    # recording an act that reached a venue without passing the risk chain, so
+    # it carries what was closed rather than only that something was.
+    await audit.record(
+        AuditEntry(
+            at=clock.now(),
+            actor=actor,
+            action=Action.FLATTEN_ALL,
+            detail={
+                "succeeded": True,
+                "was_halted": halted,
+                "positions_closed": len(closed),
+                "symbols": sorted({order.symbol for order in closed}),
+            },
+        )
+    )
+    log.critical(
+        "risk.flatten_all",
+        actor=actor,
+        positions_closed=len(closed),
+        symbols=sorted({order.symbol for order in closed}),
+        was_halted=halted,
+    )
+    return {
+        "flattened": True,
+        "positions_closed": len(closed),
+        "symbols": sorted({order.symbol for order in closed}),
+        "was_halted": halted,
+        "orders": [
+            {
+                "symbol": order.symbol,
+                "side": order.side.value,
+                "qty": str(order.qty),
+                "broker_order_id": order.broker_order_id,
+            }
+            for order in closed
+        ],
+    }
 
 
 class RejectionView(BaseModel):

@@ -81,17 +81,6 @@ def frozen_clock(utc_now: datetime):
 
 
 @pytest.fixture
-def sample_bars():
-    """Deterministic daily bars for one symbol.
-
-    TODO: build a fixture that deliberately includes a gap (a holiday), a 2:1
-    split, and one bar whose range spans both a stop and a target — the three
-    cases most engine bugs hide in.
-    """
-    raise NotImplementedError
-
-
-@pytest.fixture
 def fake_broker():
     """In-memory `BrokerPort` with controllable fills and failures.
 

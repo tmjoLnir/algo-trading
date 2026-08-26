@@ -1019,11 +1019,18 @@ class TestCancelAll:
 class TestFlatten:
     async def test_it_goes_through_the_risk_chain_not_around_it(self) -> None:
         """`BrokerPort.close_position` would reach the venue without passing
-        `validate()`, which is the bypass ADR 0005 exists to refuse. The fake
-        raises from it, so this test fails loudly if that path is ever taken."""
+        `validate()`, which is the bypass ADR 0005 exists to refuse.
+
+        `close_calls` is the assertion, and it is the point of this case rather
+        than a detail of it: the fake implements both close methods now, because
+        the one path ADR 0005 carves out for them — `POST /risk/flatten-all` —
+        is built and needs a fake that answers. So the bypass is caught here, by
+        name, instead of by the fake raising from under whoever took it.
+        """
         broker = FakeBroker()
         result = await router(broker, chain()).flatten("SPY", book(SPY=(100, 100)))
 
+        assert broker.close_calls == []
         assert result.submitted
         assert result.order is not None
         assert result.order.side is Side.SELL

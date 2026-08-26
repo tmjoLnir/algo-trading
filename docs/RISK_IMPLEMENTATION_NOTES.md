@@ -264,9 +264,17 @@ until Phase 4.
   and cannot be resolved against the venue — the case `RUNBOOK.md`'s "Broker unreachable →
   *Auto-halts. Confirm.*" describes. The general point stands for the remaining four
   (`DAILY_LOSS_LIMIT`, `RECONCILIATION_MISMATCH`, `RATE_LIMIT_STORM`, `UNHANDLED_EXCEPTION`):
-  each belongs to whichever subsystem detects it, and two of those subsystems —
-  reconciliation and the runner — are still stubs. `flatten_all_positions()` also remains a
-  stub, deliberately: it needs a broker, and halting is not flattening.
+  each belongs to whichever subsystem detects it. `RECONCILIATION_MISMATCH` is wired now:
+  `scheduler.reconcile_with_broker` runs the real `Reconciler` against the runner's live
+  book every five minutes during market hours, and the reconciler engages. That leaves
+  `DAILY_LOSS_LIMIT`, `RATE_LIMIT_STORM` and `UNHANDLED_EXCEPTION`, all of which belong to
+  the runner. `flatten_all_positions()` is **gone** rather than implemented: the act is
+  `POST /api/v1/risk/flatten-all`, behind a typed confirmation, a step-up password and an
+  audit row, because ADR 0005's carve-out is a human calling the broker directly and ends
+  "no automated path may call either method" — and a module-level function in this package
+  is reachable by every automated path there is. Halting is still not flattening, which is
+  why the endpoint is separate from `engage()` and reports whether the platform was halted
+  when it ran.
 - ~~**`StaleDataRule.max_age_seconds = 30`** is hardcoded on the dataclass~~ — **RESOLVED.**
   Moved to `RiskLimits.max_quote_age_seconds`, so it is configurable like every other limit.
 - ~~**`RiskDecision.adjusted_qty`** is specified but unreachable~~ — **RESOLVED.**

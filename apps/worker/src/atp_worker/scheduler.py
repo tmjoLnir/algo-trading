@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import timedelta
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from atp_core.clock import SystemClock, TradingCalendar
@@ -27,7 +28,8 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from atp_core.clock import Clock
-    from atp_core.domain import Timeframe
+    from atp_core.domain import Order, Portfolio, Timeframe
+    from atp_core.execution.reconciliation import Reconciler
 
 log = get_logger(__name__)
 
@@ -44,12 +46,73 @@ NIGHTLY_LOOKBACK_DAYS = 7
 NIGHTLY_REQUESTS_PER_MINUTE = 120
 
 
-async def reconcile_with_broker() -> None:
-    """Every 5 minutes during market hours, and at startup.
+@dataclass(frozen=True, slots=True)
+class SessionJobs:
+    """The live trading state a scheduled job needs, supplied by `main.py`.
 
-    Any mismatch halts trading — see `execution.reconciliation`.
+    `portfolio` is the runner's own object, held by reference rather than
+    copied. It is mutated in place as fills arrive, and a copy would be a book
+    that stopped being true the moment it was taken — which is the one kind of
+    staleness a reconciler must not have.
+
+    `open_orders` is a callable rather than a list for the same reason: what is
+    working at the venue changes between one five-minute check and the next, and
+    a list captured at wiring time would report every order placed since as an
+    orphan and halt on it.
     """
-    raise NotImplementedError
+
+    reconciler: Reconciler
+    portfolio: Portfolio
+    open_orders: Callable[[], list[Order]]
+
+
+async def reconcile_with_broker(session: SessionJobs) -> None:
+    """Every 5 minutes during market hours. Any mismatch halts trading.
+
+    `execution.reconciliation`'s own docstring says it runs "at startup, on a
+    schedule, and after any reconnect". Two of those three were built: the
+    runner reconciles in `warmup`, and `trading.consume_trade_updates` does it
+    again whenever the trade-updates socket comes back. **The schedule was
+    not**, so between a clean start and the next reconnect nothing checked the
+    book at all — and the drift this exists to catch (a stop that fired while
+    the socket was healthy, a corporate action, a fill the venue never pushed)
+    announces itself at neither of those moments. docs/SAFETY.md layer 7 names
+    its failure mode as "reconciliation itself is not running", which is what a
+    schedule with a hole in it is.
+
+    Session-bound rather than building its own dependencies like the nightly
+    sweep below, and it has to be. The book this must check is the **runner's
+    live portfolio** — the object orders are sized against — not a row read back
+    from Postgres. A reload would compare the venue against a snapshot written
+    up to a tick ago and report every fill in between as a discrepancy, which is
+    a halt caused by reading, not by drift.
+
+    Left to the `Reconciler`'s default, a mismatch halts. That is not this job
+    softening or hardening anything: `reconcile` engages the kill switch itself,
+    and passing `halt_on_mismatch=False` here would disable a documented safety
+    check from the one caller that runs unattended.
+
+    The report is logged either way. A clean run at INFO is what makes "layer 7
+    is running" observable rather than assumed — the absence of a halt proves
+    nothing, since a job that never ran also never halts.
+    """
+    report = await session.reconciler.reconcile(
+        session.portfolio, known_orders=session.open_orders()
+    )
+    if report.is_clean:
+        log.info("worker.reconcile.clean", checked_at=report.checked_at.isoformat())
+        return
+
+    # The reconciler has already engaged the kill switch. Repeated here because
+    # this is an unattended path: an operator reading the worker's log should
+    # find what diverged next to the halt, not have to correlate two streams.
+    log.critical(
+        "worker.reconcile.diverged",
+        summary=report.summary(),
+        discrepancies=len(report.discrepancies),
+        orphan_orders=len(report.orphan_order_ids),
+        msg="trading is halted — see docs/RUNBOOK.md 'Reconciliation mismatch'",
+    )
 
 
 async def backfill_missing_bars() -> list[GapBackfillResult]:
@@ -134,12 +197,6 @@ async def backfill_missing_bars() -> list[GapBackfillResult]:
     return results
 
 
-async def snapshot_positions() -> None:
-    """Every minute during market hours — feeds the dashboard's history charts
-    and gives reconciliation something to compare against after a restart."""
-    raise NotImplementedError
-
-
 async def generate_daily_report() -> None:
     """After the close: P&L, trades, risk rejections, halts, feed incidents."""
     raise NotImplementedError
@@ -161,14 +218,48 @@ async def rollover_daily_counters() -> None:
     raise NotImplementedError
 
 
+#: What runs whether or not this worker is trading. Three of the four are still
+#: stubs and the driver marks each dormant after one attempt.
+#:
+#: **`snapshot_positions` is deliberately absent rather than unimplemented.** It
+#: sat here on a one-minute market-hours interval, described as feeding the
+#: dashboard's history charts and giving reconciliation a baseline after a
+#: restart. `StrategyRunner._persist` already does exactly that at the end of
+#: every evaluation — `portfolio_repo.snapshot` then `snapshot_store.put` — on
+#: the same one-minute cadence (`ENGINE_TICK_INTERVAL_SECONDS`) inside the same
+#: session window. Building it would have duplicated every equity-history point
+#: and added a second writer to a store whose port says it has one by design:
+#: "a second writer would be a bug to fix at its source rather than a race to
+#: arbitrate here" (`dashboard/ports.py`). A worker not running a strategy has
+#: no book to snapshot either, so there is no case the job would have covered.
 SCHEDULE: list[dict[str, Any]] = [
-    {"job": reconcile_with_broker, "trigger": "interval", "minutes": 5, "market_hours_only": True},
-    {"job": snapshot_positions, "trigger": "interval", "minutes": 1, "market_hours_only": True},
     {"job": rollover_daily_counters, "trigger": "market_open", "offset_minutes": -5},
     {"job": apply_corporate_actions, "trigger": "market_open", "offset_minutes": -60},
     {"job": generate_daily_report, "trigger": "market_close", "offset_minutes": 30},
     {"job": backfill_missing_bars, "trigger": "cron", "hour": 2, "minute": 0},
 ]
+
+
+def build_schedule(session: SessionJobs | None = None) -> list[dict[str, Any]]:
+    """The schedule this worker will actually run.
+
+    `SCHEDULE` is the part that needs nothing from the trading loop. The jobs
+    that need the live book are added only when there is one: a worker with no
+    strategy configured holds no portfolio and has no broker to compare it
+    against, and an entry that failed every five minutes for want of either
+    would be indistinguishable in the log from a venue that had gone away.
+    """
+    if session is None:
+        return list(SCHEDULE)
+    return [
+        {
+            "job": partial(reconcile_with_broker, session),
+            "trigger": "interval",
+            "minutes": 5,
+            "market_hours_only": True,
+        },
+        *SCHEDULE,
+    ]
 
 
 # ── the driver ──────────────────────────────────────────────────────────────
@@ -199,21 +290,31 @@ SESSION_SCAN_DAYS = 10
 MAX_SLEEP_SECONDS = 300.0
 
 
+def _job_name(entry: dict[str, Any]) -> str:
+    """What to call this entry in a log line or an error.
+
+    Unwraps `functools.partial`, which carries no `__name__` of its own: the
+    session-bound jobs `build_schedule` produces are partials, and a scheduler
+    naming them all "partial" would name nothing.
+    """
+    job: Any = entry["job"]
+    return str(getattr(job, "__name__", None) or job.func.__name__)
+
+
 @dataclass(slots=True)
 class _Job:
     """One entry from `SCHEDULE`, plus the mutable bit: when it next runs."""
 
     entry: dict[str, Any]
     due: datetime
-    #: Set once a job turns out to be a `NotImplementedError` stub. Five of the
-    #: six in `SCHEDULE` still are, and a scheduler that retried them every
+    #: Set once a job turns out to be a `NotImplementedError` stub. Three of the
+    #: four in `SCHEDULE` still are, and a scheduler that retried them every
     #: interval would bury its own log in the same traceback forever.
     dormant: bool = False
 
     @property
     def name(self) -> str:
-        job: Any = self.entry["job"]
-        return str(job.__name__)
+        return _job_name(self.entry)
 
 
 def next_due(entry: dict[str, Any], now: datetime, calendar: TradingCalendar) -> datetime:
@@ -241,7 +342,7 @@ def next_due(entry: dict[str, Any], now: datetime, calendar: TradingCalendar) ->
     if trigger in {"market_open", "market_close"}:
         return _next_session_edge(entry, now, calendar, trigger)
 
-    raise ValueError(f"unknown scheduler trigger {trigger!r} for {entry['job'].__name__}")
+    raise ValueError(f"unknown scheduler trigger {trigger!r} for {_job_name(entry)}")
 
 
 def _next_session_edge(
@@ -266,7 +367,7 @@ def _next_session_edge(
         day += timedelta(days=1)
     raise ValueError(
         f"no trading session within {SESSION_SCAN_DAYS} days of {now.isoformat()} — "
-        f"cannot schedule {entry['job'].__name__}"
+        f"cannot schedule {_job_name(entry)}"
     )
 
 

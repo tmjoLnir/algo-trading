@@ -461,11 +461,43 @@ that is not the guarantee a broker-side stop gives.
 
 ## Emergency flatten
 
-`POST /api/v1/risk/flatten-all` with `confirm: "FLATTEN ALL POSITIONS"`.
+**Halt first.** This does not halt, and the runner can re-enter within a tick of
+the book going flat. The endpoint reports `was_halted` and logs `CRITICAL` if you
+did not, but it will not refuse you — the one moment it exists for is the moment
+an extra step is most expensive.
+
+```bash
+curl -X POST https://<host>/api/v1/risk/flatten-all \
+  -b "$COOKIE" -H 'Content-Type: application/json' \
+  -d '{"confirm": "FLATTEN ALL POSITIONS", "password": "<account password>"}'
+```
+
+Two proofs, not either. The phrase shows you know what this does; the password
+shows you are entitled to do it — a session cookie alone satisfies neither
+(ADR 0009). There is no elevation window, so the password travels with the call.
+
+The venue cancels resting orders as part of the same operation. That ordering
+matters: flattening without it leaves a stop working against a position that no
+longer exists, and it opens the other side the moment it fires.
+
+**Read the response.** A `200` carries `positions_closed` and the symbols. A
+`502` means the flatten did **not** complete and one or more positions may still
+be open — Alpaca reports per-symbol status and anything non-200 is raised rather
+than dropped. On a 502, read the book from the broker's own UI before retrying;
+do not assume the call did nothing.
 
 Irreversible: realises every open P&L at whatever the market offers. Correct
 when you have lost confidence in the system's state. Wrong when you have simply
 lost visibility — you would be dumping the book into a market you cannot see.
+
+Narrower tools, when the whole book is not the problem:
+
+- `POST /api/v1/positions/{symbol}/close` — one position, at market, through the
+  risk chain. It can be **refused** (the kill switch is one of six rules that
+  can refuse an exit), and a refusal is a `200` with `submitted: false` and the
+  rule that said no. Read it; do not assume the position closed.
+- `POST /api/v1/orders/cancel-all` — withdraw working orders without touching
+  positions. Cancelling a protective stop leaves the position it covered naked.
 
 ---
 

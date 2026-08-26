@@ -72,12 +72,12 @@ class Action:
     a row written by an older version unloadable by a newer one, which is
     precisely the property an append-only record must not have.
 
-    Only actions that actually occur are listed. The remaining order-flow and
-    strategy-lifecycle verbs the table's docstring anticipates — "manual order,
-    strategy promotion to live" — are not here yet because those handlers are
-    still `NotImplementedError` stubs, and a constant for an event nothing emits
-    is a claim the record does not support. They land with their handlers, which
-    is how `halt_engaged` arrived and how `strategy_created` did.
+    Only actions that actually occur are listed. A constant for an event nothing
+    emits is a claim the record does not support, so each lands with its handler
+    — which is how `halt_engaged` arrived, how `strategy_created` did, and how
+    the three close-out verbs below did. What is still missing is still missing
+    for that reason: `POST /orders` (a manual order) and strategy promotion to
+    live are `NotImplementedError` stubs, so nothing writes a verb for either.
     """
 
     LOGIN = "login"
@@ -133,6 +133,29 @@ class Action:
     #: Written *after* the row exists, like the two halt verbs, so an entry never
     #: claims a strategy that was refused.
     STRATEGY_CREATED = "strategy_created"
+    #: One working order cancelled by a human, through `DELETE /orders/{id}` or
+    #: as part of `POST /orders/cancel-all`. Written *after* the venue confirms,
+    #: like the halt verbs: an entry claiming a cancel that did not take would
+    #: have a reader stop looking for an order that is still working.
+    #:
+    #: A cancel the platform performed for itself writes nothing here —
+    #: `OrderRouter.cancel_protection` retiring a stop against a position it is
+    #: closing is order flow, not a human decision. So an absent row means "not
+    #: cancelled *by a person*", never "not cancelled".
+    ORDER_CANCELLED = "order_cancelled"
+    #: One position closed at market by a human, through
+    #: `POST /positions/{symbol}/close`. Goes through `OrderRouter.flatten` like
+    #: every other order (ADR 0005), so the risk chain can refuse it — and the
+    #: row is written either way, with `detail["submitted"]` telling them apart.
+    #: A refusal is the more interesting record of the two: somebody decided a
+    #: position should be closed and the platform did not close it.
+    POSITION_CLOSED = "position_closed"
+    #: The emergency flatten — `POST /api/v1/risk/flatten-all`. The one action in
+    #: the platform that reaches the venue *around* the risk chain, which is
+    #: exactly why ADR 0005 makes an audit row part of the carve-out rather than
+    #: a nicety. Records what was cancelled and what was closed, so the book
+    #: before it can be reconstructed from the record alone.
+    FLATTEN_ALL = "flatten_all"
 
 
 class AuditSink(Protocol):
