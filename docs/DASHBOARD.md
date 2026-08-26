@@ -479,6 +479,14 @@ writes that one run to `backtest-<strategy>-<queued date>-<run id>.json`: the ru
 as the API served it — spec, metrics, warnings, all three timestamps — plus its
 equity curve and every trade. Four decisions in it are worth stating:
 
+What it does **not** carry is the run's money: `ending_equity`, the realised and
+unrealised split, the open-position count, the fill counts and the fees. Those
+are on `BacktestResult.to_report()` and reach the CLI's `--out`, and the queued
+path has never stored them, so neither this screen nor its export can show that
+a return is unbanked. Known, deliberate, and written up in
+`docs/PARKING_LOT.md` — not a gap in the exporter, which copies verbatim what it
+is served.
+
 - **Per run, not per list.** What a reader keeps, diffs or hands to a notebook is
   a *result*. Forty of them with the curves attached is not a file anybody opens,
   and a minute run's curve alone is hundreds of thousands of points.

@@ -94,6 +94,7 @@ env flag plus a typed confirmation.
 | [RUNBOOK.md](docs/RUNBOOK.md) | Something is broken in production |
 | [BACKUPS.md](docs/BACKUPS.md) | Taking a backup, and restoring one |
 | [GLOSSARY.md](docs/GLOSSARY.md) | A trading term is unfamiliar |
+| [PARKING_LOT.md](docs/PARKING_LOT.md) | Something shipped looks wrong — check whether it was parked deliberately |
 | [adr/](docs/adr/) | "Why is it built this way?" |
 
 `CLAUDE.md` carries the conventions AI coding agents (and new humans) must follow.

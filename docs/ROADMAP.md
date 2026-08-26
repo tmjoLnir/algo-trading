@@ -1865,6 +1865,15 @@ wording if it is not the demonstration you want.
   serve exactly what they served before: the warnings were computed and dropped,
   and an empty list would claim they finished clean.
 
+  **The other half of that seam is still open and is parked, not forgotten.**
+  The nine money and count fields `to_report()` produces — ending equity, the
+  realised/unrealised split, open positions, the fill counts, fees — are still
+  stored nowhere, so this tab shows a `buy_and_hold` return of 202.8% with no
+  way to say that none of it is realised and twenty positions are still open.
+  Split off from #104 deliberately: it needs a schema decision about how money
+  crosses this API, a migration, an OpenAPI change and `make gen-types`, where
+  the warnings fix needed one JSON column. Written up in `docs/PARKING_LOT.md`.
+
 - [ ] Live-vs-backtest comparison — @claude.
   Built as of #68: `GET /analytics/live-vs-backtest/{run_id}` serves the live
   metric set, the stored backtest's, the divergence between them, and the reasons
