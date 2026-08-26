@@ -89,6 +89,7 @@ env flag plus a typed confirmation.
 | [API.md](docs/API.md) | REST/WS surface and conventions |
 | [TESTING.md](docs/TESTING.md) | Test layout and what must be covered |
 | [DEPLOYMENT.md](docs/DEPLOYMENT.md) | Shipping it somewhere |
+| [HOSTING.md](docs/HOSTING.md) | Picking the machine to ship it to, free options included |
 | [OBSERVABILITY.md](docs/OBSERVABILITY.md) | Metrics, the scrape endpoints, correlation ids |
 | [RUNBOOK.md](docs/RUNBOOK.md) | Something is broken in production |
 | [BACKUPS.md](docs/BACKUPS.md) | Taking a backup, and restoring one |
