@@ -182,14 +182,20 @@ class TestAQueuedRunHasNotStarted:
 
 
 class TestTheResultRoundTrips:
-    async def test_metrics_a_curve_and_trades_come_back_as_stored(
+    async def test_the_whole_result_comes_back_as_stored(
         self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
     ) -> None:
-        """The JSON columns, including the part that matters: money stays a string.
+        """The four JSON columns, including the part that matters: money stays a
+        string.
 
         A curve stored as JSON numbers would come back as floats, and the chart
         the dashboard draws would be the first thing in this platform to render a
         balance that had been through IEEE 754 (CLAUDE.md §1.1).
+
+        `warnings` is asserted here as well as in `TestWarningsRoundTrip` below,
+        and the duplication is deliberate: this is the case that says *the whole
+        result* survives the round trip, so a column added to the result and
+        forgotten here would leave that claim quietly untrue.
         """
         runs, strategies = repo
         await _registered(strategies)
@@ -202,6 +208,7 @@ class TestTheResultRoundTrips:
             metrics={"sharpe": 1.25, "num_trades": 42, "profit_factor": None},  # type: ignore[dict-item]
             equity_curve=[[T0.isoformat(), "100000.10"], [T0.isoformat(), "100500.55"]],
             trades=[{"symbol": "SPY", "net_pnl": "500.45", "exit_reason": "stop_loss"}],
+            warnings=["3 of 40 orders were refused before reaching the market"],
         )
         stored = await runs.get("r1")
 
@@ -214,6 +221,7 @@ class TestTheResultRoundTrips:
             [T0.isoformat(), "100500.55"],
         ]
         assert stored.trades == [{"symbol": "SPY", "net_pnl": "500.45", "exit_reason": "stop_loss"}]
+        assert stored.warnings == ["3 of 40 orders were refused before reaching the market"]
 
     async def test_the_spec_survives_the_config_column(
         self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
