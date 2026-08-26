@@ -299,9 +299,36 @@ jobs:
         run: |
           sed -i 's/^RISK_MAX_POSITION_PCT=.*/RISK_MAX_POSITION_PCT=not-a-number/' .env
           docker compose up -d --force-recreate api || true
-          sleep 25
+          cid=$(docker compose ps -aq api | head -n1)
+
+          # Poll the restart count. Do NOT sample `.State` once after a fixed
+          # sleep, which is what this step did and is why it was racy.
+          #
+          # The corrected API *crash-loops* under a config it cannot parse: the
+          # foreground `python -c 'import atp_api.main'` raises, PID 1 exits,
+          # `restart: unless-stopped` starts it again, and it exits again. So
+          # `docker compose ps` reads `restarting` for most of that cycle and
+          # `running` for the fraction of a second the import takes before it
+          # fails. `[ "$state" != "running" ]` therefore asserted a property the
+          # *correct* behaviour does not have; it passed only because a single
+          # sample usually missed the window. Run 32956727804 landed inside it
+          # and reported `Up Less than a second (health: starting)` — on a tree
+          # byte-identical to one whose CI had already passed.
+          #
+          # The climbing restart count is the real signal, and the one
+          # docs/RUNBOOK.md tells an operator to look for. The regression this
+          # step exists to catch — a `--reload` parent idling over a dead child
+          # — never exits, so its count stays 0 for as long as anyone waits.
+          # That distinction is exact rather than probabilistic.
+          restarts=0
+          for _ in $(seq 1 40); do
+            restarts=$(docker inspect -f '{{.RestartCount}}' "$cid" 2>/dev/null || echo 0)
+            if [ "${restarts:-0}" -gt 0 ]; then break; fi
+            sleep 1
+          done
+
           docker compose ps api
-          state=$(docker compose ps api --format '{{.State}}')
+          state=$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || echo gone)
           # `|| true` on the assignment, NOT `|| echo 000` inside it. curl
           # writes its own `000` for a refused connection AND exits non-zero,
           # so an `echo` in the pipeline appends a second one: the variable
@@ -309,7 +336,7 @@ jobs:
           # never be true. That is how this step read when it was written, and
           # it passed for the same reason a `[ -z ]` on a two-line string does.
           code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:8000/healthz) || true
-          echo "api state=$state  /healthz=$code"
+          echo "api state=$state  restarts=$restarts  /healthz=$code"
 
           # First that the setup took effect at all. If the API still answers,
           # the malformed value never reached `Settings` — the sed missed, or
@@ -321,13 +348,13 @@ jobs:
             exit 1
           }
 
-          # Then the regression itself.
-          [ "$state" != "running" ] || {
-            echo "::error::the api container is up and serving nothing -- a dead app behind a live reloader, which restart: unless-stopped cannot see"
+          # Then the regression itself: never exited, and serving nothing.
+          [ "${restarts:-0}" -gt 0 ] || {
+            echo "::error::the api container has never exited (restarts=$restarts, state=$state) and answers nothing -- a dead app behind a live reloader, which restart: unless-stopped cannot see"
             docker compose logs --tail=40 api
             exit 1
           }
-          echo "a config the API cannot start with does not masquerade as a running API (state=$state)"
+          echo "a config the API cannot start with exits and is restarted rather than idling as a live API (restarts=$restarts, state=$state)"
 
       - name: And it recovers by itself once the configuration is fixed
         run: |
