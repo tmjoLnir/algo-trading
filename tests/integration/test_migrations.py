@@ -31,6 +31,29 @@ pytestmark = pytest.mark.integration
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ALEMBIC_INI = REPO_ROOT / "infra" / "alembic" / "alembic.ini"
 
+#: Spelled out because `strategies` has seven NOT NULL columns with no defaults
+#: and this file talks to the database directly — there is no repository here to
+#: fill them in. Written wrong first: omitting `description` passed against a
+#: hand-built table and failed against the real schema, which is the whole
+#: reason these tests are integration tests.
+_INSERT_STRATEGY = (
+    "INSERT INTO strategies "
+    "(id, name, description, kind, class_name, params, universe, timeframe, "
+    " risk_config, state, created_at, updated_at) "
+    "VALUES ($1, $1, 'a stand-in for a registered strategy', 'coded', 'Scripted', "
+    "'{}', '[]', '1d', '{}', 'draft', now(), now()) "
+    "ON CONFLICT (id) DO NOTHING"
+)
+
+#: Named, never `-1`. These tests exercise one specific migration, and a
+#: relative target silently starts exercising a different one the moment
+#: somebody adds a revision on top — which happened during the change that
+#: introduced them: `downgrade -1` began dropping `backtest_runs.totals`
+#: instead of shifting the curve, and the assertion that caught it was about
+#: dates rather than about columns.
+RETIME_REVISION = "c5e9a03b1f47"
+BEFORE_RETIME = "a9f37c14e6b2"
+
 STRATEGY = "retime-probe"
 RUN_ID = "retime-run"
 QUEUED_ID = "retime-queued"
@@ -237,6 +260,8 @@ class TestTheCurveIsRetimed:
     Driven backwards then forwards. The database arrives at head, so the only
     way to produce a row in the *old* convention is to run the downgrade, which
     is the half of a data migration nobody usually exercises.
+
+    The target is named rather than relative — see `BEFORE_RETIME` above.
     """
 
     SESSION_DATES: ClassVar[list[list[str]]] = [
@@ -262,9 +287,7 @@ class TestTheCurveIsRetimed:
         conn = await asyncpg.connect(_asyncpg_dsn(migrated))
         try:
             await conn.execute(
-                "INSERT INTO strategies (id, name, class_name, params, universe, state, "
-                "created_at, updated_at) VALUES ($1, $1, 'Scripted', '{}', '{}', 'draft', "
-                "now(), now()) ON CONFLICT (id) DO NOTHING",
+                _INSERT_STRATEGY,
                 STRATEGY,
             )
             await conn.execute(
@@ -289,7 +312,7 @@ class TestTheCurveIsRetimed:
         fails while downgraded would otherwise hand the next one a database a
         revision behind, and the failure a reader sees would be that one.
         """
-        assert _run_alembic("downgrade", "-1").returncode == 0
+        assert _run_alembic("downgrade", BEFORE_RETIME).returncode == 0
         try:
             yield
         finally:
@@ -307,7 +330,7 @@ class TestTheCurveIsRetimed:
         ]
 
     async def test_upgrading_puts_every_point_back_on_its_session(self, a_run: str) -> None:
-        assert _run_alembic("downgrade", "-1").returncode == 0
+        assert _run_alembic("downgrade", BEFORE_RETIME).returncode == 0
         assert _run_alembic("upgrade", "head").returncode == 0
 
         assert await self._row(a_run, RUN_ID) == self.SESSION_DATES
@@ -315,7 +338,7 @@ class TestTheCurveIsRetimed:
     async def test_the_equity_beside_each_label_never_moves(self, a_run: str) -> None:
         """The property that makes this safe to run against results a human has
         already read: labels move, figures do not."""
-        assert _run_alembic("downgrade", "-1").returncode == 0
+        assert _run_alembic("downgrade", BEFORE_RETIME).returncode == 0
         stale = await self._row(a_run, RUN_ID)
         assert _run_alembic("upgrade", "head").returncode == 0
         fresh = await self._row(a_run, RUN_ID)
@@ -329,9 +352,7 @@ class TestTheCurveIsRetimed:
         conn = await asyncpg.connect(_asyncpg_dsn(migrated))
         try:
             await conn.execute(
-                "INSERT INTO strategies (id, name, class_name, params, universe, state, "
-                "created_at, updated_at) VALUES ($1, $1, 'Scripted', '{}', '{}', 'draft', "
-                "now(), now()) ON CONFLICT (id) DO NOTHING",
+                _INSERT_STRATEGY,
                 STRATEGY,
             )
             await conn.execute(
@@ -341,7 +362,7 @@ class TestTheCurveIsRetimed:
                 STRATEGY,
                 json.dumps({"timeframe": "1d"}),
             )
-            assert _run_alembic("downgrade", "-1").returncode == 0
+            assert _run_alembic("downgrade", BEFORE_RETIME).returncode == 0
             assert _run_alembic("upgrade", "head").returncode == 0
             assert await self._row(migrated, QUEUED_ID) is None
         finally:
