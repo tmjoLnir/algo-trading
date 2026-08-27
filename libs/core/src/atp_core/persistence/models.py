@@ -292,10 +292,11 @@ class BacktestRunRow(Base):
     time, which is what this table's original shape forced, would make every
     run's reported duration include however long the queue was backed up.
 
-    `metrics`, `equity_curve`, `trades` and `warnings` are written together or
-    not at all: a `done` row whose metrics landed and whose curve did not would
-    claim a result it cannot show, and one whose warnings did not land would
-    claim a clean result it never had.
+    `metrics`, `equity_curve`, `trades`, `warnings` and `totals` are written
+    together or not at all: a `done` row whose metrics landed and whose curve
+    did not would claim a result it cannot show, one whose warnings did not land
+    would claim a clean result it never had, and one whose totals did not land
+    would report a return with no way to say how much of it was banked.
     """
 
     __tablename__ = "backtest_runs"
@@ -327,6 +328,14 @@ class BacktestRunRow(Base):
     #: never signalled, and only this column tells them apart (migration
     #: `a9f37c14e6b2`).
     warnings: Mapped[JsonList | None] = mapped_column(JSON, nullable=True)
+    #: What the run made and what it did — ending equity, the realised and
+    #: unrealised split, fees, and the signal/order/fill counts. One column
+    #: rather than nine, and separate from `metrics` rather than folded into it:
+    #: `metrics` is float by contract and five of these are money, which must
+    #: not be (CLAUDE.md §1.1). Decimal strings inside JSON, the way
+    #: `equity_curve` already carries money (migration `f1b7c0d4e295`, ADR
+    #: 0019).
+    totals: Mapped[JsonDict | None] = mapped_column(JSON, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     #: Null until a worker claims it. A queued run has not started.

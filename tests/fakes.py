@@ -55,6 +55,27 @@ if TYPE_CHECKING:
     from atp_core.strategy.ports import NewStrategy, SignalOutcome, StrategyRecord
 
 
+def a_totals(**overrides: object) -> dict[str, object]:
+    """`BacktestResult.totals()`'s shape, for a test that needs a plausible one.
+
+    Money as decimal strings and counts as integers, because that is what the
+    column holds — a fixture that used floats here would let a serialisation bug
+    through the one test meant to catch it (CLAUDE.md §1.1).
+    """
+    return {
+        "starting_equity": "100000",
+        "ending_equity": "102000",
+        "total_return": "0.02",
+        "realized_pnl": "1500",
+        "unrealized_pnl": "500",
+        "fees": "12.34",
+        "open_positions": 1,
+        "orders": 4,
+        "filled_orders": 3,
+        "signals": 5,
+    } | overrides
+
+
 class FakeBroker:
     """A `BrokerPort` you can make misbehave on demand."""
 
@@ -772,6 +793,7 @@ class FakeBacktestRunRepository:
         equity_curve: list[list[str]],
         trades: list[dict[str, object]],
         warnings: list[str],
+        totals: dict[str, object],
     ) -> None:
         run = self._in_flight(run_id)
         if run is not None:
@@ -782,6 +804,7 @@ class FakeBacktestRunRepository:
                 equity_curve=equity_curve,
                 trades=trades,
                 warnings=warnings,
+                totals=totals,
                 error=None,
                 finished_at=at,
             )
@@ -802,6 +825,7 @@ class FakeBacktestRunRepository:
             equity_curve=None,
             warnings=None,
             trades=None,
+            totals=None,
             finished_at=at,
         )
 

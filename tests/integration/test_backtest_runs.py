@@ -35,6 +35,7 @@ from atp_core.persistence.backtests import PostgresBacktestRunRepository, new_ru
 from atp_core.persistence.db import create_engine, create_session_factory
 from atp_core.persistence.strategies import PostgresStrategyRepository
 from atp_core.strategy.ports import StrategyRecord
+from tests.fakes import a_totals
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -185,7 +186,7 @@ class TestTheResultRoundTrips:
     async def test_the_whole_result_comes_back_as_stored(
         self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
     ) -> None:
-        """The four JSON columns, including the part that matters: money stays a
+        """The five JSON columns, including the part that matters: money stays a
         string.
 
         A curve stored as JSON numbers would come back as floats, and the chart
@@ -209,6 +210,7 @@ class TestTheResultRoundTrips:
             equity_curve=[[T0.isoformat(), "100000.10"], [T0.isoformat(), "100500.55"]],
             trades=[{"symbol": "SPY", "net_pnl": "500.45", "exit_reason": "stop_loss"}],
             warnings=["3 of 40 orders were refused before reaching the market"],
+            totals=a_totals(),
         )
         stored = await runs.get("r1")
 
@@ -222,6 +224,7 @@ class TestTheResultRoundTrips:
         ]
         assert stored.trades == [{"symbol": "SPY", "net_pnl": "500.45", "exit_reason": "stop_loss"}]
         assert stored.warnings == ["3 of 40 orders were refused before reaching the market"]
+        assert stored.totals == a_totals()
 
     async def test_the_spec_survives_the_config_column(
         self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
@@ -289,6 +292,116 @@ class TestTheResultRoundTrips:
         assert stored.trades is None
 
 
+class TestTheMoneyRoundTrips:
+    """The `totals` column, against the real thing (migration `f1b7c0d4e295`).
+
+    A unit test with a fake repository cannot answer the question this column
+    was added for: whether a **decimal string survives a JSON column**. That is
+    a property of the driver and the database, and it is the whole point — the
+    figures here are balances, and a balance that came back as a float would be
+    the first corrupted P&L in this platform (CLAUDE.md §1.1).
+
+    NULL versus a populated bag is the other distinction, and it is the same one
+    `warnings` draws: a run stored before this column computed these figures and
+    threw them away. NULL says that; zeros would be a claim nobody can check.
+    """
+
+    async def test_money_comes_back_a_string_not_a_float(
+        self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
+    ) -> None:
+        """Values chosen to be unrepresentable as binary floats, so anything in
+        this path that made one a number shows up here rather than as a slightly
+        wrong P&L six months later."""
+        runs, strategies = repo
+        await _registered(strategies)
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        exact = a_totals(
+            ending_equity="100000.10",
+            realized_pnl="0.30",
+            unrealized_pnl="202800.07",
+            fees="12.34",
+        )
+
+        await runs.finish(
+            "r1",
+            at=T0,
+            metrics={"sharpe": 1.0},
+            equity_curve=[],
+            trades=[],
+            warnings=[],
+            totals=exact,
+        )
+        stored = await runs.get("r1")
+
+        assert stored is not None
+        assert stored.totals == exact
+        assert stored.totals["unrealized_pnl"] == "202800.07"
+        assert isinstance(stored.totals["unrealized_pnl"], str)
+        assert isinstance(stored.totals["open_positions"], int)
+
+    async def test_a_run_that_never_recorded_them_reads_null(
+        self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
+    ) -> None:
+        """A queued run, which is also the shape of every row stored before the
+        column existed."""
+        runs, strategies = repo
+        await _registered(strategies)
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+
+        stored = await runs.get("r1")
+
+        assert stored is not None
+        assert stored.totals is None
+
+    async def test_a_run_that_failed_has_none_of_it(
+        self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
+    ) -> None:
+        """`fail` clears these with the rest of the result. They would describe
+        a result the run does not have, and `error` is the sentence that
+        replaces all of them."""
+        runs, strategies = repo
+        await _registered(strategies)
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        await runs.mark_running("r1", at=T0)
+
+        await runs.fail("r1", at=T0 + timedelta(minutes=1), error="bars vanished")
+        stored = await runs.get("r1")
+
+        assert stored is not None
+        assert stored.status == "failed"
+        assert stored.totals is None
+
+    async def test_a_finished_run_cannot_have_its_money_erased_by_a_late_failure(
+        self, repo: tuple[PostgresBacktestRunRepository, PostgresStrategyRepository]
+    ) -> None:
+        """The other half, and the one worth pinning: `fail` matches only rows
+        still in flight, so a duplicate job arriving after a run finished cannot
+        blank a result somebody has already read. Same guard `mark_running` has,
+        and this is what makes clearing on failure safe rather than destructive.
+        """
+        runs, strategies = repo
+        await _registered(strategies)
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        await runs.mark_running("r1", at=T0)
+        await runs.finish(
+            "r1",
+            at=T0,
+            metrics={"sharpe": 1.0},
+            equity_curve=[],
+            trades=[],
+            warnings=[],
+            totals=a_totals(ending_equity="118400.55"),
+        )
+
+        await runs.fail("r1", at=T0 + timedelta(hours=2), error="a stale duplicate job")
+        stored = await runs.get("r1")
+
+        assert stored is not None
+        assert stored.status == "done"
+        assert stored.totals is not None
+        assert stored.totals["ending_equity"] == "118400.55"
+
+
 class TestWarningsRoundTrip:
     """The `warnings` column, against the real thing (migration `a9f37c14e6b2`).
 
@@ -313,6 +426,7 @@ class TestWarningsRoundTrip:
             equity_curve=[],
             trades=[],
             warnings=["20 of 20 orders were refused", "zero-cost model"],
+            totals=a_totals(),
         )
         stored = await runs.get("r1")
 
@@ -328,7 +442,9 @@ class TestWarningsRoundTrip:
         await _registered(strategies)
         await runs.create(new_run("r1", a_spec(), queued_at=T0))
 
-        await runs.finish("r1", at=T0, metrics={}, equity_curve=[], trades=[], warnings=[])
+        await runs.finish(
+            "r1", at=T0, metrics={}, equity_curve=[], trades=[], warnings=[], totals=a_totals()
+        )
         stored = await runs.get("r1")
 
         assert stored is not None
@@ -382,7 +498,13 @@ class TestConditionalTransitions:
         await _registered(strategies)
         await runs.create(new_run("r1", a_spec(), queued_at=T0))
         await runs.finish(
-            "r1", at=T0, metrics={"sharpe": 1.0}, equity_curve=[], trades=[], warnings=[]
+            "r1",
+            at=T0,
+            metrics={"sharpe": 1.0},
+            equity_curve=[],
+            trades=[],
+            warnings=[],
+            totals=a_totals(),
         )
 
         await runs.mark_running("r1", at=T0 + timedelta(hours=1))
@@ -409,6 +531,7 @@ class TestConditionalTransitions:
             equity_curve=[],
             trades=[],
             warnings=[],
+            totals=a_totals(),
         )
         stored = await runs.get("r1")
 
@@ -479,7 +602,15 @@ class TestReads:
 
         await runs.create(new_run("finished", a_spec(), queued_at=T0))
         await runs.mark_running("finished", at=T0)
-        await runs.finish("finished", at=T0, metrics={}, equity_curve=[], trades=[], warnings=[])
+        await runs.finish(
+            "finished",
+            at=T0,
+            metrics={},
+            equity_curve=[],
+            trades=[],
+            warnings=[],
+            totals=a_totals(),
+        )
 
         stale = await runs.stale_running(older_than=T0 + timedelta(hours=1))
 

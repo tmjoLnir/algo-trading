@@ -46,7 +46,7 @@ from atp_worker.queue import (
     sweep_interrupted,
 )
 from atp_worker.tasks import run_backtest_task
-from tests.fakes import FakeBacktestQueue, FakeBacktestRunRepository
+from tests.fakes import FakeBacktestQueue, FakeBacktestRunRepository, a_totals
 
 T0 = datetime(2024, 1, 2, tzinfo=UTC)
 RUN_ID = "run-1"
@@ -490,7 +490,9 @@ class TestTheStartupSweep:
     async def test_it_leaves_a_finished_run_alone(self, runs: FakeBacktestRunRepository) -> None:
         await queued(runs)
         await runs.mark_running(RUN_ID, at=T0)
-        await runs.finish(RUN_ID, at=T0, metrics={}, equity_curve=[], trades=[], warnings=[])
+        await runs.finish(
+            RUN_ID, at=T0, metrics={}, equity_curve=[], trades=[], warnings=[], totals=a_totals()
+        )
 
         assert await sweep_interrupted(runs, T0 + timedelta(days=1), at=T0) == []
         assert runs.runs[RUN_ID].status == "done"
@@ -540,6 +542,148 @@ class TestWarningsTravelWithTheResult:
         result = run_spec(a_spec(), {"SPY": bars()}, limits=get_settings().risk)
 
         assert "no pre-trade risk rules" not in " ".join(result.warnings)
+
+
+class TestTheRunKeepsItsMoney:
+    """The nine figures a run produces about the money it made.
+
+    `BacktestResult.to_report()` has always had them and the CLI's `--out` JSON
+    has always carried them. A *queued* run had none of them at any layer: the
+    engine computed them and `result_to_storage` returned metrics, the curve,
+    the trades and the warnings.
+
+    The gap that matters is the second test. A run that ends holding everything
+    and one that banked the same return have identical metric sets — every
+    per-trade statistic counts closed round trips — and they mean opposite
+    things. `num_trades: 0` is the only hint the metric set carries, and it says
+    something different: that the statistics rest on no closed trips, which
+    reads as "does not trade much" rather than "you are still holding all of
+    it".
+    """
+
+    async def test_the_money_reaches_the_row(
+        self, ctx: dict[str, Any], runs: FakeBacktestRunRepository
+    ) -> None:
+        await queued(runs)
+
+        await run_backtest_task(ctx, RUN_ID)
+
+        stored = runs.runs[RUN_ID]
+        assert stored.totals is not None
+        assert set(stored.totals) == {
+            "starting_equity",
+            "ending_equity",
+            "total_return",
+            "realized_pnl",
+            "unrealized_pnl",
+            "fees",
+            "open_positions",
+            "orders",
+            "filled_orders",
+            "signals",
+        }
+
+    async def test_a_return_that_is_all_mark_says_so(
+        self, ctx: dict[str, Any], runs: FakeBacktestRunRepository
+    ) -> None:
+        """`buy_and_hold` never closes, so every penny of its return is a mark.
+
+        This is the shape of the run that motivated the column: 202.8% reported,
+        none of it realised, twenty positions still open, and a dashboard
+        reading "202.8% return" with nothing to say otherwise.
+        """
+        await queued(runs, strategy_id="buy_and_hold")
+
+        await run_backtest_task(ctx, RUN_ID)
+
+        stored = runs.runs[RUN_ID]
+        assert stored.metrics is not None
+        assert stored.metrics["num_trades"] == 0  # says nothing about *why*
+        assert stored.totals is not None
+
+        realised = Decimal(str(stored.totals["realized_pnl"]))
+        unrealised = Decimal(str(stored.totals["unrealized_pnl"]))
+        starting = Decimal(str(stored.totals["starting_equity"]))
+        ending = Decimal(str(stored.totals["ending_equity"]))
+
+        # Nothing was banked. Asserted at the cent rather than at zero: sizing
+        # divides, so a fill price carries the Decimal context's full 28 digits
+        # and the remainder that defines `realized_pnl` keeps a residue some
+        # twenty orders of magnitude below a cent. It is not a balance anybody
+        # can hold, and rounding it away is what every reader of this figure
+        # does anyway.
+        assert abs(realised) < Decimal("0.005")
+        assert unrealised != 0
+        assert int(str(stored.totals["open_positions"])) > 0
+
+        # The invariant that makes the split trustworthy rather than two
+        # separate sums that can drift apart: `realized_pnl` is computed as the
+        # remainder, so the two halves add back to the change in equity exactly.
+        assert realised + unrealised == ending - starting
+
+    def test_money_is_a_string_and_a_count_is_an_integer(self) -> None:
+        """The reason this is a column of its own rather than more `metrics`.
+
+        `metrics` is float by contract — those are statistics over a return
+        series. Five of these are balances, and a balance that round-tripped
+        through a JSON number would no longer be exact (CLAUDE.md §1.1).
+        """
+        from atp_core.backtest.runner import run_spec
+
+        totals = run_spec(a_spec(), {"SPY": bars()}, limits=get_settings().risk).totals()
+
+        for key in (
+            "starting_equity",
+            "ending_equity",
+            "total_return",
+            "realized_pnl",
+            "unrealized_pnl",
+            "fees",
+        ):
+            assert isinstance(totals[key], str), f"{key} must cross as a decimal string"
+        for key in ("open_positions", "orders", "filled_orders", "signals"):
+            assert isinstance(totals[key], int), f"{key} is a count"
+
+    def test_the_cli_and_the_stored_row_cannot_disagree(self) -> None:
+        """One assembly, two callers — ADR 0006's rule, applied to these nine.
+
+        A second copy in `to_report` would be a second chance for a queued run
+        and a CLI run to report different money for the same backtest.
+        """
+        from atp_core.backtest.runner import run_spec
+
+        result = run_spec(a_spec(), {"SPY": bars()}, limits=get_settings().risk)
+
+        report = result.to_report()
+
+        assert result.totals().items() <= report.items()
+
+    async def test_they_are_written_in_the_same_call_as_the_rest(
+        self, ctx: dict[str, Any], runs: FakeBacktestRunRepository
+    ) -> None:
+        """A `done` row reporting a return with no way to say how much of it was
+        banked is the row this column exists to stop existing."""
+        await queued(runs)
+
+        await run_backtest_task(ctx, RUN_ID)
+
+        stored = runs.runs[RUN_ID]
+        assert stored.status == "done"
+        assert stored.metrics is not None
+        assert stored.totals is not None
+
+    async def test_a_failed_run_keeps_none_of_it(
+        self, ctx: dict[str, Any], runs: FakeBacktestRunRepository
+    ) -> None:
+        """Cleared with the rest: the figures described a result this run does
+        not have."""
+        await queued(runs, symbols=("NOPE",))
+
+        await run_backtest_task(ctx, RUN_ID)
+
+        stored = runs.runs[RUN_ID]
+        assert stored.status == "failed"
+        assert stored.totals is None
 
 
 class TestTheRunKeepsItsWarnings:

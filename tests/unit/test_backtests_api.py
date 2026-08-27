@@ -56,6 +56,7 @@ from tests.fakes import (
     FakeBacktestRunRepository,
     FakeStrategyRepository,
     RecordingAuditSink,
+    a_totals,
 )
 
 if TYPE_CHECKING:
@@ -786,6 +787,7 @@ class TestReadingRuns:
             equity_curve=[],
             trades=[],
             warnings=[],
+            totals=a_totals(),
         )
 
         body = (await client.get(f"{BACKTESTS}/r1")).json()
@@ -810,6 +812,7 @@ class TestReadingRuns:
             equity_curve=[],
             trades=[],
             warnings=[],
+            totals=a_totals(),
         )
 
         warnings = (await client.get(f"{BACKTESTS}/r1")).json()["warnings"]
@@ -829,6 +832,7 @@ class TestReadingRuns:
             equity_curve=[],
             trades=[],
             warnings=[],
+            totals=a_totals(),
         )
 
         assert (await client.get(f"{BACKTESTS}/r1")).json()["warnings"] == []
@@ -858,6 +862,7 @@ class TestWarningsTheRunItselfProduced:
             equity_curve=[],
             trades=[],
             warnings=["20 of 20 orders were refused before reaching the market"],
+            totals=a_totals(),
         )
 
         warnings = (await client.get(f"{BACKTESTS}/r1")).json()["warnings"]
@@ -877,6 +882,7 @@ class TestWarningsTheRunItselfProduced:
             equity_curve=[],
             trades=[],
             warnings=["zero-cost model: this result is NOT evidence about this strategy"],
+            totals=a_totals(),
         )
 
         warnings = (await client.get(f"{BACKTESTS}/r1")).json()["warnings"]
@@ -900,6 +906,7 @@ class TestWarningsTheRunItselfProduced:
             equity_curve=[],
             trades=[],
             warnings=["zero-cost model", "refused before reaching the market"],
+            totals=a_totals(),
         )
 
         warnings = (await client.get(f"{BACKTESTS}/r1")).json()["warnings"]
@@ -922,6 +929,7 @@ class TestWarningsTheRunItselfProduced:
             equity_curve=[],
             trades=[],
             warnings=[],
+            totals=a_totals(),
         )
         runs.runs["r1"] = replace(runs.runs["r1"], warnings=None)
 
@@ -944,6 +952,7 @@ class TestWarningsTheRunItselfProduced:
             equity_curve=[],
             trades=[],
             warnings=[],
+            totals=a_totals(),
         )
 
         assert (await client.get(f"{BACKTESTS}/r1")).json()["warnings"] == []
@@ -960,6 +969,107 @@ class TestWarningsTheRunItselfProduced:
         assert "no stored bars" in body["error"]
 
 
+class TestTheMoneyOnARun:
+    """The nine ledger figures, and the type boundary they sit on.
+
+    `metrics` is a bag of floats and always was; money must not be float
+    (CLAUDE.md §1.1), so these cross as decimal strings in a field of their own.
+    Every test here is really one assertion in two halves: the figures arrive,
+    and they arrive as strings.
+    """
+
+    async def test_the_money_reaches_the_response(
+        self, client: httpx.AsyncClient, runs: FakeBacktestRunRepository
+    ) -> None:
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        await runs.finish(
+            "r1",
+            at=T0,
+            metrics={"sharpe": 1.0, "num_trades": 4},
+            equity_curve=[],
+            trades=[],
+            warnings=[],
+            totals=a_totals(),
+        )
+
+        totals = (await client.get(f"{BACKTESTS}/r1")).json()["totals"]
+
+        assert totals["ending_equity"] == "102000"
+        assert totals["realized_pnl"] == "1500"
+        assert totals["unrealized_pnl"] == "500"
+        assert totals["open_positions"] == 1
+
+    async def test_every_money_field_is_a_string_and_every_count_an_integer(
+        self, client: httpx.AsyncClient, runs: FakeBacktestRunRepository
+    ) -> None:
+        """A P&L that went through a JSON number is no longer exact, and a chart
+        drawn from it is the first thing here to render a corrupted balance."""
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        await runs.finish(
+            "r1",
+            at=T0,
+            metrics={},
+            equity_curve=[],
+            trades=[],
+            warnings=[],
+            totals=a_totals(),
+        )
+
+        totals = (await client.get(f"{BACKTESTS}/r1")).json()["totals"]
+
+        for key in (
+            "starting_equity",
+            "ending_equity",
+            "total_return",
+            "realized_pnl",
+            "unrealized_pnl",
+            "fees",
+        ):
+            assert isinstance(totals[key], str), f"{key} must not cross as a JSON number"
+        for key in ("open_positions", "orders", "filled_orders", "signals"):
+            assert isinstance(totals[key], int), f"{key} is a count"
+
+    async def test_a_run_stored_before_the_column_reports_null_not_zeros(
+        self, client: httpx.AsyncClient, runs: FakeBacktestRunRepository
+    ) -> None:
+        """Those runs computed these figures and discarded them. A nought here
+        would be a number nobody can check, and the screen would show it."""
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        stored = runs.runs["r1"]
+        runs.runs["r1"] = replace(stored, status="done", totals=None, metrics={"num_trades": 2})
+
+        assert (await client.get(f"{BACKTESTS}/r1")).json()["totals"] is None
+
+    async def test_a_failed_run_has_none_either(
+        self, client: httpx.AsyncClient, runs: FakeBacktestRunRepository
+    ) -> None:
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        await runs.fail("r1", at=T0, error="no stored bars for NOPE")
+
+        assert (await client.get(f"{BACKTESTS}/r1")).json()["totals"] is None
+
+    async def test_the_list_carries_it_too(
+        self, client: httpx.AsyncClient, runs: FakeBacktestRunRepository
+    ) -> None:
+        """The list is what the screen polls; a field only the detail endpoint
+        served would be absent from the row a reader looks at first."""
+        await runs.create(new_run("r1", a_spec(), queued_at=T0))
+        await runs.finish(
+            "r1",
+            at=T0,
+            metrics={},
+            equity_curve=[],
+            trades=[],
+            warnings=[],
+            totals=a_totals(open_positions=20, unrealized_pnl="202800"),
+        )
+
+        row = (await client.get(BACKTESTS)).json()["runs"][0]
+
+        assert row["totals"]["open_positions"] == 20
+        assert row["totals"]["unrealized_pnl"] == "202800"
+
+
 class TestTradesAndCurve:
     async def test_trades_and_curve_are_served_from_the_stored_run(
         self, client: httpx.AsyncClient, runs: FakeBacktestRunRepository
@@ -972,6 +1082,7 @@ class TestTradesAndCurve:
             equity_curve=[[T0.isoformat(), "100500.25"]],
             trades=[{"symbol": "SPY", "net_pnl": "500.25", "exit_reason": "stop_loss"}],
             warnings=[],
+            totals=a_totals(),
         )
 
         trades = (await client.get(f"{BACKTESTS}/r1/trades")).json()
@@ -989,7 +1100,13 @@ class TestTradesAndCurve:
         a run that does not exist, which is a different sentence."""
         await runs.create(new_run("r1", a_spec(), queued_at=T0))
         await runs.finish(
-            "r1", at=T0, metrics={"num_trades": 0}, equity_curve=[], trades=[], warnings=[]
+            "r1",
+            at=T0,
+            metrics={"num_trades": 0},
+            equity_curve=[],
+            trades=[],
+            warnings=[],
+            totals=a_totals(),
         )
 
         response = await client.get(f"{BACKTESTS}/r1/trades")
@@ -1013,6 +1130,7 @@ class TestComparing:
                 equity_curve=[],
                 trades=[],
                 warnings=[],
+                totals=a_totals(),
             )
 
     async def test_metrics_are_pivoted_by_metric_then_run(
@@ -1128,7 +1246,13 @@ class TestAuthorisation:
         app.dependency_overrides[get_current_session] = lambda: Session("reader", Scope.READ)
         await runs.create(new_run("a", a_spec(), queued_at=T0))
         await runs.finish(
-            "a", at=T0, metrics={"sharpe": 1.0}, equity_curve=[], trades=[], warnings=[]
+            "a",
+            at=T0,
+            metrics={"sharpe": 1.0},
+            equity_curve=[],
+            trades=[],
+            warnings=[],
+            totals=a_totals(),
         )
 
         assert (await client.get(BACKTESTS)).status_code == 200

@@ -245,31 +245,43 @@ class BacktestResult:
         """
         return self.portfolio.equity - self.portfolio.starting_equity - self.unrealized_pnl
 
-    def to_report(self) -> dict[str, object]:
-        """Serialisable summary for the API and the dashboard.
+    def totals(self) -> dict[str, object]:
+        """What this run made and what it did, JSON-legal.
 
         `realized_pnl` and `unrealized_pnl` are reported separately because
         `ending_equity` alone is readable two ways and only one of them is a
-        track record. They are money, so they are strings here and stay out of
-        `metrics`, which is a bag of floats by contract (CLAUDE.md §1.1).
+        track record. They are money, so they are decimal **strings** and stay
+        out of `metrics`, which is a bag of floats by contract (CLAUDE.md §1.1).
+        The four counts beside them are integers, which is what they are.
+
+        One method rather than a copy in the CLI's report and another in the
+        stored row, for ADR 0006's reason: two assemblies of the same nine
+        figures are two chances for a queued run and a CLI run to disagree
+        about what the same backtest made. See ADR 0019.
         """
         filled = [o for o in self.orders if o.filled_qty > 0]
+        return {
+            "starting_equity": str(self.portfolio.starting_equity),
+            "ending_equity": str(self.portfolio.equity),
+            "total_return": str(self.total_return),
+            "realized_pnl": str(self.realized_pnl),
+            "unrealized_pnl": str(self.unrealized_pnl),
+            "fees": str(sum((o.total_fees for o in self.orders), Decimal(0))),
+            "open_positions": len(self.portfolio.open_positions),
+            "orders": len(self.orders),
+            "filled_orders": len(filled),
+            "signals": len(self.signals),
+        }
+
+    def to_report(self) -> dict[str, object]:
+        """Serialisable summary for the API and the dashboard."""
         return {
             "strategy": self.strategy_name,
             "symbols": list(self.config.symbols),
             "timeframe": self.config.timeframe.value,
             "start": self.config.start.isoformat(),
             "end": self.config.end.isoformat(),
-            "starting_equity": str(self.portfolio.starting_equity),
-            "ending_equity": str(self.portfolio.equity),
-            "total_return": str(self.total_return),
-            "realized_pnl": str(self.realized_pnl),
-            "unrealized_pnl": str(self.unrealized_pnl),
-            "open_positions": len(self.portfolio.open_positions),
-            "orders": len(self.orders),
-            "filled_orders": len(filled),
-            "signals": len(self.signals),
-            "fees": str(sum((o.total_fees for o in self.orders), Decimal(0))),
+            **self.totals(),
             "metrics": dict(self.metrics),
             "warnings": list(self.warnings),
         }

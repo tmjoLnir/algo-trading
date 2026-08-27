@@ -352,12 +352,22 @@ def run_spec(
 
 def result_to_storage(
     result: BacktestResult,
-) -> tuple[dict[str, float], list[list[str]], list[dict[str, object]], list[str]]:
-    """A finished run as the four JSON columns that hold it.
+) -> tuple[
+    dict[str, float], list[list[str]], list[dict[str, object]], list[str], dict[str, object]
+]:
+    """A finished run as the five JSON columns that hold it.
 
-    Returned as one tuple because the four are written in one transaction: a
+    Returned as one tuple because the five are written in one transaction: a
     `done` run whose metrics landed and whose equity curve did not would be a row
     claiming a result it cannot show.
+
+    **`totals` is the money and the counts**, straight from
+    `BacktestResult.totals()` rather than reassembled here. It is separate from
+    `metrics` because `metrics` is float by contract and five of these are
+    money, which must not be (CLAUDE.md §1.1) — and it is stored rather than
+    derived because nothing downstream can recover `realized_pnl` from a metric
+    set. A run that ends holding everything and one that banked the same return
+    have identical metrics and opposite meanings (ADR 0019).
 
     **`warnings` is the run's own account of itself**, and it is here rather
     than recomputed on read because most of it is not a function of the metrics.
@@ -378,7 +388,7 @@ def result_to_storage(
     metrics = _jsonable_metrics(result.metrics)
     curve = [[ts.isoformat(), str(equity)] for ts, equity in result.equity_curve]
     trades = [_jsonable_trade(trade) for trade in PerformanceAnalyzer().build_trades(result.orders)]
-    return metrics, curve, trades, list(result.warnings)
+    return metrics, curve, trades, list(result.warnings), result.totals()
 
 
 def jsonable(value: object) -> object:

@@ -338,6 +338,16 @@ Read `expectancy` and `realized_pnl` together as the track record. A large
 `unrealized_pnl` is not a result — it is a position, and it is a statement about
 one arbitrary day.
 
+**The dashboard says it too, in the same words.** All nine figures are stored on
+a queued run (`backtest_runs.totals`) and the run panel carries a *Money* block
+above the metric grid, with the same "N positions still open at the end,
+carrying X of unrealised" sentence the CLI prints. Until they were stored, the
+queued path kept neither reading — the screen showed a return with nothing to
+say how much of it had been banked, and the nearest hint was `num_trades: 0`,
+which says something different (ADR 0019). A run recorded before that column
+existed shows no split at all rather than zeros: those figures were computed and
+thrown away, and there is nothing to reconstruct them from.
+
 **An equity point is dated by its bar, not by the clock** (ADR 0018). The two
 are not the same instant: the engine's clock stands at `ts + step`, which is
 when the bar's decision could first be taken and what stamps its orders, while a

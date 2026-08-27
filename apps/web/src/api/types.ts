@@ -162,6 +162,14 @@ export type StrategiesResponse = Schemas['StrategiesResponse']
  * every value on the equity curve and every money field on a trade. Those go
  * through `money.ts`, which accepts only strings.
  *
+ * `BacktestOut.totals` is the ledger half of the same run and is the other side
+ * of that boundary: every figure in it is a decimal string for `money.ts`,
+ * while the identically-named `total_return` inside `metrics` is the float
+ * statistic. They come from the same equity computed by the same engine — the
+ * difference is the type, and which formatter may touch it. `totals` is null on
+ * a run stored before the server recorded them, which is not zero: those runs
+ * produced the figures and threw them away.
+ *
  * `BacktestTradesResponse.trades` is deliberately untyped by the server — the
  * rows are `TradeRecord`s serialised generically, so the schema carries them as
  * a JSON object. `BacktestTrade` below is this app's reading of that shape, and
@@ -171,6 +179,7 @@ export type StrategiesResponse = Schemas['StrategiesResponse']
  */
 export type BacktestOut = Schemas['BacktestOut']
 export type BacktestSpecView = Schemas['BacktestSpecView']
+export type BacktestTotalsView = Schemas['BacktestTotalsView']
 export type BacktestProgressView = Schemas['BacktestProgressView']
 export type BacktestListResponse = Schemas['BacktestListResponse']
 export type BacktestTradesResponse = Schemas['BacktestTradesResponse']

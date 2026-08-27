@@ -466,6 +466,17 @@ says so in as many words. Everything on a *trade* — price, quantity, fee, P&L 
 a decimal string and goes through `money.ts` untouched. The equity curve's single
 float conversion is `toChartNumber`, for geometry.
 
+**The panel's two blocks are that boundary made visible.** *Money* above,
+*Metrics* below: the first is `run.totals` — ending equity, the realised and
+unrealised split, fees, the counts — every figure a decimal string through
+`money.ts`; the second is float statistics through `stats.ts`. `total_return`
+appears in both, and that is not a duplicate: it is one quantity in the two types
+its two readers need, and the type is what decides which formatter may touch it
+(ADR 0019). Where a run ends still holding, the *Money* block carries the
+sentence `scripts/run_backtest.py` prints — N positions still open carrying X of
+unrealised — placed above the metric grid because every statistic under it counts
+closed round trips, and the sentence changes what they are a statement about.
+
 **The trade table is what makes the page worth opening.**
 docs/BACKTESTING.md's pre-belief checklist asks for individual trades to be
 inspected for impossible fills, and nothing else in this platform can answer it —
@@ -479,13 +490,13 @@ writes that one run to `backtest-<strategy>-<queued date>-<run id>.json`: the ru
 as the API served it — spec, metrics, warnings, all three timestamps — plus its
 equity curve and every trade. Four decisions in it are worth stating:
 
-What it does **not** carry is the run's money: `ending_equity`, the realised and
-unrealised split, the open-position count, the fill counts and the fees. Those
-are on `BacktestResult.to_report()` and reach the CLI's `--out`, and the queued
-path has never stored them, so neither this screen nor its export can show that
-a return is unbanked. Known, deliberate, and written up in
-`docs/PARKING_LOT.md` — not a gap in the exporter, which copies verbatim what it
-is served.
+That now includes the run's money — `ending_equity`, the realised and unrealised
+split, the open-position count, the fill counts and the fees — because the queued
+path stores them (`backtest_runs.totals`) and the export copies the run verbatim.
+It did not for a long time: the engine computed all nine on every queued run and
+`result_to_storage` dropped them, so neither this screen nor its export could say
+that a return was unbanked (ADR 0019). A run recorded before that column carries
+`totals: null`, which is not zeros: those figures existed and were thrown away.
 
 - **Per run, not per list.** What a reader keeps, diffs or hands to a notebook is
   a *result*. Forty of them with the curves attached is not a file anybody opens,

@@ -54,6 +54,18 @@ function run(overrides: Partial<BacktestOut> = {}): BacktestOut {
     finished_at: '2026-08-20T09:02:10Z',
     progress: null,
     warnings: [],
+    totals: {
+      starting_equity: '100000',
+      ending_equity: '118400',
+      total_return: '0.184',
+      realized_pnl: '16400',
+      unrealized_pnl: '2000',
+      fees: '128.55',
+      open_positions: 1,
+      orders: 240,
+      filled_orders: 236,
+      signals: 251,
+    },
     ...overrides,
   }
 }
@@ -70,6 +82,28 @@ describe('what the file contains', () => {
     expect(file.format).toBe(EXPORT_FORMAT)
     expect(file.exported_at).toBe(AT)
     expect(file.run.finished_at).toBe('2026-08-20T09:02:10Z')
+  })
+
+  it("carries the run's money, as the strings the server sent", () => {
+    // The file used to be missing every money figure a run produced, because
+    // the queued path did not store them (ADR 0019). It rides along now for
+    // free — the run is copied verbatim — and this is what keeps that true:
+    // never a `parseFloat` on a balance between the wire and the disk.
+    const file = buildRunExport(run(), { curve: [], trades: [], exportedAt: AT })
+
+    expect(file.run.totals?.realized_pnl).toBe('16400')
+    expect(file.run.totals?.unrealized_pnl).toBe('2000')
+    expect(file.run.totals?.open_positions).toBe(1)
+  })
+
+  it('exports an old run without inventing a split it never recorded', () => {
+    const file = buildRunExport(run({ totals: null }), {
+      curve: [],
+      trades: [],
+      exportedAt: AT,
+    })
+
+    expect(file.run.totals).toBeNull()
   })
 
   it('copies the run without editing it', () => {
