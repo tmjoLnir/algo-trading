@@ -12,16 +12,21 @@ backtest of something they did not ask for.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib.util
 import json
 import math
 import sys
+from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import pytest
 
+from atp_core.backtest.ports import BacktestRunSpec, spec_to_json
 from atp_core.backtest.runner import STOP_TYPES
+from atp_core.persistence.backtests import _spec_from_json
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -222,3 +227,127 @@ class TestHeadlineSet:
 
         fields = set(PerformanceMetrics.__slots__)
         assert {key for key, _, _ in cli._HEADLINE} <= fields
+
+
+#: Every optional field off its default, so a field the export drops cannot pass
+#: by coincidence. `test_the_sample_differs_from_every_default` guards that, for
+#: the same reason `test_backtest_run_spec.py` guards its own copy: the original
+#: dropped-field bug was invisible precisely because the values that went
+#: missing were the ones a default would have supplied anyway.
+EXPORTED = BacktestRunSpec(
+    strategy_id="sma_crossover",
+    symbols=("SPY", "QQQ"),
+    start=datetime(2024, 1, 2, tzinfo=UTC),
+    end=datetime(2024, 12, 31, tzinfo=UTC),
+    timeframe="1h",
+    starting_cash="250000.55",
+    cost_model="zero",
+    params={"fast_period": 10, "slow_period": 30},
+    ruleset={"name": "a_rule_set", "universe": ["SPY"]},
+    qty="42",
+    sizing_method="risk_pct",
+    sizing_value="0.01",
+    stop_type="atr",
+    stop_value="2.5",
+    stop_period=21,
+    stop_bars=7,
+)
+
+
+class _FakeResult:
+    """Enough of `BacktestResult` for the report assembly, which reads two
+    attributes of it and nothing else.
+
+    A real result would need bars, an engine and a database to produce, and none
+    of the three would make these assertions say anything more.
+    """
+
+    equity_curve: ClassVar[list[tuple[datetime, Decimal]]] = [
+        (datetime(2024, 1, 2, tzinfo=UTC), Decimal("250000.55")),
+        (datetime(2024, 1, 3, tzinfo=UTC), Decimal("250125.80")),
+    ]
+
+    def to_report(self) -> dict[str, Any]:
+        return {
+            "strategy": "sma_crossover",
+            "symbols": ["SPY", "QQQ"],
+            "timeframe": "1h",
+            "start": "2024-01-02T00:00:00+00:00",
+            "end": "2024-12-31T00:00:00+00:00",
+            "ending_equity": "250125.80",
+            "metrics": {"total_return": 0.0005},
+            "warnings": [],
+        }
+
+
+class TestTheExportedSpec:
+    """`--out` records what was asked for, not only what came back.
+
+    The file used to carry the strategy, the universe and the window and stop
+    there. Everything else an operator chose — the cost model, the sizing method
+    and its value, the stop and its parameters, the strategy params — was
+    reachable from the command line and recorded nowhere, so two runs that
+    differed in how they were sized produced two files that looked comparable
+    and were not. A `--zero-cost` run was indistinguishable from a costed one,
+    which is the case docs/BACKTESTING.md is most insistent about.
+    """
+
+    def test_the_sample_differs_from_every_default(self) -> None:
+        """Guards the guard, as in `test_backtest_run_spec.py`: a field sitting
+        at its default would survive an export that dropped it."""
+        for field in dataclasses.fields(BacktestRunSpec):
+            if field.default is dataclasses.MISSING:
+                continue
+            assert getattr(EXPORTED, field.name) != field.default, (
+                f"{field.name} is at its default, so no test here can tell "
+                f"whether it survives the export"
+            )
+
+    def test_the_spec_travels_with_the_result(self) -> None:
+        assert "spec" in cli.build_report(_FakeResult(), EXPORTED)
+
+    @pytest.mark.parametrize("name", [f.name for f in dataclasses.fields(BacktestRunSpec)])
+    def test_every_field_is_recorded(self, name: str) -> None:
+        """Driven off `dataclasses.fields` rather than a list written by hand,
+        so a field added to the spec cannot reach the engine while going missing
+        from the file that claims to describe the run."""
+        assert name in cli.build_report(_FakeResult(), EXPORTED)["spec"]
+
+    def test_the_recorded_spec_round_trips(self) -> None:
+        """The point of recording it: the file is enough to say what ran, well
+        enough that the spec can be rebuilt from it and compared."""
+        restored = _spec_from_json(
+            EXPORTED.strategy_id, cli.build_report(_FakeResult(), EXPORTED)["spec"]
+        )
+        assert restored == EXPORTED
+
+    def test_it_is_the_same_block_the_queued_path_stores(self) -> None:
+        """The whole reason `spec_to_json` was hoisted out of the persistence
+        adapter. A CLI run and a dashboard run have to describe themselves
+        identically, or comparing one against the other means reconciling two
+        formats first."""
+        assert cli.build_report(_FakeResult(), EXPORTED)["spec"] == spec_to_json(EXPORTED)
+
+    def test_it_survives_the_json_round_trip(self) -> None:
+        """`--out` writes through `jsonable` with `allow_nan=False`. A spec
+        holding something unserialisable would fail at the end of a long run."""
+        written = json.loads(json.dumps(cli.jsonable(cli.build_report(_FakeResult(), EXPORTED))))
+        assert written["spec"]["sizing_method"] == "risk_pct"
+        assert written["spec"]["stop_type"] == "atr"
+        assert written["spec"]["cost_model"] == "zero"
+
+
+class TestTheRestOfTheReport:
+    def test_the_spec_displaces_nothing(self) -> None:
+        """The added key is additive. Anything already reading these files —
+        a notebook, a saved comparison — keeps reading them."""
+        report = cli.build_report(_FakeResult(), EXPORTED)
+        for key in _FakeResult().to_report():
+            assert key in report
+
+    def test_the_curve_is_stringified_money(self) -> None:
+        """Decimals, not floats: the curve that reaches a chart is the one the
+        engine computed (CLAUDE.md §1.1)."""
+        curve = cli.build_report(_FakeResult(), EXPORTED)["equity_curve"]
+        assert curve[0] == ["2024-01-02T00:00:00+00:00", "250000.55"]
+        assert all(isinstance(value, str) for _, value in curve)

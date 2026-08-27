@@ -38,6 +38,7 @@ from atp_core.backtest.ports import (
     STATUS_RUNNING,
     BacktestRunSpec,
     StoredBacktestRun,
+    spec_to_json,
 )
 from atp_core.logging import get_logger
 from atp_core.persistence.db import session_scope
@@ -75,7 +76,7 @@ class PostgresBacktestRunRepository:
                 BacktestRunRow(
                     id=run.id,
                     strategy_id=run.spec.strategy_id,
-                    config=_spec_to_json(run.spec),
+                    config=spec_to_json(run.spec),
                     status=run.status,
                     metrics=run.metrics,
                     equity_curve=run.equity_curve,
@@ -218,47 +219,6 @@ class PostgresBacktestRunRepository:
             return list((await session.execute(query)).scalars().all())
 
 
-def _spec_to_json(spec: BacktestRunSpec) -> dict[str, Any]:
-    """The request as it goes into the `config` column.
-
-    Timestamps as ISO-8601 and money as a string, which is what
-    `BacktestRunSpec` already holds — the type exists so that this conversion is
-    a serialisation rather than a decision (see its docstring).
-
-    **Every field, and that is the invariant rather than a detail.** This wrote
-    nine of the spec's fifteen for a while, and the six it dropped were
-    `sizing_method`, `sizing_value` and the four `stop_*` fields. Nothing failed
-    visibly: the API validated a `risk_pct` request with an ATR stop, wrote a
-    row that recorded neither, and the worker — which rebuilds the spec from
-    this column and nothing else — ran it as `fixed_qty` with no stop. A run
-    that silently ignores the sizing and the protection somebody chose is the
-    same class of error as a backtest with no costs, and it looks exactly like a
-    correct result.
-
-    So: a field on the spec is a field here. `test_backtest_run_spec.py` asserts
-    that against `dataclasses.fields`, which is what makes the next field
-    impossible to forget rather than merely unlikely.
-    """
-    return {
-        "strategy_id": spec.strategy_id,
-        "symbols": list(spec.symbols),
-        "start": spec.start.isoformat(),
-        "end": spec.end.isoformat(),
-        "timeframe": spec.timeframe,
-        "starting_cash": spec.starting_cash,
-        "cost_model": spec.cost_model,
-        "params": dict(spec.params),
-        "ruleset": dict(spec.ruleset) if spec.ruleset is not None else None,
-        "qty": spec.qty,
-        "sizing_method": spec.sizing_method,
-        "sizing_value": spec.sizing_value,
-        "stop_type": spec.stop_type,
-        "stop_value": spec.stop_value,
-        "stop_period": spec.stop_period,
-        "stop_bars": spec.stop_bars,
-    }
-
-
 def _spec_from_json(strategy_id: str, config: dict[str, Any]) -> BacktestRunSpec:
     """The `config` column back into a spec.
 
@@ -280,7 +240,7 @@ def _spec_from_json(strategy_id: str, config: dict[str, Any]) -> BacktestRunSpec
     engine did unconditionally before stops were configurable.
 
     One consequence is worth stating plainly, because someone will notice it.
-    Rows written while `_spec_to_json` was dropping these fields come back as
+    Rows written while `spec_to_json` was dropping these fields come back as
     `fixed_qty` with no stop **even if the request that created them asked for
     `risk_pct` and an ATR stop** — the ask was never recorded and cannot be
     recovered. That is the honest reading rather than a lossy one: those runs

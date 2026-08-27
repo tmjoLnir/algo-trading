@@ -1840,6 +1840,20 @@ wording if it is not the demonstration you want.
   Runs queued before that fix still read as `fixed_qty` with no stop, which is
   what they ran as — the ask was never recorded and cannot be recovered.
 
+  **The CLI's own half of that seam closed later, and it was the mirror image.**
+  Its execution was never affected — it hands a spec straight to `build_engine`
+  — but its `--out` file recorded only the strategy, the universe and the
+  window. The cost model, the strategy params, the sizing method and its value
+  and all four stop fields were reachable from the command line and preserved
+  nowhere, so two exports differing only in `--sizing` were indistinguishable on
+  disk, and a `--zero-cost` run read as evidence. Where the queued path lost the
+  ask on the way *in* and ran the wrong thing, the CLI ran the right thing and
+  lost the ask on the way *out*: the numbers were correct and unattributable.
+  `_spec_to_json` is now `ports.spec_to_json` — one writer for the `config`
+  column and the `--out` file alike, with the `dataclasses.fields` assertion
+  covering both — so a CLI export and a run exported from this tab carry the
+  same spec block.
+
   **And until #104 the screen could not say what a run had been refused.**
   `result_to_storage` returned metrics, the curve and the trades;
   `BacktestResult.warnings` — every per-order refusal the engine booked, the

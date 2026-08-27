@@ -20,11 +20,11 @@ from typing import Any
 import pytest
 
 from atp_core.backtest.engine import BacktestEngine
-from atp_core.backtest.ports import BacktestRunSpec
+from atp_core.backtest.ports import BacktestRunSpec, spec_to_json
 from atp_core.backtest.runner import _resolve_strategy, build_engine
 from atp_core.config import get_settings
 from atp_core.errors import ConfigError
-from atp_core.persistence.backtests import _spec_from_json, _spec_to_json
+from atp_core.persistence.backtests import _spec_from_json
 from atp_core.strategy.examples import rsi_mean_reversion
 from atp_core.strategy.examples.sma_crossover import SmaCrossover
 
@@ -53,7 +53,7 @@ def shipped_rules() -> dict[str, Any]:
 
 def through_the_column(spec: BacktestRunSpec) -> BacktestRunSpec:
     """The spec as the worker receives it — via `json`, the column's medium."""
-    return _spec_from_json(spec.strategy_id, json.loads(json.dumps(_spec_to_json(spec))))
+    return _spec_from_json(spec.strategy_id, json.loads(json.dumps(spec_to_json(spec))))
 
 
 class TestResolvingTheStrategy:

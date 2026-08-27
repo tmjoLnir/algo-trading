@@ -32,8 +32,8 @@ from typing import Any
 
 import pytest
 
-from atp_core.backtest.ports import BacktestRunSpec
-from atp_core.persistence.backtests import _spec_from_json, _spec_to_json
+from atp_core.backtest.ports import BacktestRunSpec, spec_to_json
+from atp_core.persistence.backtests import _spec_from_json
 
 START = datetime(2024, 1, 2, tzinfo=UTC)
 END = datetime(2024, 12, 31, tzinfo=UTC)
@@ -61,7 +61,7 @@ FULLY_SPECIFIED = BacktestRunSpec(
 )
 
 #: A row written before the sizing and stop fields were serialised. Not a
-#: hypothetical: every run queued while `_spec_to_json` dropped them looks
+#: hypothetical: every run queued while `spec_to_json` dropped them looks
 #: exactly like this.
 LEGACY_CONFIG: dict[str, Any] = {
     "strategy_id": "sma_crossover",
@@ -98,7 +98,7 @@ class TestTheRoundTrip:
             )
 
     def test_every_field_survives(self) -> None:
-        restored = _spec_from_json(FULLY_SPECIFIED.strategy_id, _spec_to_json(FULLY_SPECIFIED))
+        restored = _spec_from_json(FULLY_SPECIFIED.strategy_id, spec_to_json(FULLY_SPECIFIED))
         assert restored == FULLY_SPECIFIED
 
     @pytest.mark.parametrize("name", [f.name for f in dataclasses.fields(BacktestRunSpec)])
@@ -107,22 +107,22 @@ class TestTheRoundTrip:
 
         This is the test that makes the next field impossible to forget rather
         than merely unlikely to be: adding one to `BacktestRunSpec` without
-        teaching `_spec_to_json` about it fails here, by name, before it can
+        teaching `spec_to_json` about it fails here, by name, before it can
         reach a run that quietly ignores it.
         """
-        assert name in _spec_to_json(FULLY_SPECIFIED)
+        assert name in spec_to_json(FULLY_SPECIFIED)
 
     @pytest.mark.parametrize("field", optional_fields(), ids=lambda f: f.name)
     def test_each_field_round_trips_individually(self, field: dataclasses.Field[Any]) -> None:
         """Named per field, so a failure says which one was lost rather than
         that two specs differed."""
-        restored = _spec_from_json(FULLY_SPECIFIED.strategy_id, _spec_to_json(FULLY_SPECIFIED))
+        restored = _spec_from_json(FULLY_SPECIFIED.strategy_id, spec_to_json(FULLY_SPECIFIED))
         assert getattr(restored, field.name) == getattr(FULLY_SPECIFIED, field.name)
 
     def test_the_window_keeps_its_timezone(self) -> None:
         """A naive datetime is rejected at the domain boundary (rule §1.2), so a
         window that came back naive would fail far from here."""
-        restored = _spec_from_json(FULLY_SPECIFIED.strategy_id, _spec_to_json(FULLY_SPECIFIED))
+        restored = _spec_from_json(FULLY_SPECIFIED.strategy_id, spec_to_json(FULLY_SPECIFIED))
         assert restored.start.tzinfo is not None
         assert restored.start == START
         assert restored.end == END

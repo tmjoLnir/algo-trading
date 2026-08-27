@@ -126,6 +126,21 @@ uv run python scripts/run_backtest.py \
   --stop atr --stop-value 2 --stop-period 14 --out results.json
 ```
 
+`--out` writes the whole result as JSON — the metrics, the money, the equity
+curve — and, under `spec`, the request that produced them. That last part is
+exactly what the two commands above differ by, and without it their files are
+indistinguishable: the second run's return reads as a fact about
+`sma_crossover` when it is a fact about `sma_crossover` sized at 0.3% risk
+behind a 2×ATR stop. The block carries every field of the request — cost model,
+strategy params, sizing method and value, stop type and its parameters — so a
+`--zero-cost` run is legible as one rather than passing for evidence.
+
+It is written by `atp_core.backtest.ports.spec_to_json`, which is the same
+writer that fills `backtest_runs.config` for a queued run and reaches the
+Backtests tab from there. A CLI export and a run exported from the tab
+therefore describe themselves identically, and a field added to the spec lands
+in both files or neither.
+
 Or from the dashboard's **Backtests** tab, over `POST /api/v1/backtests`. Both
 assemble the engine through the same function (`atp_core.backtest.runner
 .build_engine`), so the same parameters produce the same result either way — two
