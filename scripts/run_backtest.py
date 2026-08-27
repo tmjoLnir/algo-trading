@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
-from atp_core.backtest.ports import BacktestRunSpec
+from atp_core.backtest.ports import BacktestRunSpec, spec_to_json
 from atp_core.backtest.runner import (
     SIZING_METHODS,
     STOP_TYPES,
@@ -188,6 +188,35 @@ def _print_report(
             print(f"  ... and {len(result.warnings) - 10} more")
 
 
+def build_report(result: Any, spec: BacktestRunSpec) -> dict[str, Any]:
+    """The `--out` file: what the run produced, what was asked for, and the curve.
+
+    **The spec is here because a return is not evidence about a strategy on its
+    own.** Two runs of one strategy differing only in `--sizing` are two
+    different results, and a reader holding two of these files cannot see that
+    unless the request travels with them. `to_report()` carries the strategy,
+    the universe and the window and stops there — so everything `--sizing`,
+    `--stop`, `--params` and `--zero-cost` decide was reachable from the command
+    line and recorded nowhere, and a file that omits the cost model can be read
+    as evidence when it is a debugging run.
+
+    Written through `ports.spec_to_json`, which is the same writer the queued
+    path stores on `backtest_runs.config` and the Backtests tab serves. That is
+    the point rather than a convenience: a CLI run and a dashboard run describe
+    themselves identically, and a field added to the spec reaches both files or
+    neither. Same argument as `build_engine` — two call sites that assembled
+    this separately would drift, and the drift would surface as two files that
+    look comparable and are not.
+
+    Pure, and separate from `main` for that reason: the assembly is the part
+    worth a test, and reaching it through `main` would need a database.
+    """
+    report: dict[str, Any] = result.to_report()
+    report["spec"] = spec_to_json(spec)
+    report["equity_curve"] = [[ts.isoformat(), str(eq)] for ts, eq in result.equity_curve]
+    return report
+
+
 async def _load_bars(
     database_url: str, symbols: list[str], timeframe: Timeframe, start: datetime, end: datetime
 ) -> dict[str, list[Bar]]:
@@ -307,26 +336,27 @@ async def main(argv: list[str] | None = None) -> int:
     # Every `ConfigError` that function raises is unreachable from here — the
     # argument handling above has already rejected each of those conditions with
     # a message naming the flag, which is the better error for a CLI.
-    engine = build_engine(
-        BacktestRunSpec(
-            strategy_id=strategy_name,
-            symbols=tuple(symbols),
-            start=start,
-            end=end,
-            timeframe=timeframe.value,
-            starting_cash=str(Decimal(str(args.cash))),
-            cost_model="zero" if args.zero_cost else "alpaca_equities",
-            params=params,
-            qty=str(args.qty),
-            sizing_method=args.sizing,
-            sizing_value=args.sizing_value or "",
-            stop_type=args.stop or "",
-            stop_value=args.stop_value or "",
-            stop_period=args.stop_period,
-            stop_bars=args.stop_bars,
-        ),
-        limits=settings.risk,
+    # Named rather than inlined into the call, because `--out` records it: a
+    # run has to be able to say what it was a run *of*, and the spec is that
+    # sentence. See the `--out` block below.
+    spec = BacktestRunSpec(
+        strategy_id=strategy_name,
+        symbols=tuple(symbols),
+        start=start,
+        end=end,
+        timeframe=timeframe.value,
+        starting_cash=str(Decimal(str(args.cash))),
+        cost_model="zero" if args.zero_cost else "alpaca_equities",
+        params=params,
+        qty=str(args.qty),
+        sizing_method=args.sizing,
+        sizing_value=args.sizing_value or "",
+        stop_type=args.stop or "",
+        stop_value=args.stop_value or "",
+        stop_period=args.stop_period,
+        stop_bars=args.stop_bars,
     )
+    engine = build_engine(spec, limits=settings.risk)
 
     try:
         result = engine.run(bars)
@@ -367,10 +397,8 @@ async def main(argv: list[str] | None = None) -> int:
         )
 
     if args.out:
-        report = result.to_report()
-        report["equity_curve"] = [[ts.isoformat(), str(eq)] for ts, eq in result.equity_curve]
         with Path(args.out).open("w", encoding="utf-8") as handle:
-            json.dump(jsonable(report), handle, indent=2, allow_nan=False)
+            json.dump(jsonable(build_report(result, spec)), handle, indent=2, allow_nan=False)
         print(f"\nFull results written to {args.out}")
 
     return 0

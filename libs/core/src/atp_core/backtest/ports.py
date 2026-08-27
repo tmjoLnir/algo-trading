@@ -31,7 +31,7 @@ with no Redis to connect to.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -138,6 +138,62 @@ class BacktestRunSpec:
     #: How many bars a `time` stop holds for. Zero is "not configured", which
     #: that stop type refuses rather than defaults.
     stop_bars: int = 0
+
+
+def spec_to_json(spec: BacktestRunSpec) -> dict[str, Any]:
+    """The request as JSON — **every field, and that is the invariant rather
+    than a detail.**
+
+    Timestamps as ISO-8601 and money as a string, which is what
+    `BacktestRunSpec` already holds: the type exists so that this conversion is
+    a serialisation rather than a decision (see its docstring).
+
+    Two callers, and the second is why this lives beside the dataclass rather
+    than in the persistence adapter it was written in. `persistence.backtests`
+    puts it in the `config` column; `scripts/run_backtest.py` puts it in the
+    `--out` file. Those are one problem — recording what a run was a run *of* —
+    and two copies would be two chances for one of them to start dropping a
+    field. Same reasoning as `backtest.runner.jsonable`, hoisted out of that
+    same script for that same reason.
+
+    The every-field rule is not caution. This wrote nine of the spec's fifteen
+    for a while, and the six it dropped were `sizing_method`, `sizing_value` and
+    the four `stop_*` fields. Nothing failed visibly: the API validated a
+    `risk_pct` request with an ATR stop, wrote a row that recorded neither, and
+    the worker — which rebuilds the spec from that column and nothing else — ran
+    it as `fixed_qty` with no stop. A run that silently ignores the sizing and
+    the protection somebody chose is the same class of error as a backtest with
+    no costs, and it looks exactly like a correct result.
+
+    So: a field on the spec is a field here. `test_backtest_run_spec.py` asserts
+    that against `dataclasses.fields`, which is what makes the next field
+    impossible to forget rather than merely unlikely.
+
+    Values are written **raw rather than resolved** — an empty `sizing_value`
+    stays empty rather than becoming `qty`. The empty string is itself a fact
+    about the run ("sized by `qty`", per that field's own docstring) and it
+    round-trips; resolving it here would make the record disagree with what was
+    asked for. The API's `BacktestSpecView` resolves for display, which is a
+    different job with a different reader.
+    """
+    return {
+        "strategy_id": spec.strategy_id,
+        "symbols": list(spec.symbols),
+        "start": spec.start.isoformat(),
+        "end": spec.end.isoformat(),
+        "timeframe": spec.timeframe,
+        "starting_cash": spec.starting_cash,
+        "cost_model": spec.cost_model,
+        "params": dict(spec.params),
+        "ruleset": dict(spec.ruleset) if spec.ruleset is not None else None,
+        "qty": spec.qty,
+        "sizing_method": spec.sizing_method,
+        "sizing_value": spec.sizing_value,
+        "stop_type": spec.stop_type,
+        "stop_value": spec.stop_value,
+        "stop_period": spec.stop_period,
+        "stop_bars": spec.stop_bars,
+    }
 
 
 @dataclass(frozen=True, slots=True)
