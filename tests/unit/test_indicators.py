@@ -13,6 +13,7 @@ with a burst of trades taken on an SMA(200) computed from six bars
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
@@ -20,6 +21,9 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from atp_core.indicators import ta
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 PRICES = st.floats(min_value=1.0, max_value=10_000.0, allow_nan=False, allow_infinity=False)
 
@@ -250,12 +254,13 @@ def test_macd_rejects_a_fast_period_that_is_not_faster() -> None:
 @pytest.mark.parametrize("period", [0, -1])
 def test_indicators_reject_a_nonsense_period(period: int) -> None:
     values = np.arange(100.0)
-    for call in (
+    calls: tuple[Callable[[], object], ...] = (
         lambda: ta.ema(values, period),
         lambda: ta.rsi(values, period),
         lambda: ta.stddev(values, period),
         lambda: ta.atr(values, values, values, period),
-    ):
+    )
+    for call in calls:
         with pytest.raises(ValueError, match="period >= 1"):
             call()
 

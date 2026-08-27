@@ -108,6 +108,20 @@ const DONE_METRICS = {
   turnover: 3.4,
 }
 
+/** Money as decimal strings and counts as integers, exactly as the server sends. */
+const DONE_TOTALS = {
+  starting_equity: '100000',
+  ending_equity: '118400',
+  total_return: '0.184',
+  realized_pnl: '16400',
+  unrealized_pnl: '2000',
+  fees: '128.55',
+  open_positions: 0,
+  orders: 240,
+  filled_orders: 236,
+  signals: 251,
+}
+
 function run(overrides: Partial<BacktestOut> = {}): BacktestOut {
   return {
     id: 'run-1',
@@ -121,6 +135,7 @@ function run(overrides: Partial<BacktestOut> = {}): BacktestOut {
     finished_at: '2026-08-20T09:02:10Z',
     progress: null,
     warnings: [],
+    totals: DONE_TOTALS,
     ...overrides,
   }
 }
@@ -415,6 +430,89 @@ describe('a finished run', () => {
     await openRun()
 
     expect(await screen.findByText(/float statistics over the return series/)).toBeTruthy()
+  })
+})
+
+describe("what a run's return is actually made of", () => {
+  /**
+   * The gap this closes: a run reported +202.8% on this screen with nothing to
+   * say that *none of it was realised* — twenty positions still open at the
+   * end, the whole return an unrealised mark. The metric set could not say so;
+   * every per-trade statistic in it counts closed round trips, so a strategy
+   * still holding everything has the same all-zero trade statistics as one that
+   * never had an idea.
+   */
+  const holding = {
+    ...DONE_TOTALS,
+    total_return: '2.028',
+    realized_pnl: '0',
+    unrealized_pnl: '202800',
+    ending_equity: '302800',
+    open_positions: 20,
+  }
+
+  const openPanel = (totals: BacktestOut['totals']) => {
+    stubRoutes({
+      ...baseRoutes(),
+      'GET /backtests': { body: list([run({ totals })]) },
+      'GET /backtests/run-1/equity-curve': { body: { run_id: 'run-1', points: [] } },
+      'GET /backtests/run-1/trades': { body: { run_id: 'run-1', trades: [] } },
+    })
+    renderPage()
+    return openRun()
+  }
+
+  it('splits the return into what was banked and what is still a mark', async () => {
+    await openPanel(DONE_TOTALS)
+
+    const realised = await screen.findByText(/realised \(closed trades\)/)
+    expect(realised.parentElement?.querySelector('dd')?.textContent).toBe('+16,400.00')
+    const unrealised = await screen.findByText(/unrealised \(still open\)/)
+    expect(unrealised.parentElement?.querySelector('dd')?.textContent).toBe('+2,000.00')
+  })
+
+  it('says how much of a return is a position rather than a track record', async () => {
+    await openPanel(holding)
+
+    const sentence = await screen.findByText(/20 positions still open at the end/)
+    expect(sentence.textContent).toMatch(/202,800\.00 of unrealised mark-to-market/)
+    expect(sentence.textContent).toMatch(/count closed round trips only/)
+  })
+
+  it('says nothing about open positions when the run closed everything', async () => {
+    await openPanel({ ...DONE_TOTALS, unrealized_pnl: '0', open_positions: 0 })
+
+    expect(await screen.findByText('Starting equity')).toBeTruthy()
+    expect(screen.queryByText(/still open at the end/)).toBeNull()
+  })
+
+  it('puts the split above the statistics it changes the meaning of', async () => {
+    await openPanel(holding)
+
+    const sentence = await screen.findByText(/still open at the end/)
+    const metrics = await screen.findByText('Metrics')
+    expect(
+      sentence.compareDocumentPosition(metrics) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+  })
+
+  it('formats these as money, not as the float statistics of the same name', async () => {
+    // `total_return` exists twice over: a decimal string here and a float in the
+    // metric set. Both render as 18.40%, and they must reach the screen through
+    // different formatters — `money.ts` takes only strings (CLAUDE.md §1.1).
+    await openPanel(DONE_TOTALS)
+
+    const fees = await screen.findByText('Fees and commissions')
+    expect(fees.parentElement?.querySelector('dd')?.textContent).toBe('128.55')
+  })
+
+  it('says an old run has no split rather than showing it as zero', async () => {
+    // A run stored before the server kept these computed them and threw them
+    // away. Noughts here would be figures nobody can check.
+    await openPanel(null)
+
+    expect(await screen.findByText(/before the platform stored a run/)).toBeTruthy()
+    expect(screen.queryByText(/still open at the end/)).toBeNull()
   })
 })
 

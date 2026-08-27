@@ -82,7 +82,7 @@ jobs:
 
       - name: Type check
         if: ${{ !cancelled() && steps.sync.conclusion == 'success' }}
-        run: uv run mypy libs apps
+        run: uv run mypy libs apps tests
 
       - name: Unit tests
         if: ${{ !cancelled() && steps.sync.conclusion == 'success' }}

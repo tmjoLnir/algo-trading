@@ -145,7 +145,9 @@ class TestGeneratedSeries:
         for bar in year[:20]:
             for price in (bar.open, bar.high, bar.low, bar.close):
                 assert isinstance(price, Decimal)
-                assert -price.as_tuple().exponent <= 2
+                exponent = price.as_tuple().exponent
+                assert isinstance(exponent, int), "a seeded price is never NaN"
+                assert -exponent <= 2
 
     def test_every_candle_is_internally_consistent(self, year: list[Bar]) -> None:
         """`Bar.__post_init__` enforces this, so a violation would have raised
@@ -313,7 +315,7 @@ def _settings(
     """`Settings` validates by alias, so `env` is passed as `ATP_ENV` while
     `database_url` — which has no alias — is passed by field name. Same asymmetry
     `test_config_guards.py` documents."""
-    return Settings(ATP_ENV=env, database_url=database_url)  # type: ignore[call-arg]
+    return Settings(ATP_ENV=env, database_url=database_url)
 
 
 class TestEnvironmentGuard:

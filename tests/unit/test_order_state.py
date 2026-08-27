@@ -175,7 +175,9 @@ class TestOrderFills:
         assert not order.is_complete
 
         order.apply_fill(_fill(order, "50", "12"))
-        assert order.status is OrderStatus.FILLED
+        # mypy narrowed `status` at the assertion above and cannot see that
+        # `apply_fill` moved it on; the mutation is the thing under test.
+        assert order.status is OrderStatus.FILLED  # type: ignore[comparison-overlap]
         assert order.filled_qty == Decimal(100)
         assert order.avg_fill_price == Decimal(11)
         assert order.remaining_qty == Decimal(0)

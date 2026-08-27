@@ -144,7 +144,7 @@ class TestNtfyAlertSink:
         NtfyAlertSink("https://x", "t", client=_client(handler)).send(_alert())
 
     @pytest.mark.parametrize("failure", ["transport", 401, 403, 429, 500])
-    def test_a_failure_never_logs_the_topic(self, failure: object) -> None:
+    def test_a_failure_never_logs_the_topic(self, failure: str | int) -> None:
         """The topic is the capability: on a public server it is all that stands
         between the alerts and anyone who has it. A failure path that helpfully
         printed the URL would put it in every log aggregator we own.
@@ -165,7 +165,7 @@ class TestNtfyAlertSink:
         def handler(request: httpx.Request) -> httpx.Response:
             if failure == "transport":
                 raise httpx.ConnectError("boom")
-            return httpx.Response(int(failure))  # type: ignore[arg-type]
+            return httpx.Response(int(failure))
 
         with capture_logs() as events:
             NtfyAlertSink(
@@ -234,13 +234,11 @@ class TestBuildAlertSink:
         assert isinstance(build_alert_sink(Settings()), LoggingAlertSink)
 
     def test_a_topic_gives_the_ntfy_sink(self) -> None:
-        settings = Settings(ALERT_NTFY_TOPIC="atp-abc123")  # type: ignore[call-arg]
+        settings = Settings(ALERT_NTFY_TOPIC="atp-abc123")
         assert isinstance(build_alert_sink(settings), NtfyAlertSink)
 
     def test_telegram_alone_gives_the_telegram_sink(self) -> None:
-        settings = Settings(  # type: ignore[call-arg]
-            ALERT_TELEGRAM_TOKEN="123:AAF", ALERT_TELEGRAM_CHAT_ID="9876"
-        )
+        settings = Settings(ALERT_TELEGRAM_TOKEN="123:AAF", ALERT_TELEGRAM_CHAT_ID="9876")
         assert isinstance(build_alert_sink(settings), TelegramAlertSink)
 
     @pytest.mark.parametrize(
@@ -258,7 +256,7 @@ class TestBuildAlertSink:
         """Two configured transports is a request for two, and the usual reason
         to want two is that neither service is owed that much trust. Picking a
         winner would be a surprise discovered during an incident."""
-        settings = Settings(  # type: ignore[call-arg]
+        settings = Settings(
             ALERT_NTFY_TOPIC="atp-abc123",
             ALERT_TELEGRAM_TOKEN="123:AAF",
             ALERT_TELEGRAM_CHAT_ID="9876",
@@ -365,7 +363,7 @@ class TestTelegramAlertSink:
         ).send(_alert())
 
     @pytest.mark.parametrize("failure", ["transport", "ok_false", 401, 403, 404, 500])
-    def test_a_failure_never_logs_the_token(self, failure: object) -> None:
+    def test_a_failure_never_logs_the_token(self, failure: str | int) -> None:
         """The token is in the URL path, so it *is* the bot: anyone holding it
         reads the chat and posts as you. No failure path may print it.
 
@@ -383,7 +381,7 @@ class TestTelegramAlertSink:
                 raise httpx.ConnectError("boom")
             if failure == "ok_false":
                 return httpx.Response(200, json={"ok": False, "description": "unauthorized"})
-            return httpx.Response(int(failure))  # type: ignore[arg-type]
+            return httpx.Response(int(failure))
 
         with capture_logs() as events:
             TelegramAlertSink(secret, "chat-9876", client=_client(handler)).send(_alert())

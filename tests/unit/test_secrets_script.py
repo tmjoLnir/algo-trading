@@ -41,7 +41,9 @@ def _load(name: str) -> Any:
 secrets = _load("manage_secrets")
 
 
-def _completed(returncode: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
+def _completed(
+    returncode: int, stdout: str = "", stderr: str = ""
+) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(
         args=["sops"], returncode=returncode, stdout=stdout, stderr=stderr
     )
@@ -176,7 +178,7 @@ class TestWritePrivate:
 
 class TestInstall:
     def test_refuses_a_bundle_carrying_a_live_lock_and_writes_nothing(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """The check that matters most: `import` refuses these, but a bundle can
         acquire one later through `sops` directly or a hand edit, and install is

@@ -17,7 +17,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -55,7 +55,8 @@ BASE = [
 
 
 def run(argv: list[str]) -> int:
-    return asyncio.run(cli.main(argv))
+    # `cli` is loaded by path (see the module docstring), so it is `Any` to mypy.
+    return cast("int", asyncio.run(cli.main(argv)))
 
 
 class TestArgumentRefusals:

@@ -183,6 +183,12 @@ class StoredBacktestRun:
     #: row never recorded them, and reading its emptiness as "nothing was wrong"
     #: is the claim this whole field exists to stop being made silently.
     warnings: list[str] | None = None
+    #: What the run made and what it did: `BacktestResult.totals()`, verbatim.
+    #: Money as decimal strings, counts as integers — deliberately *not* in
+    #: `metrics`, which is float by contract (ADR 0019). **None on a run stored
+    #: before this column existed**, and it means it: those runs computed these
+    #: figures and discarded them, so there is nothing to backfill from.
+    totals: dict[str, object] | None = None
 
     @property
     def is_in_flight(self) -> bool:
@@ -263,12 +269,13 @@ class BacktestRunRepository(Protocol):
         equity_curve: list[list[str]],
         trades: list[dict[str, object]],
         warnings: list[str],
+        totals: dict[str, object],
     ) -> None:
         """Store a completed run's results and mark it done.
 
         One call rather than a setter per field, because a run whose metrics
         landed and whose equity curve did not is a `done` run that lies about
-        having a result. The three arrive in one transaction or not at all.
+        having a result. They arrive in one transaction or not at all.
         """
         ...
 

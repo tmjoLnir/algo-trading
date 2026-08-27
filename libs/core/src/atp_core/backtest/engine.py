@@ -245,31 +245,43 @@ class BacktestResult:
         """
         return self.portfolio.equity - self.portfolio.starting_equity - self.unrealized_pnl
 
-    def to_report(self) -> dict[str, object]:
-        """Serialisable summary for the API and the dashboard.
+    def totals(self) -> dict[str, object]:
+        """What this run made and what it did, JSON-legal.
 
         `realized_pnl` and `unrealized_pnl` are reported separately because
         `ending_equity` alone is readable two ways and only one of them is a
-        track record. They are money, so they are strings here and stay out of
-        `metrics`, which is a bag of floats by contract (CLAUDE.md §1.1).
+        track record. They are money, so they are decimal **strings** and stay
+        out of `metrics`, which is a bag of floats by contract (CLAUDE.md §1.1).
+        The four counts beside them are integers, which is what they are.
+
+        One method rather than a copy in the CLI's report and another in the
+        stored row, for ADR 0006's reason: two assemblies of the same nine
+        figures are two chances for a queued run and a CLI run to disagree
+        about what the same backtest made. See ADR 0019.
         """
         filled = [o for o in self.orders if o.filled_qty > 0]
+        return {
+            "starting_equity": str(self.portfolio.starting_equity),
+            "ending_equity": str(self.portfolio.equity),
+            "total_return": str(self.total_return),
+            "realized_pnl": str(self.realized_pnl),
+            "unrealized_pnl": str(self.unrealized_pnl),
+            "fees": str(sum((o.total_fees for o in self.orders), Decimal(0))),
+            "open_positions": len(self.portfolio.open_positions),
+            "orders": len(self.orders),
+            "filled_orders": len(filled),
+            "signals": len(self.signals),
+        }
+
+    def to_report(self) -> dict[str, object]:
+        """Serialisable summary for the API and the dashboard."""
         return {
             "strategy": self.strategy_name,
             "symbols": list(self.config.symbols),
             "timeframe": self.config.timeframe.value,
             "start": self.config.start.isoformat(),
             "end": self.config.end.isoformat(),
-            "starting_equity": str(self.portfolio.starting_equity),
-            "ending_equity": str(self.portfolio.equity),
-            "total_return": str(self.total_return),
-            "realized_pnl": str(self.realized_pnl),
-            "unrealized_pnl": str(self.unrealized_pnl),
-            "open_positions": len(self.portfolio.open_positions),
-            "orders": len(self.orders),
-            "filled_orders": len(filled),
-            "signals": len(self.signals),
-            "fees": str(sum((o.total_fees for o in self.orders), Decimal(0))),
+            **self.totals(),
             "metrics": dict(self.metrics),
             "warnings": list(self.warnings),
         }
@@ -637,8 +649,19 @@ class BacktestEngine:
                 ].close
 
             equity = self._portfolio.equity
-            self._portfolio.equity_curve.append((clock.now(), equity))
-            result.equity_curve.append((clock.now(), equity))
+            # Stamped at the bar's own `ts`, not at the clock. The clock stands
+            # at `ts + step`, which is the right instant for an *order* — it is
+            # when the decision could first be taken — and the wrong label for a
+            # *point on a curve*, which names the session whose equity it is. For
+            # a daily bar the two differ by a calendar day: a daily bar is
+            # stamped at exchange-local midnight, so `ts + 24h` is the next
+            # midnight rather than the 21:00 UTC close, and a curve built from it
+            # carried Friday's session at Saturday's date and had no Mondays at
+            # all. `ts` is the same key the session anchor uses thirteen lines
+            # above, and the same one a benchmark series is labelled by, which is
+            # what makes joining one to the other by date land (ADR 0018).
+            self._portfolio.equity_curve.append((ts, equity))
+            result.equity_curve.append((ts, equity))
             if self._portfolio.open_positions:
                 self._bars_in_market += 1
 

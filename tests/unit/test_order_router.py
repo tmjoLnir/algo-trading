@@ -95,7 +95,7 @@ def chain(
         for rule in rules:
             if isinstance(rule, DailyLossLimitRule):
                 rule.anchor(anchor)
-    return RiskEngine(limits(**limit_overrides), rules=rules)  # type: ignore[arg-type]
+    return RiskEngine(limits(**limit_overrides), rules=rules)
 
 
 def permissive() -> RiskEngine:
@@ -139,7 +139,7 @@ def signal(
 
 
 def sizing(kind: str = "fixed_qty", value: str = "100") -> PositionSizeSpec:
-    return PositionSizeSpec(type=kind, value=Decimal(value))  # type: ignore[arg-type]
+    return PositionSizeSpec(type=kind, value=Decimal(value))
 
 
 def request(
@@ -288,7 +288,7 @@ class TestSubmit:
                 return RiskDecision(approved=True, adjusted_qty=Decimal(0))
 
         broker = FakeBroker()
-        engine = RiskEngine(limits(), rules=[ShrinkToZero()])  # type: ignore[list-item]
+        engine = RiskEngine(limits(), rules=[ShrinkToZero()])
         result = await router(broker, engine).submit(request(), book())
 
         assert not result.submitted

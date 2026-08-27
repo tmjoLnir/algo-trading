@@ -187,7 +187,12 @@ lint:
 	npm --prefix $(WEB) run format:check
 
 typecheck:
-	uv run mypy libs apps
+	@# `tests` is in scope deliberately. A signature change that leaves a
+	@# broken call site in a test type-checks nowhere otherwise, and an
+	@# integration test also *runs* nowhere locally — it skips without
+	@# Postgres and Redis — so the two gaps compose into a call site no
+	@# check a contributor can run will see. #104 shipped exactly that.
+	uv run mypy libs apps tests
 	npm --prefix $(WEB) run typecheck
 
 fmt:  ## Auto-format everything

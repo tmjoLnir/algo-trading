@@ -64,7 +64,9 @@ def pinned_settings() -> Settings:
     return Settings(ATP_RUN_MODE="backtest", _env_file=None)
 
 
-def a_book(*, cash: str = "9000", positions: dict[str, tuple[str, str | None]] | None = None):
+def a_book(
+    *, cash: str = "9000", positions: dict[str, tuple[str, str | None]] | None = None
+) -> Portfolio:
     """A portfolio with exact numbers, so a boundary can be landed on.
 
     `positions` maps symbol → (qty, last_price). A `None` price is an *unmarked*
@@ -280,7 +282,7 @@ class TestTheBoundariesMatchTheRules:
     ) -> None:
         """`MaxOpenPositionsRule` refuses at `>=`: holding the limit means no
         *new* symbol may be opened, so at the limit already blocks."""
-        held = {f"SYM{i}": ("1", "10") for i in range(20)}
+        held: dict[str, tuple[str, str | None]] = {f"SYM{i}": ("1", "10") for i in range(20)}
         publish(store, a_book(cash="1000", positions=held))
         anchor(repo, "10000")
 

@@ -158,7 +158,7 @@ def run_backtest(bars: list[Bar], *, stop: StopConfig | None = SPEC_STOP) -> Any
             starting_cash=CASH,
         ),
         cost_model=ZeroCostModel(),
-        risk_engine=_AllowAllRisk(),
+        risk_engine=_AllowAllRisk(),  # type: ignore[arg-type]  # a narrower surface than the class; see the double's docstring
         # The spec's own sizing method, which is the one that needs the stop.
         position_sizer=RiskBasedSizer("risk_pct", Decimal("0.01")),
         stop_config=stop,

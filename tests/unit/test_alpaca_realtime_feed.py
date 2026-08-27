@@ -225,7 +225,10 @@ async def collect(
     except DataError as exc:
         return events, exc
     finally:
-        await stream.aclose()
+        # `DataFeed.stream` promises only an `AsyncIterator` — deliberately, see
+        # its docstring — while every implementation is an async generator that
+        # must be closed or it leaks the connection.
+        await stream.aclose()  # type: ignore[attr-defined]
     return events, None
 
 
@@ -340,6 +343,7 @@ class TestParsing:
 
         (bar,), _ = await collect(feed)
 
+        assert isinstance(bar, Bar)
         assert bar.ts == datetime(2024, 6, 3, 14, 30, tzinfo=UTC)
 
     async def test_malformed_message_is_dropped_not_fatal(self) -> None:
@@ -602,7 +606,7 @@ class TestReconnect:
         stream = feed.stream()
         async for _ in stream:
             break
-        await stream.aclose()
+        await stream.aclose()  # type: ignore[attr-defined]  # as in `collect`, above
 
         assert connection.closed
         assert feed.is_connected is False

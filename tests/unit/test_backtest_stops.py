@@ -184,7 +184,7 @@ def engine(
             starting_cash=cash,
         ),
         cost_model=ZeroCostModel(),
-        risk_engine=_Risk(),
+        risk_engine=_Risk(),  # type: ignore[arg-type]  # a narrower surface than the class; see the double's docstring
         position_sizer=sizer if sizer is not None else FixedQtySizer(Decimal(10)),
         stop_config=stop_config,
     )
@@ -548,7 +548,9 @@ class TestTargetHitIsSharedNotCopied:
     def test_the_live_runner_imports_the_same_function(self) -> None:
         from atp_worker import runner as live
 
-        assert live.target_hit is target_hit
+        # As above: the point is that the runner resolved the same object,
+        # not that `atp_worker.runner` publishes one.
+        assert live.target_hit is target_hit  # type: ignore[attr-defined]
 
     @pytest.mark.parametrize(
         ("qty", "target", "high", "low", "expected"),

@@ -317,7 +317,7 @@ def _session(
     """
     held = orders if orders is not None else []
     return SessionJobs(
-        reconciler=Reconciler(broker, switch, SimulatedClock(MIDSESSION)),  # type: ignore[arg-type]
+        reconciler=Reconciler(broker, switch, SimulatedClock(MIDSESSION)),
         portfolio=portfolio,
         open_orders=lambda: list(held),
     )
@@ -418,7 +418,7 @@ class TestReconcileWithBroker:
         switch = FakeKillSwitch()
         held: list[Order] = []
         session = SessionJobs(
-            reconciler=Reconciler(broker, switch, SimulatedClock(MIDSESSION)),  # type: ignore[arg-type]
+            reconciler=Reconciler(broker, switch, SimulatedClock(MIDSESSION)),
             portfolio=_book(),
             open_orders=lambda: list(held),
         )

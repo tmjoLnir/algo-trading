@@ -50,7 +50,7 @@ from atp_core.errors import InvalidRuleError
 from atp_core.risk.engine import RiskDecision
 from atp_core.strategy import RuleSet, compile_ruleset
 from atp_core.strategy.examples.sma_crossover import SmaCrossover
-from atp_core.strategy.rules import _Evaluation
+from atp_core.strategy.rules import Condition, ConditionGroup, _Evaluation
 
 if TYPE_CHECKING:
     from atp_core.domain import Order, Signal
@@ -192,7 +192,7 @@ def run_backtest(spec: RuleSet, bars: list[Bar], *, symbol: str = "SPY") -> Any:
         strategy=compile_ruleset(spec),
         config=config,
         cost_model=ZeroCostModel(),
-        risk_engine=_AllowAllRisk(),
+        risk_engine=_AllowAllRisk(),  # type: ignore[arg-type]  # a narrower surface than the class; see the double's docstring
         position_sizer=FixedQtySizer(Decimal(10)),
     ).run({symbol: bars})
 
@@ -684,14 +684,15 @@ class TestThreeValuedLogic:
         """An SMA(10) over exactly 10 bars has a value now and none a bar ago,
         so whether it *crossed* is unanswerable even though it is not."""
         crossing = condition(indicator("sma", 10), "crosses_above", {"value": "1"})
-        assert (
-            _Evaluation(self.BARS).value(
-                RuleSet.model_validate({**ruleset().model_dump(), "entry_long": group(crossing)})
-                .entry_long.all[0]
-                .left
-            )
-            is not None
-        )  # type: ignore[union-attr,index]
+        node = RuleSet.model_validate(
+            {**ruleset().model_dump(), "entry_long": group(crossing)}
+        ).entry_long
+        assert isinstance(node, ConditionGroup)
+        assert node.all is not None
+        first = node.all[0]
+        assert isinstance(first, Condition)
+
+        assert _Evaluation(self.BARS).value(first.left) is not None
         assert self.verdict(group(crossing)) is None
 
     def test_the_window_resolves_every_operand(self) -> None:

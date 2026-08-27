@@ -14,6 +14,13 @@
  * stay in `stats.ts`, labelled as statistics: formatting them with the ledger
  * formatter would claim a precision the response does not carry.
  *
+ * The Result block above the metrics is the ledger half and the metric grid is
+ * the statistical one, which is why they are two blocks with two formatters. A
+ * run that ends still holding its winners reports a return its closed trades
+ * never made, and every statistic in the grid counts closed round trips only —
+ * so the split, and the sentence under it, is what stops a mark being read as a
+ * track record.
+ *
  * The curve and the trades are separate requests, fetched only when a finished
  * run is opened. They are large — a minute run's curve is hundreds of thousands
  * of points — and the list this screen polls every three seconds has to stay
@@ -30,9 +37,16 @@ import {
   YAxis,
 } from 'recharts'
 import { useBacktestCurve, useBacktestTrades } from '@/hooks/useBacktests'
-import { UNKNOWN, formatDateTime, formatMoney, toChartNumber, toneFor } from '@/lib/money'
+import {
+  UNKNOWN,
+  formatDateTime,
+  formatMoney,
+  formatPercent,
+  toChartNumber,
+  toneFor,
+} from '@/lib/money'
 import { formatCount, formatDuration, formatStat, formatStatPercent, statTone } from '@/lib/stats'
-import type { BacktestOut, BacktestTrade } from '@/api/types'
+import type { BacktestOut, BacktestTotalsView, BacktestTrade } from '@/api/types'
 
 interface Props {
   run: BacktestOut
@@ -94,6 +108,88 @@ function MetricGrid({ metrics }: { metrics: Record<string, number | null> }) {
         )
       })}
     </dl>
+  )
+}
+
+/**
+ * The ledger half of a run: what it made, and how much of that is banked.
+ *
+ * Separate from `MetricGrid` above, and the separation is the point. Everything
+ * in the metric grid is a float statistic over the return series; everything
+ * here is money, arrives as a decimal string, and goes through `formatMoney`.
+ * The two `total_return`s are the same quantity in the two types — the engine
+ * computes one equity and reports it both ways — and mixing them would put a
+ * ledger figure through the statistics formatter (CLAUDE.md §1.1).
+ *
+ * This exists because a return figure alone is readable two ways and only one
+ * of them is a track record. The run that motivated it reported +202.8% of
+ * which *none* was realised: twenty positions still open, `realized_pnl` zero,
+ * the whole of it unrealised mark-to-market. Nothing on this screen could say
+ * so — the nearest hint was `num_trades: 0` in the metric grid, which says
+ * something different and reads as "does not trade much".
+ */
+function MoneyBlock({ totals }: { totals: BacktestTotalsView | null | undefined }) {
+  if (!totals) {
+    // Not zeros. A run stored before the server kept these computed them and
+    // threw them away, and a nought here would be a figure nobody can check.
+    return (
+      <p className="text-xs text-slate-500">
+        This run was recorded before the platform stored a run&rsquo;s money. Its return is in the
+        metric set below; the realised and unrealised split it had is not recoverable.
+      </p>
+    )
+  }
+
+  const open = totals.open_positions
+  return (
+    <div className="space-y-2">
+      <dl className="grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3">
+        <Figure label="Starting equity" value={totals.starting_equity} />
+        <Figure label="Ending equity" value={totals.ending_equity} />
+        <Figure label="Total return" value={totals.total_return} percent signed />
+        <Figure label="…realised (closed trades)" value={totals.realized_pnl} signed />
+        <Figure label="…unrealised (still open)" value={totals.unrealized_pnl} signed />
+        <Figure label="Fees and commissions" value={totals.fees} />
+      </dl>
+      <p className="text-[11px] tabular-nums text-slate-500">
+        {formatCount(totals.signals)} signals · {formatCount(totals.orders)} orders ·{' '}
+        {formatCount(totals.filled_orders)} filled · {formatCount(open)} open at the end
+      </p>
+      {open > 0 ? (
+        // The sentence `scripts/run_backtest.py` prints, on the screen that had
+        // no way to say it. Above the metric grid, not below: the statistics
+        // under it all count closed round trips, and this changes what they are
+        // a statement about.
+        <p className="rounded border border-sky-800/40 bg-sky-950/20 px-3 py-2 text-xs text-sky-200">
+          {formatCount(open)} position{open === 1 ? '' : 's'} still open at the end, carrying{' '}
+          {formatMoney(totals.unrealized_pnl)} of unrealised mark-to-market. That is part of the
+          return above and part of none of the trade statistics below, which count closed round
+          trips only.
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
+/** One money figure. Decimal string in, `money.ts` formatter out — never a float. */
+function Figure({
+  label,
+  value,
+  percent = false,
+  signed = false,
+}: {
+  label: string
+  value: string
+  percent?: boolean
+  signed?: boolean
+}) {
+  return (
+    <div className="flex items-baseline justify-between gap-2 text-xs">
+      <dt className="text-slate-500">{label}</dt>
+      <dd className={`tabular-nums ${signed ? toneFor(value) : 'text-slate-200'}`}>
+        {percent ? formatPercent(value, { signed }) : formatMoney(value, { signed })}
+      </dd>
+    </div>
   )
 }
 
@@ -329,6 +425,18 @@ export default function BacktestDetail({ run, onClose }: Props) {
         </div>
       ) : (
         <div className="space-y-4 p-4">
+          <div>
+            {/* "Money" rather than "Result", and not only because the run list
+                already has a Result column: the pairing with "Metrics" below is
+                the distinction this panel exists to make — decimal strings
+                through `money.ts` here, float statistics through `stats.ts`
+                there. */}
+            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Money
+            </h3>
+            <MoneyBlock totals={run.totals} />
+          </div>
+
           <div>
             <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
               Metrics

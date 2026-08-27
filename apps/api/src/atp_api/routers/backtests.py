@@ -201,6 +201,41 @@ class BacktestProgressView(BaseModel):
     at: datetime
 
 
+class BacktestTotalsView(BaseModel):
+    """What the run made and what it did.
+
+    **Money, so every figure here is a decimal string** — the same rule as
+    `starting_cash` above and every point on the equity curve. They are
+    deliberately not in `metrics`, which is a bag of floats by contract: a P&L
+    that round-tripped through a JSON number would no longer be exact, which
+    defeats the point of Decimal server-side (CLAUDE.md §1.1, ADR 0019).
+
+    `realized_pnl` and `unrealized_pnl` are both here because `ending_equity`
+    alone is readable two ways and only one of them is a track record. A run
+    that ends holding winners reports a return its closed trades never made, and
+    the metric set cannot say so: every per-trade statistic counts closed round
+    trips, so a strategy still holding everything has the same all-zero trade
+    statistics as one that never signalled.
+
+    The four counts are integers, which is what they are. `open_positions` is
+    the one that turns a number into a sentence on the screen.
+    """
+
+    starting_equity: str
+    ending_equity: str
+    #: Fractional, as a decimal string: "0.25" is +25%. The float of the same
+    #: name in `metrics` is the statistic; this is the ledger figure, and they
+    #: are computed from the same equity by the same engine.
+    total_return: str
+    realized_pnl: str
+    unrealized_pnl: str
+    fees: str
+    open_positions: int
+    orders: int
+    filled_orders: int
+    signals: int
+
+
 class BacktestOut(BaseModel):
     """One run.
 
@@ -235,6 +270,11 @@ class BacktestOut(BaseModel):
     #: too few trades, an implausible Sharpe. Server-side, because a number a
     #: human has already read is a number they have already believed.
     warnings: list[str] = Field(default_factory=list)
+    #: The ledger figures beside the statistics. **None on a run stored before
+    #: the column existed**, and that is not the same as zeros: those runs
+    #: computed these figures and discarded them, so there is nothing to show
+    #: and the screen says so rather than showing a nought.
+    totals: BacktestTotalsView | None = None
 
 
 class BacktestListResponse(BaseModel):
@@ -330,6 +370,13 @@ def _to_view(run: StoredBacktestRun, progress: BacktestProgressView | None = Non
         # yet, and a failed one has an `error`, which is the more useful
         # sentence than any caveat about a result it does not have.
         warnings=all_warnings(run.warnings, run.metrics) if run.status == STATUS_DONE else [],
+        # Validated rather than passed through, unlike `metrics`: that is a
+        # free-shaped bag of floats and this is a fixed set of figures with one
+        # writer (`BacktestResult.totals`). A row that does not fit the model is
+        # a disagreement between the writer and this schema, and it should be
+        # loud. None is the only legitimate absence — a run stored before the
+        # column, or one that failed and has no result.
+        totals=BacktestTotalsView.model_validate(run.totals) if run.totals is not None else None,
     )
 
 

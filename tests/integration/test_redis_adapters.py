@@ -156,7 +156,7 @@ class TestEventPublisher:
             message = await _next_message(subscriber, kind="message")
             assert json.loads(message["data"]) == {"type": "quote", "bid": "439.71"}
         finally:
-            await subscriber.aclose()
+            await subscriber.aclose()  # type: ignore[no-untyped-call]  # redis-py ships none
 
     async def test_publishing_to_nobody_is_not_an_error(self, client: Redis) -> None:
         """The normal state of a deployment with no dashboard open. The ingest

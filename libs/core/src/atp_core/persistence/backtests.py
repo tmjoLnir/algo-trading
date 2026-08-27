@@ -117,10 +117,11 @@ class PostgresBacktestRunRepository:
         equity_curve: list[list[str]],
         trades: list[dict[str, object]],
         warnings: list[str],
+        totals: dict[str, object],
     ) -> None:
         """Store the results and mark the run done, in one statement.
 
-        One `UPDATE` rather than four, so there is no instant at which this row
+        One `UPDATE` rather than five, so there is no instant at which this row
         says `done` and carries only some of its result.
 
         `warnings` is written even when empty, and the empty list is the point:
@@ -137,6 +138,7 @@ class PostgresBacktestRunRepository:
                     equity_curve=equity_curve,
                     trades=trades,
                     warnings=warnings,
+                    totals=totals,
                     error=None,
                     finished_at=at,
                 )
@@ -164,6 +166,7 @@ class PostgresBacktestRunRepository:
                     # this run no longer has, and `error` is the sentence that
                     # replaces all of them.
                     warnings=None,
+                    totals=None,
                     finished_at=at,
                 )
             )
@@ -322,6 +325,7 @@ def _to_stored(row: BacktestRunRow) -> StoredBacktestRun:
         equity_curve=list(row.equity_curve) if row.equity_curve is not None else None,
         trades=list(row.trades) if row.trades is not None else None,
         warnings=list(row.warnings) if row.warnings is not None else None,
+        totals=dict(row.totals) if row.totals is not None else None,
     )
 
 

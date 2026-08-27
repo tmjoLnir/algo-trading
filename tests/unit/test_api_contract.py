@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
@@ -25,15 +25,17 @@ from atp_api.ws import websocket_endpoint
 from atp_core.config import get_settings
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import AsyncIterator, Iterator
+
+    from fastapi import FastAPI
 
 
 @pytest.fixture(scope="module")
-def spec() -> dict:
+def spec() -> dict[str, Any]:
     return create_app().openapi()
 
 
-def test_openapi_schema_generates(spec: dict) -> None:
+def test_openapi_schema_generates(spec: dict[str, Any]) -> None:
     """Forces runtime resolution of every handler annotation.
 
     If this fails with a Pydantic 'not fully defined' error, an import a
@@ -45,7 +47,7 @@ def test_openapi_schema_generates(spec: dict) -> None:
 
 
 @pytest.mark.parametrize("probe", ["/healthz", "/readyz"])
-def test_probes_are_unversioned(spec: dict, probe: str) -> None:
+def test_probes_are_unversioned(spec: dict[str, Any], probe: str) -> None:
     """Orchestrators hit these directly.
 
     `infra/docker/api.Dockerfile` HEALTHCHECKs `/healthz`, and compose gates
@@ -57,7 +59,7 @@ def test_probes_are_unversioned(spec: dict, probe: str) -> None:
     )
 
 
-def test_business_routes_are_versioned(spec: dict) -> None:
+def test_business_routes_are_versioned(spec: dict[str, Any]) -> None:
     """Everything that is not a probe lives under /api/v1.
 
     `/metrics` joins the probes for the same reason they are here: a scraper's
@@ -70,7 +72,7 @@ def test_business_routes_are_versioned(spec: dict) -> None:
     assert not stray, f"unversioned business routes: {stray}"
 
 
-def test_money_fields_serialise_as_strings(spec: dict) -> None:
+def test_money_fields_serialise_as_strings(spec: dict[str, Any]) -> None:
     """Decimal must not cross the wire as a JSON number.
 
     JSON numbers are IEEE 754 doubles in every browser. A P&L value that round
@@ -205,7 +207,7 @@ async def test_a_valid_session_cookie_gets_past_the_handshake() -> None:
     assert socket.closed_with is None or socket.closed_with[0] != 1008
 
 
-def _mutating_routes(spec: dict) -> list[tuple[str, str]]:
+def _mutating_routes(spec: dict[str, Any]) -> list[tuple[str, str]]:
     """Every (method, path) that is not a safe read."""
     return [
         (method.upper(), path)
@@ -215,7 +217,11 @@ def _mutating_routes(spec: dict) -> list[tuple[str, str]]:
     ]
 
 
-async def _walk(app, spec, methods_and_paths):
+async def _walk(
+    app: FastAPI,
+    spec: dict[str, Any],
+    methods_and_paths: list[tuple[str, str]],
+) -> AsyncIterator[tuple[str, str, int]]:
     """Call each route and yield what it answered.
 
     `raise_app_exceptions=False` because most handlers here are still

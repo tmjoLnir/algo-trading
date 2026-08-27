@@ -8,8 +8,14 @@ from __future__ import annotations
 import os
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from atp_core.clock import SimulatedClock
+    from atp_core.domain import Portfolio
+    from tests.fakes import FakeBroker
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -73,7 +79,7 @@ def utc_now() -> datetime:
 
 
 @pytest.fixture
-def frozen_clock(utc_now: datetime):
+def frozen_clock(utc_now: datetime) -> SimulatedClock:
     """A `SimulatedClock` pinned to a known instant."""
     from atp_core.clock import SimulatedClock
 
@@ -81,7 +87,7 @@ def frozen_clock(utc_now: datetime):
 
 
 @pytest.fixture
-def fake_broker():
+def fake_broker() -> FakeBroker:
     """In-memory `BrokerPort` with controllable fills and failures.
 
     Simulates: a partial fill, a reject, a timeout on submit (both kinds — one
@@ -95,7 +101,7 @@ def fake_broker():
 
 
 @pytest.fixture
-def empty_portfolio():
+def empty_portfolio() -> Portfolio:
     from atp_core.domain import Portfolio
 
     return Portfolio(cash=Decimal("100000"), starting_equity=Decimal("100000"))

@@ -100,7 +100,7 @@ def available(body: dict[str, Any], name: str) -> dict[str, Any]:
     registered and meant `buy_and_hold` the day a second one landed, which is a
     test that silently changes its subject rather than failing.
     """
-    entry = next((a for a in body["available"] if a["name"] == name), None)
+    entry: dict[str, Any] | None = next((a for a in body["available"] if a["name"] == name), None)
     assert entry is not None, f"{name} is registered but the endpoint did not report it"
     return entry
 

@@ -12,7 +12,7 @@ its own small set with an injected sleep.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -94,8 +94,7 @@ def monitor(**kwargs: Any) -> StalenessMonitor:
 
 
 def ingestor(**kwargs: Any) -> StreamIngestor:
-    stub: Any = StubIngestor(**kwargs)
-    return stub
+    return cast("StreamIngestor", StubIngestor(**kwargs))
 
 
 class _ClockExhaustedError(Exception):
