@@ -674,6 +674,74 @@ class TestAgainstKnownFixture:
         assert report["metrics"]["num_trades"] == 1
 
 
+class TestCurveTimestamps:
+    """What date a point on the equity curve is filed under.
+
+    No metric reads these labels — `_duration_days` is the only metric that
+    touches a timestamp at all and it takes a *difference*, which a uniform
+    shift leaves alone — so nothing here fails when the convention is wrong.
+    That is exactly why it needs saying out loud: the curve carried Friday's
+    session at Saturday's date for as long as nobody looked (ADR 0018).
+    """
+
+    @staticmethod
+    def weekdays(count: int = 40) -> list[Bar]:
+        """A daily series over trading days only, as a real one is.
+
+        `ramp` walks consecutive calendar days, weekends included, so it cannot
+        tell a correct label from a shifted one — every date is populated either
+        way. This one can: shift it by a day and Saturdays appear.
+        """
+        series: list[Bar] = []
+        day = datetime(2024, 1, 1, tzinfo=UTC)  # a Monday
+        while len(series) < count:
+            if day.weekday() < 5:
+                price = 100.0 + len(series)
+                series.append(
+                    Bar(
+                        symbol="TEST",
+                        ts=day,
+                        timeframe=Timeframe.D1,
+                        open=Decimal(str(price)),
+                        high=Decimal(str(price)),
+                        low=Decimal(str(price)),
+                        close=Decimal(str(price)),
+                        volume=Decimal(1_000_000),
+                        adj_close=Decimal(str(price)),
+                    )
+                )
+            day += timedelta(days=1)
+        return series
+
+    def test_a_point_is_stamped_with_its_own_bar(self) -> None:
+        bars = ramp(10)
+        result = engine(ScriptedStrategy({})).run({"TEST": bars})
+
+        assert [ts for ts, _ in result.equity_curve] == [b.ts for b in bars]
+
+    def test_a_daily_curve_names_only_days_the_market_was_open(self) -> None:
+        """The observation that found this: a 1,525-point curve over six years
+        had 304 Saturdays and zero Mondays. In miniature, over eight weeks."""
+        bars = self.weekdays(40)
+        result = engine(ScriptedStrategy({}), start=bars[0].ts, end=bars[-1].ts).run({"TEST": bars})
+
+        weekdays = [ts.weekday() for ts, _ in result.equity_curve]
+        assert not [d for d in weekdays if d >= 5], "the curve names a day the market was shut"
+        assert weekdays.count(0) == 8, "every Monday is missing"
+        assert sorted(weekdays) == sorted(b.ts.weekday() for b in bars)
+
+    def test_the_clock_still_stands_at_the_bars_close(self) -> None:
+        """The half that must not move. The clock is what a strategy reads as
+        `now`, and a decision taken on a completed bar is taken once it has
+        ended — stamping it at the bar's *open* is the lookahead this engine
+        exists to prevent. Only the curve's label changed."""
+        bars = ramp(10)
+        result = engine(ScriptedStrategy({5: SignalAction.ENTER_LONG})).run({"TEST": bars})
+
+        assert [s.ts for s in result.signals] == [bars[5].close_ts]
+        assert bars[5].close_ts > bars[5].ts
+
+
 class TestMetricsReconcile:
     """The metrics the engine reports have to agree with the fixture it just
     ran. A metric set computed from its own separate bookkeeping is exactly

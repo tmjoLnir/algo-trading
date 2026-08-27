@@ -77,7 +77,21 @@ class Bar:
 
     @property
     def close_ts(self) -> datetime:
-        """When this bar finished — the earliest a strategy may act on it."""
+        """When this bar finished — the earliest a strategy may act on it.
+
+        **An upper bound for a daily bar, not the session close.** A daily bar
+        is stamped at exchange-local midnight, so `ts + 24h` is the next
+        midnight rather than the 21:00 UTC close — later than the session
+        actually ended, and on the following calendar day. That is safe for the
+        one thing this answers, because acting later than permitted cannot
+        create lookahead, and it is wrong for anything that reads it as a
+        *label*: a daily bar's `close_ts` names a day the market was shut.
+
+        A `Bar` carries no exchange, so it cannot resolve its own session close
+        without a calendar — and `domain` imports nothing from its siblings.
+        Anything that needs to name the session a bar belongs to should use
+        `ts`, which is that name. See ADR 0018.
+        """
         from datetime import timedelta
 
         return self.ts + timedelta(seconds=self.timeframe.seconds)

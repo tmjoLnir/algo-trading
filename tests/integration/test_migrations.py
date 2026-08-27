@@ -12,19 +12,28 @@ have stopped agreeing.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 from datetime import timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING, ClassVar, cast
 
 import asyncpg
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Iterator
 
 pytestmark = pytest.mark.integration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ALEMBIC_INI = REPO_ROOT / "infra" / "alembic" / "alembic.ini"
+
+STRATEGY = "retime-probe"
+RUN_ID = "retime-run"
+QUEUED_ID = "retime-queued"
 
 #: Tables the initial migration owns. `alembic_version` is alembic's own
 #: bookkeeping and survives a downgrade to base, so it is not in this list.
@@ -215,3 +224,127 @@ async def test_downgrade_removes_the_schema(migrated: str) -> None:
 
     remaining = {row["table_name"] for row in rows} & EXPECTED_TABLES
     assert not remaining, f"downgrade left tables behind: {sorted(remaining)}"
+
+
+class TestTheCurveIsRetimed:
+    """`c5e9a03b1f47` moves stored equity curves onto session dates.
+
+    Data migrations are the ones a unit test cannot vouch for: what is under
+    test is that alembic's own connection, over asyncpg, reads a JSON column
+    back as a list, rewrites it, and writes it again — none of which is a
+    property of the Python that does the rewriting.
+
+    Driven backwards then forwards. The database arrives at head, so the only
+    way to produce a row in the *old* convention is to run the downgrade, which
+    is the half of a data migration nobody usually exercises.
+    """
+
+    SESSION_DATES: ClassVar[list[list[str]]] = [
+        ["2024-01-01T00:00:00+00:00", "100000"],  # a Monday
+        ["2024-01-02T00:00:00+00:00", "100500"],
+    ]
+
+    async def _row(self, url: str, run_id: str) -> list[list[str]] | None:
+        stored = await _fetchval(
+            url, "SELECT equity_curve FROM backtest_runs WHERE id = $1", run_id
+        )
+        if stored is None:
+            return None
+        # asyncpg hands a `json` column back as text; a `jsonb` one comes back
+        # decoded. Accepting both keeps this test about the migration.
+        curve = json.loads(stored) if isinstance(stored, str) else stored
+        assert isinstance(curve, list)
+        return cast("list[list[str]]", curve)
+
+    @pytest.fixture
+    async def a_run(self, migrated: str) -> AsyncIterator[str]:
+        """One `done` run whose curve is already on session dates."""
+        conn = await asyncpg.connect(_asyncpg_dsn(migrated))
+        try:
+            await conn.execute(
+                "INSERT INTO strategies (id, name, class_name, params, universe, state, "
+                "created_at, updated_at) VALUES ($1, $1, 'Scripted', '{}', '{}', 'draft', "
+                "now(), now()) ON CONFLICT (id) DO NOTHING",
+                STRATEGY,
+            )
+            await conn.execute(
+                "INSERT INTO backtest_runs (id, strategy_id, config, status, equity_curve, "
+                "queued_at) VALUES ($1, $2, $3, 'done', $4, now())",
+                RUN_ID,
+                STRATEGY,
+                json.dumps({"timeframe": "1d", "symbols": ["SPY"]}),
+                json.dumps(self.SESSION_DATES),
+            )
+            yield migrated
+            await conn.execute("DELETE FROM backtest_runs WHERE id = $1", RUN_ID)
+            await conn.execute("DELETE FROM strategies WHERE id = $1", STRATEGY)
+        finally:
+            await conn.close()
+
+    @pytest.fixture
+    def rolled_back(self) -> Iterator[None]:
+        """The database one revision back, and at head again afterwards.
+
+        Restored in teardown rather than at the end of each test: a test that
+        fails while downgraded would otherwise hand the next one a database a
+        revision behind, and the failure a reader sees would be that one.
+        """
+        assert _run_alembic("downgrade", "-1").returncode == 0
+        try:
+            yield
+        finally:
+            assert _run_alembic("upgrade", "head").returncode == 0
+
+    async def test_the_old_convention_is_a_day_late(self, a_run: str, rolled_back: None) -> None:
+        """Establishes what the migration is correcting, from the database's
+        own copy of it rather than from a description."""
+        stale = await self._row(a_run, RUN_ID)
+
+        assert stale is not None
+        assert [point[0] for point in stale] == [
+            "2024-01-02T00:00:00+00:00",  # Monday's session, filed on Tuesday
+            "2024-01-03T00:00:00+00:00",
+        ]
+
+    async def test_upgrading_puts_every_point_back_on_its_session(self, a_run: str) -> None:
+        assert _run_alembic("downgrade", "-1").returncode == 0
+        assert _run_alembic("upgrade", "head").returncode == 0
+
+        assert await self._row(a_run, RUN_ID) == self.SESSION_DATES
+
+    async def test_the_equity_beside_each_label_never_moves(self, a_run: str) -> None:
+        """The property that makes this safe to run against results a human has
+        already read: labels move, figures do not."""
+        assert _run_alembic("downgrade", "-1").returncode == 0
+        stale = await self._row(a_run, RUN_ID)
+        assert _run_alembic("upgrade", "head").returncode == 0
+        fresh = await self._row(a_run, RUN_ID)
+
+        assert stale is not None and fresh is not None
+        assert [point[1] for point in stale] == [point[1] for point in fresh]
+
+    async def test_a_run_with_no_curve_survives_both_directions(self, migrated: str) -> None:
+        """A queued run has `equity_curve IS NULL`, and the migration selects on
+        exactly that. A NULL it tried to rewrite would fail the whole deploy."""
+        conn = await asyncpg.connect(_asyncpg_dsn(migrated))
+        try:
+            await conn.execute(
+                "INSERT INTO strategies (id, name, class_name, params, universe, state, "
+                "created_at, updated_at) VALUES ($1, $1, 'Scripted', '{}', '{}', 'draft', "
+                "now(), now()) ON CONFLICT (id) DO NOTHING",
+                STRATEGY,
+            )
+            await conn.execute(
+                "INSERT INTO backtest_runs (id, strategy_id, config, status, queued_at) "
+                "VALUES ($1, $2, $3, 'queued', now())",
+                QUEUED_ID,
+                STRATEGY,
+                json.dumps({"timeframe": "1d"}),
+            )
+            assert _run_alembic("downgrade", "-1").returncode == 0
+            assert _run_alembic("upgrade", "head").returncode == 0
+            assert await self._row(migrated, QUEUED_ID) is None
+        finally:
+            await conn.execute("DELETE FROM backtest_runs WHERE id = $1", QUEUED_ID)
+            await conn.execute("DELETE FROM strategies WHERE id = $1", STRATEGY)
+            await conn.close()

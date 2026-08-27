@@ -637,8 +637,19 @@ class BacktestEngine:
                 ].close
 
             equity = self._portfolio.equity
-            self._portfolio.equity_curve.append((clock.now(), equity))
-            result.equity_curve.append((clock.now(), equity))
+            # Stamped at the bar's own `ts`, not at the clock. The clock stands
+            # at `ts + step`, which is the right instant for an *order* — it is
+            # when the decision could first be taken — and the wrong label for a
+            # *point on a curve*, which names the session whose equity it is. For
+            # a daily bar the two differ by a calendar day: a daily bar is
+            # stamped at exchange-local midnight, so `ts + 24h` is the next
+            # midnight rather than the 21:00 UTC close, and a curve built from it
+            # carried Friday's session at Saturday's date and had no Mondays at
+            # all. `ts` is the same key the session anchor uses thirteen lines
+            # above, and the same one a benchmark series is labelled by, which is
+            # what makes joining one to the other by date land (ADR 0018).
+            self._portfolio.equity_curve.append((ts, equity))
+            result.equity_curve.append((ts, equity))
             if self._portfolio.open_positions:
                 self._bars_in_market += 1
 

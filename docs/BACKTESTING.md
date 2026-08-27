@@ -338,6 +338,21 @@ Read `expectancy` and `realized_pnl` together as the track record. A large
 `unrealized_pnl` is not a result — it is a position, and it is a statement about
 one arbitrary day.
 
+**An equity point is dated by its bar, not by the clock** (ADR 0018). The two
+are not the same instant: the engine's clock stands at `ts + step`, which is
+when the bar's decision could first be taken and what stamps its orders, while a
+curve point names the *session* whose equity it reports and so carries the bar's
+own `ts`. For a daily bar the difference is a calendar day — a daily bar is
+stamped at exchange-local midnight, so `ts + 24h` is the next midnight rather
+than the 21:00 UTC close — and a curve built from the clock filed Friday's
+session under Saturday and had no Mondays at all.
+
+That matters when you line a curve up against something else. A backtest curve,
+a live equity series and a benchmark are all keyed on the session date, so
+joining them by date lands. It never mattered to a metric: no metric reads these
+labels except `max_drawdown_duration_days`, which takes a difference between
+two of them.
+
 ## Before believing a result
 
 - [ ] Ran with realistic costs
