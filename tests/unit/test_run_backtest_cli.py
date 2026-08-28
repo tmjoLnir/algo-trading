@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 import pytest
 
 from atp_core.backtest.ports import BacktestRunSpec, spec_to_json
-from atp_core.backtest.runner import STOP_TYPES
+from atp_core.backtest.runner import STOP_TYPES, all_warnings
 from atp_core.persistence.backtests import _spec_from_json
 
 if TYPE_CHECKING:
@@ -254,18 +254,37 @@ EXPORTED = BacktestRunSpec(
 )
 
 
+#: A metric set with nothing to complain about: enough round trips for the
+#: statistics to mean something, and a Sharpe below the "bug until proven
+#: otherwise" line. Named because several tests below need the *absence* of a
+#: derived warning, and a bare dict at each of them would drift.
+_TRUSTWORTHY = {"total_return": 0.0005, "num_trades": 42, "sharpe": 1.3}
+
+
 class _FakeResult:
     """Enough of `BacktestResult` for the report assembly, which reads two
     attributes of it and nothing else.
 
     A real result would need bars, an engine and a database to produce, and none
     of the three would make these assertions say anything more.
+
+    `metrics` and `warnings` are settable because the report now derives one
+    from the other, so a fixed pair could only ever exercise one branch of it.
     """
 
     equity_curve: ClassVar[list[tuple[datetime, Decimal]]] = [
         (datetime(2024, 1, 2, tzinfo=UTC), Decimal("250000.55")),
         (datetime(2024, 1, 3, tzinfo=UTC), Decimal("250125.80")),
     ]
+
+    def __init__(
+        self,
+        *,
+        metrics: dict[str, Any] | None = None,
+        warnings: list[str] | None = None,
+    ) -> None:
+        self._metrics = {"total_return": 0.0005} if metrics is None else metrics
+        self._warnings = [] if warnings is None else warnings
 
     def to_report(self) -> dict[str, Any]:
         return {
@@ -275,8 +294,8 @@ class _FakeResult:
             "start": "2024-01-02T00:00:00+00:00",
             "end": "2024-12-31T00:00:00+00:00",
             "ending_equity": "250125.80",
-            "metrics": {"total_return": 0.0005},
-            "warnings": [],
+            "metrics": dict(self._metrics),
+            "warnings": list(self._warnings),
         }
 
 
@@ -335,6 +354,72 @@ class TestTheExportedSpec:
         assert written["spec"]["sizing_method"] == "risk_pct"
         assert written["spec"]["stop_type"] == "atr"
         assert written["spec"]["cost_model"] == "zero"
+
+
+class TestTheExportedWarnings:
+    """`--out` records how far to trust the numbers, not only what the run did.
+
+    The file used to carry `to_report()`'s warnings, which are what the run
+    *did* — coverage shortfalls, refusals — and nothing about how far to trust
+    the statistics printed beside them. The derived notes were computed and
+    printed to the terminal, then dropped on the way to disk.
+
+    The case that made it visible: a `buy_and_hold` export over twenty real
+    symbols, whose `num_trades` was 0 because the strategy never sells, and
+    with it nine placeholder-zero metrics. The dashboard's export of the same
+    run said so; the CLI's said `"warnings": []`. Two files, identical in all
+    1,525 equity points and all nineteen metrics, disagreeing about whether the
+    result could be believed — and the one an operator archives is the one that
+    stayed quiet.
+    """
+
+    def test_the_sample_size_caveat_reaches_the_file(self) -> None:
+        report = cli.build_report(_FakeResult(metrics={"num_trades": 0}), EXPORTED)
+        assert any("only 0 trades" in warning for warning in report["warnings"])
+
+    def test_the_sharpe_caveat_reaches_the_file(self) -> None:
+        """The other half of `suspicious`, and the one that fires on the result
+        an operator is least inclined to question."""
+        report = cli.build_report(_FakeResult(metrics={**_TRUSTWORTHY, "sharpe": 9.1}), EXPORTED)
+        assert any("9.10" in warning for warning in report["warnings"])
+
+    def test_it_is_the_set_the_queued_path_serves(self) -> None:
+        """The point, and the same argument as `spec_to_json` above: one
+        function decides what a finished run has to say about itself, or a CLI
+        export and a dashboard export of one run caveat it differently."""
+        result = _FakeResult(metrics={"num_trades": 3}, warnings=["coverage: SPY starts late"])
+        assert cli.build_report(result, EXPORTED)["warnings"] == all_warnings(
+            ["coverage: SPY starts late"], {"num_trades": 3}
+        )
+
+    def test_the_runs_own_warnings_survive(self) -> None:
+        """Additive. The derived notes are prepended to what the engine
+        recorded, never in place of it."""
+        result = _FakeResult(metrics={"num_trades": 0}, warnings=["coverage: SPY starts late"])
+        assert "coverage: SPY starts late" in cli.build_report(result, EXPORTED)["warnings"]
+
+    def test_the_derived_notes_come_first(self) -> None:
+        """`all_warnings`' ordering, asserted here because this file is the
+        other place it has to hold: the engine's last line is the one that says
+        how much of the run actually happened, and a note about sample size
+        wedged after it would separate that line from the return it qualifies.
+        """
+        result = _FakeResult(metrics={"num_trades": 0}, warnings=["risk refused 4 orders"])
+        assert cli.build_report(result, EXPORTED)["warnings"][-1] == "risk refused 4 orders"
+
+    def test_a_trustworthy_run_gains_nothing(self) -> None:
+        """The caveats are conditional, not decoration. A run with enough trades
+        and a believable Sharpe exports exactly what the engine recorded."""
+        result = _FakeResult(metrics=_TRUSTWORTHY, warnings=["coverage: SPY starts late"])
+        assert cli.build_report(result, EXPORTED)["warnings"] == ["coverage: SPY starts late"]
+
+    def test_it_survives_the_json_round_trip(self) -> None:
+        """`--out` writes through `jsonable` with `allow_nan=False`, and the
+        Sharpe note interpolates a float."""
+        report = cli.build_report(_FakeResult(metrics={"num_trades": 0, "sharpe": 9.1}), EXPORTED)
+        written = json.loads(json.dumps(cli.jsonable(report)))
+        assert len(written["warnings"]) == 2
+        assert all(isinstance(warning, str) for warning in written["warnings"])
 
 
 class TestTheRestOfTheReport:

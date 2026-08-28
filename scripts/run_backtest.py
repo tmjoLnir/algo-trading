@@ -35,6 +35,7 @@ from atp_core.backtest.ports import BacktestRunSpec, spec_to_json
 from atp_core.backtest.runner import (
     SIZING_METHODS,
     STOP_TYPES,
+    all_warnings,
     build_engine,
     jsonable,
     refusal_summary,
@@ -210,9 +211,22 @@ def build_report(result: Any, spec: BacktestRunSpec) -> dict[str, Any]:
 
     Pure, and separate from `main` for that reason: the assembly is the part
     worth a test, and reaching it through `main` would need a database.
+
+    **The warnings are widened to the derived set for the same reason the spec
+    is here at all.** `to_report()` carries what the run *did* — coverage
+    shortfalls, refusals — and says nothing about how far to trust the
+    statistics beside them; `runner.all_warnings` prepends the notes derived
+    from the metrics, which is what the queued path serves on every read. Both
+    of them were already printed to the terminal a few lines below, so the gap
+    was never what an operator watching a run saw. It was what the file
+    remembered: a `buy_and_hold` export whose `num_trades` is 0, and with it
+    nine placeholder-zero metrics, recorded `"warnings": []` — the caveat lived
+    in scrollback and the numbers outlived it. A file read six months later is
+    read without the terminal that produced it.
     """
     report: dict[str, Any] = result.to_report()
     report["spec"] = spec_to_json(spec)
+    report["warnings"] = all_warnings(report["warnings"], report["metrics"])
     report["equity_curve"] = [[ts.isoformat(), str(eq)] for ts, eq in result.equity_curve]
     return report
 
