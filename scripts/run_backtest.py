@@ -33,12 +33,15 @@ from pydantic import ValidationError
 
 from atp_core.backtest.ports import BacktestRunSpec, spec_to_json
 from atp_core.backtest.runner import (
+    FIXED_QTY_WARNING,
     SIZING_METHODS,
     STOP_TYPES,
+    ZERO_COST_WARNING,
     all_warnings,
-    build_engine,
     jsonable,
     refusal_summary,
+    resolve_sizing,
+    run_spec,
 )
 from atp_core.config import get_settings
 from atp_core.domain import Timeframe
@@ -155,12 +158,53 @@ def _format(value: object, kind: str) -> str:
     return f"{float(value):>13.3f}"  # type: ignore[arg-type]
 
 
+def stated_separately(spec: BacktestRunSpec, result: Any) -> set[str]:
+    """The `run_spec` caveats this CLI states in its own place, not in the table.
+
+    Three of the warnings `runner.run_spec` attaches are already on screen by
+    the time the metric table's warning block renders. The zero-cost and
+    fixed-qty notes print *above* the run — deliberately, because a number a
+    human has already read is a number they have already believed — and the
+    refusal summary prints under the table on its own, where the ten-warning cap
+    that block applies cannot swallow the one line saying how much of the run
+    actually happened.
+
+    They ride on the result regardless of this set, which is the whole point of
+    routing the CLI through `run_spec`: that list is what reaches `--out`, and
+    what a queued run — which has no terminal at all — is read from. This
+    function decides only what the table declines to repeat.
+
+    Matched against `runner`'s own constants rather than by keyword. If a
+    wording drifts apart from them the caveat is printed twice, which a reader
+    sees immediately; the opposite failure — matching too eagerly and silently
+    dropping a caveat — is the one that would matter.
+
+    Which is also why the sizing test is `spec.sizing_method` rather than
+    `resolve_sizing`'s first return value, though `run_spec` attaches the
+    warning off the latter. The two differ on one input: a spec naming no method
+    at all, which `resolve_sizing` reads as `fixed_qty` and the preamble above
+    does not print for. Taking the narrower of the two can only leave the table
+    repeating something already said; taking the wider could drop the only
+    mention of it. The formatted value still comes from `resolve_sizing`, so the
+    string this builds is the string `run_spec` put on the result.
+    """
+    said: set[str] = set()
+    if spec.cost_model == "zero":
+        said.add(ZERO_COST_WARNING)
+    if spec.sizing_method == "fixed_qty":
+        said.add(FIXED_QTY_WARNING.format(qty=resolve_sizing(spec)[1]))
+    if (refusals := refusal_summary(result)) is not None:
+        said.add(refusals)
+    return said
+
+
 def _print_report(
     strategy: str,
     symbols: list[str],
     result: Any,
     metrics: dict[str, Any],
     fees: Decimal,
+    said: set[str] | None = None,
 ) -> None:
     print(f"\n{'═' * 58}")
     print(f"  {strategy}  ·  {', '.join(symbols)}  ·  {result.config.timeframe.value}")
@@ -181,12 +225,16 @@ def _print_report(
         print(f"  {label:<32}{_format(metrics[key], kind)}")
     print(f"{'═' * 58}")
 
-    if result.warnings:
-        print(f"\n{len(result.warnings)} warning(s) during the run:")
-        for warning in result.warnings[:10]:
+    # Everything the run recorded except what this CLI has already said in its
+    # own place. Filtered here rather than left off the result, because the
+    # result is what `--out` and the dashboard read.
+    unsaid = [w for w in result.warnings if w not in (said or set())]
+    if unsaid:
+        print(f"\n{len(unsaid)} warning(s) during the run:")
+        for warning in unsaid[:10]:
             print(f"  {warning}")
-        if len(result.warnings) > 10:
-            print(f"  ... and {len(result.warnings) - 10} more")
+        if len(unsaid) > 10:
+            print(f"  ... and {len(unsaid) - 10} more")
 
 
 def build_report(result: Any, spec: BacktestRunSpec) -> dict[str, Any]:
@@ -205,7 +253,7 @@ def build_report(result: Any, spec: BacktestRunSpec) -> dict[str, Any]:
     path stores on `backtest_runs.config` and the Backtests tab serves. That is
     the point rather than a convenience: a CLI run and a dashboard run describe
     themselves identically, and a field added to the spec reaches both files or
-    neither. Same argument as `build_engine` — two call sites that assembled
+    neither. Same argument as `run_spec` — two call sites that assembled and ran
     this separately would drift, and the drift would surface as two files that
     look comparable and are not.
 
@@ -223,6 +271,13 @@ def build_report(result: Any, spec: BacktestRunSpec) -> dict[str, Any]:
     nine placeholder-zero metrics, recorded `"warnings": []` — the caveat lived
     in scrollback and the numbers outlived it. A file read six months later is
     read without the terminal that produced it.
+
+    The other half of that gap is closed upstream rather than here: `main` runs
+    through `runner.run_spec`, so `to_report()`'s `warnings` now also carry the
+    zero-cost, fixed-qty and refusal caveats this CLI used to state on screen
+    and nowhere else. Both halves had the same shape — a caveat an operator saw
+    and a file did not — and the `--zero-cost` one was the worst of them,
+    because the file it left behind is a debugging run that reads as evidence.
     """
     report: dict[str, Any] = result.to_report()
     report["spec"] = spec_to_json(spec)
@@ -370,15 +425,26 @@ async def main(argv: list[str] | None = None) -> int:
         stop_period=args.stop_period,
         stop_bars=args.stop_bars,
     )
-    engine = build_engine(spec, limits=settings.risk)
-
+    # `run_spec` rather than `build_engine(...).run(...)`, which is what this
+    # ran before. Both assemble the same engine; only `run_spec` also attaches
+    # the three caveats it owns — zero-cost, fixed-qty, and the refusal summary
+    # — to the result. Attaching them here rather than at print time is what
+    # gets them into `--out`: the CLI has always said all three on screen, and
+    # recorded none of them in the file that outlives the screen.
+    #
+    # `build_engine`'s `ConfigError`s move inside this `except` as a result, and
+    # are still unreachable for the reason given above — the argument handling
+    # has already refused each of those conditions by flag name. Were one ever
+    # to become reachable, a named failure beats the traceback it raised before.
     try:
-        result = engine.run(bars)
+        result = run_spec(spec, bars, limits=settings.risk)
     except ATPError as exc:
         raise SystemExit(f"backtest failed: {exc}") from None
 
     fees = sum((o.total_fees for o in result.orders), Decimal(0))
-    _print_report(strategy.name, symbols, result, result.metrics, fees)
+    _print_report(
+        strategy.name, symbols, result, result.metrics, fees, stated_separately(spec, result)
+    )
 
     # Above the "too few trades" note, because it is often the *reason* there
     # were too few: a run whose entries the chain refused reports a return from

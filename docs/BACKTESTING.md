@@ -148,16 +148,22 @@ through the same `runner.all_warnings` the API serves. Read them first; the
 printed to the terminal as the run finishes, but the file is the copy that
 survives, and a result is usually read long after the scrollback is gone.
 
-One gap remains on this path. The CLI attaches the zero-cost, fixed-qty and
-refusal-summary caveats at print time rather than through `runner.run_spec`, so
-those three reach the terminal and not the file. A `--zero-cost` export is the
-case that bites: the terminal says so loudly, the JSON does not. Until that is
-unified, check `spec.cost_model` in the file rather than trusting its
-`warnings` to mention it.
+That includes the three the run itself earns — the zero-cost note, the
+fixed-qty note, and the refusal summary — because the CLI runs through
+`runner.run_spec`, which is what attaches them. It used to state all three on
+screen and record none of them, so a `--zero-cost` export named the cost model
+in its `spec` block and said nothing about it in its `warnings`: a debugging
+run, on disk, reading as a result.
+
+The terminal still says each of those three in its own place — two above the
+run, the refusal summary below the table — so the metric table's warning block
+skips what has already been said rather than repeating it. The file is not
+filtered; it carries everything.
 
 Or from the dashboard's **Backtests** tab, over `POST /api/v1/backtests`. Both
-assemble the engine through the same function (`atp_core.backtest.runner
-.build_engine`), so the same parameters produce the same result either way — two
+run through the same function (`atp_core.backtest.runner.run_spec`, which
+assembles the engine with `build_engine` and attaches the caveats above), so the
+same parameters produce the same result *and the same warnings* either way — two
 call sites wiring their own engines would eventually disagree, and a dashboard
 reporting a different Sharpe from the terminal is worse than either being wrong.
 
