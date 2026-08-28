@@ -340,10 +340,12 @@ that yet, so it stays **not shown**.
 
   `POST /api/v1/backtests` and its worker task are built as of Phase 5's
   backtests tab (#67), which is where they belonged — they were never Phase 2
-  items, and the dashboard that consumes them is that phase. Both paths now
-  assemble the engine through `atp_core.backtest.runner.build_engine`, so a
-  queued run and this CLI cannot report different numbers for the same
-  parameters.
+  items, and the dashboard that consumes them is that phase. Both paths now run
+  through `atp_core.backtest.runner.run_spec` — which assembles the engine with
+  `build_engine` and attaches the caveats the run earns — so a queued run and
+  this CLI cannot report different numbers, or different warnings, for the same
+  parameters. The CLI reached that function last, in #110; until then it
+  assembled the same engine and attached none of the caveats.
 
 - [x] `buy_and_hold` benchmark — @claude (#94, #109).
   The second registered strategy, and the one that makes the first one's number
@@ -1943,14 +1945,30 @@ wording if it is not the demonstration you want.
   months later. `build_report` now derives them through the same
   `runner.all_warnings` the API calls.
 
-  **Still open on this path, and a different fix:** the CLI calls
-  `build_engine(...).run(bars)` directly rather than `runner.run_spec`, so the
-  three caveats `run_spec` attaches — zero-cost, fixed-qty, the refusal summary
-  — reach the terminal through the CLI's own prints and never reach `--out` at
-  all. Invisible on the `buy_and_hold` run, which triggers none of the three,
-  and live on any `--zero-cost` export. Unifying them means reconciling
-  `run_spec`'s ordering with the CLI's richer prose and its deliberate print
-  order, which is why it is not folded into #109.
+  **And #110 closed the rest of it.** #109 fixed the half derived from the
+  metrics; the other half was that the CLI called `build_engine(...).run(bars)`
+  directly rather than `runner.run_spec`, so the three caveats `run_spec`
+  attaches — zero-cost, fixed-qty, the refusal summary — reached the terminal
+  through the CLI's own prints and never reached `--out` at all. Invisible on
+  the `buy_and_hold` run, which earns none of the three, and live on every
+  `--zero-cost` export: a file that named the cost model in its `spec` block and
+  said nothing about it in its `warnings`, which is a debugging run on disk
+  reading as a result.
+
+  The CLI now runs through `run_spec`, so those three ride on the result and
+  reach both readers of it. What made this a separate diff from #109 was the
+  terminal rather than the file: the CLI states all three itself, two above the
+  run — deliberately, because a number a human has already read is a number they
+  have already believed — and the refusal summary below the table, where the
+  ten-warning cap on the table's own block cannot swallow it. Attaching them to
+  the result would have said each thing twice. `stated_separately` is the
+  reconciliation: it decides what the table declines to repeat, never what the
+  run records, and is matched against `runner`'s constants so a drifting wording
+  duplicates a line rather than dropping one.
+
+  Both halves had the same shape and the same root: `to_report()` is the file's
+  only account of itself, and the CLI kept saying things to the screen that it
+  never put there.
 
 - [ ] Live-vs-backtest comparison — @claude.
   Built as of #68: `GET /analytics/live-vs-backtest/{run_id}` serves the live

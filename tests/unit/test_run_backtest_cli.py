@@ -17,7 +17,7 @@ import importlib.util
 import json
 import math
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -25,7 +25,16 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 import pytest
 
 from atp_core.backtest.ports import BacktestRunSpec, spec_to_json
-from atp_core.backtest.runner import STOP_TYPES, all_warnings
+from atp_core.backtest.runner import (
+    FIXED_QTY_WARNING,
+    STOP_TYPES,
+    ZERO_COST_WARNING,
+    all_warnings,
+    refusal_summary,
+    run_spec,
+)
+from atp_core.config import get_settings
+from atp_core.domain import Bar, Timeframe
 from atp_core.persistence.backtests import _spec_from_json
 
 if TYPE_CHECKING:
@@ -260,6 +269,69 @@ EXPORTED = BacktestRunSpec(
 #: derived warning, and a bare dict at each of them would drift.
 _TRUSTWORTHY = {"total_return": 0.0005, "num_trades": 42, "sharpe": 1.3}
 
+#: A real run, small. `EXPORTED` above describes a spec and never executes one,
+#: which is all the report-assembly tests need; the caveats `run_spec` attaches
+#: are properties of a run that happened, so the tests below have to run one.
+_RUN_START = datetime(2024, 1, 2, tzinfo=UTC)
+_RUN_BARS = 90
+
+
+def _wave(count: int = _RUN_BARS) -> list[Bar]:
+    """A wave, so the shipped crossover actually crosses — a ramp never does."""
+    series = []
+    for index in range(count):
+        base = Decimal(str(round(100 + 12 * math.sin(2 * math.pi * index / (count / 2)), 2)))
+        series.append(
+            Bar(
+                symbol="SPY",
+                ts=_RUN_START + timedelta(days=index),
+                timeframe=Timeframe.D1,
+                open=base,
+                high=base + Decimal("1"),
+                low=base - Decimal("1"),
+                close=base + Decimal("0.5"),
+                # Synthetic bars have no corporate actions, so the adjusted close
+                # is the close. Present rather than null because the engine prices
+                # off adjusted closes and refuses a series without them.
+                adj_close=base + Decimal("0.5"),
+                volume=Decimal("5000000"),
+            )
+        )
+    return series
+
+
+def _runnable(**overrides: Any) -> BacktestRunSpec:
+    """A spec that produces a real result and earns none of the three caveats:
+    a costed model, sizing that is not a flat share count, and orders the chain
+    lets through. A test asserting a caveat appears has turned it on itself.
+
+    `equity_pct` rather than `risk_pct`: the latter sizes off a stop distance,
+    and with no stop configured `position_sizing` refuses every entry — which
+    makes the run carry a refusal summary and stop being the quiet baseline
+    these tests measure against.
+    """
+    fields: dict[str, Any] = {
+        "strategy_id": "sma_crossover",
+        "symbols": ("SPY",),
+        "start": _RUN_START,
+        "end": _RUN_START + timedelta(days=_RUN_BARS + 1),
+        "timeframe": "1d",
+        "starting_cash": "100000",
+        "cost_model": "alpaca_equities",
+        "params": {"fast_period": 5, "slow_period": 20},
+        "qty": "10",
+        "sizing_method": "equity_pct",
+        "sizing_value": "0.05",
+    }
+    fields.update(overrides)
+    return BacktestRunSpec(**fields)
+
+
+def _exported(spec: BacktestRunSpec) -> dict[str, Any]:
+    """Run it and assemble the `--out` file, which is the pair under test."""
+    result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+    return cast("dict[str, Any]", cli.build_report(result, spec))
+
 
 class _FakeResult:
     """Enough of `BacktestResult` for the report assembly, which reads two
@@ -420,6 +492,127 @@ class TestTheExportedWarnings:
         written = json.loads(json.dumps(cli.jsonable(report)))
         assert len(written["warnings"]) == 2
         assert all(isinstance(warning, str) for warning in written["warnings"])
+
+
+class TestTheCaveatsTheRunAttaches:
+    """`--out` carries the three caveats `run_spec` owns, not only the two the
+    metrics imply.
+
+    The CLI used to call `build_engine(...).run(...)` and state these three on
+    screen itself: the zero-cost and fixed-qty notes above the run, the refusal
+    summary below the table. None of them reached the file, so a `--zero-cost`
+    export — a debugging run, by construction not evidence about anything —
+    recorded the cost model in its `spec` block and said nothing about it in its
+    `warnings`. The queued path has attached all three since it was written.
+    """
+
+    def test_a_zero_cost_run_says_so_in_the_file(self) -> None:
+        """The one that matters most: this file is the one that reads as
+        evidence when it is not."""
+        assert ZERO_COST_WARNING in _exported(_runnable(cost_model="zero"))["warnings"]
+
+    def test_a_costed_run_does_not(self) -> None:
+        assert ZERO_COST_WARNING not in _exported(_runnable())["warnings"]
+
+    def test_a_fixed_qty_run_says_so_in_the_file(self) -> None:
+        """With the share count in it, because the caveat is that the return is
+        a property of that number."""
+        exported = _exported(_runnable(sizing_method="fixed_qty", sizing_value="10"))
+        assert FIXED_QTY_WARNING.format(qty=Decimal("10")) in exported["warnings"]
+
+    def test_a_run_sized_another_way_does_not(self) -> None:
+        """It used to be said unconditionally. Saying it of an `equity_pct` run
+        would be the file warning about something that did not happen."""
+        assert not any("sized at" in w for w in _exported(_runnable())["warnings"])
+
+    def test_the_zero_cost_caveat_leads(self) -> None:
+        """`run_spec` inserts it first because it invalidates everything under
+        it, and `all_warnings` puts the derived notes ahead of the stored ones.
+        The first *stored* line is still the one that says the run was not real.
+        """
+        exported = _exported(_runnable(cost_model="zero"))
+        derived = [w for w in exported["warnings"] if "docs/BACKTESTING.md 'Reading" in w]
+        assert exported["warnings"][len(derived)] == ZERO_COST_WARNING
+
+    def test_the_file_and_the_terminal_agree(self) -> None:
+        """The whole point. Everything the CLI states in its own place is also
+        in the file — `stated_separately` decides what the table skips, never
+        what the run records."""
+        spec = _runnable(cost_model="zero", sizing_method="fixed_qty", sizing_value="10")
+        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        exported = cli.build_report(result, spec)["warnings"]
+
+        assert cli.stated_separately(spec, result) <= set(exported)
+
+
+class TestWhatTheTableRepeats:
+    """The terminal says each caveat once, and the file keeps all of them.
+
+    Routing the CLI through `run_spec` put three warnings onto the result that
+    the CLI already prints in its own places. Left alone they would print twice
+    in one run — which is why `stated_separately` exists, and why it filters the
+    *printing* rather than trimming the result.
+    """
+
+    def test_it_skips_what_the_preamble_said(self) -> None:
+        spec = _runnable(cost_model="zero")
+        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        assert ZERO_COST_WARNING in cli.stated_separately(spec, result)
+
+    def test_it_skips_the_refusal_summary(self) -> None:
+        """Printed under the table on its own, where the ten-warning cap that
+        block applies cannot swallow the line saying how much of the run
+        actually happened."""
+        spec = _runnable(sizing_method="fixed_notional", sizing_value="100000000")
+        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        refusals = refusal_summary(result)
+
+        assert refusals is not None, "the oversized order should have been refused"
+        assert refusals in cli.stated_separately(spec, result)
+
+    def test_it_claims_nothing_a_clean_run_did_not_say(self) -> None:
+        spec = _runnable()
+        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        assert cli.stated_separately(spec, result) == set()
+
+    def test_an_unnamed_sizing_method_is_not_claimed_as_said(self) -> None:
+        """`resolve_sizing` reads an empty method as `fixed_qty`, so `run_spec`
+        attaches the share-count caveat — but the preamble, which tests the
+        argument, printed nothing. Claiming it here would filter the run's only
+        mention of it out of the table and leave the terminal silent.
+
+        Unreachable from the CLI itself, whose `--sizing` has a default and a
+        choice list. Pinned because the two conditions are equivalent only for
+        as long as that stays true.
+        """
+        spec = _runnable(sizing_method="", sizing_value="")
+        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+
+        attached = FIXED_QTY_WARNING.format(qty=Decimal("10"))
+        assert attached in result.warnings, "run_spec should have attached it"
+        assert attached not in cli.stated_separately(spec, result)
+
+    def test_the_engines_own_warnings_still_print(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """The filter is for what the CLI says elsewhere, not a mute button. A
+        coverage shortfall has no other place to appear."""
+        spec = _runnable()
+        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        result.warnings.append("coverage: SPY starts late")
+        cli._print_report("s", ["SPY"], result, result.metrics, Decimal("0"), set())
+
+        assert "coverage: SPY starts late" in capsys.readouterr().out
+
+    def test_a_filtered_warning_does_not_print(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """The zero-cost line is on the result — and so in `--out` — while the
+        preamble above the run is the only place the terminal says it."""
+        spec = _runnable(cost_model="zero")
+        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        cli._print_report(
+            "s", ["SPY"], result, result.metrics, Decimal("0"), cli.stated_separately(spec, result)
+        )
+
+        assert ZERO_COST_WARNING not in capsys.readouterr().out
+        assert ZERO_COST_WARNING in result.warnings
 
 
 class TestTheRestOfTheReport:
