@@ -141,6 +141,20 @@ Backtests tab from there. A CLI export and a run exported from the tab
 therefore describe themselves identically, and a field added to the spec lands
 in both files or neither.
 
+`warnings` carries both kinds: what the run did — coverage shortfalls, orders
+refused — and the notes derived from the metrics about how far to trust them,
+through the same `runner.all_warnings` the API serves. Read them first; the
+"Reading the result" section below is what they are pointing at. They are also
+printed to the terminal as the run finishes, but the file is the copy that
+survives, and a result is usually read long after the scrollback is gone.
+
+One gap remains on this path. The CLI attaches the zero-cost, fixed-qty and
+refusal-summary caveats at print time rather than through `runner.run_spec`, so
+those three reach the terminal and not the file. A `--zero-cost` export is the
+case that bites: the terminal says so loudly, the JSON does not. Until that is
+unified, check `spec.cost_model` in the file rather than trusting its
+`warnings` to mention it.
+
 Or from the dashboard's **Backtests** tab, over `POST /api/v1/backtests`. Both
 assemble the engine through the same function (`atp_core.backtest.runner
 .build_engine`), so the same parameters produce the same result either way — two

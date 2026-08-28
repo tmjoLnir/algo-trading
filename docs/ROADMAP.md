@@ -27,9 +27,9 @@ fix it here in the PR that discovered it.
 
 ## Where this stands
 
-**20 of 48 items ticked — and the other 28 are not a measure of what is
+**21 of 48 items ticked — and the other 27 are not a measure of what is
 unbuilt.** Reading them as one is the specific mistake this section exists to
-prevent. Twenty of the twenty-eight sit in Phases 4 and 5, whose *Verifiable:*
+prevent. Twenty of the twenty-seven sit in Phases 4 and 5, whose *Verifiable:*
 lines both come down to the same event: a strategy trading the paper account for
 a week. The code is written and tested. The week has not happened.
 
@@ -37,19 +37,19 @@ a week. The code is written and tested. The week has not happened.
 |---|---:|---:|---|
 | 0 — Foundations | 4 / 4 | 0 | — |
 | 1 — Data | 3 / 5 | 2 | A forced disconnect against the live stream, and a quote proving its own age |
-| 2 — Backtesting | 6 / 7 | 1 | `buy_and_hold` over real stored bars |
+| 2 — Backtesting | 7 / 7 | 0 | — |
 | 3 — Risk | 2 / 4 | 2 | A strategy that tries to breach every limit, refused by name |
 | 4 — Execution & paper trading | 0 / 10 | 10 | **The paper week.** A strategy trades the paper account for a week and reconciles clean |
 | 5 — Dashboard & analytics | 0 / 10 | 10 | **The same paper week**, read back through the screens and the analytics |
 | 6 — Production readiness | 5 / 8 | 3 | A scrape from a real deployment, a restore actually performed, a host to deploy to |
-| **Total** | **20 / 48** | **28** | |
+| **Total** | **21 / 48** | **27** | |
 
-The twenty-eight open items are in three different states, and the difference
+The twenty-seven open items are in three different states, and the difference
 matters more than the count:
 
 | State | Count | Means |
 |---|---:|---|
-| Claimed, in progress (`wip`) | 21 | Somebody is on it, or has been |
+| Claimed, in progress (`wip`) | 20 | Somebody is on it, or has been |
 | Built, awaiting the phase line | 6 | All Phase 5. Code merged, screen shipped, nothing left but the demonstration |
 | Unclaimed | 1 | **Daily report** (Phase 5) — the only item in this file nobody has started |
 
@@ -345,7 +345,7 @@ that yet, so it stays **not shown**.
   queued run and this CLI cannot report different numbers for the same
   parameters.
 
-- [ ] `buy_and_hold` benchmark — @claude (wip #94).
+- [x] `buy_and_hold` benchmark — @claude (#94, #109).
   The second registered strategy, and the one that makes the first one's number
   mean something. Every item above this line produces a return; none of them
   produces anything to read it against, and a return with nothing beside it is
@@ -376,13 +376,51 @@ that yet, so it stays **not shown**.
   market's return over the window it was actually in, which is the whole claim a
   benchmark makes.
 
-  Unticked. It has run only over synthetic fixtures on `ZeroCostModel`; this
-  phase's end-to-end *Verifiable:* line is a strategy over real stored bars with
-  `alpaca_equities_default()` costs and a reconciling metrics report, which is
-  what `SmaCrossover` was ticked against and what this has not yet been. Running
-  it needs a seeded database, so the tick belongs to whoever runs
-  `scripts/run_backtest.py --strategy buy_and_hold` against one and reconciles
-  the report.
+  **Ticked (#109): run over real stored bars and reconciled.** Twenty symbols
+  (four index ETFs and sixteen large caps), 1,525 daily bars from 2020-07-27 to
+  2026-08-20, `alpaca_equities_default()` costs, `--sizing equity_pct 0.05`:
+
+  ```
+  equity 100,000 → 302,809.33   total_return 2.0281   fees $0.00
+  cagr 0.2011   sharpe 1.276   sortino 1.860   calmar 0.921
+  max_drawdown -21.83% over 260 days   volatility 0.153
+  0 round trips   20 signals / 20 orders / 20 fills / 20 open
+  exposure 99.9%   turnover 0.99×
+  ```
+
+  Run twice — once through `scripts/run_backtest.py --out`, once queued and
+  exported from the Backtests tab — and the two files agree on all 1,525 equity
+  points and all nineteen metrics exactly, which is the invariant the
+  `build_engine` note above claims and the first time it has been observed
+  rather than asserted. All nineteen recompute from the exported curve through
+  `metrics.compute_all` to the last digit.
+
+  Three of the strategy's decisions are now seen on real bars rather than
+  fixtures. The first equity point is exactly the starting cash and the second
+  has moved, so the entry filled at the bar *after* the decision. Twenty signals
+  produced twenty fills and twenty still-open positions — one attempt per
+  symbol, not re-entry. And `realized_pnl` is 0 with the whole 202,809.33
+  unrealised, so nothing was ever sold.
+
+  `fees $0.00` is the cost model being right, not off: Alpaca's equity
+  commission is zero and the SEC/TAF fees `PerShareCostModel` keeps are
+  sell-side, so a strategy that never sells pays none. Slippage was charged —
+  it lands in the fill price, not the fee line.
+
+  The conversion recorded under "Backtests price off adjusted closes" (#103) is
+  confirmed by the same run, on the universe that found it: 2021-08-02, the GE
+  1:8 reverse split that once showed as a **+51.16%** day, is now −0.26%. The
+  largest move in the window is 2025-04-09's +8.22%, which is the tariff-pause
+  rally and belongs there.
+
+  **Two caveats that are properties of this run, not of the platform.** The
+  universe is twenty names that all still exist in 2026 — textbook survivorship
+  bias (`CLAUDE.md` §5), so 20.1% CAGR is a property of that basket and not of
+  the market; it is a baseline to compare strategies against on the *same*
+  universe, and nothing else. And `num_trades` is 0 by construction, so the nine
+  per-trade metrics are placeholder zeros rather than measurements — which is
+  what the run's own warning says, and, until #109, what only one of the two
+  export paths recorded.
 
 *Verifiable:* a hand-computed 20-bar fixture matches the engine exactly.
 **Shown** — @claude (#25). `TestAgainstKnownFixture` in
@@ -1891,6 +1929,28 @@ wording if it is not the demonstration you want.
   column and the `--out` file alike with the `dataclasses.fields` assertion
   covering both, so a CLI export and a run exported from this tab carry the
   same spec block.
+
+  **And #109 closed the last of that seam: the `--out` file said what it was a
+  run of, and still not how far to trust it.** `to_report()`'s warnings are what
+  the run *did* — coverage shortfalls, refusals — and the derived notes from
+  `suspicious` were computed, printed to the terminal, and dropped on the way to
+  disk, where this tab served them on every read through `all_warnings`. Found
+  by diffing the two exports of the `buy_and_hold` run ticked in Phase 2: two
+  files identical in all 1,525 equity points and all nineteen metrics, one
+  saying `only 0 trades — the statistics mean very little` and the other saying
+  `"warnings": []`. The caveat was never missing from an operator's screen, only
+  from the artifact that outlives it, which is the half that gets read six
+  months later. `build_report` now derives them through the same
+  `runner.all_warnings` the API calls.
+
+  **Still open on this path, and a different fix:** the CLI calls
+  `build_engine(...).run(bars)` directly rather than `runner.run_spec`, so the
+  three caveats `run_spec` attaches — zero-cost, fixed-qty, the refusal summary
+  — reach the terminal through the CLI's own prints and never reach `--out` at
+  all. Invisible on the `buy_and_hold` run, which triggers none of the three,
+  and live on any `--zero-cost` export. Unifying them means reconciling
+  `run_spec`'s ordering with the CLI's richer prose and its deliberate print
+  order, which is why it is not folded into #109.
 
 - [ ] Live-vs-backtest comparison — @claude.
   Built as of #68: `GET /analytics/live-vs-backtest/{run_id}` serves the live
