@@ -58,6 +58,8 @@ from tests.fakes import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from atp_core.strategy.context import StrategyContext
 
 START = datetime(2024, 6, 3, 13, 30, tzinfo=UTC)
@@ -176,6 +178,8 @@ class FakeRouter:
         self.risk_engine = RiskEngine(get_settings().risk, rules=backtest_rules())
         self.calls: list[str] = []
         self.signals: list[Signal] = []
+        #: What the runner passed as in-flight on each `submit_signal`.
+        self.pending_seen: list[list[Order]] = []
         self.flattened: list[str] = []
         self.flatten_purposes: list[str] = []
         self.protected: list[Order] = []
@@ -216,9 +220,17 @@ class FakeRouter:
         )
 
     async def submit_signal(
-        self, signal: Signal, portfolio: Portfolio, sizing: Any
+        self,
+        signal: Signal,
+        portfolio: Portfolio,
+        sizing: Any,
+        *,
+        pending: Iterable[Order] = (),
     ) -> SubmitResult:
         self.calls.append("submit_signal")
+        # Recorded so `TestPendingReachesTheChain` can assert the runner hands
+        # down what it believes is working — the whole point of the argument.
+        self.pending_seen.append(list(pending))
         self.signals.append(signal)
         side = Side.BUY if signal.action is SignalAction.ENTER_LONG else Side.SELL
         if self.refuse_signals:
@@ -413,6 +425,50 @@ class TestWarmup:
         await runner.warmup(portfolio)
 
         assert strategy.started is True
+
+
+class TestInFlightOrdersReachTheChain:
+    """The runner tells the router what it believes is working at the venue.
+
+    `_submit` loops signals through the router against one `portfolio` object,
+    and that object only moves when a fill drains in. So without this every
+    signal in a pass is risk-checked against a book holding none of the others
+    — the same defect a 40-symbol `buy_and_hold` replay showed as 1.97x gross
+    exposure with the cap refusing nothing, reached here through production
+    code rather than a backtest.
+
+    `_open_orders` is the right source rather than a batch-local list: it is
+    restored from the database at warmup and cleared on a terminal state, so an
+    order still working from an earlier bar counts too.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_runner_passes_what_it_believes_is_working(self) -> None:
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+        await runner.warmup(portfolio)
+
+        working = router._order(SYMBOL, Side.BUY)
+        runner._open_orders[working.client_order_id or "k"] = working
+
+        close_bar(runner, bar(1))
+        await runner.evaluate(portfolio)
+
+        assert router.pending_seen, "the runner should have submitted a signal"
+        assert working in router.pending_seen[-1]
+
+    @pytest.mark.asyncio
+    async def test_an_empty_book_passes_an_empty_set(self) -> None:
+        """Nothing outstanding is not the same as not passing the argument, and
+        the projection returns the book untouched either way."""
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+        await runner.warmup(portfolio)
+
+        close_bar(runner, bar(1))
+        await runner.evaluate(portfolio)
+
+        assert router.pending_seen == [[]]
 
 
 class TestTheOrdering:

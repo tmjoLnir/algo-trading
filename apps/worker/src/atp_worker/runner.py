@@ -872,8 +872,17 @@ class StrategyRunner:
                 continue
             self.stats.signals_generated += 1
 
+            # What we believe is working at the venue, so this batch's own
+            # orders count against the limits as they are approved. The
+            # portfolio only moves when a fill drains in (`_drain_fills`), so
+            # without this every signal in one pass is judged against a book
+            # holding none of the others — forty entries at 5% of equity each
+            # pass a 100% gross cap and land at 200%. `_open_orders` is the
+            # right source rather than a batch-local list: it is restored at
+            # warmup and cleared on a terminal state, so an order still working
+            # from an earlier bar counts too.
             result = await self.router.submit_signal(
-                self._with_stop(signal), portfolio, self.sizing
+                self._with_stop(signal), portfolio, self.sizing, pending=self.open_orders
             )
             await self._record_signal(signal, result)
 

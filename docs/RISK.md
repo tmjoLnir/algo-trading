@@ -184,6 +184,39 @@ loses on both legs in a correlated shock.
 **The daily loss limit blocks entries, never exits.** Refusing to let a losing
 position close would turn a bad day into an unbounded one.
 
+### Orders in flight count against every limit above
+
+A limit is checked per order, and the book only moves when a fill lands. So a
+strategy that emits many orders at once — which is what any multi-symbol
+universe does — used to have each one judged against a book containing none of
+the others. Forty entries at 5% of equity each pass a 100% gross cap
+individually and land at 200% together.
+
+That was not hypothetical. A 40-symbol `buy_and_hold` replay filled all forty,
+ended at **1.97x gross exposure with cash at −97,046**, and the exposure cap
+refused nothing. All four limits that describe the shape of the book have the
+same hole: `max_open_positions` counts positions, so a batch submitted at
+nineteen open all passes; `max_position_pct` reads one symbol's quantity, so two
+orders in the same name at 6% each pass a 10% cap.
+
+`RiskEngine.validate` therefore takes what the caller has already committed and
+not yet seen settle, and projects the book forward before running the chain
+(`rules.project_pending`). `BacktestEngine` passes its resting orders;
+`StrategyRunner` passes what it believes is working at the venue. **A caller
+that has orders outstanding and does not pass them gets the old behaviour**, so
+this is a parameter with exactly two correct call sites, not an option.
+
+Two things the projection deliberately does *not* do:
+
+- **It never credits a reduction.** A resting protective stop, counted as
+  filled, would lower projected exposure and license a position the limits would
+  otherwise refuse — a rule reasoning from an exit that has not happened.
+- **It does not make a limit an invariant.** The chain prices an in-flight order
+  at the last mark and the fill then crosses the spread, so a book can settle a
+  hair over a ceiling it was approved under. That residual is slippage-scale
+  (tens of dollars on a 100,000 account), is the same for a single order, and is
+  inherent to any pre-trade check.
+
 ### The correlation trap
 
 Ten positions at 5% each is not 50% diversified exposure if all ten are regional

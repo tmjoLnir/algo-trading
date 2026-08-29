@@ -61,6 +61,8 @@ from atp_core.risk.stops import FROM_ENTRY_TYPES, StopConfig, StopManager, targe
 from atp_core.strategy.base import Strategy
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from atp_core.backtest.engine import BacktestResult
     from atp_core.domain import Order
     from atp_core.strategy.context import StrategyContext
@@ -121,7 +123,9 @@ class _Risk:
     def anchor_session(self, equity: Decimal) -> int:
         return 1
 
-    def validate(self, order: Order, portfolio: Portfolio) -> RiskDecision:
+    def validate(
+        self, order: Order, portfolio: Portfolio, pending: Iterable[Order] = ()
+    ) -> RiskDecision:
         return RiskDecision.allow()
 
 

@@ -42,6 +42,8 @@ from atp_core.strategy import registry
 from atp_core.strategy.examples.buy_and_hold import BuyAndHold
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from atp_core.domain import Order, Signal
 
 START = datetime(2024, 1, 2, tzinfo=UTC)
@@ -89,7 +91,9 @@ class _AllowAllRisk:
     def anchor_session(self, equity: Decimal) -> int:
         return 1
 
-    def validate(self, order: Order, portfolio: Portfolio) -> RiskDecision:
+    def validate(
+        self, order: Order, portfolio: Portfolio, pending: Iterable[Order] = ()
+    ) -> RiskDecision:
         return RiskDecision.allow()
 
 

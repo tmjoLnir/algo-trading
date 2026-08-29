@@ -519,6 +519,26 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   reached look identical, and nothing has traded paper. `RiskEngine
   .anchor_session` is the named seam, `StrategyRunner.warmup` calls it at each
   session open and the backtest engine at each session in the replay.
+
+  **And every one of those nine rules measured the wrong book** (#112). A limit
+  is checked per order and the book only moves on a fill, so a caller submitting
+  several orders before any settles had each judged against a book holding none
+  of the others. Forty entries at 5% of equity each pass a 100% gross cap alone
+  and are 200% together — which a 40-symbol `buy_and_hold` replay did: forty
+  filled, 1.97x gross exposure, cash at −97,046, and the cap refused nothing.
+
+  It is not only the two rules that price the book. `max_open_positions` counts
+  positions, so a batch submitted at nineteen open all passes; `max_position_pct`
+  reads one symbol's quantity, so two orders in the same name at 6% each pass a
+  10% cap. Four of the five rules a replay can evaluate, and the same four live:
+  `StrategyRunner._submit` loops signals through the router against a portfolio
+  that only moves when `_drain_fills` runs.
+
+  `RiskEngine.validate` now takes what the caller has committed and not yet seen
+  settle, and `rules.project_pending` advances the book before the chain reads
+  it — one projection, so no rule knows in-flight orders exist. Found by
+  checking a benchmark export rather than by reading the code: the run said 542%
+  and the turnover said it had borrowed to get there. ADR 0020.
 - [ ] Position sizing, all methods — @claude (wip #30).
   All five implemented: `fixed_qty`, `fixed_notional`, `equity_pct`, `risk_pct`
   and `volatility_target`. `risk_pct` and `volatility_target` each refuse the

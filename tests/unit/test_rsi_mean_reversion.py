@@ -51,6 +51,8 @@ from atp_core.strategy.examples.rsi_mean_reversion import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from atp_core.domain import Order, Signal
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -121,7 +123,9 @@ class _AllowAllRisk:
     def anchor_session(self, equity: Decimal) -> int:
         return 1
 
-    def validate(self, order: Order, portfolio: Portfolio) -> RiskDecision:
+    def validate(
+        self, order: Order, portfolio: Portfolio, pending: Iterable[Order] = ()
+    ) -> RiskDecision:
         return RiskDecision.allow()
 
 
