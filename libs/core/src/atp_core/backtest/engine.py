@@ -1337,7 +1337,14 @@ class BacktestEngine:
             purpose=purpose,
         )
 
-        decision = self.risk_engine.validate(order, self._portfolio)
+        # `_pending` is what this replay has already committed and not yet
+        # filled — every order queued earlier on this same bar, plus anything
+        # still resting from an earlier one. Without it each entry in a bar is
+        # judged against a book containing none of the others, and a
+        # forty-symbol universe opens at twice the gross exposure cap while the
+        # chain refuses nothing. The order under validation is not in the list:
+        # it is appended below, after this returns.
+        decision = self.risk_engine.validate(order, self._portfolio, self._pending)
         if not decision.approved:
             self._book_refusal(order, bar, result, rule=decision.rule, reason=decision.reason)
             return

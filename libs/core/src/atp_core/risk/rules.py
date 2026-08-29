@@ -9,16 +9,16 @@ its rejections.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from decimal import ROUND_DOWN, Decimal
 from typing import TYPE_CHECKING
 
-from atp_core.domain import Side
+from atp_core.domain import Position, Side
 from atp_core.risk.engine import RiskDecision
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
     from datetime import datetime
 
     from atp_core.clock import Clock, TradingCalendar
@@ -72,6 +72,74 @@ def reference_price(
 def _price_for(order: Order, portfolio: Portfolio) -> Decimal | None:
     """`reference_price` for an order that already exists."""
     return reference_price(order.symbol, portfolio, order.limit_price)
+
+
+def project_pending(portfolio: Portfolio, pending: Iterable[Order]) -> Portfolio:
+    """The book as it would stand if everything already in flight filled.
+
+    **The rules measure a settled book, and orders are approved against it one
+    at a time.** `Portfolio.cash` and `Portfolio.positions` move only when a
+    fill lands, so a strategy that emits forty entries in one bar has every one
+    of them judged against a book that contains none of the other thirty-nine.
+    Each looks like 5% of equity against a 100% ceiling; together they are 200%.
+    That is not hypothetical — a 40-symbol `buy_and_hold` replay filled all
+    forty, ended at 1.97x gross exposure with cash at -97,046, and the exposure
+    cap refused nothing.
+
+    Every rule that describes the *shape of the book* is affected, not only the
+    two that price it: `MaxOpenPositionsRule` counts positions, so a batch of
+    entries submitted at nineteen open all pass; `MaxPositionSizeRule` reads one
+    symbol's quantity, so two orders in the same name each pass at 6% of a 10%
+    cap. Projecting the book once, here, fixes all four without any of them
+    knowing that in-flight orders exist.
+
+    **Reductions are not credited, and that asymmetry is the point.** A resting
+    protective stop would, if counted as filled, *lower* the projected exposure
+    and license a position the limits would otherwise refuse — a rule reasoning
+    from an exit that has not happened, which is the inversion this module's
+    default-closed posture exists to prevent. `reduces_position` already draws
+    that line for `DailyLossLimitRule`; it draws it here too.
+
+    **An unpriceable order still consumes its quantity.** Given no limit price
+    and no mark there is no notional to add, so the projected position carries
+    the quantity and no price — which puts the symbol in
+    `Portfolio.unmarked_symbols`, and `_unpriced_book` then refuses on behalf of
+    every rule that prices the book. Skipping it instead would under-count, and
+    under-counting is the direction that approves what it should refuse.
+
+    Returns `portfolio` itself when nothing is in flight, so the overwhelmingly
+    common single-order path copies nothing. The projection is a read-only view
+    for the chain: `avg_entry_price` and the P&L fields are deliberately left as
+    they are, because no rule reads them and inventing a cost basis for a fill
+    that has not happened would be a worse answer than an untouched one.
+    """
+    committed = [
+        order
+        for order in pending
+        if order.remaining_qty > 0 and not reduces_position(order, portfolio)
+    ]
+    if not committed:
+        return portfolio
+
+    positions = {symbol: replace(position) for symbol, position in portfolio.positions.items()}
+    cash = portfolio.cash
+
+    for order in committed:
+        position = positions.setdefault(order.symbol, Position(symbol=order.symbol))
+        signed = order.remaining_qty * order.side.sign
+        position.qty += signed
+        price = reference_price(order.symbol, portfolio, order.limit_price)
+        if price is None:
+            continue
+        # Exactly what a fill does to cash (`BacktestEngine._execute`), so a
+        # projected buy leaves equity unchanged and moves only the exposure —
+        # the quantity every percentage limit is a percentage *of* must not
+        # drift just because an order is in flight.
+        cash -= signed * price
+        if position.last_price is None:
+            position.last_price = price
+
+    return replace(portfolio, cash=cash, positions=positions)
 
 
 def _unpriced_book(rule: str, portfolio: Portfolio) -> RiskDecision | None:

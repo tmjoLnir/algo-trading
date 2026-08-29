@@ -76,6 +76,7 @@ from atp_core.risk.rules import position_size, reference_price
 from atp_core.risk.stops import FROM_ENTRY_TYPES
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from datetime import datetime
 
     from atp_core.brokers.ports import BrokerPort
@@ -224,7 +225,12 @@ class OrderRouter:
     # ── the submission path ─────────────────────────────────────────────────
 
     async def submit_signal(
-        self, signal: Signal, portfolio: Portfolio, sizing_config: PositionSizeSpec
+        self,
+        signal: Signal,
+        portfolio: Portfolio,
+        sizing_config: PositionSizeSpec,
+        *,
+        pending: Iterable[Order] = (),
     ) -> SubmitResult:
         """Size a signal, validate it, and send it.
 
@@ -296,10 +302,20 @@ class OrderRouter:
             signal_id=signal.id,
             purpose=purpose,
         )
-        return await self.submit(request, portfolio)
+        return await self.submit(request, portfolio, pending=pending)
 
-    async def submit(self, request: OrderRequest, portfolio: Portfolio) -> SubmitResult:
-        """Submit a concrete request. THE submission path — do not add another."""
+    async def submit(
+        self, request: OrderRequest, portfolio: Portfolio, *, pending: Iterable[Order] = ()
+    ) -> SubmitResult:
+        """Submit a concrete request. THE submission path — do not add another.
+
+        `pending` is what the caller has already sent and not yet seen settle.
+        The portfolio moves on a fill, so a caller submitting several orders
+        before any of them comes back has each judged against a book holding
+        none of the others — see `RiskEngine.validate`. `StrategyRunner` passes
+        the orders it believes are working at the venue; a caller with nothing
+        outstanding can leave it empty.
+        """
         qty = request.qty
         if qty is None:
             sized = self._size_notional(request, portfolio)
@@ -339,7 +355,7 @@ class OrderRouter:
                 request.take_profit_price,
             )
 
-        return await self._route(order, portfolio)
+        return await self._route(order, portfolio, pending)
 
     async def submit_protective_orders(
         self,
@@ -854,7 +870,9 @@ class OrderRouter:
             created_at=entry_order.filled_at or entry_order.created_at,
         )
 
-    async def _route(self, order: Order, portfolio: Portfolio) -> SubmitResult:
+    async def _route(
+        self, order: Order, portfolio: Portfolio, pending: Iterable[Order] = ()
+    ) -> SubmitResult:
         """Validate and send one built order. The gate every order passes.
 
         Private because `OrderRequest` is what callers hand in — a strategy able
@@ -871,7 +889,7 @@ class OrderRouter:
                 f"reuses the key (CLAUDE.md §1.4)"
             )
 
-        decision = self.risk_engine.validate(order, portfolio)
+        decision = self.risk_engine.validate(order, portfolio, pending)
         if not decision.approved:
             transition(
                 order,

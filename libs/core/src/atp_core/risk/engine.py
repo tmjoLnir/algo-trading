@@ -17,7 +17,7 @@ from atp_core import metrics
 from atp_core.errors import ConfigError, RiskLimitBreachedError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
     from datetime import datetime
     from decimal import Decimal
 
@@ -103,8 +103,25 @@ class RiskEngine:
         self.limits = limits
         self.rules = rules
 
-    def validate(self, order: Order, portfolio: Portfolio) -> RiskDecision:
+    def validate(
+        self, order: Order, portfolio: Portfolio, pending: Iterable[Order] = ()
+    ) -> RiskDecision:
         """Approve, shrink, or reject.
+
+        **`pending` is what the caller has already committed and not yet seen
+        settle**, and passing it is what stops a batch of orders collectively
+        breaching a limit none of them breaches alone. The book moves on a fill,
+        so without it every order in one bar is judged against a book holding
+        none of the others: forty entries at 5% of equity each pass a 100% cap
+        and land at 200%. `rules.project_pending` explains the failure and the
+        conservatism; this is the only place it is applied, so every rule gets
+        the corrected book without knowing in-flight orders exist.
+
+        It defaults to empty, which is exactly today's behaviour for a caller
+        that has nothing in flight — but a caller that *does* and omits it gets
+        the old bug back, silently. The two callers in this platform both pass
+        it: `BacktestEngine` its resting orders, `OrderRouter` whatever the
+        runner believes is working at the venue.
 
         Rules run in order and the first denial wins, so cheap checks (kill
         switch, rate limit) belong before expensive ones (exposure maths).
@@ -122,9 +139,17 @@ class RiskEngine:
         builders below both return rules, and `RiskEngine(limits)` with none at
         all raises, so nothing gets an unguarded engine by omission.
         """
+        # Imported here rather than at module scope for the reason
+        # `default_rules` gives: `rules` needs `RiskDecision` from this module
+        # at runtime, and a top-level import in both directions would not
+        # resolve.
+        from atp_core.risk.rules import project_pending
+
+        book = project_pending(portfolio, pending)
+
         adjusted: Decimal | None = None
         for rule in self.rules:
-            decision = rule.check(order, portfolio, self.limits)
+            decision = rule.check(order, book, self.limits)
             if not decision.approved:
                 # Counted with the rule that refused, which is the only label on
                 # these worth having: "risk denied 40 orders today" is a
@@ -138,9 +163,11 @@ class RiskEngine:
         metrics.risk_checked("shrunk" if adjusted is not None else "approved")
         return RiskDecision(approved=True, adjusted_qty=adjusted)
 
-    def validate_or_raise(self, order: Order, portfolio: Portfolio) -> None:
+    def validate_or_raise(
+        self, order: Order, portfolio: Portfolio, pending: Iterable[Order] = ()
+    ) -> None:
         """As `validate`, but raises `RiskLimitBreachedError` on denial."""
-        decision = self.validate(order, portfolio)
+        decision = self.validate(order, portfolio, pending)
         if not decision.approved:
             raise RiskLimitBreachedError(decision.rule, decision.reason)
 

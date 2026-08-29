@@ -36,6 +36,7 @@ from atp_core.risk.rules import (
     StaleDataRule,
     TradingHoursRule,
     position_size,
+    project_pending,
     reduces_position,
 )
 from atp_core.strategy.rules import PositionSizeSpec
@@ -622,3 +623,175 @@ class TestPositionSizeSpecBounds:
     def test_a_non_positive_value_is_refused(self) -> None:
         with pytest.raises(ValidationError):
             PositionSizeSpec(type="fixed_qty", value=Decimal(0))
+
+
+class TestInFlightOrdersCountAgainstTheLimits:
+    """A batch must not collectively breach a limit none of its orders breaches.
+
+    The book moves when a fill lands, so an order approved and not yet filled is
+    invisible to the next one. Every rule that describes the shape of the book
+    reads settled state, so forty entries submitted in one bar are each measured
+    against a book holding none of the other thirty-nine: each is 5% of equity
+    against a 100% ceiling, and together they are 200%.
+
+    Found in a real export. A `buy_and_hold` replay over forty symbols at
+    `equity_pct 0.025`... at 0.05 filled all forty, ended at 1.97x gross
+    exposure with cash at -97,046, and the exposure cap refused nothing. The
+    same shape reaches production through `StrategyRunner._submit`, which loops
+    signals through the router against one unrefreshed portfolio.
+    """
+
+    def _rules(self) -> list[RiskRule]:
+        rules = default_rules(
+            kill_switch=FakeKillSwitch(False),
+            clock=SimulatedClock(OPEN_HOURS),
+            calendar=TradingCalendar(),
+            last_tick_at=lambda _s: OPEN_HOURS,
+        )
+        for rule in rules:
+            if isinstance(rule, DailyLossLimitRule):
+                rule.anchor(Decimal(100_000))
+        return rules
+
+    def _chain(self) -> RiskEngine:
+        return RiskEngine(limits(), rules=self._rules())
+
+    def _batch(self, count: int, *, qty: float = 50, price: float = 100) -> list[Order]:
+        return [order(symbol=f"S{i:02d}", qty=qty, limit=price) for i in range(count)]
+
+    def test_a_batch_cannot_collectively_breach_the_gross_exposure_cap(self) -> None:
+        """The bug, stated as the fix. Twenty orders of 5,000 fill a 100,000
+        book exactly; the twenty-first is over the cap and is refused, even
+        though not one of the twenty-one is individually near it."""
+        chain, book = self._chain(), portfolio()
+        submitted = self._batch(20)
+
+        twenty_first = order(symbol="S20", qty=50, limit=100)
+        decision = chain.validate(twenty_first, book, submitted)
+
+        assert not decision.approved
+        assert decision.rule == "max_gross_exposure"
+
+    def test_the_same_order_passes_while_the_batch_is_still_small(self) -> None:
+        """The allow case, so the rule above is a limit and not a mute button."""
+        chain, book = self._chain(), portfolio()
+        assert chain.validate(order(symbol="S20"), book, self._batch(5)).approved
+
+    def test_omitting_pending_is_the_bug_this_closes(self) -> None:
+        """Pinned deliberately: the default is empty, and a caller that has
+        orders in flight and does not pass them gets the old behaviour. That is
+        what makes the two call sites in this platform load-bearing rather than
+        decorative, and it is why this argument is not optional in spirit."""
+        chain, book = self._chain(), portfolio()
+        twenty_first = order(symbol="S20", qty=50, limit=100)
+
+        assert chain.validate(twenty_first, book).approved
+        assert not chain.validate(twenty_first, book, self._batch(20)).approved
+
+    def test_pending_quantity_in_one_symbol_counts_against_the_position_cap(self) -> None:
+        """`MaxPositionSizeRule` reads one symbol's quantity, so two orders in
+        the same name at 6% of a 10% cap each pass alone and breach together."""
+        chain, book = self._chain(), portfolio()
+        first = order(symbol="SPY", qty=60, limit=100)  # 6,000 of a 10,000 cap
+
+        assert chain.validate(order(symbol="SPY", qty=60, limit=100), book).approved
+        decision = chain.validate(order(symbol="SPY", qty=60, limit=100), book, [first])
+        assert not decision.approved
+        assert decision.rule == "max_position_size"
+
+    def test_pending_entries_count_against_the_open_position_cap(self) -> None:
+        """`MaxOpenPositionsRule` counts positions rather than pricing them, so
+        it is broken by the same seam and fixed by the same projection."""
+        chain = RiskEngine(limits(max_open_positions=5), rules=self._rules())
+        decision = chain.validate(
+            order(symbol="S09", qty=1, limit=100), portfolio(), self._batch(5)
+        )
+
+        assert not decision.approved
+        assert decision.rule == "max_open_positions"
+
+    def test_pending_buys_consume_buying_power(self) -> None:
+        """The other half of the 40-symbol failure: cash ended at -97,046
+        because every order was priced against the opening balance.
+
+        The exposure cap is lifted here so that buying power is the rule left
+        to bind — each order is 9% of equity against a 10% position cap, and
+        eleven of them exhaust the cash without any one being remarkable.
+        """
+        chain = RiskEngine(limits(max_gross_exposure_pct=Decimal(10)), rules=self._rules())
+        book = portfolio(cash=100_000)
+        spent = self._batch(11, qty=90)  # 99,000 of 100,000
+
+        decision = chain.validate(order(symbol="S11", qty=90, limit=100), book, spent)
+        assert not decision.approved
+        assert decision.rule == "buying_power"
+
+    def test_a_resting_exit_is_not_credited(self) -> None:
+        """The deliberate asymmetry. A protective stop counted as filled would
+        *lower* projected exposure and license a position the limits would
+        otherwise refuse — a rule reasoning from an exit that has not happened.
+        """
+        chain = self._chain()
+        book = portfolio(cash=0, SPY=(1000.0, 100.0))  # 100,000 held, at the cap
+        resting_stop = order(symbol="SPY", side=Side.SELL, qty=1000, limit=90)
+
+        decision = chain.validate(order(symbol="QQQ", qty=10, limit=100), book, [resting_stop])
+        assert not decision.approved, "the stop must not free up room it has not freed"
+        assert decision.rule == "max_gross_exposure"
+
+    def test_an_unpriceable_pending_order_refuses_rather_than_under_counts(self) -> None:
+        """Default-closed. With no limit price and no mark there is no notional
+        to add, so the projected position carries the quantity and no price —
+        which `_unpriced_book` then refuses on. Skipping it would under-count,
+        and under-counting approves what it should refuse."""
+        chain, book = self._chain(), portfolio()
+        unpriceable = order(symbol="XYZ", qty=10, limit=None)
+
+        decision = chain.validate(order(qty=10), book, [unpriceable])
+        assert not decision.approved
+        assert "XYZ" in decision.reason
+
+    def test_only_the_unfilled_remainder_of_a_partial_counts(self) -> None:
+        """The filled half is already in the book; counting the whole order
+        would double it and refuse trades that are within every limit."""
+        chain, book = self._chain(), portfolio()
+        half_filled = order(symbol="S00", qty=100, limit=100)
+        half_filled.filled_qty = Decimal(50)
+
+        assert chain.validate(order(symbol="S01", qty=50, limit=100), book, [half_filled]).approved
+
+
+class TestTheProjectionItself:
+    def test_it_does_not_mutate_the_portfolio_it_is_given(self) -> None:
+        """It runs inside `validate`, before rules that read the same object.
+        A projection that wrote through would make the risk chain a mutator of
+        the book it is judging."""
+        book = portfolio(cash=50_000, SPY=(10.0, 100.0))
+        projected = project_pending(book, [order(symbol="QQQ", qty=100, limit=100)])
+
+        assert book.cash == Decimal(50_000)
+        assert "QQQ" not in book.positions
+        assert projected.cash == Decimal(40_000)
+        assert projected.positions["QQQ"].qty == Decimal(100)
+
+    def test_a_projected_buy_leaves_equity_unchanged(self) -> None:
+        """Cash out, mark in — exactly what a fill does. Every percentage limit
+        is a percentage *of* equity, so a projection that moved it would shift
+        the ceiling as well as the measurement."""
+        book = portfolio(cash=100_000)
+        projected = project_pending(book, [order(symbol="SPY", qty=100, limit=100)])
+
+        assert projected.equity == book.equity
+        assert projected.gross_exposure == Decimal(10_000)
+
+    def test_nothing_in_flight_returns_the_same_object(self) -> None:
+        """The single-order path is the overwhelmingly common one and copies
+        nothing."""
+        book = portfolio()
+        assert project_pending(book, []) is book
+
+    def test_a_reducing_order_is_dropped_entirely(self) -> None:
+        book = portfolio(cash=0, SPY=(100.0, 100.0))
+        exit_order = order(symbol="SPY", side=Side.SELL, qty=100, limit=100)
+
+        assert project_pending(book, [exit_order]) is book

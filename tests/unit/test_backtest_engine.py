@@ -49,6 +49,8 @@ from atp_core.risk.engine import RiskDecision
 from atp_core.strategy.base import Strategy
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from atp_core.domain import Order
     from atp_core.strategy.context import StrategyContext
 
@@ -135,13 +137,17 @@ class _RiskDouble:
 
 
 class _AllowAllRisk(_RiskDouble):
-    def validate(self, order: Order, portfolio: Portfolio) -> RiskDecision:
+    def validate(
+        self, order: Order, portfolio: Portfolio, pending: Iterable[Order] = ()
+    ) -> RiskDecision:
         self.seen.append(order)
         return RiskDecision.allow()
 
 
 class _DenyAllRisk(_RiskDouble):
-    def validate(self, order: Order, portfolio: Portfolio) -> RiskDecision:
+    def validate(
+        self, order: Order, portfolio: Portfolio, pending: Iterable[Order] = ()
+    ) -> RiskDecision:
         self.seen.append(order)
         return RiskDecision.deny("test_rule", "denied by test")
 

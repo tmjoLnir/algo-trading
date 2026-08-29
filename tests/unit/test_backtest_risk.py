@@ -445,6 +445,103 @@ class TestTheResultSaysWhichChainRan:
         assert result.warnings[-2] == risk_chain_summary()
 
 
+class TestABatchCannotBreachTheCapTogether:
+    """The 40-symbol failure, end to end through the engine.
+
+    `buy_and_hold` emits every entry on one bar. Orders rest and fill at the
+    next open, so before this each of the forty was risk-checked against a book
+    still holding none of the others — all forty passed a 100% gross cap and the
+    replay opened at 1.97x gross exposure with cash at -97,046. The engine now
+    hands its resting orders to `validate`, so the batch is measured as a batch.
+
+    Flat bars deliberately: the projection prices an in-flight order at the last
+    mark and the fill lands at the next open, so on a moving series the two
+    differ and the assertions below would be about that gap rather than about
+    the batch. That gap is real, unchanged by this diff, and identical for a
+    single order — it is not what these tests are for.
+
+    `max_open_positions` is lifted for the same reason. At its default of 20 a
+    forty-name universe is capped on *count* long before exposure binds, which
+    would pass these tests for the wrong reason.
+    """
+
+    CAP_ONLY_ON_EXPOSURE = RiskLimits(
+        max_position_pct=Decimal("0.10"),
+        max_gross_exposure_pct=Decimal("1.00"),
+        max_daily_loss_pct=Decimal("0.03"),
+        max_orders_per_minute=1000,
+        max_open_positions=100,
+        max_quote_age_seconds=30,
+    )
+
+    def _flat(self, symbol: str, count: int = 30) -> list[Bar]:
+        """A constant series, so a decision price and a fill price agree."""
+        return [
+            Bar(
+                symbol=symbol,
+                ts=T0 + timedelta(days=index),
+                timeframe=Timeframe.D1,
+                open=Decimal(100),
+                high=Decimal(100),
+                low=Decimal(100),
+                close=Decimal(100),
+                adj_close=Decimal(100),
+                volume=Decimal(10_000_000),
+            )
+            for index in range(count)
+        ]
+
+    def _run(self, sizing_value: str, count: int = 40) -> BacktestResult:
+        symbols = tuple(f"S{i:02d}" for i in range(count))
+        spec = a_spec(
+            strategy_id="buy_and_hold",
+            symbols=symbols,
+            params={},
+            end=T0 + timedelta(days=31),
+            sizing_method="equity_pct",
+            sizing_value=sizing_value,
+        )
+        return run_spec(spec, {s: self._flat(s) for s in symbols}, limits=self.CAP_ONLY_ON_EXPOSURE)
+
+    def test_forty_entries_at_five_percent_stop_at_the_gross_cap(self) -> None:
+        """Twenty fill and twenty are refused, rather than forty filling at
+        twice the ceiling. Before this diff: forty filled, none refused."""
+        result = self._run("0.05")
+        book = result.portfolio
+
+        assert book.gross_exposure == Decimal(100_000), "twenty positions of 5,000"
+
+        refused = [o for o in result.orders if o.rejected_by == "max_gross_exposure"]
+        filled = [o for o in result.orders if o.filled_qty > 0]
+        assert (len(filled), len(refused)) == (20, 20)
+
+        # Cash lands a few tens below zero rather than 97,046 below it, and the
+        # difference is the whole finding. The chain checks pre-trade at the
+        # reference price; the fill then crosses the spread and costs slightly
+        # more. That residual is inherent to a pre-trade limit, is identical for
+        # a single order, and is unchanged by this diff — the bound is set at a
+        # scale that separates it from the failure, not at zero.
+        assert Decimal(-100) < book.cash <= 0
+
+    def test_a_batch_that_exactly_fits_is_left_alone(self) -> None:
+        """The allow case, and the one that matters most: 40 x 2.5% is exactly
+        100%, and a projection that double-counted would refuse a book that
+        fits."""
+        result = self._run("0.025")
+
+        assert not [o for o in result.orders if o.rejected_by]
+        assert sum(1 for o in result.orders if o.filled_qty > 0) == 40
+        assert result.portfolio.gross_exposure == Decimal(100_000)
+
+    def test_the_refusal_is_reported_rather_than_silent(self) -> None:
+        """A run whose entries were capped reports a return from what survived,
+        and `refusal_summary` is what says so."""
+        summary = refusal_summary(self._run("0.05"))
+
+        assert summary is not None
+        assert "max_gross_exposure" in summary
+
+
 class TestSpecCompatibility:
     def test_a_spec_stored_before_sizing_existed_resolves_to_what_it_was(self) -> None:
         """Every run in `backtest_runs` today has neither field. Each must still
