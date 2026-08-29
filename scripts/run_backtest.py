@@ -39,9 +39,12 @@ from atp_core.backtest.runner import (
     ZERO_COST_WARNING,
     all_warnings,
     jsonable,
+    open_positions_note,
     refusal_summary,
     resolve_sizing,
+    risk_chain_summary,
     run_spec,
+    stop_coverage_note,
 )
 from atp_core.config import get_settings
 from atp_core.domain import Timeframe
@@ -161,13 +164,14 @@ def _format(value: object, kind: str) -> str:
 def stated_separately(spec: BacktestRunSpec, result: Any) -> set[str]:
     """The `run_spec` caveats this CLI states in its own place, not in the table.
 
-    Three of the warnings `runner.run_spec` attaches are already on screen by
-    the time the metric table's warning block renders. The zero-cost and
-    fixed-qty notes print *above* the run — deliberately, because a number a
-    human has already read is a number they have already believed — and the
-    refusal summary prints under the table on its own, where the ten-warning cap
-    that block applies cannot swallow the one line saying how much of the run
-    actually happened.
+    Six of the warnings `runner.run_spec` attaches are already on screen by
+    the time the metric table's warning block renders. The zero-cost, fixed-qty,
+    risk-chain and no-stop notes print *above* the run — deliberately, because a
+    number a human has already read is a number they have already believed — and
+    the refusal summary and open-position note print under the table on their
+    own, where the ten-warning cap that block applies cannot swallow either the
+    line saying how much of the run actually happened or the one saying how much
+    of the return is a mark rather than a track record.
 
     They ride on the result regardless of this set, which is the whole point of
     routing the CLI through `run_spec`: that list is what reaches `--out`, and
@@ -187,12 +191,23 @@ def stated_separately(spec: BacktestRunSpec, result: Any) -> set[str]:
     repeating something already said; taking the wider could drop the only
     mention of it. The formatted value still comes from `resolve_sizing`, so the
     string this builds is the string `run_spec` put on the result.
+
+    The risk-chain line is added unconditionally, and that is the same rule
+    applied rather than an exception to it: this CLI prints it on every run and
+    has no flag that turns the chain off, so `with_rules` is always the default
+    here. If that ever stops being true the caveat prints twice, which a reader
+    sees — the failure this function is willing to have.
     """
     said: set[str] = set()
     if spec.cost_model == "zero":
         said.add(ZERO_COST_WARNING)
     if spec.sizing_method == "fixed_qty":
         said.add(FIXED_QTY_WARNING.format(qty=resolve_sizing(spec)[1]))
+    said.add(risk_chain_summary())
+    if (unprotected := stop_coverage_note(spec)) is not None:
+        said.add(unprotected)
+    if (still_held := open_positions_note(result)) is not None:
+        said.add(still_held)
     if (refusals := refusal_summary(result)) is not None:
         said.add(refusals)
     return said

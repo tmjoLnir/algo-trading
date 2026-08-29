@@ -1970,6 +1970,42 @@ wording if it is not the demonstration you want.
   only account of itself, and the CLI kept saying things to the screen that it
   never put there.
 
+  **And #111 found three more of them, by reading an export rather than the
+  code.** #110's own sentence — "the CLI states all three itself" — was true of
+  the three it moved and quietly false of the rest: `main` prints six notes, and
+  three were still terminal-only. The risk-chain note ("five of the nine rules
+  apply to a replay"), the no-stop note, and the open-position note. A CLI export
+  of `sma_crossover` over forty symbols carried 131 refusals from three rules and
+  no indication anywhere in the file that four more rules were never consulted —
+  a chain that reads as complete because the part of it that is missing cannot
+  refuse anything and so leaves no trace. The same file ended holding twelve
+  positions worth 3,768.70 of unrealised mark, 8% of its total return, which
+  `open_positions` and `unrealized_pnl` both recorded and no warning mentioned:
+  ADR 0019 put the money on the run and left the sentence about it on screen.
+
+  The risk-chain line is the one caveat attached to **every** run, which is a
+  deliberate exception to the rule the fixed-qty note follows. A caveat should
+  describe a choice, and there is no choice here to describe: the four absent
+  rules need a calendar, a feed clock, a halt state and a runaway loop, and no
+  replay over stored bars has any of them. Because all four only ever deny, their
+  absence flatters every backtest this platform has ever produced — a live
+  account is stopped more often, never less — which is precisely the direction a
+  reader will not assume unprompted.
+
+  **The fourth was a constant that had never been attached to anything.**
+  `NO_RISK_RULES_WARNING` was defined, documented at length, and referenced by
+  nothing; `build_engine`'s docstring promised "the warning goes back on the
+  result when they do" and nothing put it back. `with_rules` stopped at
+  `build_engine`, so the only way to obtain an engine that refuses nothing went
+  around the function that attaches caveats. `run_spec` takes the flag now, which
+  makes the switch that removes the rules the switch that says so. A guarantee
+  documented and unkept is worse than one never made, because it reads as kept.
+
+  `REPLAY_BLIND_RULES` moved to `risk.engine` beside the function that omits
+  those four, so the sentence naming them cannot go on naming four rules after
+  the chain starts omitting a different set — pinned against the difference
+  between the two chains rather than against a second literal.
+
 - [ ] Live-vs-backtest comparison — @claude.
   Built as of #68: `GET /analytics/live-vs-backtest/{run_id}` serves the live
   metric set, the stored backtest's, the divergence between them, and the reasons

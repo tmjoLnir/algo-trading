@@ -33,9 +33,11 @@ import pytest
 from atp_core.backtest.engine import RiskBasedSizer
 from atp_core.backtest.ports import BacktestRunSpec
 from atp_core.backtest.runner import (
+    NO_RISK_RULES_WARNING,
     SIZING_METHODS,
     refusal_summary,
     resolve_sizing,
+    risk_chain_summary,
     run_spec,
 )
 from atp_core.clock import SimulatedClock, TradingCalendar
@@ -53,7 +55,12 @@ from atp_core.domain import (
     Timeframe,
 )
 from atp_core.errors import ConfigError
-from atp_core.risk.engine import RiskEngine, backtest_rules, default_rules
+from atp_core.risk.engine import (
+    REPLAY_BLIND_RULES,
+    RiskEngine,
+    backtest_rules,
+    default_rules,
+)
 from atp_core.risk.rules import DailyLossLimitRule, TradingHoursRule, position_size
 from atp_core.strategy import examples as _examples  # noqa: F401 — populates the registry
 from atp_core.strategy import registry
@@ -146,6 +153,30 @@ class TestTheChainAReplayCanEvaluate:
             )
         }
         assert live - backtest == {"kill_switch", "trading_hours", "rate_limit", "stale_data"}
+
+    def test_the_absent_four_are_named_by_the_constant_a_result_reads(self) -> None:
+        """`REPLAY_BLIND_RULES` is what `risk_chain_summary` interpolates, so a
+        result telling a reader which rules went unevaluated is only as true as
+        this. Pinned against the difference between the two chains rather than
+        against a second literal, which would agree with itself forever.
+        """
+        live = {
+            rule.name
+            for rule in default_rules(
+                kill_switch=FakeKillSwitch(),
+                clock=SimulatedClock(T0),
+                calendar=TradingCalendar(),
+                last_tick_at=lambda _symbol: T0,
+            )
+        }
+        assert set(REPLAY_BLIND_RULES) == live - {rule.name for rule in backtest_rules()}
+
+    def test_the_two_chains_still_add_up_to_nine(self) -> None:
+        """The count every docstring in this seam quotes, including the sentence
+        `RISK_CHAIN_WARNING` puts in front of an operator. A tenth rule added to
+        the live chain and to neither list would leave five results claiming a
+        denominator that had moved."""
+        assert len(backtest_rules()) + len(REPLAY_BLIND_RULES) == 9
 
     def test_trading_hours_would_refuse_every_daily_order(self) -> None:
         """The concrete reason it is excluded, asserted rather than asserted
@@ -341,6 +372,77 @@ class TestTheChainRefusesForReal:
         assert summary is not None
         assert "max_position_size (2)" in summary
         assert f"{SIZING} (1)" in summary
+
+
+class TestTheResultSaysWhichChainRan:
+    """The chain refuses and the result says so; this is the other half — what
+    the chain *was*.
+
+    A run whose warnings show three rules denying a hundred orders reads as a
+    complete chain doing its job. Four of the nine were never consulted, all
+    four only ever refuse, and nothing in the file said so: the CLI printed it
+    to a terminal and dropped it on the way to `--out`, and the queued path,
+    which has no terminal, said it nowhere at all.
+    """
+
+    def test_a_run_records_that_four_rules_went_unevaluated(self) -> None:
+        result = run_spec(
+            a_spec(sizing_method="equity_pct", sizing_value="0.05"),
+            {"SPY": bars()},
+            limits=get_settings().risk,
+        )
+
+        summary = " ".join(result.warnings)
+        assert f"{len(backtest_rules())} of the 9 pre-trade risk rules were evaluated" in summary
+        for absent in REPLAY_BLIND_RULES:
+            assert absent in summary
+
+    def test_it_says_a_live_account_would_be_refused_more_not_less(self) -> None:
+        """The direction is the whole point of telling anyone. All four absent
+        rules only ever deny, so their absence flatters the run — a reader who
+        assumed the opposite would treat this backtest as the conservative
+        case."""
+        assert "stopped more often than this run was, not less" in risk_chain_summary()
+
+    def test_a_run_with_no_rules_says_that_instead(self) -> None:
+        """The two claims are opposite and a result must not carry both."""
+        result = run_spec(
+            a_spec(sizing_method="equity_pct", sizing_value="0.05"),
+            {"SPY": bars()},
+            limits=get_settings().risk,
+            with_rules=False,
+        )
+
+        assert NO_RISK_RULES_WARNING in result.warnings
+        assert risk_chain_summary() not in result.warnings
+
+    def test_turning_the_chain_off_cannot_be_silent(self) -> None:
+        """The defect this closes. `with_rules` reached `build_engine` and
+        stopped there, so the only way to get an engine that refuses nothing
+        went around the function that attaches caveats — and
+        `NO_RISK_RULES_WARNING` was defined, documented and referenced by
+        nothing, which reads as a guarantee being kept.
+        """
+        spec = a_spec(sizing_method="equity_pct", sizing_value="0.50")
+        refused = run_spec(spec, {"SPY": bars()}, limits=get_settings().risk)
+        unrefused = run_spec(spec, {"SPY": bars()}, limits=get_settings().risk, with_rules=False)
+
+        assert any(o.rejected_by == "max_position_size" for o in refused.orders)
+        assert not any(o.rejected_by for o in unrefused.orders)
+        assert NO_RISK_RULES_WARNING in unrefused.warnings
+
+    def test_the_chain_line_sits_directly_above_the_refusal_summary(self) -> None:
+        """The pair is the point: this line says which rules could refuse, the
+        next says what they did. A warning wedged between them would separate
+        the count from its denominator."""
+        result = run_spec(
+            a_spec(sizing_method="equity_pct", sizing_value="0.50"),
+            {"SPY": bars()},
+            limits=get_settings().risk,
+        )
+
+        assert refusal_summary(result) == result.warnings[-1]
+        assert result.warnings[-2] == risk_chain_summary()
 
 
 class TestSpecCompatibility:

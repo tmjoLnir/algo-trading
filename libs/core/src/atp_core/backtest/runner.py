@@ -34,7 +34,7 @@ from atp_core.backtest.engine import BacktestConfig, BacktestEngine, RiskBasedSi
 from atp_core.domain import OrderStatus, Timeframe
 from atp_core.domain.enums import StopType
 from atp_core.errors import ATPError, ConfigError
-from atp_core.risk.engine import RiskEngine, backtest_rules
+from atp_core.risk.engine import REPLAY_BLIND_RULES, RiskEngine, backtest_rules
 from atp_core.risk.stops import StopConfig
 from atp_core.strategy import RuleSet, compile_ruleset, registry
 
@@ -90,9 +90,69 @@ FIXED_QTY_WARNING = (
 #: Attached only to a run that deliberately asked for no rules. It used to be
 #: attached to all of them, because the engine was always built with an empty
 #: chain; `backtest_rules()` is what changed that.
+#:
+#: And for a while after that it was attached to *none* of them: `with_rules`
+#: reached `build_engine` and stopped there, so the one caller who could turn
+#: the chain off got an engine that refused nothing and a result that said
+#: nothing about it. A constant defined, documented and never referenced is the
+#: worst of the three states — the guarantee reads as kept.
 NO_RISK_RULES_WARNING = (
     "no pre-trade risk rules were active — orders were routed through "
     "RiskEngine, but nothing refused them"
+)
+
+#: The complement, and unlike every other caveat here it is on **every** run
+#: that kept its chain.
+#:
+#: That is a deliberate exception to the rule the sizing note above follows. A
+#: caveat should describe a choice, not the platform — but there is no version
+#: of a replay that earns its way out of this one: four of the nine rules need a
+#: halt state, a calendar, a clock or a feed timestamp, and a run over stored
+#: bars has none of them. Saying it only sometimes would mean picking a
+#: condition under which the other four secretly do apply, and there is not one.
+#:
+#: It earns the space because the run it misleads is the one *full* of refusals.
+#: Three rules denying a hundred orders reads as a chain doing its job, and a
+#: reader has no way to see from the file that the four absent ones are absent —
+#: all four only ever refuse, so a live account would be stopped more often than
+#: this run was, never less. Said immediately before the refusal summary so the
+#: two read as one account of what the chain did.
+#:
+#: Both counts are interpolated rather than written out, though every docstring
+#: in this seam says "five of the nine". A stale docstring is a reader's problem
+#: for a minute; a warning quoting a denominator that has moved is the platform
+#: telling an operator something untrue about what protected their money.
+RISK_CHAIN_WARNING = (
+    "{evaluated} of the {total} pre-trade risk rules were evaluated; {absent} "
+    "cannot be checked in a replay over stored bars and refused nothing here "
+    "(risk.engine.backtest_rules). Those only ever refuse, so a live account "
+    "would be stopped more often than this run was, not less"
+)
+
+#: Said when the spec configured no stop, because what a strategy was protected
+#: by is part of what it *is*. `sma_crossover` emits no level of its own, so an
+#: unconfigured run of it exits on the reverse crossover and nothing else.
+#:
+#: docs/RISK.md rather than the CLI's `--stop`: the queued path reaches this
+#: through `stop_type` on a stored spec and has no flags to name.
+NO_STOP_WARNING = (
+    "no stop was configured, so only the levels the strategy itself emitted "
+    "were armed. A strategy backtested naked and run live behind a stop is not "
+    "the same strategy (docs/RISK.md 'Stop losses')"
+)
+
+#: Said when the run ended holding something, which is the caveat ADR 0019 is
+#: about and the one the CLI stated on screen and recorded nowhere.
+#:
+#: The money fields have carried the facts since that ADR — `open_positions` and
+#: `unrealized_pnl` are both on `totals()` — but a reader scanning `warnings`
+#: for reasons to distrust the headline return would not find this among them,
+#: and the trade statistics beside it are computed over closed round trips only.
+#: A run that ends holding winners reports a gain none of them made.
+OPEN_POSITIONS_WARNING = (
+    "{count} position(s) still open at the end, carrying {unrealised} of "
+    "unrealised mark-to-market. That is part of the total return and part of "
+    "none of the trade statistics, which count closed round trips only"
 )
 
 #: The methods a request may name, and it is `position_size`'s own list rather
@@ -127,6 +187,55 @@ def refusal_summary(result: BacktestResult) -> str | None:
         f"{len(refused)} of {len(result.orders)} orders were refused before reaching "
         f"the market — {breakdown}. The return below is what the orders that "
         f"survived produced, not what the strategy asked for"
+    )
+
+
+def risk_chain_summary(*, with_rules: bool = True) -> str:
+    """What the chain that ran was, in one line.
+
+    Two states rather than one string, because "five of nine were evaluated" and
+    "nothing refused anything" are opposite claims and a result must not carry
+    both. `with_rules` is the same flag `build_engine` takes, threaded through
+    `run_spec` so that the only way to obtain a rule-free engine is also the way
+    that says so on the result.
+
+    The absent rules come from `REPLAY_BLIND_RULES`, beside the function that
+    omits them, and both counts are read off the two lists rather than written
+    out — so this sentence cannot go on naming four rules, or claiming a
+    denominator of nine, after the chain starts omitting a different set.
+    """
+    if not with_rules:
+        return NO_RISK_RULES_WARNING
+    evaluated = len(backtest_rules())
+    return RISK_CHAIN_WARNING.format(
+        evaluated=evaluated,
+        total=evaluated + len(REPLAY_BLIND_RULES),
+        absent=", ".join(REPLAY_BLIND_RULES),
+    )
+
+
+def stop_coverage_note(spec: BacktestRunSpec) -> str | None:
+    """The caveat a spec with no stop earns, or None when one was configured.
+
+    Reads `spec.stop_type` rather than `resolve_stop_config`, which raises on a
+    stop that is named but incomplete. A spec that cannot be resolved has a
+    worse problem than this note, and it is `build_engine`'s to report.
+    """
+    return None if spec.stop_type else NO_STOP_WARNING
+
+
+def open_positions_note(result: BacktestResult) -> str | None:
+    """What the run was still holding when it ended, or None if it ended flat.
+
+    The unrealised figure is formatted from the `Decimal` itself rather than
+    through `float`, because it is money (CLAUDE.md §1.1) and this string is the
+    only place several readers will meet it.
+    """
+    open_positions = result.portfolio.open_positions
+    if not open_positions:
+        return None
+    return OPEN_POSITIONS_WARNING.format(
+        count=len(open_positions), unrealised=f"{result.unrealized_pnl:,.2f}"
     )
 
 
@@ -273,8 +382,10 @@ def build_engine(
     same class of flattery as running one with no costs.
 
     `rules=[]` is still reachable, and still deliberate: `with_rules=False` is
-    how a caller asks for an engine that refuses nothing, and the warning goes
-    back on the result when they do.
+    how a caller asks for an engine that refuses nothing. `run_spec` takes the
+    same flag and puts `NO_RISK_RULES_WARNING` back on the result when it is
+    set — which this docstring claimed before anything did it, and a promise
+    kept nowhere is worse than one never made.
     """
     start, end = parse_spec_dates(spec)
 
@@ -323,17 +434,31 @@ def run_spec(
     *,
     limits: RiskLimits,
     on_progress: ProgressCallback | None = None,
+    with_rules: bool = True,
 ) -> BacktestResult:
     """Build the engine and run it, with the caveats attached to the result.
 
-    The three warnings ride on the result rather than being logged, because a
-    queued run has no terminal and the person who needs them is reading a screen
-    hours later — and the result they are most likely to be reading is the one
-    that looks too good. `zero` goes first: it is the one that invalidates
-    everything below it.
+    The warnings ride on the result rather than being logged, because a queued
+    run has no terminal and the person who needs them is reading a screen hours
+    later — and the result they are most likely to be reading is the one that
+    looks too good. `zero` goes first: it is the one that invalidates everything
+    below it.
+
+    **`with_rules` is here so that turning the chain off cannot be silent.** It
+    was `build_engine`'s parameter alone, which meant the only way to obtain an
+    engine that refuses nothing bypassed the function that attaches caveats, and
+    `NO_RISK_RULES_WARNING` went on the result of no run ever performed. Threaded
+    through, the flag that removes the rules is the flag that says so.
+
+    Three of these are new here and were not new to an operator: the CLI printed
+    the chain, stop and open-position notes to the terminal and recorded none of
+    them, which is the same seam #109 and #110 closed from the other two ends. A
+    caveat that lives only in scrollback is a caveat the file read six months
+    later does not have.
     """
     method, value = resolve_sizing(spec)
-    result = build_engine(spec, limits=limits, on_progress=on_progress).run(bars)
+    engine = build_engine(spec, limits=limits, on_progress=on_progress, with_rules=with_rules)
+    result = engine.run(bars)
 
     if spec.cost_model == "zero":
         result.warnings.insert(0, ZERO_COST_WARNING)
@@ -342,6 +467,16 @@ def run_spec(
     # would now be the result warning about something that did not happen.
     if method == "fixed_qty":
         result.warnings.append(FIXED_QTY_WARNING.format(qty=value))
+    if (unprotected := stop_coverage_note(spec)) is not None:
+        result.warnings.append(unprotected)
+    # Before the chain and the refusals, because it is the one caveat here that
+    # qualifies the *return* rather than the run: the trade statistics count
+    # closed round trips and this says how much of the number is not in them.
+    if (still_held := open_positions_note(result)) is not None:
+        result.warnings.append(still_held)
+    # Directly above the refusal summary, which is what makes the pair legible:
+    # this line says which rules could refuse, the next says what they did.
+    result.warnings.append(risk_chain_summary(with_rules=with_rules))
     # Last, and deliberately: it is the line that says how much of the run
     # above actually happened, so it should be the one still on screen when a
     # reader stops scrolling.

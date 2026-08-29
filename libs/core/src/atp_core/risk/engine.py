@@ -223,6 +223,23 @@ def default_rules(
     ]
 
 
+#: The four rules `backtest_rules` leaves out, by name and in the order its
+#: docstring explains them.
+#:
+#: Declared here rather than written out wherever a result needs to name them,
+#: because a backtest has to be able to say *which* four went unevaluated and a
+#: second list would drift from this one silently — the rules would still be
+#: absent and the sentence describing them would stop being true.
+#: `test_the_four_that_cannot_are_absent_rather_than_stubbed` pins it against
+#: the difference between the two chains rather than against itself.
+REPLAY_BLIND_RULES: tuple[str, ...] = (
+    "trading_hours",
+    "stale_data",
+    "kill_switch",
+    "rate_limit",
+)
+
+
 def backtest_rules() -> list[RiskRule]:
     """The chain a replay over bars can actually evaluate.
 
