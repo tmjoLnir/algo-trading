@@ -148,17 +148,42 @@ through the same `runner.all_warnings` the API serves. Read them first; the
 printed to the terminal as the run finishes, but the file is the copy that
 survives, and a result is usually read long after the scrollback is gone.
 
-That includes the three the run itself earns — the zero-cost note, the
-fixed-qty note, and the refusal summary — because the CLI runs through
-`runner.run_spec`, which is what attaches them. It used to state all three on
-screen and record none of them, so a `--zero-cost` export named the cost model
-in its `spec` block and said nothing about it in its `warnings`: a debugging
-run, on disk, reading as a result.
+That includes the six the run itself earns, because the CLI runs through
+`runner.run_spec`, which is what attaches them:
 
-The terminal still says each of those three in its own place — two above the
-run, the refusal summary below the table — so the metric table's warning block
-skips what has already been said rather than repeating it. The file is not
-filtered; it carries everything.
+| Caveat | Said when | Why it is on the file |
+|---|---|---|
+| zero-cost | `--zero-cost` | A debugging run, on disk, otherwise reads as a result |
+| fixed-qty | `--sizing fixed_qty` | The return is a property of that share count |
+| no stop | no `--stop` | A strategy backtested naked is not the one you run behind a stop |
+| open positions | the run ended holding something | That part of the return is a mark, and is in none of the trade statistics |
+| risk chain | **every run** | Four of the nine rules cannot be evaluated in a replay, and all four only ever refuse |
+| refusal summary | the chain refused anything | How much of the run actually happened |
+
+The first two reached the file in #110. The other three did not: the CLI printed
+them and recorded nothing, so a file full of refusals read as a complete chain
+doing its job, and a run that ended holding twelve positions said so in
+`open_positions` and nowhere a reader scanning `warnings` would look.
+
+**The risk-chain line is the one exception to "a caveat describes a choice".**
+There is no version of a replay that earns its way out of it — `trading_hours`,
+`stale_data`, `kill_switch` and `rate_limit` need a calendar, a feed clock, a
+halt state and a runaway loop, and a run over stored bars has none of them. It
+is said directly above the refusal summary so the two read together: which rules
+could refuse, then what they did. Because all four absent rules only ever deny,
+a live account is stopped *more* often than a backtest, never less.
+
+A run built with `with_rules=False` carries `NO_RISK_RULES_WARNING` in its
+place, and the two are mutually exclusive because they are opposite claims.
+`run_spec` takes that flag for exactly this reason: it used to be
+`build_engine`'s alone, so the only way to obtain an engine that refused nothing
+went around the function that attaches caveats, and the constant saying so was
+referenced by nothing.
+
+The terminal still says each of the six in its own place — four above the run,
+the refusal summary and the open-position note below the table — so the metric
+table's warning block skips what has already been said rather than repeating it.
+The file is not filtered; it carries everything.
 
 Or from the dashboard's **Backtests** tab, over `POST /api/v1/backtests`. Both
 run through the same function (`atp_core.backtest.runner.run_spec`, which

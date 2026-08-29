@@ -20,6 +20,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import pytest
@@ -27,14 +28,17 @@ import pytest
 from atp_core.backtest.ports import BacktestRunSpec, spec_to_json
 from atp_core.backtest.runner import (
     FIXED_QTY_WARNING,
+    NO_STOP_WARNING,
     STOP_TYPES,
     ZERO_COST_WARNING,
     all_warnings,
+    open_positions_note,
     refusal_summary,
+    risk_chain_summary,
     run_spec,
 )
 from atp_core.config import get_settings
-from atp_core.domain import Bar, Timeframe
+from atp_core.domain import Bar, Portfolio, Timeframe
 from atp_core.persistence.backtests import _spec_from_json
 
 if TYPE_CHECKING:
@@ -534,6 +538,59 @@ class TestTheCaveatsTheRunAttaches:
         derived = [w for w in exported["warnings"] if "docs/BACKTESTING.md 'Reading" in w]
         assert exported["warnings"][len(derived)] == ZERO_COST_WARNING
 
+    def test_the_open_position_caveat_reaches_the_file(self) -> None:
+        """ADR 0019's own case, one layer up. That ADR put `open_positions` and
+        `unrealized_pnl` on the run so a reader *could* see the split; this is
+        the sentence saying it matters, which the CLI printed under the table
+        and recorded nowhere. A run that ends holding winners reports a gain its
+        closed trades never made, and every trade statistic beside it counts
+        closed round trips only.
+        """
+        spec = _runnable()
+        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        exported = cli.build_report(result, spec)["warnings"]
+
+        assert result.portfolio.open_positions, "the baseline run should end holding one"
+        assert open_positions_note(result) in exported
+
+    def test_a_run_that_ends_flat_says_nothing_about_open_positions(self) -> None:
+        """A real `Portfolio` rather than an extension of `_FakeResult`, which
+        exists to be exactly what the report assembly reads and nothing more.
+        `open_positions` is the property under test, so faking it would leave
+        the test asserting against its own stub."""
+        flat = SimpleNamespace(
+            portfolio=Portfolio(cash=Decimal("100000"), starting_equity=Decimal("100000"))
+        )
+
+        assert not flat.portfolio.open_positions
+        assert open_positions_note(cast("Any", flat)) is None
+
+    def test_the_open_position_caveat_carries_decimal_money(self) -> None:
+        """The unrealised figure is money, so it is formatted off the `Decimal`
+        rather than through `float` (CLAUDE.md §1.1) — this string is the only
+        place several readers will meet the number."""
+        spec = _runnable()
+        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        note = open_positions_note(result)
+
+        assert note is not None
+        assert f"{result.unrealized_pnl:,.2f}" in note
+
+    def test_the_missing_stop_caveat_reaches_the_file(self) -> None:
+        """What a strategy was protected by is part of what it is. `_runnable`
+        configures no stop, and `sma_crossover` emits no level of its own."""
+        assert NO_STOP_WARNING in _exported(_runnable())["warnings"]
+
+    def test_a_run_behind_a_stop_does_not(self) -> None:
+        exported = _exported(_runnable(stop_type="atr", stop_value="2", stop_period=14))
+        assert NO_STOP_WARNING not in exported["warnings"]
+
+    def test_the_risk_chain_caveat_reaches_the_file(self) -> None:
+        """The one every run earns, and the one the file most needed: an export
+        full of refusals reads as a complete chain doing its job, and four of
+        the nine rules were never consulted."""
+        assert risk_chain_summary() in _exported(_runnable())["warnings"]
+
     def test_the_file_and_the_terminal_agree(self) -> None:
         """The whole point. Everything the CLI states in its own place is also
         in the file — `stated_separately` decides what the table skips, never
@@ -570,10 +627,23 @@ class TestWhatTheTableRepeats:
         assert refusals is not None, "the oversized order should have been refused"
         assert refusals in cli.stated_separately(spec, result)
 
-    def test_it_claims_nothing_a_clean_run_did_not_say(self) -> None:
+    def test_it_claims_exactly_what_the_terminal_said_and_nothing_else(self) -> None:
+        """This asserted an empty set while `_runnable` earned no caveat at all.
+        It earns two now — it configures no stop and ends holding a position —
+        and every run earns the risk-chain line, so the empty set stopped being
+        the thing worth pinning. The exact set is the stronger assertion anyway:
+        it catches a caveat this function claims the terminal said when the
+        terminal did not, which is the failure that silently drops a warning
+        from the table.
+        """
         spec = _runnable()
         result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
-        assert cli.stated_separately(spec, result) == set()
+
+        assert cli.stated_separately(spec, result) == {
+            risk_chain_summary(),
+            NO_STOP_WARNING,
+            open_positions_note(result),
+        }
 
     def test_an_unnamed_sizing_method_is_not_claimed_as_said(self) -> None:
         """`resolve_sizing` reads an empty method as `fixed_qty`, so `run_spec`
@@ -601,6 +671,27 @@ class TestWhatTheTableRepeats:
         cli._print_report("s", ["SPY"], result, result.metrics, Decimal("0"), set())
 
         assert "coverage: SPY starts late" in capsys.readouterr().out
+
+    def test_the_three_new_caveats_reach_the_file_without_printing_twice(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The invariant the whole arrangement rests on, asserted on all three
+        at once: each is on the result — so in `--out` and on a queued run —
+        and none of them is in the table's warning block, because `main` prints
+        each in its own place. Getting this wrong in the safe direction prints a
+        caveat twice; getting it wrong the other way is how one disappears.
+        """
+        spec = _runnable()
+        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        cli._print_report(
+            "s", ["SPY"], result, result.metrics, Decimal("0"), cli.stated_separately(spec, result)
+        )
+        printed = capsys.readouterr().out
+
+        for caveat in (risk_chain_summary(), NO_STOP_WARNING, open_positions_note(result)):
+            assert caveat in result.warnings
+            assert caveat is not None
+            assert caveat not in printed
 
     def test_a_filtered_warning_does_not_print(self, capsys: pytest.CaptureFixture[str]) -> None:
         """The zero-cost line is on the result — and so in `--out` — while the
