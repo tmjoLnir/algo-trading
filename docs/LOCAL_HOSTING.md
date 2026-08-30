@@ -257,6 +257,148 @@ closed against an *unreachable* Redis, not an empty one — so a restore starts
 **willing to trade**, against a book as of the dump and a broker as of now.
 `halt.py engage` first, every time.
 
+### On a schedule, with launchd
+
+[BACKUPS.md](BACKUPS.md) gives the cron lines. macOS does not use cron for this,
+and the differences are not cosmetic.
+
+**A LaunchAgent, never a LaunchDaemon.** The backup needs three things that only
+exist inside a logged-in user's GUI session: Docker Desktop is running there, an
+external drive is mounted into `/Volumes` by that session, and `uv` is on that
+user's PATH. A LaunchDaemon runs as root at boot with none of the three, and
+fails every time in a way whose log says only that the command was not found.
+
+**launchd catches up a missed run; cron does not.** A `StartCalendarInterval`
+job whose time passes while the Mac is asleep is run when it wakes, rather than
+skipped. That is the single biggest reason this is workable on a laptop at all —
+though a Mac that was fully powered off runs it at next login instead, which is
+later than you think if you are away for a week.
+
+#### The wrapper
+
+Host-specific, so it lives on the machine and not in this repository — the same
+reason `BACKUPS.md` keeps vendors out of the tooling. Substitute your own volume
+name.
+
+```bash
+mkdir -p ~/bin && cat > ~/bin/atp-backup <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+# launchd hands a job a near-empty PATH. Set it here as well as in the plist so
+# the script is correct however it is invoked.
+export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+VOL="/Volumes/backup1"
+DEST="$VOL/atp-backups"
+
+# The volume must be a REAL mount. `backup_db.py create` calls
+# `mkdir(parents=True)`, so against an unmounted drive it would cheerfully
+# create /Volumes/<name>/ on the BOOT disk — putting the backup on the disk it
+# is insuring against, and leaving a directory that stops the real drive
+# mounting under that name afterwards.
+if ! mount | grep -q " on $VOL "; then
+  echo "REFUSING: $VOL is not mounted"; exit 1
+fi
+[ -w "$VOL" ] || { echo "REFUSING: $VOL is read-only"; exit 1; }
+
+mkdir -p "$DEST"
+cd "$HOME/algo-trading"
+
+# One script, two modes, so the guard above cannot drift between a daily job
+# and a weekly one. --dir explicitly, never ATP_BACKUP_DIR: that variable is
+# read from the process environment only, never from .env, so it is absent
+# under launchd and the dump would silently land in the repo.
+case "${1:-create}" in
+  create) exec uv run python scripts/backup_db.py create \
+            --exec compose --dir "$DEST" --prune --keep 14 ;;
+  verify) exec uv run python scripts/backup_db.py verify \
+            --exec compose --dir "$DEST" ;;
+  *)      echo "usage: atp-backup [create|verify]" >&2; exit 2 ;;
+esac
+EOF
+chmod +x ~/bin/atp-backup
+```
+
+`atp-backup` takes the daily dump; `atp-backup verify` does the weekly restore
+check. Two modes rather than two files, because two copies of that mount guard
+is one copy that will eventually be wrong.
+
+**Do not pass `--keep` to `verify` thinking it means retention.** On `create` it is an integer retention
+count; on `verify` it is a flag meaning *leave the scratch database behind*. The
+same word, two subcommands, opposite kinds of thing — and the wrong one quietly
+accumulates `atp_restore_check_*` databases on your server.
+
+#### The agents
+
+`~/Library/LaunchAgents/local.atp.backup.plist`. **`~` does not expand in a
+plist** — every path must be absolute, and `/Users/YOU` below is a substitution
+you have to make.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.atp.backup</string>
+
+  <key>ProgramArguments</key>
+  <array><string>/Users/YOU/bin/atp-backup</string></array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/YOU/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/YOU/Library/Logs/atp-backup.log</string>
+  <key>StandardErrorPath</key><string>/Users/YOU/Library/Logs/atp-backup.log</string>
+</dict>
+</plist>
+```
+
+The weekly verify is the same file with `Label` `local.atp.backup-verify`, a
+`ProgramArguments` array of `["/Users/YOU/bin/atp-backup", "verify"]`, and a
+`Weekday` added to the interval (`0` is Sunday).
+
+**Pick the hour against the market, not the clock.** The US session is
+09:30–16:00 in New York; convert it to the host's local time and schedule
+outside it. Prefer an hour the machine is *awake and the drive is attached* over
+one that is merely quiet — a laptop shut at 03:00 defers the job to whenever it
+next wakes, which is not a schedule.
+
+#### Loading and — the part people skip — testing it
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.atp.backup.plist
+launchctl print gui/$(id -u)/local.atp.backup | head -20
+
+# Run it NOW rather than waiting a day to find out about a PATH mistake:
+launchctl kickstart -k gui/$(id -u)/local.atp.backup
+tail -20 ~/Library/Logs/atp-backup.log
+```
+
+To remove or replace one: `launchctl bootout gui/$(id -u)/local.atp.backup`.
+
+Test with the drive **unplugged** as well. The wrapper should refuse and say so
+in the log, rather than writing to the boot disk — that is the whole reason it
+exists, and an untested guard is not a guard.
+
+#### What this still does not give you
+
+**Nothing shouts when it fails.** launchd writes the exit code to its log and
+takes no further interest. `BACKUPS.md` makes the same point about its cron
+line, and it is sharper here: an agent that has been failing since the last OS
+update looks exactly like one that has been succeeding, until you open the log.
+Wiring the exit code to `scripts/check_alerts.py` is the gap to close before a
+paper week, not after it.
+
 ## After the first deploy
 
 DEPLOYMENT.md's "After every deploy" list applies unchanged, except that the
