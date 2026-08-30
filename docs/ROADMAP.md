@@ -41,7 +41,7 @@ a week. The code is written and tested. The week has not happened.
 | 3 — Risk | 2 / 4 | 2 | A strategy that tries to breach every limit, refused by name |
 | 4 — Execution & paper trading | 0 / 10 | 10 | **The paper week.** A strategy trades the paper account for a week and reconciles clean |
 | 5 — Dashboard & analytics | 0 / 10 | 10 | **The same paper week**, read back through the screens and the analytics |
-| 6 — Production readiness | 5 / 8 | 3 | A scrape from a real deployment, a restore actually performed, a host to deploy to |
+| 6 — Production readiness | 5 / 8 | 3 | A scrape from a real deployment, a restore actually performed, the chosen host with the stack actually on it |
 | **Total** | **21 / 48** | **27** | |
 
 The twenty-seven open items are in three different states, and the difference
@@ -2217,9 +2217,12 @@ has met a database holding a real strategy's history.
   rather than silent.
 
   **Not** ready for a public address, and this item should not be read as
-  saying so: no rate limit on the login endpoint, no revocation before a
-  session expires, no TLS of our own, no secrets manager. The items below are
-  the difference.
+  saying so: ~~no rate limit on the login endpoint,~~ no revocation before a
+  session expires, no TLS of our own, no secrets manager. The rate limit is
+  struck rather than deleted, because what this item shipped on its own is what
+  the line records — the limiter arrived two items below, with "Rate limiting,
+  audit log surfaced in UI" (ADR 0010). The other three are still the
+  difference.
 - [x] **Authorisation** — @claude. Not roles: this platform still has one
   account, and the note that stood here — that a role column with one value in
   it would describe a permission model rather than enforce one — is still true.
@@ -2594,14 +2597,30 @@ has met a database holding a real strategy's history.
   takes, it is not something the backup tooling can fix, and it is now step 4 of
   the restore procedure and a paragraph in docs/DEPLOYMENT.md.
 - [ ] Deployment target chosen; secrets manager — @claude (wip #50, #51, #100).
-  **The deployment *shape* is chosen and recorded. No host has been selected,
-  and nothing is deployed.** ADR 0011: one always-on VM per run mode in a
-  US-East region, the existing compose stack, reached over a private network,
+  **The shape and the host are both chosen now. Nothing is deployed, which is
+  the whole of why this stays open.** ADR 0011: one always-on VM per run mode in
+  a US-East region, the existing compose stack, reached over a private network,
   deployed by an explicit operator action, with paper and live on separate
   hosts so that docs/SAFETY.md layer 3 is structural rather than conventional.
-  The ADR deliberately did not pick a machine or a vendor, and this item should
-  not be read as saying one was picked — what exists is a specification to buy
-  against.
+  That ADR deliberately did not pick a machine or a vendor.
+
+  **ADR 0021 picks one, for paper: the operator's own Mac.** It amends ADR 0011's
+  x86-64 clause (Apple Silicon is arm64, and docs/HOSTING.md's manifest analysis
+  is what it rests on), accepts the loss of US-East proximity and of provider
+  snapshots, and is conditional on the machine being configured not to sleep —
+  which is the property ADR 0011 rejected a laptop for, and the one thing that
+  decides whether a paper week is possible at all. docs/LOCAL_HOSTING.md is the
+  delta against docs/DEPLOYMENT.md; live still needs a second host.
+
+  **Unticked, and choosing a host is not what would tick it.** This item's
+  demonstration is a host with the stack actually on it, `scripts/status.py`
+  answering, and an alert that reached a phone — none of which is a decision,
+  and none of which has happened. What ADR 0021 closes is the sentence "no host
+  has been selected", which docs/DEPLOYMENT.md, docs/HOSTING.md and this item
+  were all carrying. What stays open is everything that needs the machine to
+  exist and to have run. The secrets-manager half is likewise unchanged: SOPS +
+  age is chosen and `scripts/manage_secrets.py` is written, and on a machine the
+  operator is sitting at it is optional rather than load-bearing.
 
   **Tailscale is not the deployment target**, and where the docs name it they
   mean the access layer: the VPN that keeps the dashboard off a public address.
@@ -2811,10 +2830,11 @@ has met a database holding a real strategy's history.
   lists it and docs/DEPLOYMENT.md explains it.
 
   **The specification now has a survey against it** — @claude (#100),
-  docs/HOSTING.md. Still not a choice, and the box does not move for it: what
-  landed is which offerings can satisfy DEPLOYMENT.md's table and what each of
-  the rest fails on, so that whoever picks a machine picks it with the tradeoffs
-  in front of them. Three findings are worth having here rather than only there.
+  docs/HOSTING.md. Not itself a choice — that came afterwards, with ADR 0021
+  above — and the box moves for neither: what landed is which offerings can
+  satisfy DEPLOYMENT.md's table and what each of the rest fails on, so that
+  whoever picks a machine picks it with the tradeoffs in front of them, which
+  is what ADR 0021 then did. Three findings are worth having here rather than only there.
   **The database cannot be split onto a free managed tier to shrink the VM**:
   Neon ships Apache-2 `timescaledb`, whose missing native compression fails the
   initial migration on `add_compression_policy`, and Supabase cannot enable the
