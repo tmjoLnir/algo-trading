@@ -154,11 +154,12 @@ jobs:
       - uses: actions/checkout@v4
 
       # Static, and first, because it is about what the committed file *says*
-      # rather than what starts. The platform has no authentication, so a
-      # service published on 0.0.0.0 puts the trading database, the Redis
-      # holding the kill-switch state, or the API itself on every interface of
-      # the host. That should fail a build, not wait to be found by whoever
-      # scans the subnet first. docs/SAFETY.md, "Access control".
+      # rather than what starts. A service published on 0.0.0.0 puts the
+      # trading database, the Redis holding the kill-switch state, or the API
+      # on every interface of the host — and of those three only the API asks
+      # for a password (ADR 0008). Postgres answers to atp/atp and Redis to
+      # nobody. That should fail a build, not wait to be found by whoever scans
+      # the subnet first. docs/SAFETY.md, "Access control".
       - name: No service binds every interface
         run: make check-bindings
 

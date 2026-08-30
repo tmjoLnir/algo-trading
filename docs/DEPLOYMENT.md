@@ -11,14 +11,23 @@ are allowed to deploy.
 
 ## What you are deploying onto
 
-> **No host has been selected yet.** ADR 0011 chose the *shape* — one
-> always-on VM per run mode, the compose stack, reached over a private network,
-> deployed by hand — and deliberately did not pick a machine or a vendor. The
-> table below is the specification to buy against, not a description of
-> something that exists. Nothing in this repository has been deployed anywhere.
-> [HOSTING.md](HOSTING.md) surveys what can satisfy the table — including what
-> is available at zero cost, and what each free tier fails on — without
-> choosing either.
+> **A host has been chosen and nothing has been deployed to it yet.**
+> ADR 0011 chose the *shape* — one always-on VM per run mode, the compose
+> stack, reached over a private network, deployed by hand — and deliberately
+> did not pick a machine.
+> [ADR 0021](adr/0021-the-paper-host-is-the-operators-own-mac.md) picks one for
+> paper: **the operator's own Mac.** Nothing in this repository has been
+> deployed anywhere, so the table below is still a specification rather than a
+> description of something that exists.
+>
+> **If that is where you are deploying, read
+> [LOCAL_HOSTING.md](LOCAL_HOSTING.md) alongside this document.** It is a delta
+> — six steps where a Mac under a desk differs from the rented Linux VM this
+> document assumes, the first of which is that the machine sleeps. Everything
+> not listed there is here and is unchanged.
+>
+> [HOSTING.md](HOSTING.md) surveys what else can satisfy the table — including
+> what is available at zero cost, and what each free tier fails on.
 >
 > **Tailscale is not the host.** It is the access layer: a VPN that puts the
 > dashboard on a private network instead of a public address. Whatever host is
@@ -216,6 +225,7 @@ Both are separate installs, neither is a daemon:
 
 ```bash
 # sops — one binary. `.linux.arm64` if the host is not x86-64, which is the one
+# (on macOS: `brew install sops age` instead of both lines — LOCAL_HOSTING.md §4)
 # asset in this document that is architecture-specific (see HOSTING.md).
 curl -fsSLo /usr/local/bin/sops \
   https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64

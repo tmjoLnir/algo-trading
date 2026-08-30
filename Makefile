@@ -53,9 +53,11 @@ up-prod: .env check-bindings  ## Start the stack with the BUILT dashboard behind
 	     echo "   .env to a LAN or VPN address — docs/DASHBOARD.md, 'Reaching it from"; \
 	     echo "   another machine'.";; \
 	   *) \
-	     echo "!! NO AUTHENTICATION (ROADMAP Phase 6). Anyone who reaches $$bound reads"; \
-	     echo "!! the entire book and can call the risk endpoints. check-bindings has"; \
-	     echo "!! confirmed that address is private; keep the network it is on trusted.";; \
+	     echo "!! $$bound is reachable from your network. Signing in is required"; \
+	     echo "!! (ADR 0008) and check-bindings has confirmed that address is"; \
+	     echo "!! private — but this is plain HTTP, so the password and the whole"; \
+	     echo "!! book cross the wire in clear text, and a session cannot be"; \
+	     echo "!! revoked before it expires. Keep the network it is on trusted.";; \
 	 esac
 
 deploy: check-bindings  ## Deploy on a host: built dashboard, code from the images

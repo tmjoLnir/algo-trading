@@ -60,8 +60,10 @@ READ_ELSEWHERE = {
     "ATP_DEV_PROXY_TARGET": "read by the dev server (apps/web/vite.config.ts)",
     # Interpolated by compose into the published port, before anything starts.
     "ATP_WEB_BIND_ADDR": "read by docker compose (docker-compose.yml)",
-    # Set in compose `environment:` for the api/worker/queue containers; it is a
-    # real `Settings` field there, and absent from a stock `.env`.
+    # Interpolated by compose into POSTGRES_PASSWORD and into the DATABASE_URL
+    # it hands the api/worker/queue containers. Never read by `Settings`: the
+    # containers receive the assembled url, not this. In .env.example since the
+    # deploy overlay made it mandatory and the template did not mention it.
     "ATP_DB_PASSWORD": "read by docker compose (docker-compose.prod.yml)",
 }
 

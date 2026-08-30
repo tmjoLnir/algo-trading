@@ -11,9 +11,17 @@ is the specification and the procedure. **This document is neither.** It is a
 survey of what is available at zero cost, written against that specification so
 that the choice can be made with the tradeoffs in front of it.
 
-> **This does not choose a target.** `docs/ROADMAP.md`'s Phase 6 item
-> "Deployment target chosen; secrets manager" stays open, and nothing here has
-> been provisioned. A survey of hosts is not a host.
+> **A target has since been chosen, and this document did not choose it.**
+> [ADR 0021](adr/0021-the-paper-host-is-the-operators-own-mac.md) picked
+> "hardware you already own" — specifically the operator's own Mac — for the
+> paper host, on the reasoning in the section of that name below.
+> [LOCAL_HOSTING.md](LOCAL_HOSTING.md) is the procedure.
+>
+> This survey stays as it is, and stays useful for two reasons: **live still
+> needs a second host** (`docs/SAFETY.md` layer 3), and the Mac is explicitly a
+> starting point rather than a destination. `docs/ROADMAP.md`'s Phase 6 item
+> "Deployment target chosen; secrets manager" also stays open — nothing has
+> been provisioned, and a chosen host is not a host.
 
 **Vendor terms below were checked on 2026-08-26 and will drift.** One of them
 moved eight days before that date and moved by half — see Oracle, below. Treat
@@ -150,6 +158,12 @@ instance is not accumulating idle time before you rely on it.
 
 ## Hardware you already own
 
+**This is the option that was taken** —
+[ADR 0021](adr/0021-the-paper-host-is-the-operators-own-mac.md), for paper only,
+with the procedure in [LOCAL_HOSTING.md](LOCAL_HOSTING.md). What follows is the
+reasoning as it stood before that choice, which is what the ADR was decided
+against.
+
 A mini PC, a NUC, or a laptop that has stopped being a laptop. It is the only
 permanently free option that no vendor can reclaim, resize or reprice, and the
 access layer is unchanged: Tailscale is already how DEPLOYMENT.md reaches the
@@ -188,6 +202,10 @@ VM is a decision to make after that, not before it.
   having read all three caveats and confirmed the ARM build yourself.
 - **A free paper host, accepting latency instead:** hardware you own, with
   BACKUPS.md scheduled from the first day rather than the first incident.
+  **This is what was chosen** (ADR 0021). If the machine is one that sleeps —
+  a Mac, or any laptop — that is a disqualifying property until it is
+  configured away, and LOCAL_HOSTING.md §1 is the part to read before the
+  rest.
 - **Neither is free:** any commodity VPS in US-East at the 8 GB / 4 vCPU row.
   ADR 0011 names DigitalOcean, Vultr, Linode, Hetzner and Lightsail and declines
   to choose between them, which is still the right answer.

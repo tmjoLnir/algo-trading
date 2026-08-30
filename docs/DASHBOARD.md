@@ -648,11 +648,16 @@ this on a wildcard or a public address fails the build.
 
 ### It should still not face the public internet
 
-Signing in is required now (below), which is a floor rather than a finish. What
-is still absent is everything around it: no rate limit on the login endpoint, no
-way to revoke a session before it expires, no TLS of our own, and no secrets
-manager. A password is the only thing between a reachable port and the whole
-book, and there is nothing slowing down guesses at it but bcrypt.
+Signing in is required now (below), which is a floor rather than a finish.
+Guesses at the password are slowed by bcrypt and capped by the login rate
+limiter (ADR 0010): `API_LOGIN_ATTEMPTS` per `API_LOGIN_WINDOW_SECONDS` per
+client address, counted per address rather than per username so that knowing
+the operator's name cannot lock them out of their own platform.
+
+What is still absent is everything else around it: no way to revoke a session
+before it expires, no TLS of our own, and no secrets manager. One password is
+what stands between a reachable port and the whole book, and on plain HTTP it
+crosses the wire in clear text on its way to being checked.
 
 On a LAN or a VPN that is a reasonable place to be. On a public address it is
 not, and `make check-bindings` refuses to start the stack bound to one. The
@@ -710,6 +715,7 @@ Stated here rather than left to be discovered:
   acting control here, so a read-only session looks almost identical; the badge
   in the nav is there because otherwise the difference would be invisible until
   something was refused. What it changes is what the API permits, so a stolen
-  cookie cannot trade. What is *not* built: any rate limit on the login endpoint,
+  cookie cannot trade. The login endpoint is rate-limited per client address and
+  every attempt reaches the audit trail (ADR 0010). What is *not* built:
   revocation before a session expires, and any notion of roles — with one account
   there is nothing to distinguish.
