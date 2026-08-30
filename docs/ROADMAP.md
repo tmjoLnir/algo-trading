@@ -2506,9 +2506,18 @@ has met a database holding a real strategy's history.
   the halt state, the per-symbol last tick — are useful from one `curl` today,
   and that is the honest extent of it.
 - [ ] Backups and a tested restore — @claude (wip #57).
-  **The tooling is built and the restore is genuinely tested. Nothing schedules
-  it, and no dump has ever left the host that made it** — so this stays
-  unticked, for the same missing machine as the item above.
+  **The tooling is built and the restore is genuinely tested. Nothing in this
+  repository schedules it** — so this stays unticked.
+
+  The machine is no longer what is missing: ADR 0021 chose one, and there is now
+  a recipe for each host shape — the cron lines in docs/BACKUPS.md, and a
+  launchd LaunchAgent in docs/LOCAL_HOSTING.md for the Mac, where cron is the
+  wrong mechanism outright (a LaunchDaemon cannot see Docker, the mounted drive
+  or `uv`, and launchd re-runs a calendar job missed while the machine slept
+  where cron skips it). What is missing is that **loading** one is an act on a
+  host, which a checkout can neither perform nor observe. Whoever loads it ticks
+  this against their own `launchctl print` and a dump that outlived the disk
+  that made it — not against this file.
 
   `scripts/backup_db.py` is `create`, `list`, `verify`, `restore` and `prune`
   over `pg_dump -Fc`; ADR 0014 has the argument for logical dumps over PITR, and

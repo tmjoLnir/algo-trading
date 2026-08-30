@@ -122,8 +122,7 @@ What it checks and why each clause is there:
 
 ## On a schedule
 
-Once there is a host (ADR 0011 has specified one; nothing is provisioned yet),
-this is the whole of it:
+On a Linux host, this is the whole of it:
 
 ```cron
 # Nightly at 02:30 UTC — after the US close, before any pre-market work.
@@ -134,6 +133,14 @@ this is the whole of it:
 
 `--prune` applies retention in the same run; retention is per database, so a
 shared destination cannot let one database evict another's history.
+
+**On macOS, cron is the wrong mechanism** and the differences are not cosmetic:
+the job must be a LaunchAgent rather than a LaunchDaemon to see Docker, the
+mounted drive and `uv` at all, and launchd re-runs a calendar job missed while
+the machine slept where cron simply skips it. ADR 0021 chose a Mac as the paper
+host, so that recipe is the one most likely to be used —
+[LOCAL_HOSTING.md](LOCAL_HOSTING.md), "On a schedule, with launchd", carries it
+along with the guard an external drive needs.
 
 There is no alerting wired into this. `scripts/check_alerts.py` and
 `docs/OBSERVABILITY.md` are how a failure reaches a phone, and the cron line
@@ -205,8 +212,11 @@ pg_restore -t audit_log -d atp --data-only backups/atp-atp-20260819T052226Z.dump
 
 ## What is not here
 
-- **Nothing runs this.** No host exists to schedule it on. The cron above is
-  documentation until one does.
+- **This repository still schedules nothing, and cannot.** A host is chosen now
+  (ADR 0021) and both recipes above are written for real machines rather than
+  hypothetical ones — but whether an agent or a cron line is actually loaded is
+  a property of that host, not of this checkout. Check it there; a schedule
+  nobody verified is the same as no schedule, and it looks better.
 - **No off-host copy.** `ATP_BACKUP_DIR` is where you make that true; the tool
   will not do it for you.
 - **No encryption at rest.**
