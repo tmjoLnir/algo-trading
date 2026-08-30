@@ -392,6 +392,35 @@ jobs:
           done
           echo "web-prod never responded"; exit 1
 
+      # The step above proves nginx answers on the published port. This proves
+      # the container's own HEALTHCHECK agrees, which is a different question —
+      # and for the whole life of this file the two disagreed. The probe asked
+      # `localhost`, which resolves to ::1 before 127.0.0.1, and nginx binds
+      # IPv4 only, so web-prod served every request and reported `unhealthy`
+      # forever (fixed in infra/docker/web.Dockerfile, which has the detail).
+      #
+      # Nothing here caught it, and the reason is worth keeping: the
+      # `Every service with a healthcheck is actually healthy` step is ~200
+      # lines above, and runs before this service is started. Even now it would
+      # not see it — `docker compose ps` without `--profile prod` does not list
+      # web-prod at all. A check that cannot observe a service is not coverage
+      # of it.
+      - name: The built dashboard's own healthcheck agrees it is serving
+        run: |
+          for i in $(seq 1 45); do
+            health=$(docker compose --profile prod ps --format '{{.Service}} {{.Health}}' \
+              | awk '$1 == "web-prod" { print $2 }')
+            [ "$health" = "healthy" ] && {
+              echo "web-prod healthcheck: healthy after ~$((i * 2))s"; exit 0; }
+            sleep 2
+          done
+          docker compose --profile prod ps
+          docker inspect "$(docker compose --profile prod ps -q web-prod)" \
+            --format '{{range .State.Health.Log}}exit={{.ExitCode}} out={{.Output}}
+            {{end}}' | tail -3
+          echo "::error::web-prod serves the bundle but its own healthcheck reports '$health'"
+          exit 1
+
       - name: The bundle carries no hardcoded API host
         # The regression this exists for, and it is a silent one: Vite inlines
         # VITE_API_BASE_URL at BUILD time, so setting it as runtime container
