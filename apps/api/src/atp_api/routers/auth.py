@@ -88,11 +88,13 @@ async def login(
 ) -> WhoAmI:
     """Exchange a username and password for a session cookie.
 
-    There is no rate limit here yet — that is its own Phase 6 item. What stands
-    in for one meanwhile is bcrypt itself: a cost-12 hash takes roughly a
-    quarter-second to verify, which is a poor rate for guessing and is why the
-    work factor is not tuned down. It is a brake, not a lock, and the item above
-    it in the roadmap is the lock.
+    Two brakes on guessing. The endpoint is rate-limited per client address
+    (ADR 0010) — attempts rather than failures, so the guess that happens to be
+    right is refused too once the limit is reached, and counted per address
+    rather than per username, because counting per username lets anyone who
+    knows the operator's name lock them out of their own platform. Behind it,
+    bcrypt: a cost-12 hash takes roughly a quarter-second to verify, which is a
+    poor rate for guessing and is why the work factor is not tuned down.
 
     The failure is one 401 with one message. "No such user" and "wrong password"
     are the same answer here, because telling them apart confirms which usernames

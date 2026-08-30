@@ -64,9 +64,11 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://atp:atp@db:5432/atp
       REDIS_URL: redis://redis:6379/0
-    # Loopback, and deliberately nothing else for as long as the API has no
-    # authentication — docs/SAFETY.md says so in as many words. Published only
-    # for the developer's own /docs and curl.
+    # Loopback, and deliberately nothing else. The API authenticates now
+    # (ADR 0008), which changes what this port is worth to a stranger and not
+    # whether it should be published: docs/SAFETY.md keeps everything but the
+    # dashboard on localhost. Published only for the developer's own /docs and
+    # curl.
     #
     # The dashboard does NOT need this port. nginx proxies /api and /ws to
     # `api` across the compose network (infra/docker/web.nginx.conf), so
@@ -274,11 +276,23 @@ services:
     # roadmap deliverable — are completely unaffected by it. `make up-prod`
     # starts this one instead of `web`.
     #
-    # THERE IS STILL NO AUTHENTICATION (ROADMAP Phase 6, docs/SAFETY.md). Bind
-    # port 8080 to a private network. Anyone who reaches it reads the entire
-    # book, and the risk endpoints — halt, and a flatten-all specified to
-    # liquidate at market — ask nobody who is calling. They are stubs today,
-    # which is build order rather than a safeguard.
+    # SIGNING IN IS REQUIRED, AND THIS STILL BELONGS ON A PRIVATE NETWORK
+    # (docs/SAFETY.md). The API authenticates — one operator against a bcrypt
+    # hash, a signed HttpOnly cookie, read/full scopes, and a rate limit on the
+    # login endpoint (ADRs 0008, 0009, 0010). The risk endpoints are built and
+    # they do ask who is calling: /risk/halt takes any session because
+    # hesitation is the expensive part, while /resume and the flatten-all that
+    # liquidates at market additionally demand the account password again.
+    #
+    # This comment used to say the opposite — no authentication, those handlers
+    # stubs — and it was read by whoever was deciding how to expose this port,
+    # which made it the worst line in the file to leave stale.
+    #
+    # What is still missing is everything around the password: this is plain
+    # HTTP, so on a LAN the book and the password itself cross the wire in
+    # clear text; a session cannot be revoked before it expires; and there is
+    # one account, so a stolen cookie is the operator. Bind 8080 to a private
+    # network — that is a floor holding, not a perimeter.
     profiles: ["prod"]
     build:
       context: .

@@ -2,10 +2,17 @@
 """Fail if the compose stack would expose a port, deploy the wrong code, or
 come back from a reboot in pieces.
 
-The platform has no authentication — `get_current_user()` is a stub, and every
-endpoint under /risk, /orders and /positions is reachable by anyone who can
-open a socket to it. docs/SAFETY.md's "Access control" section states the rule
-that follows from that: bind to localhost only until auth lands.
+The API authenticates now (ADR 0008), and this check is unchanged by that,
+because most of what it guards never did. `db` is Postgres with the base file's
+`atp`/`atp`; `redis` holds the kill-switch state with no password in front of
+it at all, so whoever reaches that port can clear a halt. Those two are the
+reason the rule exists, and a sign-in screen on the API does not touch them.
+
+For the API itself a session is a floor, not a perimeter: one operator, one
+bcrypt hash, no TLS of our own and no way to revoke a session before it
+expires. docs/SAFETY.md's "Access control" section states the rule that
+follows: bind to localhost, and move exactly one port off it — the dashboard's,
+to one private LAN or VPN address, via ATP_WEB_BIND_ADDR.
 
 A rule stated only in prose is a rule that drifts. This is the same rule as a
 check, run against the committed defaults so that a compose file which puts the
@@ -262,8 +269,10 @@ def main() -> int:
         print()
 
     if failures:
-        print("There is no authentication in front of any of this (docs/SAFETY.md):")
-        print("whoever reaches the port reads the whole book. Bind 127.0.0.1 for")
+        print("Not everything behind these ports asks who is calling (docs/SAFETY.md).")
+        print("The API does. The Postgres behind it answers to atp/atp, and the Redis")
+        print("holding the kill-switch state asks for nothing at all — so anyone who")
+        print("can open a socket to that one can clear a halt. Bind 127.0.0.1 for")
         print("everything except the dashboard, and one private LAN or VPN address")
         print("via ATP_WEB_BIND_ADDR for that one.")
         return 1
