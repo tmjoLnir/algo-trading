@@ -371,6 +371,111 @@ refocused or reloaded, under a message promising it would retry on its own. If
 this screen persists for more than a few seconds, the API genuinely is not
 answering: work the table above.
 
+## `password authentication failed for user "atp"`
+
+*Symptom:* the API is up, the dashboard renders, a few panels even show numbers
+— and every panel backed by the database is `500`. `docker compose logs api`
+is a wall of identical tracebacks ending in:
+
+```
+asyncpg.exceptions.InvalidPasswordError: password authentication failed for user "atp"
+```
+
+**The API is not broken and neither is Postgres. They disagree about the
+password**, and that is a configuration fault, not a fault in any of the code
+the traceback names. Read the traceback's *last* line, not its first: the
+frames above it are whichever endpoint happened to ask — `analytics/trades`
+today, `strategies` on the next click — and they are all equally innocent.
+
+**Confirm it in one command.** `/readyz` is proxied onto the dashboard's own
+origin, so this works from the same browser showing the errors:
+
+```
+$ curl -s localhost:8080/readyz
+{"status":"not ready","checks":{"database":"unreachable","redis":"ok"}}
+```
+
+`database: unreachable` with `redis: ok` is this fault. It also explains the
+half that still works and makes the stack look alive: `/dashboard/live`,
+`/risk/status` and `/auth/me` read Redis or a session, never Postgres, so they
+answer `200` beside neighbours that cannot.
+
+**Then find out which side moved.**
+
+```
+docker compose logs db | head -5
+```
+
+> `PostgreSQL Database directory appears to contain a database; Skipping initialization`
+
+That line is the whole diagnosis. **`POSTGRES_PASSWORD` is read at initdb and
+never again**, so on every start after the first it is ignored entirely and the
+role keeps whatever password the volume was created with. If `ATP_DB_PASSWORD`
+in `.env` was set or rotated after that first start, the containers have been
+sending the new one to a database that still wants the old one — and nothing
+says so until something reads a table.
+
+Two fixes, and the first is almost always the right one.
+
+**Change the password in the database to match `.env`** — keeps the data:
+
+```
+docker compose exec db psql -U atp -d atp \
+  -c "ALTER USER atp PASSWORD '<the ATP_DB_PASSWORD in .env>';"
+docker compose restart api worker queue
+```
+
+In-container loopback is `trust` in this image, which is why that `psql` works
+without the password you do not have. Restart the three services afterwards:
+SQLAlchemy pools connections, so a process that authenticated before the change
+keeps working and one that reconnects after it does not — which is exactly how
+this fault arrives mid-session rather than at startup.
+
+**Or re-initialise the volume** — only when the data is disposable, because it
+is not a reset, it is a deletion:
+
+```
+docker compose down -v      # DESTROYS every bar, order and snapshot
+make deploy && make migrate
+```
+
+`-v` removes the TimescaleDB volume. On a paper or live host that is the trade
+history; take a backup first (docs/BACKUPS.md) or use the `ALTER USER` above.
+
+**The other cause: a password that cannot survive the trip.** If the volume was
+*not* pre-existing — no `Skipping initialization` line — then the two sides were
+set from the same `ATP_DB_PASSWORD` and still disagree, which means the value
+was transformed on the way. `docker-compose.prod.yml` interpolates it into
+`POSTGRES_PASSWORD`, which initdb stores verbatim, and into a `DATABASE_URL`
+that SQLAlchemy parses as a URL; three characters do not mean the same thing to
+both. `%` followed by two hex digits is a percent-escape and is **decoded**
+before it reaches Postgres — the silent one, and the one that produces this
+error with a `.env` that reads correctly. `@` ends the credentials in a URL.
+`$` is a variable reference to compose. `make check-env` names whichever it is
+without printing the password:
+
+```
+$ make check-env
+.env: 1 database credential that will not work
+
+  ATP_DB_PASSWORD    .env line 95
+    contains a `%` followed by two hex digits, which is a percent-escape in a
+    database URL and is DECODED before it reaches Postgres. ...
+    value withheld — this is a credential (CLAUDE.md §1.6)
+```
+
+Run it before `make deploy`, not after: once initdb has stored a mangled
+password, fixing `.env` alone leaves the two sides disagreeing in the *other*
+direction and you are back at the `ALTER USER` above.
+
+**Nothing about the book changed while this was happening.** The API could not
+read the database, so it wrote nothing to it either; positions, stops and the
+halt state are whatever they were, and broker-side stops are held by the venue
+regardless. `scripts/halt.py` and `scripts/status.py` read Redis and the venue,
+not Postgres — they still work, and `make halt` is still available if you would
+have halted anyway.
+
+
 ## Worker crash-looping
 
 1. Halt (the API is independent of the worker).
