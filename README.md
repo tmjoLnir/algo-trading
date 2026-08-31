@@ -84,7 +84,7 @@ env flag plus a typed confirmation.
 | [RISK.md](docs/RISK.md) | Configuring stops, sizing and limits |
 | [RISK_IMPLEMENTATION_NOTES.md](docs/RISK_IMPLEMENTATION_NOTES.md) | Implementing Phase 3 — where RISK.md and the code disagree |
 | [DATA.md](docs/DATA.md) | Market-data ingestion, storage, backfill |
-| [DASHBOARD.md](docs/DASHBOARD.md) | Frontend conventions, the 5-min refresh |
+| [DASHBOARD.md](docs/DASHBOARD.md) | Frontend conventions, refreshing on demand |
 | [ANALYTICS.md](docs/ANALYTICS.md) | Trade reconstruction, attribution, MAE/MFE |
 | [API.md](docs/API.md) | REST/WS surface and conventions |
 | [TESTING.md](docs/TESTING.md) | Test layout and what must be covered |

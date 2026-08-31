@@ -8,9 +8,9 @@ vendor connection.
 Redis pub/sub is fire-and-forget with no persistence and no delivery guarantee.
 That is the correct trade for this traffic and worth being explicit about: a
 subscriber that is down misses ticks and catches up on the dashboard's next
-5-minute poll, which is the authoritative path (`atp_api.ws`). Nothing that must
-not be lost may travel over this — a fill, a halt or a position change belongs
-in the database first and on a channel second.
+read, which is the authoritative path (`atp_api.ws`). Nothing that must not be
+lost may travel over this — a fill, a halt or a position change belongs in the
+database first and on a channel second.
 """
 
 from __future__ import annotations

@@ -8,9 +8,9 @@ The threat this platform has is someone guessing the one password. That happens
 at `/auth/login`, before any session exists, and nothing else about the API is
 reachable until it succeeds. Throttling the authenticated surface as well would
 be defending against an operator abusing their own single-user trading platform,
-at the cost of a limit that can misfire on the dashboard's own polling — and the
-dashboard polls the same endpoints on a timer, from a tab that may be open in
-several windows.
+at the cost of a limit that can misfire on the dashboard's own reads — which
+since ADR 0022 arrive when the reader asks, in bursts of several endpoints at
+once, from however many windows they have open.
 
 **`/risk/halt` must never be rate limited**, whatever is added later. It is the
 one endpoint whose whole purpose is to work in the worst moment, and the same

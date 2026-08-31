@@ -358,9 +358,10 @@ class StreamIngestor:
     async def _publish(self, channel: str, message: dict[str, Any]) -> None:
         """Best-effort fan-out. A dead subscriber is not a reason to stop.
 
-        The dashboard's authority is its 5-minute poll, not this (`atp_api.ws`),
-        so a dropped tick costs freshness and nothing else. Losing a bar we had
-        already stored because Redis blinked would cost data.
+        The dashboard's authority is its aggregate read, not this
+        (`atp_api.ws`), so a dropped tick costs liveness until the reader next
+        asks and nothing else. Losing a bar we had already stored because Redis
+        blinked would cost data.
         """
         if self.publisher is None:
             return

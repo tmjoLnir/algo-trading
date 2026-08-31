@@ -1186,10 +1186,11 @@ class StrategyRunner:
 
         Best-effort by contract (`data.ports.EventPublisher`), and the
         swallowing belongs here rather than in the adapter because this is the
-        call site that knows a dropped message is survivable: the dashboard
-        polls every five minutes and the poll is the authoritative path. What
-        must not happen is an evaluation failing over it — three of those halt
-        trading, and Redis being unable to gossip is not a reason to stop.
+        call site that knows a dropped message is survivable: the dashboard's
+        aggregate read is the authoritative path, and it re-reads the whole
+        book. What must not happen is an evaluation failing over it — three of
+        those halt trading, and Redis being unable to gossip is not a reason to
+        stop.
         """
         if self.publisher is None:
             return

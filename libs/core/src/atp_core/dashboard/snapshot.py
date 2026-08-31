@@ -136,10 +136,13 @@ class AccountSummary:
     """Account-level figures, all from one book at one instant.
 
     Deliberately no `buying_power`. That is the venue's number, and reading it
-    costs a broker call — one per dashboard poll, on the process that is also
-    placing orders against the same rate limit. `BuyingPowerRule` constrains
-    against `cash`, so cash is the number that actually decides whether an
-    order is approved here, and it is the one shown.
+    costs a broker call — one per dashboard read, on the process that is also
+    placing orders against the same rate limit. That the reads are now on demand
+    (ADR 0022) makes them fewer, not cheap: a reader hitting reload during an
+    incident is exactly when the order path least wants to share a rate limit.
+    `BuyingPowerRule` constrains against `cash`, so cash is the number that
+    actually decides whether an order is approved here, and it is the one
+    shown.
     """
 
     equity: Decimal

@@ -258,7 +258,7 @@ class TestRoundTrip:
 
 
 class TestAnnouncements:
-    """A halt on the screen within a second, not within five minutes.
+    """A halt on the screen within a second, not whenever somebody next reloads.
 
     The state is in Redis before any of this runs and every risk check reads
     that state, so what is under test here is the *notification*: `atp_api.ws`

@@ -1,16 +1,24 @@
-"""WebSocket endpoint — live push between the dashboard's 5-minute polls.
+"""WebSocket endpoint — live push between the dashboard's reads.
 
 Two update paths, on purpose:
 
-  polling  (5 min)  → the authoritative, consistent snapshot (requirement #7)
-  websocket (live)  → price ticks, fills and halts as they happen
+  aggregate read (on demand) → the authoritative snapshot (requirement #7)
+  websocket (live)           → price ticks, fills and halts as they happen
 
 The WebSocket is an enhancement, never the source of truth. A dropped socket
-degrades the dashboard to 5-minute freshness rather than showing stale data
-indefinitely — which is why the poll exists even though push is "better". Every
-decision in this file follows from that: nothing here retries a delivery,
-nothing here queues, and a client the server cannot keep up with is dropped
-rather than allowed to slow anything down. The poll will fix it.
+costs the dashboard its liveness between reads and not its correctness: the next
+read is a whole consistent snapshot. Every decision in this file follows from
+that: nothing here retries a delivery, nothing here queues, and a client the
+server cannot keep up with is dropped rather than allowed to slow anything down.
+The next read will fix it.
+
+**Since ADR 0022 nothing polls, and that changes what a dropped socket looks
+like rather than what it costs.** A healthy platform and a dead bridge both
+present as a screen that is not moving, and only reloading tells them apart —
+docs/RUNBOOK.md carries the diagnosis. It is not a reason to push harder here:
+the age on the screen counts up on its own clock, so a stale reading is visibly
+stale rather than quietly reassuring, and a halt still reaches the banner
+because the client re-reads the book when one arrives.
 
 The API does not connect to the market-data vendor. It subscribes to Redis
 pub/sub, which the worker publishes to — the ingestor for quotes and bars, the
@@ -207,8 +215,8 @@ class ConnectionManager:
 
         Sends run concurrently and each carries its own deadline, so a client
         that has stopped reading delays nobody: it is dropped and cleaned up,
-        and its dashboard falls back to the 5-minute poll it never stopped
-        making.
+        and its dashboard falls back to the aggregate read it makes whenever
+        somebody asks.
         """
         symbol = message.get("symbol")
         targets = [
@@ -249,8 +257,8 @@ async def redis_bridge(
     It never gives up, and that is the difference between this and a feed
     adapter. A market-data stream that cannot reconnect must raise, because
     trading on missing data is worse than stopping. Nothing here is traded on:
-    losing the bridge costs the dashboard its live updates and the poll still
-    works, so retrying forever is strictly better than a live API with a dead
+    losing the bridge costs the dashboard its live updates and its reads still
+    work, so retrying forever is strictly better than a live API with a dead
     socket handler.
 
     A message that is not JSON, or is not an object, is dropped with a log

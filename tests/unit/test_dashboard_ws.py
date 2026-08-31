@@ -1,9 +1,9 @@
 """The dashboard WebSocket: who gets what, and what happens when a client stops
 reading.
 
-The socket is an enhancement and the 5-minute poll is the source of truth, so
-nothing here is about delivery guarantees — it is about the two ways a fan-out
-can be wrong in a trading UI:
+The socket is an enhancement and the dashboard's own aggregate read is the
+source of truth, so nothing here is about delivery guarantees — it is about the
+two ways a fan-out can be wrong in a trading UI:
 
 - **a halt that does not arrive**, because the client did not think to subscribe
   to one. `ws.py` promises it reaches every client regardless;
@@ -197,7 +197,7 @@ class TestOneDeadClientCostsNobodyElse:
         self, manager: ConnectionManager
     ) -> None:
         """Unbounded buffering for one slow reader costs every other client. The
-        poll recovers whatever it misses, so dropping is cheap."""
+        next read recovers whatever it misses, so dropping is cheap."""
         import atp_api.ws as ws_module
 
         stalled = FakeSocket(hang=True)
@@ -557,8 +557,8 @@ class TestTheBridgeStillReconnectsWhenItShould:
         self, manager: ConnectionManager, instant_backoff: None
     ) -> None:
         """It never gives up — losing the bridge costs the dashboard its live
-        updates while the 5-minute poll still works, so retrying forever beats a
-        live API with a dead socket handler."""
+        updates while its reads still work, so retrying forever beats a live API
+        with a dead socket handler."""
         redis = FakeRedis(
             [RedisConnectionError("one")],
             [RedisConnectionError("two")],

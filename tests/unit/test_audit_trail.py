@@ -209,7 +209,7 @@ class TestRefusals:
         """The record is of consequential actions, not of traffic.
 
         A row per GET would bury the events worth reading under the dashboard's
-        own five-minute poll.
+        own reads.
         """
         sink = RecordingSink()
         session = Session("operator", Scope.READ)
