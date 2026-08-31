@@ -51,6 +51,8 @@ from atp_core.logging import get_logger
 from atp_core.ws import backoff_delay
 
 if TYPE_CHECKING:
+    from collections.abc import Coroutine
+
     from redis.asyncio import Redis
 
 log = get_logger(__name__)
@@ -90,6 +92,16 @@ SYMBOL_FILTERED = frozenset({"quotes", "bars"})
 #: deadline turns into unbounded buffering on the server — which costs every
 #: other client. Dropping is cheap here precisely because the poll recovers it.
 SEND_TIMEOUT_SECONDS = 2.0
+
+#: How long the server waits for a socket it is hanging up on to close.
+#:
+#: Short, and for the same reason the send has a deadline at all: this only ever
+#: runs against a socket that has *already* failed or stopped reading, so the
+#: close is at least as likely to hang as the send that just did. Waiting on it
+#: would let a client that is dropped for being slow go on costing the fan-out
+#: time after it has been dropped, which is the cost dropping it was supposed to
+#: end.
+CLOSE_TIMEOUT_SECONDS = 2.0
 
 #: How long the bridge waits for one message before going round the loop again.
 #:
@@ -169,11 +181,23 @@ class ConnectionManager:
         self._subscriptions[client_id] = set()
         log.info("ws.connected", client_id=client_id, clients=len(self._connections))
 
-    def disconnect(self, client_id: str) -> None:
-        """Forget a client. Safe to call for one that was never registered."""
-        self._connections.pop(client_id, None)
+    def disconnect(self, client_id: str) -> bool:
+        """Forget a client. Safe to call for one that was never registered.
+
+        Returns whether this call is the one that removed it. Fan-outs run
+        concurrently — one task per published message — so two of them can fail
+        against the same dead client at the same instant, and the answer is what
+        lets `broadcast` hang that socket up exactly once instead of racing to
+        close it twice.
+
+        Forgetting is deliberately not hanging up. The endpoint's `finally` gets
+        here with a socket the client itself closed, where there is nothing left
+        to close; `broadcast` gets here with one that is still open and must be.
+        Only the caller knows which, so only the caller closes.
+        """
         self._channels.pop(client_id, None)
         self._subscriptions.pop(client_id, None)
+        return self._connections.pop(client_id, None) is not None
 
     def subscribe(self, client_id: str, channels: list[str], symbols: list[str]) -> None:
         """Add channels and symbols to what this client receives.
@@ -214,9 +238,13 @@ class ConnectionManager:
         """Send to subscribers. Never let one dead client block the loop.
 
         Sends run concurrently and each carries its own deadline, so a client
-        that has stopped reading delays nobody: it is dropped and cleaned up,
-        and its dashboard falls back to the aggregate read it makes whenever
-        somebody asks.
+        that has stopped reading delays nobody: it is dropped and hung up on,
+        and its dashboard reconnects and falls back to the aggregate read.
+
+        Dropping and hanging up are one act here and must stay one. Removing a
+        client from the fan-out without closing its socket leaves a browser that
+        believes it is connected and will never learn otherwise — see
+        `_hang_up`.
         """
         symbol = message.get("symbol")
         targets = [
@@ -230,14 +258,63 @@ class ConnectionManager:
         results = await asyncio.gather(
             *(self._send(ws, message) for _, ws in targets), return_exceptions=True
         )
-        for (client_id, _), outcome in zip(targets, results, strict=True):
+        hang_ups: list[Coroutine[Any, Any, None]] = []
+        for (client_id, ws), outcome in zip(targets, results, strict=True):
             if isinstance(outcome, BaseException):
                 log.info("ws.dropping_client", client_id=client_id, error=str(outcome))
-                self.disconnect(client_id)
+                if self.disconnect(client_id):
+                    hang_ups.append(self._hang_up(client_id, ws))
+        # Concurrently, and only after the loop: each carries its own deadline,
+        # and two dead clients should cost one of them rather than two.
+        if hang_ups:
+            await asyncio.gather(*hang_ups)
 
     @staticmethod
     async def _send(ws: WebSocket, message: dict[str, Any]) -> None:
         await asyncio.wait_for(ws.send_json(message), timeout=SEND_TIMEOUT_SECONDS)
+
+    @staticmethod
+    async def _hang_up(client_id: str, ws: WebSocket) -> None:
+        """Close a socket the server has stopped delivering to.
+
+        **Dropping a client from the fan-out is only half of a disconnect.**
+        Forgetting it here does not close its socket, and the endpoint's receive
+        loop goes on awaiting frames on one nobody will ever send to again. From
+        the browser that is indistinguishable from a healthy connection: the
+        socket is open, `onclose` never fires, so the dashboard's reconnect
+        ladder never runs, and a `subscribe` sent afterwards is still answered
+        `{"type": "subscribed"}` by a server that has no record of the client and
+        will act on none of it. The screen then sits there, live-looking and
+        permanently silent, until somebody reloads the page — and what it is
+        silent about includes the halt this class delivers unconditionally
+        precisely because it must not be missed.
+
+        Closing is what turns that into the failure this module is designed
+        around instead: a dropped socket, which costs liveness until the client
+        reconnects and re-reads, and costs nothing afterwards.
+
+        **The code matters and 1008 must never be used here.** The dashboard
+        branches on it — 1008 means "your session is not valid, stop retrying and
+        show the login screen" (ADR 0008) — so sending it to a browser whose only
+        fault was a slow connection would sign the operator out of a working
+        platform. `1013 Try Again Later` says the true thing, and every code that
+        is not 1008 reconnects.
+
+        Bounded and suppressed, because everything about this path is already
+        broken: the close races the client's own, it may hang exactly as the send
+        did, and a socket that cannot be closed is one that is already gone.
+        Failing to close it changes nothing that matters — the client is out of
+        `_connections` either way — so there is nothing here worth propagating
+        into the fan-out that is only trying to reach everybody else.
+        """
+        try:
+            await asyncio.wait_for(
+                ws.close(code=status.WS_1013_TRY_AGAIN_LATER), timeout=CLOSE_TIMEOUT_SECONDS
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.info("ws.hang_up_failed", client_id=client_id, error=str(exc))
 
 
 manager = ConnectionManager()
