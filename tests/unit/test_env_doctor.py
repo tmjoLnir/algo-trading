@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from dotenv import dotenv_values
 
 from atp_core.config import (
     ConfigProblem,
@@ -294,3 +295,109 @@ class TestTheAllowlistDoesNotDrift:
         for key, why in check_env.READ_ELSEWHERE.items():
             assert why.strip(), f"{key} has no explanation"
             assert "read by" in why, f"{key} does not say what reads it: {why!r}"
+
+
+class TestTheDatabasePasswordSurvivesTheTrip:
+    """`ATP_DB_PASSWORD` reaches Postgres by two paths that must agree.
+
+    Compose interpolates it into `POSTGRES_PASSWORD`, which initdb stores
+    verbatim, and into a `DATABASE_URL` that SQLAlchemy parses as a URL. A
+    character that means something to either path arrives as two different
+    strings, and the only symptom is `password authentication failed for user
+    "atp"` on every request the API serves — with a `.env` that reads correctly
+    and a password that is correct.
+
+    `Settings` never sees this value, so `config_problems()` cannot reach it.
+    These cases were verified against the real `docker compose config` output
+    and SQLAlchemy's own parser, not reasoned about.
+    """
+
+    def test_a_hex_password_is_fine(self) -> None:
+        """What `openssl rand -hex 24` produces, which is what we recommend."""
+        assert check_env.db_password_problem("a1b2c3d4e5f6") is None
+
+    def test_empty_is_not_a_problem(self) -> None:
+        """`make up` runs the base file, which hardcodes atp/atp. Reporting an
+        empty value would fire on every developer's machine."""
+        assert check_env.db_password_problem("") is None
+
+    def test_a_percent_escape_is_decoded_before_postgres_sees_it(self) -> None:
+        """The silent one, and the one that produces the error verbatim.
+
+        Compose passes `x%3Ay` through to both sides unchanged, so initdb
+        stores it literally — and then SQLAlchemy percent-decodes it to `x:y`
+        on the way out. The two never match and nothing says why.
+        """
+        problem = check_env.db_password_problem("x%3Ay")
+        assert problem is not None
+        assert "%" in problem
+
+    def test_an_at_sign_is_read_as_the_host(self) -> None:
+        """Different symptom, same cause: `@` ends the credentials in a URL, so
+        the rest of the password becomes part of the hostname and the failure
+        is an unresolvable host rather than a refused password."""
+        problem = check_env.db_password_problem("p@ssw0rd")
+        assert problem is not None
+        assert "@" in problem
+
+    def test_a_dollar_is_a_variable_reference_to_compose(self) -> None:
+        """Compose substitutes `$ret` away in *both* places, so the containers
+        still agree with each other — and `.env`'s own DATABASE_URL, which
+        pydantic reads without interpolating, does not. `make migrate` is then
+        what fails, against a database the stack is happily using."""
+        problem = check_env.db_password_problem("sec$ret")
+        assert problem is not None
+        assert "$" in problem
+
+    def test_a_bare_percent_is_not_an_escape(self) -> None:
+        """Only `%` + two hex digits decodes. Reporting every `%` would refuse
+        passwords that work, which is how a check gets bypassed."""
+        assert check_env.db_password_problem("pa%ss") is None
+
+    def test_the_reason_never_carries_the_password(self) -> None:
+        """§1.6. The reason names the character class so it is actionable; the
+        value is withheld by the caller and must not leak through here."""
+        secret = "sup3rs3cret%3Avalue"
+        problem = check_env.db_password_problem(secret)
+        assert problem is not None
+        assert secret not in problem
+
+    def test_a_host_side_url_disagreeing_with_the_deploy_password_is_reported(self) -> None:
+        """`make migrate`, `seed` and `halt.py` read `.env`'s DATABASE_URL, not
+        the one compose builds. On a deployed host the two must carry the same
+        password or the host-side tools fail against the database the
+        containers are using (.env.example, 'datastores')."""
+        found = check_env.db_credential_problems(
+            {
+                "ATP_DB_PASSWORD": "deadbeef",
+                "DATABASE_URL": "postgresql+asyncpg://atp:atp@localhost:5432/atp",
+            },
+            {},
+        )
+        assert [key for key, _ in found] == ["DATABASE_URL"]
+
+    def test_a_matching_pair_is_silent(self) -> None:
+        found = check_env.db_credential_problems(
+            {
+                "ATP_DB_PASSWORD": "deadbeef",
+                "DATABASE_URL": "postgresql+asyncpg://atp:deadbeef@localhost:5432/atp",
+            },
+            {},
+        )
+        assert found == []
+
+    def test_the_stock_developer_env_is_silent(self) -> None:
+        """No ATP_DB_PASSWORD means `make up` against the base file's atp/atp,
+        where the stock DATABASE_URL is correct as written. Reporting it there
+        would be noise on every developer's machine."""
+        found = check_env.db_credential_problems(
+            {"DATABASE_URL": "postgresql+asyncpg://atp:atp@localhost:5432/atp"}, {}
+        )
+        assert found == []
+
+    def test_a_stock_env_example_reports_no_credential_problem(self) -> None:
+        """The template ships ATP_DB_PASSWORD empty and DATABASE_URL on atp/atp.
+        A fresh copy must come out clean or the check teaches people to skip it."""
+        example = Path(__file__).resolve().parents[2] / ".env.example"
+        values = {k: v for k, v in dotenv_values(example).items() if v is not None}
+        assert check_env.db_credential_problems(values, {}) == []

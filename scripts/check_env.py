@@ -38,6 +38,9 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import dotenv_values
+from sqlalchemy.engine import make_url
+
 from atp_core.config import ConfigProblem, config_problems, known_env_vars
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -148,6 +151,162 @@ def unread_keys(lines: dict[str, int]) -> list[tuple[str, int, str]]:
     return found
 
 
+#: The DSN `docker-compose.prod.yml` builds, with the password left to fill in.
+#: Kept here as the one literal so the round trip below is checked against the
+#: string the deployed stack actually assembles rather than an approximation of
+#: it — the whole value of the check is that it agrees with production.
+DEPLOYED_DSN = "postgresql+asyncpg://atp:{password}@db:5432/atp"
+
+
+def db_password_problem(password: str) -> str | None:
+    """Why `ATP_DB_PASSWORD` will not reach Postgres intact, or `None`.
+
+    The one value in `.env` that is copied down **two paths that must agree and
+    neither of which is a plain copy**. Compose interpolates it into
+    `POSTGRES_PASSWORD`, which initdb stores verbatim, and into a `DATABASE_URL`
+    that SQLAlchemy then parses as a URL. A character that means something to
+    either path arrives at the database as two different strings, and what the
+    operator sees is:
+
+        asyncpg.exceptions.InvalidPasswordError: password authentication
+        failed for user "atp"
+
+    on every request the API serves — with a `.env` that reads correctly, a
+    password that *is* correct, and nothing anywhere naming the character that
+    did it. `Settings` never sees this value, so until now nothing in this
+    repository looked at it at all.
+
+    Three characters break it, and they break it differently:
+
+    ``$``   compose reads it as a variable reference and substitutes the empty
+            string. It does so in *both* places, so the two still match and the
+            containers authenticate fine — but `.env`'s own `DATABASE_URL`, read
+            by pydantic, is not interpolated, so `make migrate` and `seed` are
+            then the things that fail, against a database the stack is happily
+            using.
+
+    ``@``   the DSN's authority splits at the first one, so the password is
+            truncated there and the rest becomes part of the hostname. That
+            surfaces as an unresolvable host rather than as a refused password,
+            which sends the diagnosis somewhere else entirely.
+
+    ``%``   followed by two hex digits it is a percent-escape, and SQLAlchemy
+            decodes it. Postgres stored `x%3Ay`; the API sends `x:y`. This is
+            the silent one and the one that produces the error above verbatim.
+
+    The check for the second and third is the round trip itself rather than a
+    character list, so it cannot drift from the parser it is checking — the same
+    reasoning `config_problems()` gives for reading `.env` through `Settings`.
+
+    Never returns the password or any part of it: the reason names the
+    *character class* that broke, which is what makes it actionable, and the
+    caller withholds the value (CLAUDE.md §1.6).
+    """
+    if not password:
+        # Documented as fine until you deploy: `make up` and `make up-prod` run
+        # the base file, which hardcodes `atp`/`atp`. The deploy overlay's `:?`
+        # is what refuses an empty one, at the moment it matters.
+        return None
+
+    if "$" in password:
+        return (
+            "contains `$`, which docker compose reads as a variable reference and "
+            "substitutes away — Postgres and the host-side DATABASE_URL then "
+            "disagree about the password. Use `$$` for a literal `$`, or generate "
+            "one with `openssl rand -hex 24`"
+        )
+
+    try:
+        url = make_url(DEPLOYED_DSN.format(password=password))
+    except Exception:
+        return (
+            "cannot be parsed as part of a database URL — docker-compose.prod.yml "
+            "interpolates it into one. Generate one with `openssl rand -hex 24`"
+        )
+
+    if url.host != "db" or url.database != "atp":
+        return (
+            "contains `@`, which ends the credentials in a database URL — the rest "
+            "of the password is read as the hostname, so the API cannot resolve the "
+            "database at all. Generate one with `openssl rand -hex 24`"
+        )
+
+    if url.password != password:
+        return (
+            "contains a `%` followed by two hex digits, which is a percent-escape "
+            "in a database URL and is DECODED before it reaches Postgres. initdb "
+            "stored what you wrote; the API sends the decoded form, and every "
+            'request fails with `password authentication failed for user "atp"`. '
+            "Generate one with `openssl rand -hex 24`"
+        )
+
+    return None
+
+
+def db_credential_problems(values: dict[str, str], lines: dict[str, int]) -> list[tuple[str, str]]:
+    """`(env var, reason)` for a database password that will not work, worst first.
+
+    Two findings, and they are the two halves of one failure — the deployed
+    stack and the host-side tools reach the same database by different routes,
+    and a password can be wrong on either.
+
+    The mismatch check fires only once `ATP_DB_PASSWORD` is set, because an
+    empty one means this is a laptop running `make up` against the base file's
+    hardcoded `atp`/`atp`, where `.env`'s stock `DATABASE_URL` is correct as
+    written and reporting it would be noise on every developer's machine.
+    """
+    found: list[tuple[str, str]] = []
+
+    password = values.get("ATP_DB_PASSWORD", "")
+    reason = db_password_problem(password)
+    if reason is not None:
+        found.append(("ATP_DB_PASSWORD", reason))
+
+    dsn = values.get("DATABASE_URL", "")
+    if password and dsn:
+        try:
+            host_side = make_url(dsn).password
+        except Exception:
+            # A DATABASE_URL that will not parse is `Settings`' problem to
+            # report, not this one's — saying it twice in one run reads as two
+            # faults.
+            return found
+        if host_side != password:
+            found.append(
+                (
+                    "DATABASE_URL",
+                    "carries a different password from ATP_DB_PASSWORD. The containers "
+                    "get the one compose builds and will be fine; the host-side tools "
+                    "read THIS url, so `make migrate`, `seed`, `backfill` and "
+                    "`scripts/halt.py` will fail against the database the stack is "
+                    "using (.env.example, 'datastores')",
+                )
+            )
+
+    return found
+
+
+def env_file_values(path: Path = ENV_FILE) -> dict[str, str]:
+    """`{KEY: value}` as the things that read `.env` will resolve it.
+
+    Through a dotenv reader rather than the split in `env_file_lines`, because
+    here the question *is* "what is the value" — quoting and escapes have to be
+    resolved the way compose and pydantic resolve them, or the check would judge
+    a password neither of them will ever see.
+
+    The real environment wins over the file, matching `source_of` and matching
+    both readers.
+    """
+    values = (
+        {k: v for k, v in dotenv_values(path).items() if v is not None} if path.is_file() else {}
+    )
+    for key in [*values, "ATP_DB_PASSWORD", "DATABASE_URL"]:
+        exported = os.environ.get(key)
+        if exported is not None:
+            values[key] = exported
+    return values
+
+
 def main(argv: list[str] | None = None) -> int:
     # `Settings` resolves `env_file=".env"` against the *working directory*, so
     # run from `scripts/` or from a subpackage it would read a different file
@@ -159,8 +318,9 @@ def main(argv: list[str] | None = None) -> int:
     problems = config_problems()
     lines = env_file_lines()
     unread = unread_keys(lines)
+    credentials = db_credential_problems(env_file_values(), lines)
 
-    if not problems and not unread:
+    if not problems and not unread and not credentials:
         print("environment: every value loads, and every key in .env is read")
         if not ENV_FILE.is_file():
             print("  no .env here — defaults only (`make up` writes one from .env.example)")
@@ -198,6 +358,25 @@ def main(argv: list[str] | None = None) -> int:
         print("recognise, because this file is shared with compose and Vite. A misspelled")
         print("limit is the dangerous one — the field silently keeps its default, so a cap")
         print("you believe you tightened is still whatever it was.")
+
+    # ── a password that will not survive the trip to Postgres ───────────────
+    # The third shape, and the only one where the value is both correct and
+    # unusable: it loads, nothing reads it wrong, and it still arrives at the
+    # database as a different string from the one initdb stored.
+    if credentials:
+        if problems or unread:
+            print()
+        count = len(credentials)
+        print(f".env: {count} database credential{'' if count == 1 else 's'} that will not work\n")
+        for key, reason in credentials:
+            print(f"  {key}    {source_of(key, lines)}")
+            print(f"    {reason}")
+            print("    value withheld — this is a credential (CLAUDE.md §1.6)")
+            print()
+        print("The API starts fine with these and then fails every request that reads the")
+        print('database: `password authentication failed for user "atp"`, with /readyz')
+        print('reporting `database: unreachable` (docs/RUNBOOK.md, "password authentication')
+        print('failed").')
 
     return 1
 

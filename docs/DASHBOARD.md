@@ -79,6 +79,12 @@ of them is safe to act on.
 "no positions" because Redis blinked would be telling its reader they are flat.
 The client keeps its last good data on screen, labelled stale.
 
+The rule is not Redis's alone: an unreachable *database* is a 503 on every
+endpoint that reads one, answered in one place for all of them
+(`atp_api.errors`). It used to be a `500`, which said the API was broken when
+the API was fine — and said it on eight panels at once, which reads as eight
+faults rather than the one credential behind them.
+
 ## Layout priority
 
 Top to bottom, in the order a person needs it:

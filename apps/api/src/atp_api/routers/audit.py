@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -59,17 +59,19 @@ async def list_audit_entries(
     dashboard applies to the book: a write that cannot land must not stop the
     action, but a read that cannot happen must not be rendered as "nothing
     happened". An empty page and an unreachable record are different sentences,
-    and only one of them is safe to believe — so a missing database is the 503
-    `get_session_factory` already answers with.
+    and only one of them is safe to believe.
+
+    So an unreachable database has to be a 503, and it is — from
+    `atp_api.errors`, which now answers that for every route rather than only
+    this one. This handler used to catch it itself, and the two things wrong
+    with doing it here are why it no longer does. It caught `Exception`, so a
+    bug in the query below reported itself as an outage; and it put `str(exc)`
+    in the response, where a driver's connection error is free to quote the DSN
+    it failed to connect with — and the DSN carries the password (CLAUDE.md
+    §1.6).
     """
     log = PostgresAuditLog(session_factory)
-    try:
-        rows = await log.recent(limit=limit, before_id=before_id, action=action)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"cannot read the audit trail: {exc}",
-        ) from exc
+    rows = await log.recent(limit=limit, before_id=before_id, action=action)
 
     entries = [
         AuditEntryView(

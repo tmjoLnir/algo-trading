@@ -50,6 +50,19 @@ which carries the database password (CLAUDE.md §1.6). The reason goes to the lo
 instead — `readyz.dependency_unreachable`, with `dependency`, `error_type` and
 `error` — where a shell on the host reaches it and a browser does not.
 
+**A request makes the same distinction the probes do.** A dependency being down
+is not this API being broken, and that has to hold on the request path too —
+otherwise the probes say "Postgres is unreachable" while every panel on the
+dashboard says "the API is broken", and the reader has to decide which to
+believe. An unreachable database leaves `atp_core.persistence.db` as
+`DatabaseUnavailableError` and `atp_api.errors` answers `503` with
+`{"detail": "the database is unreachable"}` and a `Retry-After` — the same word
+`/readyz` uses, so the two agree by construction. It carries no exception text
+either, and for the same reason; the cause goes to the log as
+`api.database_unavailable`, with `path` and `cause`. A `500` from a
+database-backed endpoint therefore means what it should: the connection was
+fine and the *statement* failed, which is a bug here.
+
 **The broker is not checked**, though readiness is where people look for it. A
 probe is polled on a schedule and Alpaca rate-limits per key; in `backtest` mode
 there is no broker to reach; and a broker that is down is not a reason to take

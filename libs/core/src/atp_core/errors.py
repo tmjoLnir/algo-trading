@@ -26,6 +26,39 @@ class MissingBrokerCredentialsError(ConfigError):
     """
 
 
+# ── persistence ─────────────────────────────────────────────────────────────
+class PersistenceError(ATPError): ...
+
+
+class DatabaseUnavailableError(PersistenceError):
+    """The database could not be reached, or dropped the connection mid-request.
+
+    Raised by `atp_core.persistence.db` in place of whatever the driver threw,
+    and deliberately NOT raised for a statement that failed. The distinction is
+    the whole point of the type: "Postgres would not let this process in" and
+    "this query is wrong" are the same shape of traceback and opposite kinds of
+    problem — the first is an outage somebody has to go and fix, the second is a
+    bug in this repository — and a caller that cannot tell them apart reports
+    both as the second. Which is what the API did: an operator watching every
+    panel answer `500 Internal Server Error` was being told, by a platform that
+    knew better, that it had broken.
+
+    The driver's own exception is the `__cause__`. It is not folded into this
+    message and it never reaches an HTTP response: a connection error is free to
+    quote the DSN it failed to connect with, and the DSN carries the password
+    (CLAUDE.md §1.6). The type name is safe and is most of the diagnosis
+    anyway — `InvalidPasswordError` says what went wrong without saying what the
+    password is.
+    """
+
+    def __init__(self, cause: BaseException) -> None:
+        #: The driver exception's class name — `InvalidPasswordError`,
+        #: `ConnectionRefusedError`. Named rather than reconstructed from
+        #: `__cause__` so a log line can carry it without walking the chain.
+        self.cause_type = type(cause).__name__
+        super().__init__(f"the database is unreachable ({self.cause_type})")
+
+
 # ── market data ─────────────────────────────────────────────────────────────
 class DataError(ATPError): ...
 
