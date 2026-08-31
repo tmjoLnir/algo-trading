@@ -32,7 +32,14 @@ from fastapi import status
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from atp_api.ws import ConnectionManager, _dispatch, _string_list, redis_bridge
+from atp_api.ws import (
+    ALL_CLIENT_CHANNELS,
+    GAP_CHANNEL,
+    ConnectionManager,
+    _dispatch,
+    _string_list,
+    redis_bridge,
+)
 from atp_core.channels import CHANNEL_HALTS, CHANNEL_ORDERS, CHANNEL_QUOTES
 
 
@@ -203,6 +210,100 @@ class TestSubscriptionFiltering:
         await manager.broadcast("quotes", {"type": "quote", "symbol": "AAPL"})
 
         assert socket.sent == []
+
+
+class TestEmptyingTheFilterIsNotAskingForEverything:
+    """`None` and `set()` are different answers, and reading them as one was a
+    firehose.
+
+    An empty symbol set is the sentinel for "no filter — send the whole
+    channel", which is what makes a `subscribe` naming no symbols deliver
+    something rather than silence. `unsubscribe` reached that same empty set by
+    removing the last symbol, so a dashboard panel unmounting or a watchlist
+    being cleared silently promoted that client from five symbols to every tick
+    in the universe — the exact outcome per-subscription fan-out exists to
+    prevent. The server then paid the fan-out on every tick and the browser paid
+    the parse, and the only symptom was a tab that got slow.
+
+    So the two states are held apart: never-named-one is `None`, named-and-
+    removed is empty. Both directions are asserted here, because a fix that only
+    closed the firehose by making an empty set mean "nothing" would silence
+    every client that subscribed without naming a symbol.
+    """
+
+    async def test_removing_the_last_symbol_delivers_nothing(
+        self, manager: ConnectionManager
+    ) -> None:
+        socket = await connected(manager, "a", channels=["quotes"], symbols=["AAPL"])
+        manager.unsubscribe("a", ["AAPL"])
+
+        await manager.broadcast("quotes", {"type": "quote", "symbol": "AAPL"})
+        await manager.broadcast("quotes", {"type": "quote", "symbol": "TSLA"})
+
+        assert socket.sent == []
+
+    async def test_a_client_that_never_named_a_symbol_still_gets_the_channel(
+        self, manager: ConnectionManager
+    ) -> None:
+        """The other direction, and the reason the sentinel exists at all."""
+        socket = await connected(manager, "a", channels=["quotes"])
+
+        await manager.broadcast("quotes", {"type": "quote", "symbol": "TSLA"})
+
+        assert socket.types() == ["quote"]
+
+    async def test_unsubscribing_without_ever_having_filtered_changes_nothing(
+        self, manager: ConnectionManager
+    ) -> None:
+        """A filter cannot express "everything except AAPL", and inventing an
+        empty set to hold that would silence a client that asked for the whole
+        channel."""
+        socket = await connected(manager, "a", channels=["quotes"])
+        manager.unsubscribe("a", ["AAPL"])
+
+        await manager.broadcast("quotes", {"type": "quote", "symbol": "TSLA"})
+
+        assert socket.types() == ["quote"]
+
+    async def test_naming_a_symbol_after_an_unfiltered_subscribe_starts_filtering(
+        self, manager: ConnectionManager
+    ) -> None:
+        """The additive rule read from the other end: a panel that mounts and
+        names what it watches narrows the feed, rather than being ignored
+        because an earlier call asked for everything."""
+        socket = await connected(manager, "a", channels=["quotes"])
+        manager.subscribe("a", [], ["AAPL"])
+
+        await manager.broadcast("quotes", {"type": "quote", "symbol": "TSLA"})
+        await manager.broadcast("quotes", {"type": "quote", "symbol": "AAPL"})
+
+        assert [m["symbol"] for m in socket.sent] == ["AAPL"]
+
+    async def test_subscribing_again_after_emptying_the_filter_resumes_that_symbol(
+        self, manager: ConnectionManager
+    ) -> None:
+        """A panel that unmounts and remounts — the sequence that produced the
+        firehose — must end up watching what it asked for, not nothing."""
+        socket = await connected(manager, "a", channels=["quotes"], symbols=["AAPL"])
+        manager.unsubscribe("a", ["AAPL"])
+        manager.subscribe("a", ["quotes"], ["MSFT"])
+
+        await manager.broadcast("quotes", {"type": "quote", "symbol": "AAPL"})
+        await manager.broadcast("quotes", {"type": "quote", "symbol": "MSFT"})
+
+        assert [m["symbol"] for m in socket.sent] == ["MSFT"]
+
+    async def test_an_execution_event_is_never_symbol_filtered_either_way(
+        self, manager: ConnectionManager
+    ) -> None:
+        """A fill on a symbol you have just stopped watching is still your
+        money, so emptying the filter must not reach it in either direction."""
+        socket = await connected(manager, "a", channels=["fills"], symbols=["AAPL"])
+        manager.unsubscribe("a", ["AAPL"])
+
+        await manager.broadcast("fills", {"type": "fill", "symbol": "TSLA"})
+
+        assert socket.types() == ["fill"]
 
 
 class TestOneDeadClientCostsNobodyElse:
@@ -501,6 +602,13 @@ class FakePubSub:
     #: Nothing was published during the read. Not an error — a quiet market.
     IDLE = object()
 
+    #: A subscription that cannot be established at all, so `SUBSCRIBE` raises
+    #: rather than a later read. This is what a Redis that is simply *down*
+    #: looks like, and it is the shape that matters for gap reporting: every
+    #: retry through one outage fails here, so the outage has to be measured
+    #: from the first of them rather than restarted by each.
+    SUBSCRIBE_FAILS = object()
+
     def __init__(self, script: list[Any], *, answers_ping: bool = True) -> None:
         self._script = list(script)
         self.subscribed = False
@@ -519,6 +627,13 @@ class FakePubSub:
         self.exhausted = asyncio.Event()
 
     async def subscribe(self, *channels: str) -> None:
+        if self._script and self._script[0] is self.SUBSCRIBE_FAILS:
+            self._script.pop(0)
+            # Set before raising: `run_bridge` waits on this to know the fake
+            # has done everything it was scripted to, and a subscription that
+            # never succeeds reads nothing that could set it later.
+            self.exhausted.set()
+            raise RedisConnectionError("Error connecting to redis:6379")
         self.subscribed = True
         self.channels = channels
 
@@ -690,7 +805,10 @@ class TestTheBridgeStillReconnectsWhenItShould:
 
         assert len(redis.pubsubs) == 2, "a genuine failure must still reconnect"
         assert redis.pubsubs[0].closed == 1, "the dead pubsub must be released"
-        assert socket.types() == ["quote"], "and delivery resumes on the new one"
+        # The order is the assertion, not an accident of it: the gap notice has
+        # to land *before* the resumed stream, or a client re-reads the book it
+        # has just been sent updates for and throws them away.
+        assert socket.types() == ["gap", "quote"], "the gap is announced, then delivery resumes"
 
     async def test_a_socket_timeout_from_a_real_command_still_reconnects(
         self, manager: ConnectionManager, instant_backoff: None
@@ -816,3 +934,146 @@ class TestSilenceIsCheckedRatherThanAssumed:
 
         assert redis.pubsubs[0].pings == 0
         assert socket.types() == ["quote", "quote", "quote"]
+
+
+class TestAReconnectedBridgeAnnouncesItsGap:
+    """The outage the browsers cannot see.
+
+    When this process loses its Redis subscription, the sockets *to* the
+    browsers stay up throughout. Nothing on the client reconnects, nothing
+    re-reads, and everything published in the meantime reached nobody — pub/sub
+    has no replay. While the dashboard polled, the next poll repaired that
+    within five minutes without anyone deciding it should; since ADR 0022 the
+    gap is permanent on every open tab, and what is missing might be the halt
+    the banner exists to show.
+
+    So coming back says so, and the dashboard answers by re-reading the book.
+    The message is not a replay and does not pretend to be: one aggregate read
+    *is* the current state of everything this bridge carries.
+    """
+
+    async def test_the_first_subscribe_announces_nothing(self, manager: ConnectionManager) -> None:
+        """A bridge that has never dropped has closed no gap. Announcing one at
+        startup would have every tab re-read for nothing, in the seconds after
+        a deploy when they have all just read anyway."""
+        socket = await connected(manager, "a", channels=["quotes"])
+        redis = FakeRedis([FakePubSub.IDLE])
+
+        await run_bridge(redis, manager)
+        await asyncio.sleep(0)
+
+        assert socket.sent == []
+
+    async def test_coming_back_tells_every_client_what_it_missed(
+        self, manager: ConnectionManager, instant_backoff: None
+    ) -> None:
+        socket = await connected(manager, "a", channels=["quotes"])
+        redis = FakeRedis([RedisConnectionError("connection lost")], [FakePubSub.IDLE])
+
+        await run_bridge(redis, manager, pubsubs=2)
+        await asyncio.sleep(0)
+
+        assert socket.types() == ["gap"]
+        assert socket.sent[0]["seconds"] >= 0
+
+    async def test_the_gap_reaches_a_client_that_subscribed_to_nothing(
+        self, manager: ConnectionManager, instant_backoff: None
+    ) -> None:
+        """Same argument as the halt it may be standing in for. A dashboard that
+        asked for nothing is still one that has been quietly stale, and it is
+        the halt banner rather than the tick tables that makes that matter."""
+        socket = await connected(manager, "a")
+        redis = FakeRedis([RedisConnectionError("connection lost")], [FakePubSub.IDLE])
+
+        await run_bridge(redis, manager, pubsubs=2)
+        await asyncio.sleep(0)
+
+        assert socket.types() == ["gap"]
+
+    async def test_the_gap_is_not_symbol_filtered(
+        self, manager: ConnectionManager, instant_backoff: None
+    ) -> None:
+        """It carries a `seconds`, never a symbol, but a filter that reached it
+        would drop it for every client watching anything specific — which is
+        every client that is actually being used."""
+        socket = await connected(manager, "a", channels=["quotes"], symbols=["AAPL"])
+        redis = FakeRedis([RedisConnectionError("connection lost")], [FakePubSub.IDLE])
+
+        await run_bridge(redis, manager, pubsubs=2)
+        await asyncio.sleep(0)
+
+        assert socket.types() == ["gap"]
+
+    def test_a_client_cannot_subscribe_to_the_gap_channel(self) -> None:
+        """Guarding the mechanism rather than a behaviour. Adding `gaps` to
+        `CLIENT_CHANNELS` would put it in `ALL_CLIENT_CHANNELS`, which is the
+        set `subscribe` filters against — and the moment it is subscribable it
+        is also *opt-out-able*, which is the one thing this message must not be.
+        """
+        assert GAP_CHANNEL not in ALL_CLIENT_CHANNELS
+
+    async def test_one_outage_announces_one_gap_however_many_retries(
+        self, manager: ConnectionManager, instant_backoff: None
+    ) -> None:
+        """A Redis that is down fails at `SUBSCRIBE`, so an outage is a run of
+        failed attempts rather than one. The gap is measured from the first of
+        them: restarting the clock on each retry would report the length of the
+        last backoff instead of the length of the outage, and telling every tab
+        to re-read once per attempt would aim a retry storm at a Redis that is
+        already the reason they are stale."""
+        socket = await connected(manager, "a", channels=["quotes"])
+        redis = FakeRedis(
+            [FakePubSub.SUBSCRIBE_FAILS],
+            [FakePubSub.SUBSCRIBE_FAILS],
+            [FakePubSub.IDLE],
+        )
+
+        await run_bridge(redis, manager, pubsubs=3)
+        await asyncio.sleep(0)
+
+        assert len(redis.pubsubs) == 3, "every attempt must have been made"
+        assert socket.types() == ["gap"], "and exactly one gap announced for the outage"
+
+    async def test_the_reported_gap_spans_the_outage_not_the_last_retry(
+        self, manager: ConnectionManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The number has to describe the outage or it should not be reported.
+
+        `down_since` is only *read* on the successful subscribe, so restarting
+        it on each retry still announces exactly one gap — the count is blind to
+        this. What it corrupts is the duration: a Redis down for forty seconds
+        would be reported as the length of the final backoff, and an operator
+        reading `ws.bridge_gap seconds=0.4` after a four-attempt outage would
+        conclude the platform had barely missed anything.
+
+        A real backoff rather than the instant one, because elapsed time is the
+        assertion. The bound is one-sided on purpose: a loaded runner can only
+        make the true figure larger, never smaller.
+        """
+        monkeypatch.setattr("atp_api.ws.backoff_delay", lambda attempt: 0.1)
+        socket = await connected(manager, "a", channels=["quotes"])
+        redis = FakeRedis(
+            [FakePubSub.SUBSCRIBE_FAILS],
+            [FakePubSub.SUBSCRIBE_FAILS],
+            [FakePubSub.SUBSCRIBE_FAILS],
+            [FakePubSub.IDLE],
+        )
+
+        await run_bridge(redis, manager, pubsubs=4)
+        await asyncio.sleep(0)
+
+        assert socket.types() == ["gap"]
+        assert socket.sent[0]["seconds"] >= 0.25, "three 0.1s waits, not just the last one"
+
+    async def test_a_gap_with_nobody_listening_is_not_an_error(
+        self, manager: ConnectionManager, instant_backoff: None
+    ) -> None:
+        """The overnight case: the bridge flaps at 03:00 with no tab open. The
+        announcement has nobody to reach and must not take the bridge down on
+        its way back up."""
+        redis = FakeRedis([RedisConnectionError("connection lost")], [FakePubSub.IDLE])
+
+        await run_bridge(redis, manager, pubsubs=2)
+        await asyncio.sleep(0)
+
+        assert redis.pubsubs[1].subscribed, "the bridge is back up regardless"

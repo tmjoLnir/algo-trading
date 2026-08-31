@@ -137,7 +137,10 @@ export function useLiveQuotes(): Record<string, LiveQuote> {
  * on money in IEEE 754 (rule §1.1).
  *
  * A fill or a halt refetches instead: both change more of the picture than one
- * message carries, and the aggregate read is the authoritative path.
+ * message carries, and the aggregate read is the authoritative path. So does a
+ * `gap`, which is the API reporting that its *own* subscription to the
+ * producers dropped and recovered — the one outage this socket cannot detect
+ * for itself, because it stays open throughout.
  *
  * The socket opens even when there is nothing to subscribe to. Halts are
  * delivered to every client regardless of subscription, and a dashboard holding
@@ -230,6 +233,18 @@ export function useDashboardStream(symbols: string[]) {
           case 'halt':
             // Refetch rather than patch: a fill or a halt changes more of the
             // picture than one message carries.
+            queryClient.invalidateQueries({ queryKey: LIVE_DASHBOARD_KEY })
+            break
+          case 'gap':
+            // The API's own subscription to the producers dropped and came
+            // back, so anything published in between reached nobody and
+            // pub/sub will not replay it. This socket never closed, so nothing
+            // below reconnects and nothing else here would ever ask.
+            //
+            // Unlike a fill or a halt it carries no news of its own — it is
+            // the server saying it does not know what was missed either, which
+            // is exactly why the answer is the same read. That read is the
+            // whole repair rather than a catch-up.
             queryClient.invalidateQueries({ queryKey: LIVE_DASHBOARD_KEY })
             break
         }

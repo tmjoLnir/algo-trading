@@ -194,12 +194,27 @@ it. It no longer fires on an idle subscription.
    own — the bridge retries forever by design. A repeating pair with no other
    Redis symptom is the connection dying under load; check `maxclients` and
    memory on the Redis instance.
-4. Note what *was* missed. Pub/sub has no replay, so anything published while
-   the bridge was down reached no browser — including a halt. Reloading fills
-   the book back in and the banner then renders from the kill switch directly,
-   but a halt banner that should have appeared at 14:31 will not appear until
-   somebody reloads. **While this warning is firing, the halt banner is not a
-   live alarm** — treat `scripts/status.py` as the check, not the screen.
+4. **`ws.bridge_gap` says how long it was down and who was stale.** It follows
+   every recovery, and its `clients=` is how many browsers were holding a socket
+   through the outage — `clients=0` means it cost nobody anything. `seconds` is
+   a **lower bound**: the clock starts when the failure was noticed, and a
+   connection that stops carrying data without closing takes up to 30s to be
+   noticed (`LIVENESS_TIMEOUT_SECONDS`). A gap materially longer than the
+   `ws.bridge_failed` lines suggest is that case, not a mis-measurement.
+5. Note what *was* missed — and what now repairs itself. Pub/sub has no replay,
+   so anything published while the bridge was down reached no browser,
+   including a halt. **The recovery closes that on its own**: coming back sends
+   every open tab a `gap` message and each one re-reads the book, so a halt
+   engaged at 14:31 appears in the banner when the bridge returns rather than
+   waiting for somebody to reload. That is the whole repair, not a catch-up —
+   one aggregate read is the current state of everything the socket carries.
+
+   **What is not repaired is the interval itself.** Between the drop and the
+   recovery the banner is still not a live alarm: nothing is arriving, and a
+   halt engaged inside that window is invisible until the bridge is back. So
+   while `ws.bridge_failed` is firing *without* a following `ws.bridge_gap`,
+   treat `scripts/status.py` as the check and not the screen. Once the gap line
+   lands, the screens have caught up by themselves.
 
 ## Dashboard shows "502 Bad Gateway"
 
@@ -426,6 +441,10 @@ docker compose logs api | grep -E 'ws\.(connected|disconnected|dropping_client)'
   `client_id` is a browser that cannot keep up — check the machine, not the API.
 - `ws.hang_up_failed` — the close itself failed, meaning the socket was already
   gone. Cosmetic; the client is out of the fan-out either way.
+- `ws.bridge_gap` — this process lost its *own* subscription to Redis and got it
+  back, and has just told every browser to re-read. Not a WebSocket fault at
+  all; it is the tail of `ws.bridge_failed` above, and that section is where to
+  work it.
 
 **A dropped socket costs liveness, never correctness.** Pub/sub has no replay, so
 whatever was published while a browser was disconnected reached it never — but
