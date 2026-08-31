@@ -8,7 +8,12 @@ two ways a fan-out can be wrong in a trading UI:
 - **a halt that does not arrive**, because the client did not think to subscribe
   to one. `ws.py` promises it reaches every client regardless;
 - **one slow client holding up everyone else**, which is how a single browser on
-  a bad connection stops the whole dashboard fleet updating.
+  a bad connection stops the whole dashboard fleet updating;
+- **a client dropped but not hung up on**, which is the same browser one step
+  later: muted by the server, told nothing about it, and therefore never
+  reconnecting. It is the worst of the three because it is the only one that
+  does not look like anything — the socket is open, the screen is live, and the
+  halt it is not being sent is the one it exists to show.
 
 And one way the bridge feeding them can be wrong, which no test covered until it
 happened in production: **a quiet channel read as a broken one**, which drops the
@@ -23,6 +28,7 @@ import json
 from typing import Any
 
 import pytest
+from fastapi import status
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
@@ -33,14 +39,34 @@ from atp_core.channels import CHANNEL_HALTS, CHANNEL_ORDERS, CHANNEL_QUOTES
 class FakeSocket:
     """Just enough `WebSocket`. Can be told to hang or to fail."""
 
-    def __init__(self, *, hang: bool = False, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        hang: bool = False,
+        error: Exception | None = None,
+        close_error: Exception | None = None,
+        close_hangs: bool = False,
+    ) -> None:
         self.accepted = False
         self.sent: list[dict[str, Any]] = []
         self.hang = hang
         self.error = error
+        self.close_error = close_error
+        self.close_hangs = close_hangs
+        #: Every close code this socket was hung up with, in order. A list
+        #: rather than a flag: closing twice is a distinct bug from not closing,
+        #: and the second close is the one that raises against a real socket.
+        self.closed_with: list[int] = []
 
     async def accept(self) -> None:
         self.accepted = True
+
+    async def close(self, code: int = 1000) -> None:
+        if self.close_error is not None:
+            raise self.close_error
+        if self.close_hangs:
+            await asyncio.Event().wait()  # never returns
+        self.closed_with.append(code)
 
     async def send_json(self, message: dict[str, Any]) -> None:
         if self.error is not None:
@@ -229,6 +255,143 @@ class TestOneDeadClientCostsNobodyElse:
         manager.subscribe("ghost", ["quotes"], ["AAPL"])
 
         assert manager.client_count == 0
+
+
+class TestADroppedClientIsAlsoHungUpOn:
+    """Dropping a client from the fan-out is only half of a disconnect.
+
+    The other half is closing its socket, and leaving it out is worse than it
+    sounds. The socket stays open, so from the browser nothing has happened:
+    `onclose` never fires, `useDashboardStream`'s reconnect ladder never runs,
+    and a `subscribe` sent afterwards is still answered `{"type": "subscribed"}`
+    by a server holding no record of the client. The dashboard is then live-
+    looking and permanently silent until somebody reloads the page — and what it
+    is silent about includes the halt this class delivers unconditionally.
+
+    That is the one failure mode this codebase is least able to see from the
+    outside (CLAUDE.md §5): every other way of losing the socket announces
+    itself as a socket that is gone.
+    """
+
+    @pytest.fixture
+    def instant_deadlines(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Both deadlines, short enough that a test waits on neither."""
+        monkeypatch.setattr("atp_api.ws.SEND_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr("atp_api.ws.CLOSE_TIMEOUT_SECONDS", 0.01)
+
+    async def test_a_client_whose_send_failed_is_closed(self, manager: ConnectionManager) -> None:
+        broken = FakeSocket(error=RuntimeError("socket is gone"))
+        await manager.connect("broken", broken)  # type: ignore[arg-type]
+        manager.subscribe("broken", ["quotes"], [])
+
+        await manager.broadcast("quotes", {"type": "quote", "symbol": "AAPL"})
+
+        assert broken.closed_with == [status.WS_1013_TRY_AGAIN_LATER]
+
+    async def test_a_client_dropped_on_the_deadline_is_closed(
+        self, manager: ConnectionManager, instant_deadlines: None
+    ) -> None:
+        """The slow reader, which is the case that actually happens. A browser
+        on a bad connection misses one send deadline and must be told, or it
+        spends the rest of the session believing it is connected."""
+        stalled = FakeSocket(hang=True)
+        await manager.connect("stalled", stalled)  # type: ignore[arg-type]
+        manager.subscribe("stalled", ["quotes"], [])
+
+        await manager.broadcast("quotes", {"type": "quote", "symbol": "AAPL"})
+
+        assert stalled.closed_with == [status.WS_1013_TRY_AGAIN_LATER]
+
+    async def test_the_close_code_is_never_the_one_that_signs_the_operator_out(
+        self, manager: ConnectionManager
+    ) -> None:
+        """1008 is not a spare code. The dashboard reads it as "this session is
+        not valid" and drops to the login screen without retrying (ADR 0008), so
+        using it here would sign an operator out of a working platform because
+        their laptop's wifi dipped. Every other code reconnects, which is the
+        whole point of closing."""
+        broken = FakeSocket(error=RuntimeError("socket is gone"))
+        await manager.connect("broken", broken)  # type: ignore[arg-type]
+        manager.subscribe("broken", ["quotes"], [])
+
+        await manager.broadcast("quotes", {"type": "quote", "symbol": "AAPL"})
+
+        assert status.WS_1008_POLICY_VIOLATION not in broken.closed_with
+
+    async def test_a_socket_that_cannot_be_closed_does_not_break_the_fan_out(
+        self, manager: ConnectionManager
+    ) -> None:
+        """A close that raises means the socket was already gone, which is the
+        outcome closing was trying to reach. It must not propagate into the
+        fan-out that is only trying to reach everybody else."""
+        broken = FakeSocket(
+            error=RuntimeError("socket is gone"),
+            close_error=RuntimeError("already closed"),
+        )
+        await manager.connect("broken", broken)  # type: ignore[arg-type]
+        manager.subscribe("broken", ["quotes"], [])
+        healthy = await connected(manager, "healthy", channels=["quotes"])
+
+        await manager.broadcast("quotes", {"type": "quote", "symbol": "AAPL"})
+
+        assert healthy.types() == ["quote"]
+        assert manager.client_count == 1
+
+    async def test_a_socket_that_will_not_close_does_not_hold_up_the_fan_out(
+        self, manager: ConnectionManager, instant_deadlines: None
+    ) -> None:
+        """The close runs against a socket that has *already* stopped reading,
+        so it is at least as likely to hang as the send that just did. Waiting
+        on it would hand a dropped client the delay dropping it was meant to
+        end. The `wait_for` below is the assertion: without a deadline on the
+        close this never returns."""
+        stalled = FakeSocket(hang=True, close_hangs=True)
+        await manager.connect("stalled", stalled)  # type: ignore[arg-type]
+        manager.subscribe("stalled", ["quotes"], [])
+        healthy = await connected(manager, "healthy", channels=["quotes"])
+
+        await asyncio.wait_for(
+            manager.broadcast("quotes", {"type": "quote", "symbol": "AAPL"}), timeout=5
+        )
+
+        assert healthy.types() == ["quote"]
+        assert manager.client_count == 1
+
+    async def test_a_client_is_closed_once_however_many_fan_outs_fail_on_it(
+        self, manager: ConnectionManager
+    ) -> None:
+        """Fan-outs are one task per published message and run concurrently, so
+        a tick and a fill arriving together both fail against the same dead
+        client. Only the call that actually removed it hangs up; the second
+        close would race the first and raise against a real socket."""
+        broken = FakeSocket(error=RuntimeError("socket is gone"))
+        await manager.connect("broken", broken)  # type: ignore[arg-type]
+        manager.subscribe("broken", ["quotes", "fills"], [])
+
+        await asyncio.gather(
+            manager.broadcast("quotes", {"type": "quote", "symbol": "AAPL"}),
+            manager.broadcast("fills", {"type": "fill", "symbol": "AAPL"}),
+        )
+
+        assert broken.closed_with == [status.WS_1013_TRY_AGAIN_LATER]
+
+    async def test_the_endpoints_own_cleanup_does_not_close_the_socket(
+        self, manager: ConnectionManager
+    ) -> None:
+        """`disconnect` is forgetting, not hanging up, and the distinction is
+        load-bearing. The endpoint's `finally` reaches it with a socket the
+        client itself closed — closing again there raises against a real
+        `WebSocket`, and the only thing that would achieve is a log line about a
+        disconnect that went exactly as it should."""
+        socket = await connected(manager, "a", channels=["quotes"])
+
+        assert manager.disconnect("a") is True
+        assert socket.closed_with == []
+
+    async def test_forgetting_an_unknown_client_reports_that_it_did_nothing(
+        self, manager: ConnectionManager
+    ) -> None:
+        assert manager.disconnect("never-connected") is False
 
 
 class TestTheRedisBridge:

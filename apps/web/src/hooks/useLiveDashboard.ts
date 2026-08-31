@@ -37,8 +37,39 @@ import type { EquityCurveView, LiveDashboard } from '@/api/types'
  */
 const WS_POLICY_VIOLATION = 1008
 
+/**
+ * The book. Named because three separate things now invalidate it — a fill, a
+ * halt, and a reconnect — and three copies of a key literal is how one of them
+ * quietly stops matching after a rename.
+ */
+export const LIVE_DASHBOARD_KEY = ['dashboard', 'live'] as const
+
 /** Where the socket writes ticks. Its own key: the aggregate read owns the book. */
 export const LIVE_QUOTES_KEY = ['quotes', 'live'] as const
+
+/** First reconnect wait, doubling from there. */
+const RECONNECT_BASE_MS = 1_000
+
+/** Ceiling on the wait. Reconnecting in a tight loop against a server that is
+ * already struggling makes it worse. */
+const RECONNECT_MAX_MS = 30_000
+
+/**
+ * How long to wait before attempt `n` (0-based): exponential, capped, jittered.
+ *
+ * The jitter is the part worth explaining, and it is the same reasoning as
+ * `atp_core.ws.backoff_delay` on the server — one ladder's worth of thinking,
+ * applied at both ends. Every socket that dropped for the same reason came down
+ * at the same instant, so an unjittered ladder has them all knock again at the
+ * same instant, and again after that: the API is restarted, every open tab
+ * reconnects together, and the moment it is worst able to cope is the moment
+ * they all arrive. Uniform in `[delay/2, delay]`, so it only ever waits *less*
+ * than the ceiling and a reconnect is never slower for being jittered.
+ */
+function reconnectDelay(attempt: number): number {
+  const capped = Math.min(RECONNECT_BASE_MS * 2 ** attempt, RECONNECT_MAX_MS)
+  return capped * (0.5 + Math.random() / 2)
+}
 
 /** One tick, as the socket delivers it. Prices stay strings (rule §1.1). */
 export interface LiveQuote {
@@ -50,7 +81,7 @@ export interface LiveQuote {
 
 export function useLiveDashboard() {
   const query = useQuery<LiveDashboard>({
-    queryKey: ['dashboard', 'live'],
+    queryKey: LIVE_DASHBOARD_KEY,
     queryFn: () => apiGet<LiveDashboard>('/api/v1/dashboard/live'),
     refetchOnWindowFocus: true,
     staleTime: 0,
@@ -112,6 +143,24 @@ export function useLiveQuotes(): Record<string, LiveQuote> {
  * delivered to every client regardless of subscription, and a dashboard holding
  * no positions is exactly the one that most needs to be told trading has
  * stopped.
+ *
+ * **A reconnect re-reads the book, because a reconnect means a gap.** Redis
+ * pub/sub has no replay, so everything published while this socket was down
+ * reached nobody and is not coming — a fill, and in the worst case a halt. That
+ * used to be survivable by accident: the dashboard polled, so the next poll
+ * repaired it within five minutes without anybody deciding it should. Nothing
+ * polls now (ADR 0022), so the repair has to be deliberate or it does not
+ * happen, and the screen carries the pre-outage book for as long as the tab
+ * stays open — with the halt banner, which is the one thing on the page whose
+ * job is to interrupt somebody, showing the state of trading from before the
+ * disconnection.
+ *
+ * This is the browser's half of the reconnect gap that CLAUDE.md §5 names, and
+ * the read is the whole backfill: unlike a market-data feed there is no history
+ * to re-request here, because one aggregate read *is* the current state of
+ * everything the socket carries. So it costs one Redis GET, which ADR 0022
+ * measured at indistinguishable from zero on this host, in exchange for the
+ * screen never being quietly wrong after a blip.
  */
 export function useDashboardStream(symbols: string[]) {
   const queryClient = useQueryClient()
@@ -131,12 +180,23 @@ export function useDashboardStream(symbols: string[]) {
     let reconnectTimer: ReturnType<typeof setTimeout>
     let attempt = 0
     let closed = false
+    // Whether this effect has ever had a live socket. The distinction is the
+    // whole of the gap repair below: the first open of a freshly-mounted effect
+    // has missed nothing, because the query that renders alongside it is
+    // fetching the book at the same moment. Every open after that is a
+    // reconnection, and a reconnection is by definition preceded by a stretch
+    // where the server was publishing to a socket nobody was holding.
+    let everOpened = false
 
     const connect = () => {
       ws = new WebSocket(url)
 
       ws.onopen = () => {
         attempt = 0
+        if (everOpened) {
+          queryClient.invalidateQueries({ queryKey: LIVE_DASHBOARD_KEY })
+        }
+        everOpened = true
         ws?.send(
           JSON.stringify({ type: 'subscribe', channels: ['quotes', 'fills'], symbols: subscribed }),
         )
@@ -170,7 +230,7 @@ export function useDashboardStream(symbols: string[]) {
           case 'halt':
             // Refetch rather than patch: a fill or a halt changes more of the
             // picture than one message carries.
-            queryClient.invalidateQueries({ queryKey: ['dashboard', 'live'] })
+            queryClient.invalidateQueries({ queryKey: LIVE_DASHBOARD_KEY })
             break
         }
       }
@@ -189,10 +249,7 @@ export function useDashboardStream(symbols: string[]) {
           return
         }
 
-        // Exponential backoff, capped at 30s. Reconnecting in a tight loop
-        // against a server that is already struggling makes it worse.
-        const delay = Math.min(1000 * 2 ** attempt++, 30_000)
-        reconnectTimer = setTimeout(connect, delay)
+        reconnectTimer = setTimeout(connect, reconnectDelay(attempt++))
       }
     }
 

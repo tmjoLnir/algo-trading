@@ -147,10 +147,34 @@ bars, the strategy runner for fills and signals, the kill switch for halts.
 - **Market data is filtered by symbol**; execution events are not. A fill on a
   symbol you did not subscribe to is still your money.
 - **A client that stops reading is dropped** on a short deadline rather than
-  buffered for. Unbounded buffering for one slow reader costs every other
-  client, and the next read recovers whatever it misses.
+  buffered for, **and hung up on**. Unbounded buffering for one slow reader
+  costs every other client. Closing is the half that is easy to leave out and
+  cannot be: a client removed from the fan-out with its socket still open sees
+  nothing happen, never fires `onclose`, never reconnects, and goes on looking
+  live while receiving nothing — including the halt. The close code is `1013`
+  and deliberately never `1008`, which the dashboard reads as "your session is
+  gone" and acts on by signing out.
 - **The bridge retries forever.** Nothing here is traded on, so a dead bridge
   costs live updates and never data a decision is made from.
+
+The browser's half of it:
+
+- **The socket belongs to the session, not to a screen**
+  (`src/components/LiveStream.tsx`). It is opened once somebody is signed in and
+  held across every route, because `HaltBanner` is mounted above the nav on all
+  of them and a banner fed by a socket that exists on one route cannot interrupt
+  anybody on the others.
+- **A reconnect re-reads the book.** Pub/sub has no replay, so a fill or a halt
+  published while the socket was down reached nobody and is not coming. While
+  the dashboard polled, the next poll repaired that within five minutes without
+  anyone deciding it should; nothing polls now (ADR 0022), so the repair is
+  deliberate or it does not happen. One aggregate read *is* the current state of
+  everything the socket carries, which is what makes it a complete backfill
+  rather than a catch-up.
+- **The reconnect ladder is exponential, capped at 30s and jittered**, for the
+  same reason `atp_core.ws.backoff_delay` is on the server: every tab whose
+  socket dropped for one reason dropped at one instant, and an unjittered ladder
+  has them all knock again together.
 
 ## Conventions
 

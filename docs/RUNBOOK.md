@@ -371,6 +371,69 @@ refocused or reloaded, under a message promising it would retry on its own. If
 this screen persists for more than a few seconds, the API genuinely is not
 answering: work the table above.
 
+## WebSocket errors in the nginx log
+
+*Symptom:* `docker compose logs web-prod` carries lines like these, and nothing
+on the dashboard looks wrong:
+
+```
+[error] recv() failed (104: Connection reset by peer) while proxying upgraded
+        connection, upstream: "http://172.18.0.4:8000/ws"
+"GET /ws HTTP/1.1" 101 911
+[error] connect() failed (111: Connection refused) while connecting to
+        upstream, upstream: "http://172.18.0.6:8000/ws"
+"GET /ws HTTP/1.1" 502 157
+[warn]  upstream sent duplicate header line: "date: Mon, 31 Aug 2026 ...",
+        previous value: "Date: Mon, 31 Aug 2026 ...", ignored
+```
+
+**Read the upstream IPs first.** Two different addresses a second apart —
+`172.18.0.4` then `172.18.0.6` — is the API container having been *replaced*,
+not the network having failed. Everything else in that block follows from it,
+and none of it needs a human.
+
+| Line | What it is | Act? |
+|---|---|---|
+| `recv() failed (104)` **while proxying upgraded connection** | The API went away holding a socket open. The reset is the old container's socket dying; a WebSocket has no graceful goodbye that survives a `SIGKILL`. | No |
+| `connect() failed (111)` → `502` on `GET /ws` | The browser reconnected into the gap between the new container getting an IP and uvicorn binding `:8000`. nginx found the address (`resolver … valid=10s` in `web.nginx.conf` is what stops it caching the dead one) and the port was not open yet. | Only if it does not clear |
+| `duplicate header line: "date:" … previous value: "Date:"` | uvicorn's WebSocket handshake emits both — `Date` from the `websockets` library's own response builder and `date` from uvicorn — on **every** upgrade. nginx ignores the second and says so. Upstream behaviour, not configuration, and it costs nothing. | Never |
+
+**The pair is benign only if a `101` follows within seconds.** A `502` on
+`GET /ws` that keeps repeating is the API being down rather than restarting, and
+it is the same fault as a 502 on `/api/` — work the `/healthz` and `/readyz`
+table under **Dashboard shows "502 Bad Gateway"** above. The reads will be
+failing too; if they are not, look again at the upstream IP, because nginx
+reaching *something* on `:8000` and being refused is a container that is `Up`
+with nothing listening (`docker-compose.yml` explains how `--reload` produces
+exactly that).
+
+**What to check instead of the nginx log.** The API says how many browsers it is
+actually serving, and that is the number that matters:
+
+```bash
+docker compose logs api | grep -E 'ws\.(connected|disconnected|dropping_client)'
+```
+
+- `ws.connected … clients=1` — a browser is holding the socket. Since the socket
+  is held for the whole signed-in session rather than by the dashboard screen,
+  `clients` counts open tabs, not people looking at `/`. **`clients=0` with a tab
+  open is a fault**; before, it was the normal state of every screen except the
+  dashboard.
+- `ws.dropping_client` — the server gave up sending to a browser inside
+  `SEND_TIMEOUT_SECONDS` and hung up on it (close code `1013`), which is a slow
+  or dead connection at the far end. The tab reconnects on its own ladder and
+  re-reads the book when it does. One is a blip. A stream of them for one
+  `client_id` is a browser that cannot keep up — check the machine, not the API.
+- `ws.hang_up_failed` — the close itself failed, meaning the socket was already
+  gone. Cosmetic; the client is out of the fan-out either way.
+
+**A dropped socket costs liveness, never correctness.** Pub/sub has no replay, so
+whatever was published while a browser was disconnected reached it never — but
+the reconnect re-reads `/dashboard/live`, and that read is a whole consistent
+snapshot of everything the socket carries. What a restart costs is the seconds
+in between. What it does not cost is the book, an order, or a halt going
+unnoticed.
+
 ## `password authentication failed for user "atp"`
 
 *Symptom:* the API is up, the dashboard renders, a few panels even show numbers
