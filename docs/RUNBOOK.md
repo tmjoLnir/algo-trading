@@ -374,18 +374,37 @@ answering: work the table above.
 ## `password authentication failed for user "atp"`
 
 *Symptom:* the API is up, the dashboard renders, a few panels even show numbers
-— and every panel backed by the database is `500`. `docker compose logs api`
-is a wall of identical tracebacks ending in:
+— and every panel backed by the database says **the database is unreachable**
+and answers `503`. `docker compose logs api` is a wall of one line, once per
+request, naming the endpoint and the cause:
 
 ```
-asyncpg.exceptions.InvalidPasswordError: password authentication failed for user "atp"
+[error] api.database_unavailable cause=InvalidPasswordError path=/api/v1/analytics/trades
 ```
 
 **The API is not broken and neither is Postgres. They disagree about the
 password**, and that is a configuration fault, not a fault in any of the code
-the traceback names. Read the traceback's *last* line, not its first: the
-frames above it are whichever endpoint happened to ask — `analytics/trades`
-today, `strategies` on the next click — and they are all equally innocent.
+the log line names. The path is whichever endpoint happened to ask —
+`analytics/trades` today, `strategies` on the next click — and every one of
+them is equally innocent.
+
+> **On a build from before this was named**, the same fault presents as `500
+> Internal Server Error` on every one of those panels, and the log is tracebacks
+> rather than log lines, each ending in:
+>
+> ```
+> asyncpg.exceptions.InvalidPasswordError: password authentication failed for user "atp"
+> ```
+>
+> Read the traceback's *last* line, not its first. The frames above it are the
+> endpoint that asked, and a wall of 500s across eight unrelated panels reads as
+> eight bugs rather than one outage — which is what `atp_api.errors` and the
+> `503` above exist to stop.
+
+**A `500` from a database-backed panel now means something else**, and it is
+worth not conflating the two: the connection was fine and the *statement*
+failed. That is a bug in this repository or a database whose schema does not
+match the build — check `make migrate` before you go looking at credentials.
 
 **Confirm it in one command.** `/readyz` is proxied onto the dashboard's own
 origin, so this works from the same browser showing the errors:

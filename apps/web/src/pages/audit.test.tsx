@@ -85,7 +85,9 @@ describe('the trail', () => {
 
 describe('an unreadable record is not an empty one', () => {
   it('does NOT say "nothing recorded" when the trail cannot be read', async () => {
-    stub(503, { detail: 'cannot read the audit trail' })
+    // What the API actually sends now: an unreachable database is answered in
+    // one place for every route (`atp_api.errors`), not per handler.
+    stub(503, { detail: 'the database is unreachable' })
     renderPage()
 
     const alert = await screen.findByRole('alert')

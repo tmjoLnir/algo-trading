@@ -2446,6 +2446,20 @@ has met a database holding a real strategy's history.
   This does not tick anything — the line here is about a collector scraping
   across a trading day, and nothing scrapes yet.
 
+  **The same confusion existed one layer out, on the request path, and is fixed
+  too.** A wrong `ATP_DB_PASSWORD` made every database-backed endpoint answer
+  `500` — strategies, positions, orders, backtests, the equity curve, all three
+  analytics endpoints — while `/dashboard/live` and `/risk/status` answered
+  `200` off Redis. That shape reads as eight bugs rather than one outage, and it
+  read that way because asyncpg raises `InvalidPasswordError` while *opening* a
+  connection, where SQLAlchemy does not wrap it: not a `DBAPIError`, not an
+  `OSError`, so nothing recognised it. `atp_core.persistence.db.is_unavailable`
+  now makes that call once, `session_scope` raises `DatabaseUnavailableError`,
+  and `atp_api.errors` answers `503` for every route at once. A statement that
+  merely *failed* is still a `500`, deliberately: widening it to "any database
+  exception is a 503" would delete the platform's ability to report its own
+  bugs. This ticks nothing either — it is a fix, not an item.
+
   So **each process exports its own `/metrics` and the worker does not push**,
   which is the decision worth arguing with. The natural alternative was for the
   worker to write its numbers into Redis — already the cross-process bus for the

@@ -22,6 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from atp_api.auth import looks_like_bcrypt_hash
 from atp_api.deps import get_current_session, require_write_scope
+from atp_api.errors import install_exception_handlers
 from atp_api.middleware import ObservabilityMiddleware
 from atp_api.routers import (
     analytics,
@@ -204,6 +205,12 @@ def create_app() -> FastAPI:
         description="Automated execution, backtesting, risk management and analytics.",
         lifespan=lifespan,
     )
+
+    # Before the middleware and the routes, because it changes what an
+    # exception from any of them becomes. An unreachable database is not this
+    # API being broken and must not be reported as though it were — see
+    # `atp_api.errors`.
+    install_exception_handlers(app)
 
     # Added last, so it runs first. Starlette applies middleware in reverse
     # order of registration, and this one has to wrap CORS rather than sit

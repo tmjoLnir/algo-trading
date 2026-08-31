@@ -17,7 +17,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from atp_core.data.gaps import expected_windows, query_bounds, require_supported, scan_gaps
 from atp_core.domain import Bar, Timeframe
 from atp_core.logging import get_logger
-from atp_core.persistence.db import session_scope
+from atp_core.persistence.db import read_scope, session_scope
 from atp_core.persistence.models import BarRow
 
 if TYPE_CHECKING:
@@ -143,7 +143,7 @@ class PostgresBarRepository:
             )
             .order_by(BarRow.ts)
         )
-        async with self._session_factory() as session:
+        async with read_scope(self._session_factory) as session:
             result = await session.execute(stmt)
             return [self._to_bar(row) for row in result.scalars()]
 
@@ -164,7 +164,7 @@ class PostgresBarRepository:
             .order_by(BarRow.ts.desc())
             .limit(n)
         )
-        async with self._session_factory() as session:
+        async with read_scope(self._session_factory) as session:
             result = await session.execute(stmt)
             return [self._to_bar(row) for row in reversed(list(result.scalars()))]
 
@@ -254,7 +254,7 @@ class PostgresBarRepository:
             .distinct()
             .order_by(BarRow.symbol, BarRow.timeframe)
         )
-        async with self._session_factory() as session:
+        async with read_scope(self._session_factory) as session:
             rows = (await session.execute(stmt)).all()
 
         series: list[tuple[str, Timeframe]] = []
@@ -279,7 +279,7 @@ class PostgresBarRepository:
             )
             .order_by(BarRow.ts)
         )
-        async with self._session_factory() as session:
+        async with read_scope(self._session_factory) as session:
             result = await session.execute(stmt)
             return list(result.scalars())
 
