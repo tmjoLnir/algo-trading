@@ -1,17 +1,18 @@
 /**
  * The backtest queries, and the one mutation in this app.
  *
- * **Polling is conditional on there being something to poll for.** Every other
- * screen here either polls on a fixed cadence (the live book, every five
- * minutes) or not at all (strategies, orders — rows that change when a worker
- * boots). This one is different: a queued run changes state within seconds and
- * then never again, so the interval is derived from the data rather than
- * configured. While any run is `queued` or `running` the list refetches every
- * few seconds; once they are all terminal it stops entirely, and a tab left open
- * on a page of finished backtests makes no requests at all.
+ * **Polling is conditional on there being something to poll for**, and this is
+ * now the only polling left in the app. Since ADR 0022 every other screen is
+ * read when its reader asks. This one is different, and the difference is why it
+ * survived: a queued run changes state within seconds and then never again, with
+ * nobody watching the screen at the moment it does. So the interval is derived
+ * from the data rather than configured — while any run is `queued` or `running`
+ * the list refetches every few seconds; once they are all terminal it stops
+ * entirely, and a tab left open on a page of finished backtests makes no
+ * requests at all.
  *
- * That is the same reasoning `useLiveDashboard` applies to a hidden tab, pointed
- * at a different axis: do not ask a question whose answer cannot have changed.
+ * The principle is the one ADR 0022 applied everywhere else, pointed at a
+ * different axis: do not ask a question whose answer cannot have changed.
  */
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'

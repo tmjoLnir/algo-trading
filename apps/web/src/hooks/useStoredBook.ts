@@ -12,40 +12,33 @@
  * that the answer can be arbitrarily old, which is why `age_seconds` travels
  * with it and why nothing on this screen renders without it.
  *
- * Polled on the same cadence as the dashboard rather than left static: the
- * worker rewrites this row every evaluation, so it does move — and a screen an
- * operator is watching during an incident should show the age advancing rather
- * than a frozen number that might mean either "nothing changed" or "this tab
- * stopped asking".
+ * Read on demand rather than on a cadence (ADR 0022): the reader reloads, or
+ * returns to the tab, and this re-reads. The worker rewrites this row every
+ * evaluation, so what is on screen does go out of date between reads — which is
+ * why the page shows how long ago it was read *and* how old the book was when
+ * it was, and keeps both advancing on their own clock. A frozen number that
+ * might mean either "nothing changed" or "this tab stopped asking" is the one
+ * outcome this screen cannot afford.
  */
 
 import { useQuery } from '@tanstack/react-query'
 import { apiGet } from '@/api/client'
 import type { StoredBookView } from '@/api/types'
 
-const REFRESH_MS = 5 * 60 * 1000
-
 export function useStoredBook() {
   const query = useQuery<StoredBookView>({
     queryKey: ['positions', 'stored'],
     queryFn: () => apiGet<StoredBookView>('/api/v1/positions'),
-    refetchInterval: REFRESH_MS,
-    // A hidden tab does not poll, matching the dashboard: twenty forgotten tabs
-    // refreshing every five minutes is real load for no reader.
-    refetchIntervalInBackground: false,
+    // Matching the dashboard: no cadence, and `staleTime: 0` so returning to
+    // this tab — in the app or in the window manager — re-reads rather than
+    // replaying whatever was cached the last time somebody looked.
+    staleTime: 0,
     refetchOnWindowFocus: true,
   })
 
-  return {
-    ...query,
-    /**
-     * How stale the *fetch* is, which is a different question from how stale
-     * the *book* is. Both are shown: a tab that refreshed a second ago against
-     * a worker that stopped publishing an hour ago is fresh by one measure and
-     * useless by the other (docs/DASHBOARD.md).
-     */
-    fetchedSecondsAgo: query.dataUpdatedAt
-      ? Math.floor((Date.now() - query.dataUpdatedAt) / 1000)
-      : null,
-  }
+  // `dataUpdatedAt` is returned raw rather than as an age. How stale the *fetch*
+  // is and how stale the *book* is are two different questions, both shown, and
+  // both have to keep advancing while nobody fetches anything — so the arithmetic
+  // belongs in the component that renders them, next to its clock.
+  return query
 }

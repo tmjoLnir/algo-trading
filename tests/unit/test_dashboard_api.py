@@ -620,13 +620,20 @@ class TestEquityCurveEndpoint:
 
 
 class TestContract:
-    async def test_the_refresh_interval_comes_from_the_server(
+    async def test_the_staleness_threshold_comes_from_the_server(
         self, client: httpx.AsyncClient
     ) -> None:
-        """One place to change the cadence — the client must not hardcode it."""
+        """One place to decide "too old to act on" — not a browser constant.
+
+        Nothing polls any more (ADR 0022), so this field stopped being a cadence
+        and became the age past which the screen warns. It still has to travel
+        with the response: the judgement of when a reading is too stale to trade
+        on belongs to the platform, and a client that hardcoded it would keep
+        reassuring its reader after the operator had decided otherwise.
+        """
         _, body = await get_live(client)
 
-        assert body["refresh_seconds"] == 300
+        assert body["stale_after_seconds"] == 300
 
     async def test_halts_are_ordered_oldest_first(
         self, client: httpx.AsyncClient, kill_switch: FakeKillSwitch

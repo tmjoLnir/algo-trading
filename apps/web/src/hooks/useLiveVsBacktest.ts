@@ -44,7 +44,8 @@ export function isComparable(run: Pick<BacktestOut, 'status' | 'metrics'>): bool
  * The same endpoint the Backtests tab lists, without its polling: this screen
  * is not watching anything run, it is choosing among things that have finished.
  * `staleTime` is left at the client default so switching tabs re-reads a list
- * that may have gained a run since.
+ * that may have gained a run since — which after ADR 0022 is how the rest of the
+ * app behaves too.
  */
 export function useComparableRuns() {
   return useQuery<BacktestListResponse>({

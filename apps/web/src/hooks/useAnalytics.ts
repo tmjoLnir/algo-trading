@@ -18,10 +18,12 @@
  * requests lands in one and not the other. It corrects itself on the next
  * refresh, and it is the reason the period is stated on screen.
  *
- * These are not polled. The live dashboard refreshes every 5 minutes because
- * the book moves; a report over a finished period does not, and a poll would
- * re-run a reconstruction that reads the whole order history (docs/ANALYTICS.md,
- * "The read, and what it costs") to produce an identical answer.
+ * These are not polled, and nothing in the app is on a cadence any more
+ * (ADR 0022) — but the reason these never were is stronger than the reason the
+ * dashboard stopped: a report over a finished period cannot change, and re-running
+ * it would repeat a reconstruction that reads the whole order history
+ * (docs/ANALYTICS.md, "The read, and what it costs") to produce an identical
+ * answer.
  */
 
 import { useQuery } from '@tanstack/react-query'

@@ -289,7 +289,8 @@ additions specific to hosting here:
 
 - **US-East proximity.** Accepted deliberately in ADR 0021. A daily-bar strategy
   will not notice; anything reacting within the bar will. The dashboard is
-  unaffected — it refreshes every five minutes.
+  unaffected — it is read on demand (ADR 0022), so your distance from it costs
+  one round trip when you ask for one.
 - **A second host for live.** `docs/SAFETY.md` layer 3 wants paper and live on
   separate machines with separate key pairs, and ADR 0021 chose a paper host
   only. Going live is a decision to make after the paper week, not before it.

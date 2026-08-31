@@ -1,20 +1,26 @@
 /**
- * The 5-minute auto-refresh — requirement #7.
+ * The live dashboard read — requirement #7.
  *
  * One query for the whole dashboard, so every number on screen comes from the
  * same instant (see the API's dashboard router for why that matters).
  *
- * Four details here are deliberate and easy to get wrong:
+ * **There is no longer a refresh cadence.** The reader decides when to read,
+ * with the browser's own reload or the button on the screen (ADR 0022). What
+ * remains automatic is deliberately only the three things that are not a timer:
  *
- * 1. `refetchInterval` is driven by the server's `refresh_seconds`, not a
- *    hardcoded 300000. Change the cadence in one place — the backend config.
- * 2. `refetchIntervalInBackground: false` — a hidden tab does not poll. Twenty
- *    forgotten tabs polling every 5 minutes is real load for zero benefit.
- * 3. `refetchOnWindowFocus: true` — returning to the tab refetches immediately.
- *    Without it, a trader who alt-tabs back sees data up to 5 minutes stale
- *    and has no way to know.
- * 4. `staleTime` sits just under the interval, so the poll is what drives
- *    refreshes rather than incidental remounts.
+ * 1. `refetchOnWindowFocus: true` — returning to the tab re-reads. Kept, and
+ *    load-bearing now rather than a convenience: with nothing on a schedule it
+ *    is the one thing that refreshes a screen somebody walked back to.
+ * 2. `staleTime: 0` — moving between tabs in the app re-reads rather than
+ *    replaying a cache. It used to sit just under the poll interval because the
+ *    poll was what drove refreshes; with no poll, that number would be the only
+ *    thing standing between a navigation and a stale screen.
+ * 3. A fill or a halt on the socket still invalidates this query. That is not a
+ *    cadence — it is the book changing underneath the reader, which is the one
+ *    case where waiting to be asked is wrong.
+ *
+ * The age of the reading is displayed and advances on its own clock
+ * (`useSecondsSince`), because a number nobody refreshes still gets older.
  */
 
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -31,9 +37,7 @@ import type { EquityCurveView, LiveDashboard } from '@/api/types'
  */
 const WS_POLICY_VIOLATION = 1008
 
-const DEFAULT_REFRESH_MS = 5 * 60 * 1000
-
-/** Where the socket writes ticks. Its own key: the poll owns the book. */
+/** Where the socket writes ticks. Its own key: the aggregate read owns the book. */
 export const LIVE_QUOTES_KEY = ['quotes', 'live'] as const
 
 /** One tick, as the socket delivers it. Prices stay strings (rule §1.1). */
@@ -48,22 +52,12 @@ export function useLiveDashboard() {
   const query = useQuery<LiveDashboard>({
     queryKey: ['dashboard', 'live'],
     queryFn: () => apiGet<LiveDashboard>('/api/v1/dashboard/live'),
-    refetchInterval: (q) => (q.state.data?.refresh_seconds ?? 300) * 1000,
-    refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,
-    staleTime: DEFAULT_REFRESH_MS - 30_000,
+    staleTime: 0,
     retry: 3,
   })
 
-  return {
-    ...query,
-    /**
-     * How stale the data on screen is. Show this — a dashboard that looks
-     * live but is quietly four minutes behind is worse than one that admits it,
-     * because the user acts on it either way.
-     */
-    ageSeconds: query.dataUpdatedAt ? Math.floor((Date.now() - query.dataUpdatedAt) / 1000) : null,
-  }
+  return query
 }
 
 /**
@@ -71,23 +65,21 @@ export function useLiveDashboard() {
  *
  * A separate query from the dashboard's, on purpose. It is a *history*, not
  * part of the current picture, so it does not need to share the aggregate's
- * instant — and putting it in the aggregate would make every 5-minute poll drag
- * a month of points behind it. It refreshes on the same cadence because the
- * newest point is the one the reader is looking at.
+ * instant — and putting it in the aggregate would make every read drag a month
+ * of points behind it. It re-reads when the dashboard does, because the newest
+ * point is the one the reader is looking at.
  */
 export function useEquityCurve(days = 30, resolution?: string) {
   const suffix = resolution ? `&resolution=${resolution}` : ''
   return useQuery<EquityCurveView>({
     queryKey: ['dashboard', 'equity-curve', days, resolution ?? 'auto'],
     queryFn: () => apiGet<EquityCurveView>(`/api/v1/dashboard/equity-curve?days=${days}${suffix}`),
-    refetchInterval: DEFAULT_REFRESH_MS,
-    refetchIntervalInBackground: false,
-    staleTime: DEFAULT_REFRESH_MS - 30_000,
+    staleTime: 0,
     retry: 2,
   })
 }
 
-/** The latest tick per symbol, as delivered by the socket since the last poll. */
+/** The latest tick per symbol, as delivered by the socket since the last read. */
 export function useLiveQuotes(): Record<string, LiveQuote> {
   const { data } = useQuery<Record<string, LiveQuote>>({
     queryKey: LIVE_QUOTES_KEY,
@@ -102,11 +94,11 @@ export function useLiveQuotes(): Record<string, LiveQuote> {
 }
 
 /**
- * Live push between polls.
+ * Live push between reads.
  *
  * **Ticks do not patch the book.** A quote goes into its own cache entry and is
  * rendered as its own, clearly-labelled live price; the position's mark, its
- * P&L and every percentage beside it stay exactly as the poll delivered them,
+ * P&L and every percentage beside it stay exactly as the read delivered them,
  * with the book's age shown. The alternative — writing a fresh price into the
  * position and leaving the P&L computed from the old one — produces precisely
  * the screen assembled from two instants that the single aggregate endpoint
@@ -114,7 +106,7 @@ export function useLiveQuotes(): Record<string, LiveQuote> {
  * on money in IEEE 754 (rule §1.1).
  *
  * A fill or a halt refetches instead: both change more of the picture than one
- * message carries, and the poll is the authoritative path.
+ * message carries, and the aggregate read is the authoritative path.
  *
  * The socket opens even when there is nothing to subscribe to. Halts are
  * delivered to every client regardless of subscription, and a dashboard holding

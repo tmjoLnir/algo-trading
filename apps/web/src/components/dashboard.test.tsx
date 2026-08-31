@@ -1,6 +1,7 @@
-import { cleanup, render, screen, within } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { act, cleanup, render, screen, within } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import AccountSummary from './AccountSummary'
+import RefreshIndicator from './RefreshIndicator'
 import OrdersTable from './OrdersTable'
 import PositionsTable from './PositionsTable'
 import SignalFeed from './SignalFeed'
@@ -340,5 +341,72 @@ describe('FeedStatus', () => {
     render(<FeedStatus healthy={false} lastDataAt="2024-06-03T14:00:00Z" marketOpen={false} />)
 
     expect(screen.getByText('feed quiet')).toBeDefined()
+  })
+})
+
+/**
+ * The indicator is the whole freshness story now that nothing refreshes on a
+ * timer (ADR 0022), so the property under test is not what it renders once —
+ * it is that it keeps telling the truth while nothing whatsoever happens.
+ */
+describe('RefreshIndicator', () => {
+  const props = {
+    isFetching: false,
+    onRefresh: () => {},
+    staleAfterSeconds: 300,
+  }
+
+  it('advances the read age with nothing re-reading', async () => {
+    // Before ADR 0022 the poll re-rendered this component on its own schedule
+    // and the age moved as a side effect. Manual refresh removes that, and an
+    // age frozen at "5s ago" for an hour is the single most misleading thing
+    // this screen could say.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      render(<RefreshIndicator {...props} updatedAt={Date.now()} bookAgeSeconds={null} />)
+      expect(screen.getByText(/Read 0s ago/)).toBeTruthy()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(90 * 1000)
+      })
+
+      expect(screen.getByText(/Read 1m ago/)).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('warns that the worker book is old as time passes, not only on arrival', async () => {
+    /**
+     * The local-hosting case, in a test (docs/LOCAL_HOSTING.md §1).
+     *
+     * A tab is open against a healthy worker — book 20 seconds old — and then
+     * the machine sleeps for hours. Nothing fetches, so the server never gets
+     * to tell us the book has aged; the only number we have is the one from
+     * before the outage started. Judging by it alone, the badge could never
+     * appear, and the screen would sit there looking current for as long as
+     * anybody left it open.
+     */
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      render(<RefreshIndicator {...props} updatedAt={Date.now()} bookAgeSeconds={20} />)
+      expect(screen.queryByText(/worker book/)).toBeNull()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1000)
+      })
+
+      expect(screen.getByText(/worker book 2h old/)).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('says plainly that it does not update itself', () => {
+    // A reader who believes the screen is live will not reload it, which makes
+    // this sentence part of the safety story rather than a caption.
+    render(<RefreshIndicator {...props} updatedAt={Date.now()} bookAgeSeconds={null} />)
+
+    expect(screen.getByText(/does not update itself/)).toBeTruthy()
   })
 })

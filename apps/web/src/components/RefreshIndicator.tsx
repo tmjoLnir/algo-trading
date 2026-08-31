@@ -1,60 +1,78 @@
 /**
- * Says how old the data is and when it next refreshes.
+ * Says how old what you are looking at is, and gives you the button to re-read.
  *
- * With a 5-minute cadence the user cannot tell fresh data from four-minute-old
- * data by looking. Making the age explicit — and visibly warning once it
- * exceeds the interval — is the difference between a dashboard that is trusted
- * correctly and one that is trusted blindly.
+ * Nothing on this dashboard refreshes on a timer any more (ADR 0022), which
+ * makes this component the whole of the freshness story rather than a caption
+ * beside it. A screen that is only ever as current as the last time somebody
+ * asked has to say so continuously and without being asked, because the reader
+ * has no other way to tell four-second-old data from four-hour-old data.
  *
- * Two ages, not one, because there are two of them. `ageSeconds` is how long
- * since this browser last fetched; `bookAgeSeconds` is how far behind the
- * *worker's* book was when it did. A tab that just refreshed against a worker
- * that stopped publishing an hour ago is fresh by one measure and useless by
- * the other, and collapsing them into a single "updated 2s ago" is exactly the
- * reassurance that would hide it.
+ * **Two ages, not one, because there are two of them.** How long since this
+ * browser read, and how far behind the *worker's* book already was when it did.
+ * A tab that read a second ago against a worker that stopped publishing an hour
+ * ago is fresh by one measure and useless by the other, and collapsing them
+ * into a single "updated 2s ago" is exactly the reassurance that would hide it.
+ *
+ * **The book age shown is the sum of both, and that is the point.** The server
+ * can only tell us how old the book was *at the moment we asked*; that number is
+ * frozen the instant it arrives. Adding the time since we asked turns it back
+ * into a live lower bound on how stale the book is now — which is what makes the
+ * warning still fire when a laptop sleeps for four hours with this tab open
+ * (docs/LOCAL_HOSTING.md §1). Without the addition the badge would be judging a
+ * four-hour-old outage by a number captured before it started.
  */
 
 import { formatAge } from '@/lib/money'
+import { useSecondsSince } from '@/hooks/useSecondsSince'
 
 interface Props {
-  ageSeconds: number | null
+  /** When this browser last read, in epoch ms. Null before the first read. */
+  updatedAt: number | null
   isFetching: boolean
   onRefresh: () => void
-  intervalSeconds: number
+  /** Past this, an age stops being a caption and becomes a warning. */
+  staleAfterSeconds: number
   stale?: boolean
-  /** How far behind the worker's published book was. Null when there is none. */
+  /** How far behind the worker's book was *when it was read*. Null when none. */
   bookAgeSeconds?: number | null
 }
 
 export default function RefreshIndicator({
-  ageSeconds,
+  updatedAt,
   isFetching,
   onRefresh,
-  intervalSeconds,
+  staleAfterSeconds,
   stale,
   bookAgeSeconds = null,
 }: Props) {
-  const overdue = ageSeconds !== null && ageSeconds > intervalSeconds * 1.5
+  // Ticks here rather than in the page: this is the only thing on the dashboard
+  // that has to re-render every second, and dragging the position table and the
+  // equity chart along with it would be a real cost to move one caption.
+  const ageSeconds = useSecondsSince(updatedAt)
+
+  const overdue = ageSeconds !== null && ageSeconds > staleAfterSeconds
   const color = stale || overdue ? 'text-amber-400' : 'text-slate-400'
-  // The book lagging by more than a poll interval means the worker has stopped
+  // The lower bound on how old the worker's book is *now* — see the header.
+  // A book that has aged past the threshold means the worker has stopped
   // publishing, not that this tab is behind.
-  const bookLagging = bookAgeSeconds !== null && bookAgeSeconds > intervalSeconds
+  const effectiveBookAge = bookAgeSeconds === null ? null : bookAgeSeconds + (ageSeconds ?? 0)
+  const bookLagging = effectiveBookAge !== null && effectiveBookAge > staleAfterSeconds
 
   return (
     <div className="flex flex-wrap items-center gap-3 text-xs">
       <span className={color}>
         {isFetching
-          ? 'Refreshing…'
+          ? 'Reading…'
           : ageSeconds === null
             ? '—'
-            : `Updated ${ageSeconds}s ago${overdue ? ' — data may be stale' : ''}`}
+            : `Read ${formatAge(ageSeconds)} ago${overdue ? ' — may be out of date' : ''}`}
       </span>
       {bookLagging ? (
         <span className="rounded bg-amber-950/50 px-1.5 py-0.5 font-medium text-amber-400">
-          worker book {formatAge(bookAgeSeconds)} old
+          worker book {formatAge(effectiveBookAge)} old
         </span>
       ) : null}
-      <span className="text-slate-600">auto-refresh every {intervalSeconds / 60} min</span>
+      <span className="text-slate-600">manual refresh — this screen does not update itself</span>
       <button
         onClick={onRefresh}
         className="rounded border border-slate-700 px-2 py-1 text-slate-300 hover:bg-slate-800"

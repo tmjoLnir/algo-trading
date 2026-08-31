@@ -163,8 +163,10 @@ class ResumedView(BaseModel):
     while a symbol halt stands leaves trading partly stopped, which matters — but
     answering it here means a second read of the store on a path whose first
     write has already landed, so a failed read would report failure for a resume
-    that actually happened. The banner re-reads every halt on the next poll and
-    stays up if any remain; that is the honest place for the question.
+    that actually happened. The halt reaches every connected client over the
+    socket, and the banner re-reads the full list when it does — staying up if
+    any remain. That is the honest place for the question, and it is why halts
+    were left on a push path rather than a schedule the reader controls.
     """
 
     scope: str

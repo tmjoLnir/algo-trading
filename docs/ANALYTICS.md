@@ -331,9 +331,10 @@ demonstrably describing one period rather than three that coincide, and each
 panel renders or fails on its own — a reader who can still see their trades is
 better served than one looking at an error page.
 
-**Nothing polls.** The live dashboard refreshes every five minutes because the
-book moves. A finished period does not, and a poll would re-run a reconstruction
-that reads the whole order history to produce an identical answer.
+**Nothing polls** — and since ADR 0022 nothing anywhere does, so this stopped
+being the exception it was written as. The reason these reads never polled is the
+stronger one: a finished period cannot change, and re-reading would repeat a
+reconstruction over the whole order history to produce an identical answer.
 
 Four things the screen refuses to do, each of which is the tempting version:
 

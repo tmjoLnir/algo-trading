@@ -180,7 +180,8 @@ plus backfilled bars is the whole prerequisite.
 ## 4. Positions — `/positions`
 
 The stored book — the copy the worker wrote to Postgres, with its age stated
-separately from the tab's own refresh.
+separately from the tab's own. Both count up on their own clock, and the book's
+is shown as its age now rather than when it was read (ADR 0022).
 
 **Outstanding**
 
