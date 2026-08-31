@@ -9,6 +9,7 @@ import Audit from './pages/Audit'
 import Login from './pages/Login'
 import RunModeBanner from './components/RunModeBanner'
 import HaltBanner from './components/HaltBanner'
+import LiveStream from './components/LiveStream'
 import { useLogout, useSession } from './api/session'
 
 const NAV = [
@@ -54,6 +55,12 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
+      {/* Renders nothing; holds the live socket open for as long as somebody is
+          signed in. Here rather than on the dashboard because `HaltBanner`
+          below is on every screen, and a banner fed by a socket that exists on
+          one route cannot interrupt anybody on the other six. */}
+      <LiveStream />
+
       {/* Both banners are above the nav on purpose: whether this is real money,
           and whether trading is halted, are the two facts a user must never
           have to scroll or click to discover. */}

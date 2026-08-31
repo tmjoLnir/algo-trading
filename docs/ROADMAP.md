@@ -1577,6 +1577,16 @@ wording if it is not the demonstration you want.
   published", which demonstrates the null-book path and says nothing whatever
   about agreement between the worker's numbers and the screen's — which is the
   only property that makes the screen worth reading.
+
+  **That push path was narrower than the sentence above implies, and no longer
+  is.** The socket was opened by the dashboard *screen*, so React Router closed
+  it on navigation: `HaltBanner` sits above the nav on all seven routes and was
+  fed on exactly one, and the API logged `clients=0` for the other six. A halt
+  reached the banner without a reload only while somebody happened to be looking
+  at `/`. It is held for the signed-in session now, and a reconnect re-reads the
+  book, because pub/sub has no replay and with nothing polling a gap nobody
+  repairs is permanent. Neither changes what this line asks for, or whether it
+  has been shown — the worker still has not published a book.
 - [ ] Trade reconstruction, attribution, MAE/MFE — @claude (wip #58).
   Built: `PerformanceAnalyzer` folds stored fills into round trips, measures
   MAE/MFE against bars, and groups P&L five ways; `/analytics/performance`,

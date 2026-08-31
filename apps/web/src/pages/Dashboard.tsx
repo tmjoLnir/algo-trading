@@ -9,10 +9,13 @@
  *
  * The run-mode and halt banners are not here: they live above the nav in
  * `App`, because whether this is real money and whether trading is stopped are
- * the two facts a user must never have to scroll or click to discover.
+ * the two facts a user must never have to scroll or click to discover. **The
+ * WebSocket is not here either, and for the same reason** — it feeds those
+ * banners, so it belongs to the session rather than to this page
+ * (`components/LiveStream.tsx`).
  */
 
-import { useDashboardStream, useLiveDashboard, useLiveQuotes } from '@/hooks/useLiveDashboard'
+import { useLiveDashboard, useLiveQuotes } from '@/hooks/useLiveDashboard'
 import AccountSummary from '@/components/AccountSummary'
 import PositionsTable from '@/components/PositionsTable'
 import SignalFeed from '@/components/SignalFeed'
@@ -24,11 +27,10 @@ import KillSwitchButton from '@/components/KillSwitchButton'
 
 export default function Dashboard() {
   const { data, isLoading, error, dataUpdatedAt, refetch, isFetching } = useLiveDashboard()
+  // Read here, written by the socket `App` holds open. This page renders the
+  // ticks; it deliberately does not own the connection that carries them —
+  // `components/LiveStream.tsx` says why.
   const quotes = useLiveQuotes()
-  // Subscribed to what the book holds, but the socket opens regardless — halts
-  // reach every client whether it asked for anything or not, and a dashboard
-  // holding nothing is the one that most needs to hear about one.
-  useDashboardStream(data?.positions?.map((p) => p.symbol) ?? [])
 
   if (isLoading) return <div className="p-8 text-slate-400">Loading…</div>
 
