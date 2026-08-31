@@ -13,10 +13,11 @@ loudly but two that disagree quietly.
 
 Nothing here is a durable record. Redis pub/sub has no persistence and no
 delivery guarantee, so a subscriber that is down misses everything sent while it
-was away and catches up on the dashboard's 5-minute poll, which is the
-authoritative path (docs/DASHBOARD.md, `persistence/events.py`). Anything that
-must not be lost is written to the database or to a key *first* and announced
-here second.
+was away, and the dashboard catches up on its next read — which is the
+authoritative path, and since ADR 0022 happens when the reader asks rather than
+on a timer (docs/DASHBOARD.md, `persistence/events.py`). Anything that must not
+be lost is written to the database or to a key *first* and announced here
+second.
 """
 
 from __future__ import annotations

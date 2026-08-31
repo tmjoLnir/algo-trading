@@ -150,9 +150,11 @@ class Settings(BaseSettings):
     api_password_hash: SecretStr = SecretStr("")
 
     #: How long a login lasts. Short enough that a forgotten open tab is not a
-    #: standing key, long enough not to interrupt a trading session — the
-    #: dashboard polls every 5 minutes and a re-login mid-incident is exactly
-    #: the wrong moment to demand one.
+    #: standing key, long enough not to interrupt a trading session. Nothing
+    #: polls since ADR 0022, so an expiry is no longer discovered by a background
+    #: request while nobody is watching — it surfaces on the next read, which is
+    #: to say in front of somebody who just asked the screen a question, and a
+    #: re-login mid-incident is exactly the wrong moment to demand one.
     api_session_hours: int = 12
 
     #: How many sign-in attempts one client address may make per window before

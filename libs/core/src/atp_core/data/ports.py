@@ -178,9 +178,10 @@ class EventPublisher(Protocol):
     holding a socket.
 
     Publishing is best-effort by contract, and callers are expected to swallow
-    its failures. The dashboard degrades to its 5-minute poll when a tick is
-    dropped (`apps/api/src/atp_api/ws.py`); market data must not stop being
-    stored because a subscriber is down.
+    its failures. A dropped tick leaves the dashboard on what its last read
+    returned, with that reading's age on the screen
+    (`apps/api/src/atp_api/ws.py`); market data must not stop being stored
+    because a subscriber is down.
     """
 
     async def publish(self, channel: str, message: dict[str, Any]) -> None:

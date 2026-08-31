@@ -607,7 +607,7 @@ class TestEquityCurveEndpoint:
         self, client: httpx.AsyncClient, repo: FakePortfolioRepository
     ) -> None:
         """An unbounded query is one URL away from a table scan that blocks
-        every dashboard poll behind it."""
+        every other dashboard read behind it."""
         repo.equity_points = self.minute_points(10)
 
         await client.get(CURVE, params={"days": 7})

@@ -53,9 +53,10 @@ if TYPE_CHECKING:
 #: "how close are we to the timeout", so the tail is where the buckets are.
 _BROKER_BUCKETS: Final = (0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0)
 
-#: Buckets for handling one HTTP request. The dashboard polls every five minutes
-#: and a human is waiting on the other end of each of these, so anything past a
-#: couple of seconds is a single "too slow" bucket rather than a distribution.
+#: Buckets for handling one HTTP request. Since ADR 0022 the dashboard reads only
+#: when asked, so a human is waiting on the other end of every one of these —
+#: anything past a couple of seconds is a single "too slow" bucket rather than a
+#: distribution.
 _API_BUCKETS: Final = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0)
 
 

@@ -388,11 +388,13 @@ class RedisKillSwitch:
         that matters, by making an unpublishable halt look like a halt that did
         not happen.
 
-        Without it a halt reaches the screen on the dashboard's next five-minute
-        poll. `atp_api.ws` fans these out to every client regardless of what it
-        subscribed to, because a trading halt is not something to opt into, and
-        five minutes is a long time to be looking at a screen that says trading
-        is fine.
+        Without it a halt reaches the screen only when somebody thinks to
+        reload. Nothing polls (ADR 0022), so this is the whole of what puts a
+        halt in front of a reader who has not asked — the client re-reads the
+        book when one arrives. `atp_api.ws` fans these out to every client
+        regardless of what it subscribed to, because a trading halt is not
+        something to opt into, and a screen whose job is to interrupt somebody
+        cannot require them to consult it first.
         """
         message: dict[str, Any] = {
             "type": "halt",

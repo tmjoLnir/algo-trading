@@ -36,8 +36,9 @@ are allowed to deploy.
 > reach the dashboard on it.
 
 One always-on x86 VM per run mode, in a **US-East region** — Alpaca's API is
-there, and that is where latency is spent. The dashboard refreshes every five
-minutes, so your own distance from the host does not matter.
+there, and that is where latency is spent. Nothing on the trading path runs in
+your browser — the dashboard is read when you ask for it (ADR 0022), not on a
+timer — so your own distance from the host does not matter.
 
 | | |
 |---|---|

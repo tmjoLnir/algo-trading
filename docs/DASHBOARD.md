@@ -142,7 +142,7 @@ bars, the strategy runner for fills and signals, the kill switch for halts.
   symbol you did not subscribe to is still your money.
 - **A client that stops reading is dropped** on a short deadline rather than
   buffered for. Unbounded buffering for one slow reader costs every other
-  client, and the poll recovers whatever it misses.
+  client, and the next read recovers whatever it misses.
 - **The bridge retries forever.** Nothing here is traded on, so a dead bridge
   costs live updates and never data a decision is made from.
 
@@ -445,12 +445,12 @@ to hold forty bars; a running run that has not reported yet says so rather than
 showing 0%, which reads as stalled. A failed one shows its reason in words. A done
 one shows its headline figures.
 
-**This screen polls only while something is in flight.** Every other tab either
-polls on a fixed cadence or not at all; a backtest changes state within seconds
-and then never again, so the interval is derived from the data — once every run is
+**This screen polls only while something is in flight**, and since ADR 0022 it
+is the only one that polls at all. A backtest changes state within seconds and
+then never again, so the interval is derived from the data — once every run is
 terminal the timer stops entirely and a tab left open makes no requests. Same
-principle as not polling a hidden tab, on a different axis: do not ask a question
-whose answer cannot have changed.
+principle as the rest of the dashboard refreshing only when asked, on a different
+axis: do not ask a question whose answer cannot have changed.
 
 **The caveats are above the numbers, not below them.** A run's `warnings` come
 from the server, because a number a reader has already seen is a number they
