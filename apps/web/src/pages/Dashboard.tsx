@@ -1,8 +1,10 @@
 /**
  * The live dashboard — requirement #7.
  *
- * Auto-refreshes every 5 minutes via `useLiveDashboard`, with WebSocket ticks
- * in between. Layout priority, top to bottom, is what a person needs in the
+ * Read when the reader asks — a browser reload, or the button on the indicator
+ * (ADR 0022). WebSocket ticks still arrive in between, and a fill or a halt
+ * still re-reads on its own, because those are the book changing rather than a
+ * clock going off. Layout priority, top to bottom, is what a person needs in the
  * order they need it: am I in danger → what do I hold → why → what's pending.
  *
  * The run-mode and halt banners are not here: they live above the nav in
@@ -21,7 +23,7 @@ import RefreshIndicator from '@/components/RefreshIndicator'
 import KillSwitchButton from '@/components/KillSwitchButton'
 
 export default function Dashboard() {
-  const { data, isLoading, error, ageSeconds, refetch, isFetching } = useLiveDashboard()
+  const { data, isLoading, error, dataUpdatedAt, refetch, isFetching } = useLiveDashboard()
   const quotes = useLiveQuotes()
   // Subscribed to what the book holds, but the socket opens regardless — halts
   // reach every client whether it asked for anything or not, and a dashboard
@@ -41,10 +43,10 @@ export default function Dashboard() {
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <RefreshIndicator
-          ageSeconds={ageSeconds}
+          updatedAt={dataUpdatedAt || null}
           isFetching={isFetching}
           onRefresh={() => refetch()}
-          intervalSeconds={data?.refresh_seconds ?? 300}
+          staleAfterSeconds={data?.stale_after_seconds ?? 300}
           stale={Boolean(error)}
           bookAgeSeconds={data?.book_age_seconds ?? null}
         />
@@ -61,8 +63,8 @@ export default function Dashboard() {
       {error ? (
         // Kept alongside the data rather than instead of it.
         <p className="rounded border border-amber-700/60 bg-amber-950/30 px-3 py-2 text-sm text-amber-200">
-          ⚠ The last refresh failed — everything below is as of{' '}
-          {ageSeconds === null ? 'an unknown time' : `${ageSeconds}s ago`} and may be out of date.
+          ⚠ The last read failed — everything below is from the last one that succeeded, whose age
+          is above and still counting. Reload to try again.
         </p>
       ) : null}
 

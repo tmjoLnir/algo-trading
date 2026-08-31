@@ -1527,7 +1527,7 @@ wording if it is not the demonstration you want.
   `TradingCalendar` in-process, without an HTTP round trip. It is for the
   charting views that will grey out non-trading days, and it wants a
   *Verifiable:* line of its own when one of those exists.
-- [ ] React dashboard, 5-min refresh + WS — @claude (wip #45).
+- [ ] React dashboard, on-demand refresh + WS — @claude (wip #45).
   The six stub components render the book now, and `src/api/types.ts` stopped
   being a hand-written copy of a server contract: `make gen-types` dumps the
   OpenAPI document straight from the app — no running server, which is what
@@ -1555,7 +1555,25 @@ wording if it is not the demonstration you want.
   built bundle, through the proxy, against a live API — so the front end, the
   serving layer and the endpoint are shown to work as one. What is missing is
   the subject of this phase's *Verifiable:* line, a book that a **worker**
-  published. With nothing trading, the screen correctly reports "No book
+  published.
+
+  **The 5-minute cadence is gone** (ADR 0022): the reader reloads, or uses the
+  button on the indicator. The item is retitled rather than re-scoped — what
+  changed is the requirement, not the amount built. The cadence had been
+  carrying something nobody had written down, which is why this was more than a
+  deletion: every age on the screen was computed during render, so the poll was
+  what made it advance. Both ages now run on their own ticker, and the book's is
+  shown as its age *now* — the server's number plus the time since the read —
+  because a frozen one could not warn about an outage that started after the
+  read. That is the tab-left-open-across-a-sleeping-laptop case, which on this
+  host (ADR 0021) is the failure mode that decides a paper week.
+
+  **This phase's *Verifiable:* line is unaffected and was the constraint.** It
+  asks that the age of the book be on the screen *and advance*, and that halting
+  make the banner appear without a reload. A naive removal would have broken
+  both; halts stayed on the socket's push path and the ticker keeps the age
+  moving, so the line stands as written and this item stays unticked for the
+  reason it already was — no worker has published a book to agree with. With nothing trading, the screen correctly reports "No book
   published", which demonstrates the null-book path and says nothing whatever
   about agreement between the worker's numbers and the screen's — which is the
   only property that makes the screen worth reading.

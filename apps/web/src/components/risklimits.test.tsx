@@ -227,7 +227,7 @@ describe('when the status endpoint fails', () => {
 
   it('does not ask for the ceilings while the primary is answering', async () => {
     // One request in the ordinary case. The fallback is a failure path, not a
-    // second poll on every page load.
+    // second request on every page load.
     const fetchMock = stub({})
     renderPanel()
 

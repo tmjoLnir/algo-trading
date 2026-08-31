@@ -1,32 +1,45 @@
 # Dashboard
 
-Requirement #7: review live trades selected by preset rules, auto-refreshed
-every 5 minutes.
+Requirement #7: review live trades selected by preset rules, refreshed on
+demand.
 
 ## The refresh model
 
-Two paths, deliberately:
+**Nothing refreshes on a clock** ([ADR 0022](adr/0022-the-dashboard-refreshes-when-asked.md)).
+The reader re-reads with a browser reload or the button on the indicator.
 
-| | Cadence | Role |
+| | When | Role |
 |---|---|---|
-| Poll `/dashboard/live` | 5 min | authoritative, consistent snapshot |
-| WebSocket | live | ticks, fills, signals and halts between polls |
+| Read `/dashboard/live` | on demand · window focus · in-app navigation | authoritative, consistent snapshot |
+| WebSocket | live | ticks, fills, signals and halts between reads |
 
 **One aggregate endpoint, not six parallel requests.** Six fetches produce a
 screen assembled from six different instants; on a fast-moving position, a P&L
 computed from one snapshot and a price from another simply disagree, and the
 reader cannot tell which to trust. One query, one picture.
 
-**The WebSocket is an enhancement, never the source of truth.** A dropped socket
-degrades the dashboard to 5-minute freshness rather than leaving it stale
-forever. That is why the poll exists even though push is "better".
+**The WebSocket is an enhancement, never the source of truth.** It carries
+ticks; a fill or a halt makes the client re-read the aggregate rather than patch
+what is on screen, because both change more of the picture than one message
+carries. A dropped socket costs the live half and leaves reloading intact.
 
-Implemented in `useLiveDashboard.ts`:
+**A halt does not wait to be asked for.** It is pushed to every client,
+subscribed or not, and re-reads the book when it lands. A banner whose job is to
+interrupt somebody cannot require them to reload first.
 
-- interval comes from the server's `refresh_seconds` — one place to change it
-- no polling in a hidden tab
-- refetch on window focus, so alt-tabbing back does not show 5-minute-old data
-- `ageSeconds` is displayed, and warns visibly past 1.5× the interval
+Implemented in `useLiveDashboard.ts` and `useSecondsSince.ts`:
+
+- no interval on any live query; `staleTime: 0` so in-app navigation re-reads
+- refetch on window focus, so returning to the tab does not show an old screen
+- both ages advance on a one-second ticker, because a reading nobody refreshes
+  still gets older — and an age that only moved when something fetched would sit
+  frozen for as long as the tab is open
+- the **book's** age is shown as its age *now*: the server's number plus the time
+  since the read. Frozen, it could not warn about an outage that began after the
+  read — which is the tab-left-open-across-a-sleeping-laptop case
+  (`docs/LOCAL_HOSTING.md` §1)
+- `stale_after_seconds` comes from the server — one place to decide "too old to
+  act on"
 
 ## Where the numbers come from
 
@@ -569,8 +582,9 @@ on `API_CORS_ORIGINS` and giving up a bundle that travels.
 The socket's scheme is derived from the page's rather than hardcoded
 (`src/api/origin.ts`): a browser refuses a `ws://` socket from an `https://` page
 as mixed content, so a hardcoded scheme is a dashboard that loses every live
-update the day it goes behind TLS — while the 5-minute poll keeps working and
-hides that it has.
+update the day it goes behind TLS — while reloading keeps working and hides that
+it has. What is lost is the live half: ticks, and the halt that was meant to
+interrupt somebody.
 
 ### What nginx does
 

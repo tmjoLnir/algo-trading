@@ -38,7 +38,9 @@ export function apiBase(override = import.meta.env.VITE_API_BASE_URL): string {
  * The scheme is derived from the page's, not hardcoded: a page served over
  * HTTPS may not open a `ws://` socket — browsers block it as mixed content —
  * so a hardcoded `ws://` is a dashboard that silently loses live updates the
- * day it is put behind TLS, while the 5-minute poll keeps working and hides it.
+ * day it is put behind TLS. The reads keep working and hide it: the screen still
+ * fills in on every reload, so what is missing is the live half — ticks, and the
+ * halt that was supposed to interrupt somebody.
  */
 export function wsUrl(
   loc: OriginLocation = window.location,

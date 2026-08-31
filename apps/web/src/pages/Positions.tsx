@@ -28,6 +28,7 @@
 
 import PositionsTable from '@/components/PositionsTable'
 import { useStoredBook } from '@/hooks/useStoredBook'
+import { useSecondsSince } from '@/hooks/useSecondsSince'
 import { UNKNOWN, formatAge, formatDateTime, formatMoney } from '@/lib/money'
 import type { AccountView } from '@/api/types'
 
@@ -38,6 +39,11 @@ import type { AccountView } from '@/api/types'
  * runs on the minute. A book older than ten of them means the worker has missed
  * several in a row, which is a fact about the *worker* rather than about the
  * market — and it is the fact this screen is being read for.
+ *
+ * Measured against the book's age *now* rather than its age when we read it —
+ * see `BookAge`. Nothing re-reads on a schedule any more (ADR 0022), so judging
+ * this against the server's frozen number would mean a book that was fresh when
+ * the tab loaded could never become stale no matter how long the tab sat there.
  */
 const STALE_AFTER_SECONDS = 600
 
@@ -76,8 +82,78 @@ function formatDecimalOrDash(value: string | null): string {
   return value === null ? UNKNOWN : `${formatMoney(value)}×`
 }
 
+/**
+ * The age header — the most important thing on this page.
+ *
+ * Its own component because it is the only part of this screen that has to
+ * re-render every second. Ticking at the page level would redraw the position
+ * table alongside it, once a second, to advance two captions.
+ *
+ * **Both ages are live, and the book's age is derived rather than reported.**
+ * `age_seconds` from the server is how old the book was at the instant we read
+ * it, and it stops moving the moment it arrives. Adding the time since that
+ * read turns it back into what the reader actually needs — how old the book is
+ * *now* — and is what keeps the staleness warning reachable on a screen that
+ * nothing refreshes on a schedule (ADR 0022). A tab left open across a sleeping
+ * laptop is the case this is for: the book was 20 seconds old when the tab
+ * loaded and is four hours old now, and only one of those is worth telling
+ * somebody about.
+ *
+ * It is a lower bound, not an estimate: the worker may have stopped publishing
+ * at any point after we read, never before it.
+ */
+function BookAge({
+  bookAgeAtRead,
+  asOf,
+  runMode,
+  updatedAt,
+}: {
+  bookAgeAtRead: number | null
+  asOf: string | null
+  runMode: string
+  updatedAt: number | null
+}) {
+  const sinceRead = useSecondsSince(updatedAt)
+  const bookAge = (bookAgeAtRead ?? 0) + (sinceRead ?? 0)
+  const stale = bookAge >= STALE_AFTER_SECONDS
+
+  return (
+    // The age leads. Every figure below describes one past instant, and how far
+    // past it is decides whether any of them can be acted on.
+    <div
+      className={`rounded border px-4 py-3 ${
+        stale
+          ? 'border-amber-700/60 bg-amber-950/30 text-amber-200'
+          : 'border-slate-800 bg-slate-900/40 text-slate-300'
+      }`}
+    >
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <span className="text-sm">
+          {stale ? '⚠ ' : ''}
+          The worker last recorded this book{' '}
+          <span className="font-semibold tabular-nums">{formatAge(bookAge)}</span> ago
+          <span className="text-slate-500"> · {formatDateTime(asOf)}</span>
+        </span>
+        <span className="text-xs text-slate-500">
+          {/* Two ages, deliberately. A tab that read a second ago against a
+              worker that stopped an hour ago is fresh by one measure and
+              useless by the other. */}
+          this tab read {formatAge(sinceRead)} ago · {runMode}
+        </span>
+      </div>
+      {stale ? (
+        <p className="mt-1 text-xs">
+          The worker writes a snapshot on every evaluation, so a book this old means it has missed
+          several. Treat every figure below as history, not as your current exposure. Reload to
+          re-read.
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
 export default function Positions() {
-  const { data, isLoading, error, fetchedSecondsAgo } = useStoredBook()
+  const { data, isLoading, error, dataUpdatedAt } = useStoredBook()
 
   if (isLoading) return <p className="p-8 text-sm text-slate-400">Loading…</p>
 
@@ -109,7 +185,6 @@ export default function Positions() {
     )
   }
 
-  const stale = (data.age_seconds ?? 0) >= STALE_AFTER_SECONDS
   const positions = data.positions ?? []
   // Optional in the generated schema because the server model defaults it.
   // Resolved once, so the branch below compares a list rather than a maybe-list.
@@ -117,36 +192,12 @@ export default function Positions() {
 
   return (
     <div className="space-y-4">
-      {/* The age leads. Every figure below describes one past instant, and how
-          far past it is decides whether any of them can be acted on. */}
-      <div
-        className={`rounded border px-4 py-3 ${
-          stale
-            ? 'border-amber-700/60 bg-amber-950/30 text-amber-200'
-            : 'border-slate-800 bg-slate-900/40 text-slate-300'
-        }`}
-      >
-        <div className="flex flex-wrap items-baseline justify-between gap-2">
-          <span className="text-sm">
-            {stale ? '⚠ ' : ''}
-            The worker last recorded this book{' '}
-            <span className="font-semibold tabular-nums">{formatAge(data.age_seconds)}</span> ago
-            <span className="text-slate-500"> · {formatDateTime(data.as_of)}</span>
-          </span>
-          <span className="text-xs text-slate-500">
-            {/* Two ages, deliberately. A tab that refreshed a second ago against
-                a worker that stopped an hour ago is fresh by one measure and
-                useless by the other. */}
-            this tab refreshed {formatAge(fetchedSecondsAgo)} ago · {data.run_mode}
-          </span>
-        </div>
-        {stale ? (
-          <p className="mt-1 text-xs">
-            The worker writes a snapshot on every evaluation, so a book this old means it has missed
-            several. Treat every figure below as history, not as your current exposure.
-          </p>
-        ) : null}
-      </div>
+      <BookAge
+        bookAgeAtRead={data.age_seconds}
+        asOf={data.as_of}
+        runMode={data.run_mode}
+        updatedAt={dataUpdatedAt || null}
+      />
 
       {data.account ? <Account account={data.account} /> : null}
 
@@ -180,8 +231,8 @@ export default function Positions() {
 
       {error ? (
         <p className="rounded border border-amber-700/60 bg-amber-950/30 px-3 py-2 text-xs text-amber-200">
-          ⚠ The last refresh failed, so the age above has stopped advancing. Everything on screen is
-          the last book that was read successfully.
+          ⚠ The last read failed, so nothing below has changed since the read before it. The ages
+          above are still counting, and are measured from that earlier read.
         </p>
       ) : null}
     </div>

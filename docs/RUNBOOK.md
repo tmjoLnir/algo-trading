@@ -166,10 +166,17 @@ Likely a retry without `client_order_id` reuse, or two workers running.
 3. Decide immediately: close manually or accept the position. Do not leave it.
 4. Afterwards: why was there no broker-side stop?
 
-## Dashboard stopped updating between polls (`ws.bridge_failed`)
+## Dashboard stopped updating between reads (`ws.bridge_failed`)
 
 *Symptom:* `ws.bridge_failed error='Timeout reading from redis:6379'` in the API
-log; the dashboard still refreshes every 5 minutes but nothing moves in between.
+log; prices on the dashboard sit still, and a halt or a fill does not appear
+until somebody reloads.
+
+**This is harder to spot than it was.** While the dashboard polled, a live
+screen that had stopped moving between polls was the tell. Nothing polls now
+(ADR 0022), so a working platform and a dropped bridge look the same until you
+reload: if reloading fills in prices and events that never arrived on their own,
+the reads are fine and the socket is not.
 
 This warning means the API's Redis subscription dropped. **It is signal, not
 noise** — worth knowing because it used to be the opposite. Before #89 a quiet
@@ -178,8 +185,8 @@ healthy Redis, so anyone who worked here through that has learned to scroll past
 it. It no longer fires on an idle subscription.
 
 1. The trading loop does not depend on this. The worker publishes to Redis and
-   does not care whether the API is listening, and the dashboard's 5-minute
-   poll is the source of truth regardless — so this degrades freshness, it does
+   does not care whether the API is listening, and the dashboard's aggregate
+   read is the source of truth regardless — so this degrades freshness, it does
    not stop trading and it does not lose an order.
 2. Check Redis is up and reachable *from the API container*: `docker compose
    exec api redis-cli -u "$REDIS_URL" ping`. `/readyz` reports the same thing.
@@ -188,9 +195,11 @@ it. It no longer fires on an idle subscription.
    Redis symptom is the connection dying under load; check `maxclients` and
    memory on the Redis instance.
 4. Note what *was* missed. Pub/sub has no replay, so anything published while
-   the bridge was down reached no browser — including a halt. The poll fills the
-   book back in, but a halt banner that should have appeared at 14:31 will not
-   appear until the next poll.
+   the bridge was down reached no browser — including a halt. Reloading fills
+   the book back in and the banner then renders from the kill switch directly,
+   but a halt banner that should have appeared at 14:31 will not appear until
+   somebody reloads. **While this warning is firing, the halt banner is not a
+   live alarm** — treat `scripts/status.py` as the check, not the screen.
 
 ## Dashboard shows "502 Bad Gateway"
 

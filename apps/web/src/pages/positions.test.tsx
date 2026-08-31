@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import Positions from './Positions'
 import type { AccountView, PositionView, StoredBookView } from '@/api/types'
@@ -20,8 +20,11 @@ import type { AccountView, PositionView, StoredBookView } from '@/api/types'
  *    said what you hold" are different sentences and only one is safe to act on.
  * 3. **An unreadable book is not an empty one either** — the same rule the audit
  *    page follows for a 503.
- * 4. **Two ages, not one.** A tab that refreshed a second ago against a worker
- *    that stopped an hour ago is fresh by one measure and useless by the other.
+ * 4. **Two ages, not one.** A tab that read a second ago against a worker that
+ *    stopped an hour ago is fresh by one measure and useless by the other. Both
+ *    advance on their own clock, because since ADR 0022 nothing re-reads on a
+ *    schedule and an age that only moved when something fetched would sit still
+ *    for as long as the tab is open.
  */
 
 afterEach(() => {
@@ -121,12 +124,45 @@ describe('the age', () => {
     expect(screen.queryByText(/Treat every figure below as history/)).toBeNull()
   })
 
-  it('shows the tab refresh age separately from the book age', async () => {
+  it('shows the tab read age separately from the book age', async () => {
     // Fresh by one measure and useless by the other (docs/DASHBOARD.md).
     stub(200, book())
     renderPage()
 
-    expect(await screen.findByText(/this tab refreshed/)).toBeTruthy()
+    expect(await screen.findByText(/this tab read/)).toBeTruthy()
+  })
+
+  it('ages the book on its own clock, with nothing re-reading', async () => {
+    /**
+     * The regression this whole change could have shipped.
+     *
+     * `age_seconds` is how old the book was *when we read it*, and it stops
+     * moving the moment it arrives. While a 5-minute poll existed, a fresh one
+     * arrived before anybody noticed. With manual refresh, judging staleness by
+     * that frozen number means a book that was current when the tab loaded can
+     * never become stale — which is precisely the tab-left-open-across-a-sleeping
+     * -laptop case the warning exists for (docs/LOCAL_HOSTING.md §1).
+     *
+     * So: read a book that is comfortably fresh, then let ten minutes pass with
+     * no fetch at all, and the screen must have worked out on its own that what
+     * it is showing is now too old to act on.
+     */
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      stub(200, book({ age_seconds: 30 }))
+      renderPage()
+
+      await screen.findByText(/The worker last recorded this book/)
+      expect(screen.queryByText(/Treat every figure below as history/)).toBeNull()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10 * 60 * 1000)
+      })
+
+      expect(screen.getByText(/Treat every figure below as history/)).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

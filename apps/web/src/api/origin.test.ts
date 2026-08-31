@@ -5,8 +5,9 @@ import { apiBase, wsUrl } from './origin'
  * These two functions decide which host every request and every live update
  * goes to, and they are baked into the bundle at build time. Getting them wrong
  * does not fail loudly: the dashboard renders, and then talks to nothing — or,
- * worse, keeps polling successfully while the socket is silently blocked, which
- * on screen is a dashboard that is merely five minutes stale.
+ * worse, keeps reading successfully while the socket is silently blocked, which
+ * on screen is a dashboard that fills in on every reload and never tells you
+ * trading stopped.
  */
 
 afterEach(() => {
@@ -43,8 +44,8 @@ describe('wsUrl', () => {
   it('derives wss:// from an https page', () => {
     // The one that matters: a browser refuses a ws:// socket from an https
     // page as mixed content, so a hardcoded scheme loses every live update the
-    // day the dashboard goes behind TLS — while the poll keeps working and
-    // hides it.
+    // day the dashboard goes behind TLS — while the reads keep working and
+    // hide it.
     expect(wsUrl({ protocol: 'https:', host: 'atp.example.internal' }, undefined)).toBe(
       'wss://atp.example.internal/ws',
     )

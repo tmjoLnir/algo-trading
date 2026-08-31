@@ -171,10 +171,11 @@ dashboard, and it does not care whether the host is in Ashburn or under a desk.
 
 The tradeoff is the one ADR 0011 actually cares about. **US-East proximity is
 on the order path**, and a host at the far end of a residential connection puts
-your distance from Alpaca into every submission. The dashboard's 5-minute
-refresh means your own distance from the *dashboard* is irrelevant — that is
-already in DEPLOYMENT.md — but the order path is a different question, and how
-much it costs depends on where you are and what the strategy does. A daily-bar
+your distance from Alpaca into every submission. Your own distance from the
+*dashboard* is irrelevant — it is read on demand (ADR 0022), so latency there
+costs one round trip when you ask for one — but the order path is a different
+question, and how much it costs depends on where you are and what the strategy
+does. A daily-bar
 strategy will not notice. Anything reacting within the bar will.
 
 Two smaller things, both solvable and both worth knowing in advance: a

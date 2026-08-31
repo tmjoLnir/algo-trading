@@ -7,14 +7,17 @@
  * operator acts on, and "who stopped it and when" is the first question asked
  * afterwards (docs/SAFETY.md, layer 6).
  *
- * The halt list is read live from the kill switch on every poll rather than
+ * The halt list is read live from the kill switch on every read rather than
  * from the worker's published book. That is deliberate on the server side and
  * worth restating here: a banner sourced from a snapshot that nobody is
  * publishing would say "not halted" at exactly the moment that matters most.
  *
- * Halts also arrive over the WebSocket, which every client receives whether or
- * not it subscribed to anything — so this normally appears within a second
- * rather than at the next five-minute poll.
+ * **This banner is why halts stayed on a push path when the refresh cadence went
+ * away (ADR 0022).** Halts arrive over the WebSocket, which every client receives
+ * whether or not it subscribed to anything, and that message re-reads the
+ * dashboard. So this appears within a second of trading stopping. Had it been
+ * left to the reader to ask, the screen that exists to interrupt somebody would
+ * have waited to be consulted.
  */
 
 import { formatDateTime } from '@/lib/money'

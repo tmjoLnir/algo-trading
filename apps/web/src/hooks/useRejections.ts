@@ -9,7 +9,8 @@
  *
  * Not polled. Refusals accumulate on the worker's evaluation interval, and the
  * Dashboard's signal feed is the screen for watching something move; this one is
- * read when somebody is asking why nothing is happening.
+ * read when somebody is asking why nothing is happening — and since ADR 0022 it
+ * is read when they reload, like everything else.
  */
 
 import { useQuery } from '@tanstack/react-query'

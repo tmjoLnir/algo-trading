@@ -70,7 +70,11 @@ class Settings(BaseSettings):
 
     # ── engine ──────────────────────────────────────────────────────────────
     engine_tick_interval_seconds: int = 60
-    dashboard_refresh_seconds: int = 300  # requirement #7
+    #: How old a dashboard reading may be before the screen calls it stale.
+    #: Not a refresh cadence: nothing polls (ADR 0022). This is the threshold the
+    #: age indicator warns past, kept server-side so the judgement of "too old to
+    #: act on" lives with the platform rather than in a browser constant.
+    dashboard_stale_after_seconds: int = 300
 
     # ── worker ──────────────────────────────────────────────────────────────
     #: The ingestor's watchlist, comma-separated (`WORKER_SYMBOLS=SPY,QQQ`).

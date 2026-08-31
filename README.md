@@ -19,7 +19,7 @@ trading strategies against live market data.
 | 4 | **Real-time data** for execution | `libs/core/.../data/`, Redis pub/sub |
 | 5 | **Paper trading** on live data, no real money | `libs/core/.../brokers/paper.py` + Alpaca paper endpoint |
 | 6 | **Analytics & reporting** | `libs/core/.../analytics/` |
-| 7 | **Dashboard**, auto-refresh every 5 min | `apps/web/` |
+| 7 | **Dashboard**, refreshed on demand | `apps/web/` |
 
 ## Architecture in one paragraph
 

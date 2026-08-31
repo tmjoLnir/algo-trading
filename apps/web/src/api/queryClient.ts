@@ -20,8 +20,12 @@ export function createQueryClient(): QueryClient {
      * failed.
      *
      * Sessions expire on a timer (`API_SESSION_HOURS`), so the usual way to meet
-     * one is a tab left open overnight: the 5-minute poll comes back 401 and so
-     * does every one after it. Handled centrally because the response is the
+     * one is a tab left open overnight: the first read after it lapsed comes back
+     * 401 and so does every one after that. Since ADR 0022 that first read is a
+     * reload or a return to the tab rather than a poll, which means an expired
+     * session is now discovered when somebody looks rather than while nobody is —
+     * later, but at the only moment it changes what anyone does.
+     * Handled centrally because the response is the
      * same wherever it happens — stop pretending to be logged in — and because a
      * component that swallowed it would leave the last good book on screen,
      * labelled fresh, for a viewer the server no longer recognises.

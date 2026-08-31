@@ -7,9 +7,11 @@
  * record of something that already happened, so reading it here cannot disagree
  * with anything the runner is doing — the same reasoning `/analytics` uses.
  *
- * Not polled. The dashboard refreshes every five minutes because the book
- * moves; this is a log, and the newest row on it is already the newest row.
- * `refetchOnWindowFocus` (the client default) covers coming back to the tab.
+ * Not polled — and since ADR 0022 nothing here is, so this is no longer the
+ * exception it was written as. It remains worth saying why: the dashboard is
+ * re-read because the book moves, while this is a log, and the newest row on it
+ * is already the newest row. `refetchOnWindowFocus` (the client default) covers
+ * coming back to the tab.
  */
 
 import { useQuery } from '@tanstack/react-query'

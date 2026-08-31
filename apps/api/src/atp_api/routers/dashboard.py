@@ -1,8 +1,9 @@
 """Dashboard endpoints — requirement #7.
 
-The dashboard polls `GET /api/v1/dashboard/live` every 5 minutes. That endpoint
-returns everything the main view needs in ONE response: account, open positions,
-recent signals, working orders, and any active halt.
+The dashboard reads `GET /api/v1/dashboard/live` when its reader asks it to — a
+browser reload, or the button on the screen (ADR 0022). That endpoint returns
+everything the main view needs in ONE response: account, open positions, recent
+signals, working orders, and any active halt.
 
 One aggregate endpoint rather than six parallel requests, for a reason worth
 stating: six independent fetches produce a screen assembled from six different
@@ -10,8 +11,9 @@ instants. On a fast-moving position, a P&L figure computed from one snapshot and
 a price from another simply disagree, and the human reading it cannot tell which
 number to trust. One query, one consistent picture.
 
-Live prices still arrive over the WebSocket between polls — the 5-minute refresh
-is the floor, not the ceiling.
+Live prices still arrive over the WebSocket between reads, and a fill or a halt
+prompts the client to re-read on its own. What was removed is the clock, not the
+paths that exist because the book changed.
 
 ## Where each number comes from, and why it is not all one place
 
@@ -76,7 +78,7 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 #: The longest window the equity chart may ask for in one request. A year of
 #: minute snapshots is roughly 130k rows; the chart draws a few hundred points.
 #: Bounded here rather than trusted, because an unbounded `days` is one URL away
-#: from a table scan that blocks every other dashboard poll behind it.
+#: from a table scan that blocks every other dashboard read behind it.
 MAX_CURVE_DAYS = 365
 
 #: How far back to look for the session whose open anchors day P&L. A week
@@ -161,7 +163,7 @@ class AccountView(BaseModel):
     """Account-level figures, all from one book at one instant.
 
     No `buying_power`: that is the venue's number and reading it costs a broker
-    call per dashboard poll, on the same rate limit the trading process is
+    call per dashboard read, on the same rate limit the trading process is
     placing orders against. `BuyingPowerRule` constrains against `cash`, so cash
     is the number that actually decides whether an order is approved here.
     """
@@ -205,9 +207,10 @@ class LiveDashboard(BaseModel):
     #: Read live from the kill switch on every request, never from the book.
     #: A halt must be visible whether or not the worker is publishing.
     active_halts: list[HaltView] = Field(default_factory=list)
-    #: Echoed so the client's poll interval follows the server's config rather
-    #: than a hardcoded constant that drifts out of sync.
-    refresh_seconds: int
+    #: How old a reading may be before the client calls it stale. Echoed so that
+    #: judgement follows the server's config rather than a hardcoded browser
+    #: constant that drifts out of sync. It is not a cadence — nothing polls.
+    stale_after_seconds: int
 
     # ── the worker's half, all null when nothing has been published ─────────
     #: When the worker built the book below. None means it has published
@@ -267,7 +270,7 @@ async def _active_halts(kill_switch: KillSwitch) -> list[HaltView]:
 
     Off the event loop because the kill switch is synchronous — it has to be,
     since the risk chain that consults it is (`persistence.redis_client`) — and
-    a blocking Redis round trip on every dashboard poll from every open tab is
+    a blocking Redis round trip on every dashboard read from every open tab is
     exactly the sort of thing that makes an event loop stutter.
 
     A failure here is a 503 rather than an empty list. `active_halts` already
@@ -430,7 +433,7 @@ async def get_live_dashboard(
 ) -> LiveDashboard:
     """Everything the dashboard needs, from one point in time.
 
-    Fast by construction: it is polled by every open browser tab, so the book is
+    Fast by construction: it is read by every open browser tab, so the book is
     one Redis `GET` of a document the worker already assembled rather than a
     recomputation from fills. The two other reads — the halt keys and, only when
     a book exists, one bounded equity query for the day anchor — are both small
@@ -448,7 +451,7 @@ async def get_live_dashboard(
         "run_mode": settings.run_mode.value,
         "market_open": market_open,
         "active_halts": halts,
-        "refresh_seconds": settings.dashboard_refresh_seconds,
+        "stale_after_seconds": settings.dashboard_stale_after_seconds,
     }
     if snapshot is None:
         # Not an error. A worker that is up but not trading publishes nothing,
