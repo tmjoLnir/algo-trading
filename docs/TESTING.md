@@ -21,6 +21,17 @@ make test               # everything
 **Tests never touch a live endpoint.** `conftest.py` hard-fails any session
 where `ATP_RUN_MODE == "live"`. Broker interactions use the in-memory fake.
 
+**A test session reads no ambient configuration.** `Settings` has two sources —
+the process environment and `env_file=".env"` — and `conftest.pytest_configure`
+takes both away: it pops the alert credentials out of the environment and
+detaches the `.env` from every settings model. So a bare `Settings()` in a test
+means *the documented defaults*, on a fresh CI clone and on the machine of an
+operator whose platform is configured and trading, which are otherwise two
+different answers. Both halves matter and each was found the hard way: a machine
+with `ALERT_TELEGRAM_*` exported, and then the same pair reached through a `.env`
+instead. A test that genuinely wants a file passes `_env_file=<path>` when it
+constructs `Settings`, which overrides this for that instance only.
+
 ## What must be tested
 
 Failure paths, not just happy paths, for anything touching order flow, risk or
