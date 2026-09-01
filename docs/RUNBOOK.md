@@ -501,6 +501,27 @@ half that still works and makes the stack look alive: `/dashboard/live`,
 `/risk/status` and `/auth/me` read Redis or a session, never Postgres, so they
 answer `200` beside neighbours that cannot.
 
+**Ask `make check-env` first — it now names this fault outright.** It reads
+`.env`, and then, if nothing in the file could account for a refusal, asks the
+database whether it actually accepts the password the file carries:
+
+```
+$ make check-env
+.env: nothing wrong with the file, and the database refuses it anyway
+
+  DATABASE_URL    .env line 95
+    atp@localhost:5432/atp answered, read this password, and refused it.
+    POSTGRES_PASSWORD is read at initdb and NEVER AGAIN, so a volume that
+    already existed kept whatever password it was created with. ...
+```
+
+That is this fault, diagnosed, and the command prints both fixes below. It
+needs the database up — which during this fault it is, since a database that
+refuses you is a database that answered. If nothing answers, the command says
+so and stays silent rather than guessing; `--offline` skips the question
+entirely. Note the target it names: on a machine with an unrelated Postgres on
+5432 that line is how you see the answer is about the wrong server.
+
 **Then find out which side moved.**
 
 ```
@@ -568,6 +589,16 @@ $ make check-env
 Run it before `make deploy`, not after: once initdb has stored a mangled
 password, fixing `.env` alone leaves the two sides disagreeing in the *other*
 direction and you are back at the `ALTER USER` above.
+
+That is also exactly what the connection check at the top of this section
+catches, and the two are worth keeping apart. **The character checks are about
+a password that was never right**, and they run against the file alone, before
+anything is deployed. **The connection check is about a password that was right
+and then changed on one side** — the rotation above, the far more ordinary
+story — and it can only be answered by the database. A file can pass every
+static check in the script and still be refused; that is not a contradiction,
+it is the stale volume, and it is the case the script used to answer "every
+value loads" to.
 
 **Nothing about the book changed while this was happening.** The API could not
 read the database, so it wrote nothing to it either; positions, stops and the

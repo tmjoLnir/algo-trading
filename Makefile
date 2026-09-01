@@ -156,9 +156,15 @@ backfill:  ## Backfill bars:  make backfill sym=AAPL,MSFT from=2020-01-01
 check-env:  ## Which value in .env stops the platform starting?
 	@# Deliberately not part of `make check`: that runs against a developer's
 	@# machine in CI, where there is no .env and nothing to diagnose. This is an
-	@# operator command for the moment the stack will not come up, and it needs
-	@# no container, database or network — see the header of the script.
-	uv run python scripts/check_env.py
+	@# operator command for the moment the stack will not come up.
+	@#
+	@# Every check of the FILE needs no container, database or network. One
+	@# check cannot: a password rotated against an existing volume leaves .env
+	@# correct and Postgres still refusing it, and only the database knows. So
+	@# once the file comes back clean this opens one connection, with a three
+	@# second timeout, and a database that does not answer is not a finding —
+	@# `make check-env args="--offline"` skips even that.
+	uv run python scripts/check_env.py $(args)
 
 # ── paper trading ───────────────────────────────────────────────────────────
 preflight:  ## Is this configuration ready for a paper week?  (docs/FIRST_PAPER_RUN.md)

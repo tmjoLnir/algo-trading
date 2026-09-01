@@ -18,12 +18,23 @@ and `max_position_pct` is not in `.env`. `RISK_MAX_POSITION_PCT` is. This prints
 the second name, the line it is on, and what is wrong with it — for every broken
 value at once rather than one per edit-and-retry.
 
-**It runs without the platform.** No container, no database, no network: it reads
-the same `.env` through the same `Settings` and reports what happens. That
-matters because the situation it is for is one where nothing else starts,
-including `scripts/preflight.py` and `scripts/status.py` — both of which call
-`get_settings()` and, until this existed, died with the same traceback they were
-being run to explain.
+**Every check here runs without the platform.** No container, no database, no
+network: it reads the same `.env` through the same `Settings` and reports what
+happens. That matters because the situation it is for is one where nothing else
+starts, including `scripts/preflight.py` and `scripts/status.py` — both of which
+call `get_settings()` and, until this existed, died with the same traceback they
+were being run to explain.
+
+**One question cannot be answered that way, and it is the one that comes up
+most.** `POSTGRES_PASSWORD` is read at initdb and never again, so a password
+rotated against an existing volume leaves `.env` internally consistent and the
+database still wanting the old one — nothing in the file is wrong, and every
+static check above passes while the platform cannot authenticate to its own
+database. So after the static checks come back clean, this asks the database
+itself, once, with a short timeout. A server that answers and refuses is the
+finding; a server that does not answer is not, and the command behaves exactly
+as it always did on a machine where nothing is up. `--offline` skips the
+question entirely.
 
 Secrets are never printed. A value that fails to load is still a credential, and
 most of one is still worth grinding offline (CLAUDE.md §1.6) — so a problem on a
@@ -33,15 +44,20 @@ and anything it cannot classify is withheld too.
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import difflib
 import os
 import sys
+from enum import StrEnum
 from pathlib import Path
 
+import asyncpg
 from dotenv import dotenv_values
 from sqlalchemy.engine import make_url
 
 from atp_core.config import ConfigProblem, config_problems, known_env_vars
+from atp_core.persistence.db import is_auth_failure
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = REPO_ROOT / ".env"
@@ -286,6 +302,164 @@ def db_credential_problems(values: dict[str, str], lines: dict[str, int]) -> lis
     return found
 
 
+#: How long to wait for the database to answer. Short on purpose: this runs when
+#: the platform will not come up, and an operator staring at a hung command
+#: learns nothing. Three seconds is far more than a loopback Postgres needs and
+#: far less than a wrong host takes to time out.
+PROBE_TIMEOUT_SECONDS = 3.0
+
+
+class Probe(StrEnum):
+    """What the database said when asked to accept the password in `.env`."""
+
+    #: It answered and let us in. The stored password and `.env` agree — the one
+    #: outcome no static check can establish.
+    ACCEPTED = "accepted"
+    #: It answered and refused. SQLSTATE class 28: the server is up, it read the
+    #: credentials, and it said no.
+    REFUSED = "refused"
+    #: Nothing answered — refused socket, wrong host, timeout, or no database
+    #: running. Not a finding: this is the normal state of a laptop with the
+    #: stack down, which is most of when this command is run.
+    UNREACHABLE = "unreachable"
+    #: Not asked: `--offline`, or there is no url to ask down.
+    NOT_ASKED = "not asked"
+
+
+async def _ask_the_database(dsn: str, timeout: float) -> Probe:
+    """Open one connection and immediately close it."""
+    url = make_url(dsn)
+    try:
+        connection = await asyncpg.connect(
+            host=url.host,
+            port=url.port or 5432,
+            user=url.username,
+            password=url.password,
+            database=url.database,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        # The same verdict the API and preflight use, from the module that owns
+        # it — so "the database refused these credentials" cannot come to mean
+        # one thing here and another there.
+        return Probe.REFUSED if is_auth_failure(exc) else Probe.UNREACHABLE
+    await connection.close()
+    return Probe.ACCEPTED
+
+
+def probe_stored_password(dsn: str, timeout: float = PROBE_TIMEOUT_SECONDS) -> Probe:
+    """Does the database actually accept the password `.env` carries?
+
+    **The fault this exists for is invisible to every other check in this file.**
+    `POSTGRES_PASSWORD` is read by initdb and never again, so on every start
+    after the first the volume keeps whatever password it was created with. Set
+    or rotate `ATP_DB_PASSWORD` against an existing volume and the containers
+    begin sending a new password to a database that still wants the old one —
+    with a `.env` that is correct, internally consistent, and passes everything
+    above. `docker compose logs db` says `password authentication failed for
+    user "atp"` and nothing else in the repository has an opinion.
+
+    It is also the *common* case. The three characters `db_password_problem`
+    catches are a password that was never right; this is the far more ordinary
+    story of a password that was right and then changed on one side only.
+
+    Asked of the **host-side** `DATABASE_URL`, because that is the one reachable
+    from wherever this command runs — the containers' url names `db`, a host on
+    the compose network that does not resolve here. The two are checked against
+    each other by `db_credential_problems`, so when they agree this answers for
+    both, and when they disagree that is already reported.
+
+    Never sends anything anywhere else: one connection to the host in that url,
+    closed immediately. Nothing is read, written or migrated.
+    """
+    try:
+        make_url(dsn)
+    except Exception:
+        # `Settings` reports an unparseable url; saying it twice reads as two
+        # faults.
+        return Probe.NOT_ASKED
+    try:
+        return asyncio.run(_ask_the_database(dsn, timeout))
+    except Exception:
+        # A driver that will not even start is not evidence about a password.
+        return Probe.UNREACHABLE
+
+
+def should_ask_the_database(
+    *, offline: bool, problems: list[ConfigProblem], credentials: list[tuple[str, str]], dsn: str
+) -> bool:
+    """Would a refusal from the database still be unexplained by `.env`?
+
+    The gating rule, and the whole reason the probe adds information rather than
+    noise. **Every finding above is already a reason the database would refuse
+    us.** A `%` escape, a password that disagrees with `ATP_DB_PASSWORD`, a
+    value that will not load — ask through any of those and the answer is "the
+    database said no", which is true, useless, and printed next to the check
+    that just named the character and the line. One fault must not be reported
+    twice, and certainly not with the vaguer half last.
+
+    So the question is asked only when the file has nothing left to say. A
+    refusal that survives this gate cannot be accounted for by anything in
+    `.env` — which is the stale volume, and is the one shape no static check
+    can reach.
+
+    Unread keys are deliberately not a reason to stay silent: a misspelled risk
+    limit has no bearing on whether Postgres accepts a password, and suppressing
+    the probe over one would hide the database fault behind a typo.
+    """
+    return bool(dsn) and not offline and not problems and not credentials
+
+
+def describe_refusal(dsn: str, lines: dict[str, int]) -> list[str]:
+    """The finding, as the lines to print for it.
+
+    Shaped like `describe` above: this returns the report and `main` prints it,
+    so what it says can be checked without a terminal — including the one thing
+    that must never be in it (CLAUDE.md §1.6).
+    """
+    return [
+        ".env: nothing wrong with the file, and the database refuses it anyway",
+        "",
+        f"  DATABASE_URL    {source_of('DATABASE_URL', lines)}",
+        f"    {where_it_asked(dsn)} answered, read this password, and refused it.",
+        "    POSTGRES_PASSWORD is read at initdb and NEVER AGAIN, so a volume that",
+        "    already existed kept whatever password it was created with. If",
+        "    ATP_DB_PASSWORD was set or rotated after the first start, every container",
+        "    has been sending the new one to a database that still wants the old.",
+        "    value withheld — this is a credential (CLAUDE.md §1.6)",
+        "",
+        "Two fixes, and the first is almost always the right one.",
+        "",
+        "  Change the password in the database to match .env — KEEPS THE DATA:",
+        "    docker compose exec db psql -U atp -d atp \\",
+        "      -c \"ALTER USER atp PASSWORD '<the password in .env>';\"",
+        "    docker compose restart api worker queue",
+        "",
+        "  Or re-initialise the volume — DESTROYS every bar, order and snapshot:",
+        "    docker compose down -v && make deploy && make migrate",
+        "",
+        "Restart the three services after an ALTER USER: SQLAlchemy pools connections,",
+        "so a process that authenticated before the change keeps working and one that",
+        "reconnects after it does not — which is how this fault arrives mid-session",
+        'rather than at startup. docs/RUNBOOK.md, "password authentication failed",',
+        "has both procedures in full.",
+    ]
+
+
+def where_it_asked(dsn: str) -> str:
+    """The database a probe went to, named without its password.
+
+    Printed with the finding because the answer is only as good as the target:
+    a developer with an unrelated Postgres on 5432 gets a true statement about
+    the wrong server, and this is the line that shows it.
+    """
+    try:
+        url = make_url(dsn)
+    except Exception:
+        return "the url in DATABASE_URL"
+    return f"{url.username}@{url.host}:{url.port or 5432}/{url.database}"
+
+
 def env_file_values(path: Path = ENV_FILE) -> dict[str, str]:
     """`{KEY: value}` as the things that read `.env` will resolve it.
 
@@ -307,7 +481,21 @@ def env_file_values(path: Path = ENV_FILE) -> dict[str, str]:
     return values
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="skip the one check that opens a connection; read .env and nothing else",
+    )
+    return parser.parse_args(argv)
+
+
 def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+
     # `Settings` resolves `env_file=".env"` against the *working directory*, so
     # run from `scripts/` or from a subpackage it would read a different file
     # (usually none) from the one whose line numbers are printed below — and
@@ -318,12 +506,35 @@ def main(argv: list[str] | None = None) -> int:
     problems = config_problems()
     lines = env_file_lines()
     unread = unread_keys(lines)
-    credentials = db_credential_problems(env_file_values(), lines)
+    values = env_file_values()
+    credentials = db_credential_problems(values, lines)
 
-    if not problems and not unread and not credentials:
+    # Asked only once the file itself is clean, and that is the whole design:
+    # every finding above is a reason the database would refuse us that `.env`
+    # already explains. Probing through one of those would report the same
+    # fault twice and bury the actionable half — the static reason names the
+    # character or the line, and "the database said no" does not. So a refusal
+    # reaching this point means something the file cannot account for, which
+    # is exactly the stale volume.
+    dsn = values.get("DATABASE_URL", "")
+    probe = Probe.NOT_ASKED
+    if should_ask_the_database(
+        offline=args.offline, problems=problems, credentials=credentials, dsn=dsn
+    ):
+        probe = probe_stored_password(dsn)
+
+    if not problems and not unread and not credentials and probe is not Probe.REFUSED:
         print("environment: every value loads, and every key in .env is read")
         if not ENV_FILE.is_file():
             print("  no .env here — defaults only (`make up` writes one from .env.example)")
+        # Worth a line of its own: it is the only statement here that was
+        # confirmed against the running database rather than reasoned about.
+        if probe is Probe.ACCEPTED:
+            print(f"  and {where_it_asked(dsn)} accepts the password in DATABASE_URL")
+        elif probe is Probe.UNREACHABLE:
+            print(f"  not checked: nothing answered at {where_it_asked(dsn)} — the stored")
+            print("  password is whatever initdb was given, which only a running database")
+            print("  can confirm (`make up`, then run this again)")
         return 0
 
     # ── values that will not load ───────────────────────────────────────────
@@ -377,6 +588,17 @@ def main(argv: list[str] | None = None) -> int:
         print('database: `password authentication failed for user "atp"`, with /readyz')
         print('reporting `database: unreachable` (docs/RUNBOOK.md, "password authentication')
         print('failed").')
+
+    # ── a file that is right about a database that disagrees ────────────────
+    # The fourth shape, and the only one nothing in `.env` can account for:
+    # every value loads, every key is read, the password survives both paths —
+    # and the database refuses it anyway, because it is not the password initdb
+    # was given.
+    if probe is Probe.REFUSED:
+        if problems or unread or credentials:
+            print()
+        for line in describe_refusal(dsn, lines):
+            print(line)
 
     return 1
 
