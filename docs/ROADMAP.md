@@ -2503,6 +2503,44 @@ has met a database holding a real strategy's history.
 
   Ticks nothing — a fix, like the two above it.
 
+  **And the cause those three kept deferring to the runbook is now caught.**
+  Each of them ends at the same sentence — *the dominant cause in the field is
+  not catchable statically* — and that was true of the technique, not of the
+  question. `POSTGRES_PASSWORD` is read by initdb and never again, so a password
+  rotated against an existing volume leaves `.env` correct, internally
+  consistent, passing every check `make check-env` had, and refused by the
+  database anyway. The three characters that script already caught are a
+  password that was *never* right; this is the ordinary story of one that was
+  right and then changed on one side, and it is the one operators actually hit.
+
+  So after the file comes back clean, the script asks the database: one
+  connection, three second timeout, closed immediately. The gate is the design
+  rather than an optimisation — every static finding is *already* a reason the
+  database would refuse us, so probing through one would report a single fault
+  twice and put the vaguer half last, after the line that named the character
+  and the file line. A refusal that survives the gate is unexplainable by
+  anything in `.env`, which is what makes it a diagnosis instead of an echo.
+
+  This is the first check here that needs the platform, and the header's promise
+  is narrowed rather than dropped: every check of the *file* still runs with no
+  container, database or network, a database that does not answer is not a
+  finding, and `--offline` skips the question. "We did not look" and "we looked
+  and it was fine" print differently, which is the distinction `preflight`'s
+  SKIP exists for applied one tool over — and the accepted case is now the only
+  line the command prints that was confirmed against a running database rather
+  than inferred from a file.
+
+  Verified against a real Postgres rather than a fake, because everything worth
+  checking is behaviour of the server: a wrong password refused rather than
+  ignored, the refusal carrying the SQLSTATE the classifier reads, a right one
+  accepted over a real scram-sha-256 handshake. `tests/integration/` runs it
+  against the CI service container, which is initialised with one password and
+  asked about another — the stale volume, reproduced.
+
+  Ticks nothing either. The Phase 6 *Verifiable:* line wants a week of unattended
+  uptime on a provisioned host; this is one more thing that host will not need a
+  human to diagnose, not the host.
+
   So **each process exports its own `/metrics` and the worker does not push**,
   which is the decision worth arguing with. The natural alternative was for the
   worker to write its numbers into Redis — already the cross-process bus for the

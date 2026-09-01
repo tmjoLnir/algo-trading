@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import asyncpg.exceptions as pg
 import pytest
 from dotenv import dotenv_values
 
@@ -401,3 +402,170 @@ class TestTheDatabasePasswordSurvivesTheTrip:
         example = Path(__file__).resolve().parents[2] / ".env.example"
         values = {k: v for k, v in dotenv_values(example).items() if v is not None}
         assert check_env.db_credential_problems(values, {}) == []
+
+
+#: A DSN shaped like the one `.env` ships, with a password that must never be
+#: echoed by anything below (CLAUDE.md §1.6).
+_SECRET = "sup3r-s3cret-db-password"
+_DSN = f"postgresql+asyncpg://atp:{_SECRET}@127.0.0.1:5432/atp"
+
+
+class TestTheDatabaseThatRefusesACorrectFile:
+    """The dominant cause in the field, and the one `.env` cannot explain.
+
+    `POSTGRES_PASSWORD` is read by initdb and never again, so a volume that
+    already existed keeps whatever password it was created with. Set or rotate
+    `ATP_DB_PASSWORD` against one and every container sends a new password to a
+    database that still wants the old — with a file that is correct, internally
+    consistent, and passes every static check in this module. The command used
+    to answer "every value loads" to that, and the operator went looking at code.
+
+    What is pinned here is the *gate*, because that is what makes the answer
+    worth printing: the question reaches the database only when nothing in the
+    file could account for a refusal, so a refusal that survives it means the
+    volume rather than a second telling of a fault already named.
+    """
+
+    def test_a_clean_file_is_worth_asking_about(self) -> None:
+        assert check_env.should_ask_the_database(
+            offline=False, problems=[], credentials=[], dsn=_DSN
+        )
+
+    def test_a_file_that_already_explains_a_refusal_is_not(self) -> None:
+        """A `%` escape names the character and the line. Asking through it adds
+        "the database said no" — true, vaguer, and printed last."""
+        assert not check_env.should_ask_the_database(
+            offline=False,
+            problems=[],
+            credentials=[("ATP_DB_PASSWORD", "contains a `%` ...")],
+            dsn=_DSN,
+        )
+
+    def test_a_configuration_that_will_not_load_is_not(self) -> None:
+        problem = ConfigProblem(env_var="RISK_MAX_POSITION_PCT", reason="nope", value="x")
+        assert not check_env.should_ask_the_database(
+            offline=False, problems=[problem], credentials=[], dsn=_DSN
+        )
+
+    def test_offline_never_asks(self) -> None:
+        """The header's promise that this needs no database stays available."""
+        assert not check_env.should_ask_the_database(
+            offline=True, problems=[], credentials=[], dsn=_DSN
+        )
+
+    def test_no_url_to_ask_down(self) -> None:
+        assert not check_env.should_ask_the_database(
+            offline=False, problems=[], credentials=[], dsn=""
+        )
+
+    def test_an_unread_key_does_not_silence_it(self) -> None:
+        """A misspelled risk limit has no bearing on whether Postgres accepts a
+        password — suppressing the probe over one would hide the database fault
+        behind a typo. Unread keys are not a parameter here, and that is why."""
+        assert check_env.should_ask_the_database(
+            offline=False, problems=[], credentials=[], dsn=_DSN
+        )
+
+
+class TestWhatTheFindingTellsAnOperator:
+    """The report itself: it has to name the cause and the two ways out."""
+
+    def test_it_names_initdb_as_the_reason_a_correct_file_fails(self) -> None:
+        report = "\n".join(check_env.describe_refusal(_DSN, {"DATABASE_URL": 7}))
+        assert "initdb" in report
+        assert "NEVER AGAIN" in report
+
+    def test_it_offers_the_fix_that_keeps_the_data_first(self) -> None:
+        """`down -v` is a deletion, not a reset — on a paper host that is the
+        trade history. It must not be the first thing an operator reaches for."""
+        report = "\n".join(check_env.describe_refusal(_DSN, {}))
+        assert report.index("ALTER USER") < report.index("down -v")
+        assert "KEEPS THE DATA" in report
+        assert "DESTROYS" in report
+
+    def test_it_points_at_the_line_to_edit(self) -> None:
+        report = "\n".join(check_env.describe_refusal(_DSN, {"DATABASE_URL": 42}))
+        assert "line 42" in report
+
+    def test_the_report_never_carries_the_password(self) -> None:
+        """§1.6. The finding is *about* a credential, so every line of it — the
+        target it names included — is a place the value must not appear."""
+        assert _SECRET not in "\n".join(check_env.describe_refusal(_DSN, {"DATABASE_URL": 7}))
+
+    def test_the_target_is_named_without_its_password(self) -> None:
+        """Printed so a probe aimed at the wrong server is visible — a developer
+        with an unrelated Postgres on 5432 gets a true answer about it."""
+        named = check_env.where_it_asked(_DSN)
+        assert named == "atp@127.0.0.1:5432/atp"
+        assert _SECRET not in named
+
+    def test_an_unnameable_url_still_renders(self) -> None:
+        assert check_env.where_it_asked("not a url") == "the url in DATABASE_URL"
+
+
+class TestTheProbeClassifiesWhatTheDriverRaises:
+    """Which asyncpg outcome is a refusal and which is merely silence.
+
+    Real driver exceptions rather than stand-ins, as `test_database_unavailable`
+    and `test_database_auth_failure` both argue: a fake raising what we believe
+    asyncpg raises would agree with a wrong implementation. `asyncpg.connect` is
+    the seam, so the classification under test is the one that actually runs.
+    """
+
+    def _connect_raising(self, monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> Any:
+        async def _boom(**kwargs: object) -> object:
+            raise exc
+
+        monkeypatch.setattr(check_env.asyncpg, "connect", _boom)
+        return check_env.probe_stored_password(_DSN, timeout=0.1)
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            pytest.param(pg.InvalidPasswordError("no"), id="28P01-wrong-password"),
+            pytest.param(
+                pg.InvalidAuthorizationSpecificationError("no"), id="28000-bad-authorization"
+            ),
+        ],
+    )
+    def test_the_server_answered_and_refused(
+        self, monkeypatch: pytest.MonkeyPatch, exc: BaseException
+    ) -> None:
+        assert self._connect_raising(monkeypatch, exc) is check_env.Probe.REFUSED
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            pytest.param(ConnectionRefusedError(111, "refused"), id="nothing-listening"),
+            pytest.param(TimeoutError("timed out"), id="timed-out"),
+            pytest.param(OSError("name or service not known"), id="unresolvable-host"),
+            pytest.param(pg.InvalidCatalogNameError("nodb"), id="3D000-no-such-database"),
+            pytest.param(pg.CannotConnectNowError("starting"), id="57P03-still-starting"),
+        ],
+    )
+    def test_silence_is_never_a_finding(
+        self, monkeypatch: pytest.MonkeyPatch, exc: BaseException
+    ) -> None:
+        """None of these is evidence about a stored password, and reporting one
+        as though it were would send an operator to rotate a working password."""
+        assert self._connect_raising(monkeypatch, exc) is check_env.Probe.UNREACHABLE
+
+    def test_a_connection_that_opens_is_accepted_and_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        closed: list[bool] = []
+
+        class _Connection:
+            async def close(self) -> None:
+                closed.append(True)
+
+        async def _connect(**kwargs: object) -> _Connection:
+            return _Connection()
+
+        monkeypatch.setattr(check_env.asyncpg, "connect", _connect)
+        assert check_env.probe_stored_password(_DSN, timeout=0.1) is check_env.Probe.ACCEPTED
+        assert closed == [True], "the probe left a connection open"
+
+    def test_an_unparseable_url_is_left_to_settings(self) -> None:
+        """`Settings` reports it; saying it twice reads as two faults."""
+        assert check_env.probe_stored_password("not a url at all") is check_env.Probe.NOT_ASKED
