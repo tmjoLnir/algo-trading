@@ -572,9 +572,38 @@ direction and you are back at the `ALTER USER` above.
 **Nothing about the book changed while this was happening.** The API could not
 read the database, so it wrote nothing to it either; positions, stops and the
 halt state are whatever they were, and broker-side stops are held by the venue
-regardless. `scripts/halt.py` and `scripts/status.py` read Redis and the venue,
-not Postgres — they still work, and `make halt` is still available if you would
-have halted anyway.
+regardless. `scripts/halt.py` reads Redis and the venue, not Postgres, so it is
+unaffected, and `make halt` is available if you would have halted anyway.
+
+> **This section used to say `scripts/status.py` was unaffected too, and that
+> was wrong.** It reads Redis *and* Postgres — the bars section is a database
+> read — and the failure propagated out of it and ended the script, so during
+> this fault the tool exited with a traceback **before** printing the broker's
+> positions and working orders. Those are the only book anyone can still see
+> while Postgres is refusing, which made it the worst moment to lose them. It
+> now reports the outage on the `bars` line and carries on to the venue, the way
+> the broker section has always handled a source it cannot reach.
+
+**`make preflight` names this fault now, and fails on it.** It reported a
+refused password as a skipped check and exited `0` — and a skip is not a
+failure, so the command that answers "is this configuration ready to spend a
+week trading paper?" answered yes about a platform that could not persist a bar,
+an order or a fill. It also printed `make up && make migrate`, which cannot
+work: the stack is already up, and `make migrate` fails against this same
+password with this same error. A refused password is now a `FAIL`:
+
+```
+$ make preflight
+  [FAIL] history          database refused the credentials (InvalidPasswordError) — it is up, and it said no
+                          → make check-env
+                            (docs/RUNBOOK.md, "password authentication failed")
+```
+
+A database that is merely *not up yet* still skips, and still does not fail the
+command — an operator bringing the stack up a piece at a time runs preflight
+against a half-started machine on purpose. The line between the two is the
+SQLSTATE: class `28` is the server answering and refusing these credentials,
+which no amount of waiting resolves.
 
 
 ## Worker crash-looping

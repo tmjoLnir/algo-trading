@@ -8,6 +8,11 @@ an outage as a bug in this repository. `is_unavailable` makes the call once and
 `session_scope` acts on it, so a repository method raises either
 `DatabaseUnavailableError` (Postgres is not there) or the driver's own error
 (the statement was wrong) and a caller can simply believe it.
+
+`is_auth_failure` splits the first of those once more, for the callers that have
+to *advise* rather than merely report: a refused password and a refused socket
+are both an unreachable database, and only one of them stops being true if you
+wait.
 """
 
 from __future__ import annotations
@@ -30,6 +35,13 @@ if TYPE_CHECKING:
 #: Every code in all three is the server declining to serve this process; none
 #: of them is a statement being wrong.
 UNAVAILABLE_SQLSTATE_CLASSES: Final = frozenset({"08", "28", "53"})
+
+#: The SQLSTATE class that means the server was reached, spoke, and refused
+#: *these credentials* — `28000` invalid authorization specification, `28P01`
+#: the wrong password. A subset of the classes above, and kept as its own name
+#: because `is_auth_failure` asks a narrower question of it than
+#: `is_unavailable` does (see that function for why the difference matters).
+AUTH_FAILURE_SQLSTATE_CLASS: Final = "28"
 
 #: Individual codes from classes that are a mix. Class `57` is "operator
 #: intervention", which holds both a database shutting down under us and a query
@@ -87,6 +99,50 @@ def is_unavailable(exc: BaseException) -> bool:
     if not isinstance(sqlstate, str):
         return False
     return sqlstate[:2] in UNAVAILABLE_SQLSTATE_CLASSES or sqlstate in UNAVAILABLE_SQLSTATES
+
+
+def is_auth_failure(exc: BaseException) -> bool:
+    """Did the database *refuse these credentials*, rather than merely not answer?
+
+    A strict subset of `is_unavailable`, and the distinction it draws is about
+    time. Most of what that function catches is a state the operator waits out
+    or starts their way through: a refused socket is a stack not up yet, `57P03`
+    is Postgres still starting, `53300` is a pool that will drain. A `28` is
+    none of those. **The server is up, it read our credentials, and it said no**
+    — so waiting changes nothing, `make up` changes nothing, and every retry
+    fails identically until a human changes a password on one side or the other.
+
+    That is worth a separate question because the tools that ask it must give
+    opposite advice. `scripts/preflight.py` reports an unreachable database as
+    SKIP — honest, because "the stack is not up yet" is the normal state of a
+    machine an operator is bringing up a piece at a time — and a SKIP does not
+    fail the command. Answering a refused password that way told an operator the
+    configuration was ready for a paper week when nothing it did would ever be
+    persisted, and pointed them at `make up && make migrate`, which fails with
+    this same error.
+
+    Read off SQLSTATE alone, and deliberately not off the two signals
+    `is_unavailable` trusts above it: `connection_invalidated` and `OSError` are
+    both the transport failing, which is the case this one exists to be distinct
+    from. Postgres assigns `28P01` to the wrong password and `28000` to the rest
+    of the class, and it can only assign either after a server answered.
+
+    Sees through `DatabaseUnavailableError`, because by the time a caller is
+    holding one `session_scope` has already done the translation — asking this
+    of the wrapper is the normal case, not the exotic one, and it is the
+    `__cause__` that carries the driver's verdict.
+    """
+    original: BaseException = exc
+    if isinstance(original, DatabaseUnavailableError) and original.__cause__ is not None:
+        original = original.__cause__
+
+    # As `is_unavailable`: SQLAlchemy wraps a driver error as `.orig`, and at
+    # connect time — which is where a wrong password surfaces — it does not wrap
+    # it at all.
+    original = getattr(original, "orig", None) or original
+
+    sqlstate = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+    return isinstance(sqlstate, str) and sqlstate[:2] == AUTH_FAILURE_SQLSTATE_CLASS
 
 
 @contextmanager

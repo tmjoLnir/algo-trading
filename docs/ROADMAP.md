@@ -2470,6 +2470,39 @@ has met a database holding a real strategy's history.
   exception is a 503" would delete the platform's ability to report its own
   bugs. This ticks nothing either — it is a fix, not an item.
 
+  **The operator tools were the last place that fault was still misread, and
+  the miss there was worse than the `500`s.** The API's part of this is a
+  report; `scripts/preflight.py` is a *decision*. It classified a refused
+  password as an unreachable database, which is true, and rendered it as `SKIP`
+  — a status that deliberately does not fail the command, because "the stack is
+  not up yet" is the normal state of a machine an operator is bringing up a
+  piece at a time. So `make preflight` exited `0` against a database that would
+  refuse every write for the whole week it was being asked to approve, and the
+  `fix` it offered was `make up && make migrate` — a stack that is already up,
+  and a command that fails with this same error. This tool exists because the
+  input a paper week needs and cannot re-run is calendar time, and the failure
+  it was built to prevent is a week of silence indistinguishable from a correct
+  run: giving a go signal here is that failure, produced by the check meant to
+  catch it.
+
+  `is_auth_failure` splits SQLSTATE class `28` — the server answered and refused
+  *these credentials* — out of `is_unavailable`, because the two call for
+  opposite advice: everything else that function catches is a state that ends
+  without anyone editing a password, and a `28` is a state that ends only when
+  somebody does. A refused password now `FAIL`s; a database that is merely not
+  up yet still skips, so the local-only run an operator does first is unchanged.
+
+  `scripts/status.py` did not catch the outage at all. Its bars section is a
+  database read, so the failure propagated out of `_print_local` and ended the
+  script **before** the broker section — discarding the venue's positions and
+  working orders at the one moment they are the only book still readable. It
+  now reports the outage on the `bars` line and continues, which is the rule
+  `_print_broker` already stated and the database was simply never held to.
+  docs/RUNBOOK.md claimed this tool kept working during this fault; it did not,
+  and that claim is corrected rather than quietly dropped.
+
+  Ticks nothing — a fix, like the two above it.
+
   So **each process exports its own `/metrics` and the worker does not push**,
   which is the decision worth arguing with. The natural alternative was for the
   worker to write its numbers into Redis — already the cross-process bus for the
