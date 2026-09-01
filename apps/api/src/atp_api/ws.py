@@ -76,10 +76,19 @@ CLIENT_CHANNELS: dict[str, str] = {
 #: producer channel becomes subscribable the moment it is mapped above.
 ALL_CLIENT_CHANNELS = frozenset(CLIENT_CHANNELS.values())
 
+#: The name the bridge announces its own outage on.
+#:
+#: Deliberately absent from `CLIENT_CHANNELS`, and therefore from
+#: `ALL_CLIENT_CHANNELS`, which is what makes it unsubscribable: nothing in
+#: Redis publishes it. It is the one message this module originates rather than
+#: forwards, and it is about this process rather than about the market.
+GAP_CHANNEL = "gaps"
+
 #: Channels a client is subscribed to whether it asked or not. A trading halt is
 #: not something to opt into: a dashboard that filtered one out would show a
-#: green screen while nothing was trading.
-ALWAYS_DELIVERED = frozenset({"halts"})
+#: green screen while nothing was trading. A gap is the same argument one step
+#: removed — it is the message that says a halt may have been missed.
+ALWAYS_DELIVERED = frozenset({"halts", GAP_CHANNEL})
 
 #: Channels whose messages are filtered by the client's symbol list. Market data
 #: only — a dashboard watching five symbols should not receive the universe's
@@ -163,7 +172,11 @@ class ConnectionManager:
     def __init__(self) -> None:
         self._connections: dict[str, WebSocket] = {}
         self._channels: dict[str, set[str]] = {}
-        self._subscriptions: dict[str, set[str]] = {}
+        #: Watched symbols per client, where `None` and `set()` are different
+        #: answers and conflating them was a bug. `None` is "never named a
+        #: symbol", which means everything on the channel; an empty set is
+        #: "named some and removed them all", which means nothing. See `_wants`.
+        self._subscriptions: dict[str, set[str] | None] = {}
 
     @property
     def client_count(self) -> int:
@@ -172,13 +185,16 @@ class ConnectionManager:
     async def connect(self, client_id: str, ws: WebSocket) -> None:
         """Accept the socket and register the client with no subscriptions.
 
-        None rather than a default set: a client that has not said what it wants
-        gets halts and nothing else, which is the one thing it must have.
+        No channels rather than a default set: a client that has not said what
+        it wants gets halts and nothing else, which is the one thing it must
+        have. Its symbol filter starts as `None` — never named one — which is
+        what makes a first `subscribe` naming no symbols deliver the channel
+        rather than silence.
         """
         await ws.accept()
         self._connections[client_id] = ws
         self._channels[client_id] = set()
-        self._subscriptions[client_id] = set()
+        self._subscriptions[client_id] = None
         log.info("ws.connected", client_id=client_id, clients=len(self._connections))
 
     def disconnect(self, client_id: str) -> bool:
@@ -209,16 +225,45 @@ class ConnectionManager:
         Symbols are upper-cased because `symbol` is always an uppercase ticker
         here (CLAUDE.md §4) and a client sending `aapl` means the same
         instrument, not a different one.
+
+        Naming no symbols leaves the filter alone rather than creating an empty
+        one. Subscribing to a channel without naming a symbol asks for all of
+        it, and a client that later names one is filtered from that point — the
+        additive rule again, read from the other end.
         """
         if client_id not in self._connections:
             return
         self._channels[client_id].update(c for c in channels if c in ALL_CLIENT_CHANNELS)
-        self._subscriptions[client_id].update(s.upper() for s in symbols)
+        if not symbols:
+            return
+        watched = self._subscriptions[client_id]
+        if watched is None:
+            watched = set()
+            self._subscriptions[client_id] = watched
+        watched.update(s.upper() for s in symbols)
 
     def unsubscribe(self, client_id: str, symbols: list[str]) -> None:
+        """Stop delivering these symbols to this client.
+
+        Removing the last one leaves an empty filter, which means *nothing* —
+        not everything. That distinction is the whole reason `None` exists
+        alongside the set: this method used to empty the set into the sentinel
+        for "no filter", so a dashboard panel unmounting, or a watchlist being
+        cleared, silently promoted that client from five symbols to every tick
+        in the universe. The server then paid the fan-out on every tick and the
+        browser paid the parse, and the only symptom was a tab that got slow.
+
+        A client that never named a symbol is left alone: it asked for the whole
+        channel, and "everything except AAPL" is not something this filter can
+        express. Creating an empty set here to hold that would silence it
+        outright, which is the opposite of what it asked for.
+        """
         if client_id not in self._connections:
             return
-        self._subscriptions[client_id].difference_update(s.upper() for s in symbols)
+        watched = self._subscriptions[client_id]
+        if watched is None:
+            return
+        watched.difference_update(s.upper() for s in symbols)
 
     def _wants(self, client_id: str, channel: str, symbol: str | None) -> bool:
         if channel in ALWAYS_DELIVERED:
@@ -227,12 +272,14 @@ class ConnectionManager:
             return False
         if channel not in SYMBOL_FILTERED or symbol is None:
             return True
-        # An empty symbol set means "everything on this channel". A dashboard
-        # holding no positions still wants the ticks for what it is watching,
-        # and treating empty as "nothing" would make the first subscribe
-        # deliver silence.
-        watched = self._subscriptions.get(client_id, set())
-        return not watched or symbol in watched
+        watched = self._subscriptions.get(client_id)
+        if watched is None:
+            # Never named a symbol, so it asked for the whole channel. A
+            # dashboard holding no positions still wants the ticks for what it
+            # is watching, and reading this as "nothing" would make the first
+            # subscribe deliver silence.
+            return True
+        return symbol in watched
 
     async def broadcast(self, channel: str, message: dict[str, Any]) -> None:
         """Send to subscribers. Never let one dead client block the loop.
@@ -355,20 +402,51 @@ async def redis_bridge(
     silent from the outside: treating a quiet market as a dead socket drops
     messages nobody knows were sent, and treating a dead socket as a quiet
     market delivers nothing while looking calm.
+
+    **Coming back announces the gap it just closed.** Everything published while
+    this subscription was down reached no browser and pub/sub will not replay
+    it — possibly a fill, possibly a halt. The browsers noticed nothing: their
+    own sockets to this process stayed up throughout, so nothing on the client
+    reconnects and nothing re-reads. That was survivable while the dashboard
+    polled and stopped being so with ADR 0022, which left the gap permanent on
+    every open tab: a halt engaged at 14:31 would sit unrendered behind a banner
+    that is the one thing on the screen whose job is to interrupt somebody.
+
+    So a re-subscribe sends `{"type": "gap"}` to every client, subscribed or
+    not, and the dashboard answers it by re-reading the book. It is not a replay
+    and does not pretend to be — the aggregate read *is* the current state of
+    everything this bridge carries, which makes asking for it the complete
+    repair rather than a catch-up.
+
+    `seconds` on that message is a **lower bound**, not a measurement. The clock
+    starts when the failure was noticed, and a connection that stopped carrying
+    data without closing is noticed up to `LIVENESS_TIMEOUT_SECONDS` after it
+    actually died. Reporting it as exact would be the same mistake as a frozen
+    book age (ADR 0022): a number that describes the detection rather than the
+    outage.
     """
+    # Loop time rather than `Clock.now()`: this measures how long a socket has
+    # been silent and how long an outage lasted, not when anything happened. It
+    # must be monotonic — a wall clock stepping backwards over an NTP correction
+    # would suppress the liveness check exactly when it is due, and could report
+    # a negative outage — and it is never read by the domain, so §1.2 does not
+    # reach it.
+    clock = asyncio.get_running_loop().time
     attempt = 0
+    #: When the subscription was last seen to fail, or None while it is healthy.
+    #: Set on the first failure of an outage rather than on each retry, so a
+    #: Redis that takes six attempts to come back reports one gap of its true
+    #: length instead of the length of the final wait.
+    down_since: float | None = None
     while True:
         pubsub = redis.pubsub(ignore_subscribe_messages=True)
         try:
             await pubsub.subscribe(*channels)
             attempt = 0
             log.info("ws.bridge_subscribed", channels=list(channels))
-            # Loop time rather than `Clock.now()`: this measures how long a
-            # socket has been silent, not when anything happened. It must be
-            # monotonic — a wall clock stepping backwards over an NTP correction
-            # would suppress the liveness check exactly when it is due — and it
-            # is never read by the domain, so §1.2 does not reach it.
-            clock = asyncio.get_running_loop().time
+            if down_since is not None:
+                await _announce_gap(connections, clock() - down_since)
+                down_since = None
             last_seen = clock()
             awaiting_pong = False
             while pubsub.subscribed:
@@ -403,6 +481,8 @@ async def redis_bridge(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if down_since is None:
+                down_since = clock()
             attempt += 1
             delay = backoff_delay(attempt)
             log.warning(
@@ -416,6 +496,24 @@ async def redis_bridge(
             close: Any = pubsub.aclose
             with contextlib.suppress(Exception):
                 await close()
+
+
+async def _announce_gap(connections: ConnectionManager, seconds: float) -> None:
+    """Tell every browser that this process stopped receiving for a while.
+
+    Awaited rather than fired and forgotten, unlike a message fan-out. There is
+    exactly one of these per outage and the next thing the bridge does is block
+    on a poll, so nothing is held up by it — and a gap notice that lost a race
+    with the resumed stream would be a client re-reading the book it has just
+    been sent updates for, in that order.
+
+    Logged as well as sent, because the number is worth having even when nobody
+    is holding a socket: `clients=0` here says the outage cost no browser
+    anything, and any other value says how many were quietly stale until now.
+    """
+    seconds = round(seconds, 1)
+    log.info("ws.bridge_gap", seconds=seconds, clients=connections.client_count)
+    await connections.broadcast(GAP_CHANNEL, {"type": "gap", "seconds": seconds})
 
 
 def _dispatch(raw: dict[str, Any], connections: ConnectionManager) -> asyncio.Task[None] | None:
@@ -465,10 +563,16 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         ← {"type": "fill",      "order_id": ..., "symbol": ..., "qty": ..., "price": ...}
         ← {"type": "signal",    "strategy": ..., "symbol": ..., "action": ..., "reason": ...}
         ← {"type": "halt",      "scope": ..., "reason": ...}
+        ← {"type": "gap",       "seconds": ...}
         ← {"type": "pong"}
 
-    `halt` messages reach the client even if it subscribed to nothing — a
-    trading halt is not something to opt into.
+    `halt` and `gap` messages reach the client even if it subscribed to
+    nothing. A trading halt is not something to opt into, and a `gap` is the
+    message saying one may have been missed: the API's own subscription to the
+    producers dropped and came back, so anything published in between reached
+    nobody and pub/sub has no replay. It carries no news of its own — re-reading
+    the book is the only way to find out what changed, and that read is the
+    whole repair. `seconds` is a lower bound on the outage (`redis_bridge`).
 
     **Authenticated, in here rather than by a dependency.** Everything this
     socket carries is the book — positions, fills, signals — so a reader is a

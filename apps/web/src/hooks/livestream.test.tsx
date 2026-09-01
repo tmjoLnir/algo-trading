@@ -71,6 +71,13 @@ async function serverAccepts(socket: FakeWebSocket): Promise<void> {
   })
 }
 
+/** One frame from the server, as the socket hands it over. */
+async function serverSends(socket: FakeWebSocket, frame: unknown): Promise<void> {
+  await act(async () => {
+    socket.onmessage?.({ data: typeof frame === 'string' ? frame : JSON.stringify(frame) })
+  })
+}
+
 /** 1006 is what a browser reports for a handshake nginx answered 502 to. */
 async function serverDrops(socket: FakeWebSocket, code = 1006): Promise<void> {
   await act(async () => {
@@ -357,5 +364,93 @@ describe('where the socket is held', () => {
 
     await waitFor(() => expect(document.body.textContent).toMatch(/sign in/i))
     expect(FakeWebSocket.opened.length).toBe(0)
+  })
+})
+
+describe('what re-reads the book', () => {
+  /**
+   * The socket carries two kinds of message and only one of them is news.
+   *
+   * A quote is a price, rendered beside the book as its own clearly-labelled
+   * live figure — it must not cost a read, or a busy symbol would refetch the
+   * whole dashboard on every tick. A fill, a halt and a gap each mean the book
+   * itself is no longer what was last read, and the aggregate read is the only
+   * authoritative way to find out what it is now.
+   */
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  async function connected() {
+    const fetchMock = stubApi({ '/api/v1/dashboard/live': { status: 200, body: EMPTY_BOOK } })
+    renderStream()
+    await settle()
+    await serverAccepts(current())
+    await settle()
+    expect(bookReads(fetchMock)).toBe(1)
+    return fetchMock
+  }
+
+  it('a gap does — the API saying it does not know what it missed either', async () => {
+    // The outage this socket cannot detect for itself: the API's own
+    // subscription to the producers dropped and recovered while this
+    // connection stayed open throughout, so nothing here would otherwise ever
+    // ask. What was published in the meantime might have been a halt.
+    const fetchMock = await connected()
+
+    await serverSends(current(), { type: 'gap', seconds: 12.4 })
+    await settle()
+
+    expect(bookReads(fetchMock)).toBe(2)
+  })
+
+  it('a fill does', async () => {
+    const fetchMock = await connected()
+
+    await serverSends(current(), { type: 'fill', order_id: 'o-1', symbol: 'AAPL' })
+    await settle()
+
+    expect(bookReads(fetchMock)).toBe(2)
+  })
+
+  it('a halt does', async () => {
+    const fetchMock = await connected()
+
+    await serverSends(current(), { type: 'halt', scope: 'global', reason: 'daily_loss' })
+    await settle()
+
+    expect(bookReads(fetchMock)).toBe(2)
+  })
+
+  it('a quote does not', async () => {
+    // A tick is not the book changing. Refetching on one would put the whole
+    // dashboard behind every price update on a busy symbol.
+    const fetchMock = await connected()
+
+    await serverSends(current(), {
+      type: 'quote',
+      symbol: 'AAPL',
+      bid: '100.00',
+      ask: '100.02',
+      ts: '2026-08-31T15:00:00Z',
+    })
+    await settle()
+
+    expect(bookReads(fetchMock)).toBe(1)
+  })
+
+  it('a frame we cannot read does not, and does not tear the socket down', async () => {
+    // A malformed frame is a server bug. Reconnecting into the same bug would
+    // turn it into a loop against an API that is answering fine.
+    const fetchMock = await connected()
+    const socket = current()
+
+    await serverSends(socket, 'not json at all')
+    await serverSends(socket, { type: 'something-we-have-never-heard-of' })
+    await settle()
+
+    expect(bookReads(fetchMock)).toBe(1)
+    expect(FakeWebSocket.opened.length).toBe(1)
+    expect(socket.closedByTheClient).toBe(false)
   })
 })

@@ -145,7 +145,11 @@ bars, the strategy runner for fills and signals, the kill switch for halts.
 - **Halts reach every client**, subscribed or not. A trading halt is not
   something to opt into.
 - **Market data is filtered by symbol**; execution events are not. A fill on a
-  symbol you did not subscribe to is still your money.
+  symbol you did not subscribe to is still your money. Naming no symbols asks
+  for the whole channel; naming some and then unsubscribing from all of them
+  asks for none of it. Those are different requests and the server holds them
+  apart — collapsing them into one empty set meant a panel unmounting silently
+  promoted that client to every tick in the universe.
 - **A client that stops reading is dropped** on a short deadline rather than
   buffered for, **and hung up on**. Unbounded buffering for one slow reader
   costs every other client. Closing is the half that is easy to leave out and
@@ -154,8 +158,16 @@ bars, the strategy runner for fills and signals, the kill switch for halts.
   live while receiving nothing — including the halt. The close code is `1013`
   and deliberately never `1008`, which the dashboard reads as "your session is
   gone" and acts on by signing out.
-- **The bridge retries forever.** Nothing here is traded on, so a dead bridge
-  costs live updates and never data a decision is made from.
+- **The bridge retries forever**, and **coming back announces the gap it
+  closed**. Nothing here is traded on, so a dead bridge costs live updates and
+  never data a decision is made from — but it costs them invisibly, which is the
+  part that needed fixing. The browsers' own sockets stay up throughout an
+  outage of the API's Redis subscription, so nothing on the client reconnects
+  and nothing re-reads; whatever was published in the meantime reached nobody
+  and pub/sub will not replay it. A re-subscribe therefore sends every client
+  `{"type": "gap", "seconds": ...}`, subscribed or not, and each one re-reads
+  the book. `seconds` is a lower bound — the clock starts when the failure was
+  noticed, not when it happened.
 
 The browser's half of it:
 
@@ -164,8 +176,12 @@ The browser's half of it:
   held across every route, because `HaltBanner` is mounted above the nav on all
   of them and a banner fed by a socket that exists on one route cannot interrupt
   anybody on the others.
-- **A reconnect re-reads the book.** Pub/sub has no replay, so a fill or a halt
-  published while the socket was down reached nobody and is not coming. While
+- **A reconnect re-reads the book, and so does a `gap`.** The two cover the two
+  halves of the same loss: a reconnect is this socket having been down, a `gap`
+  is the API's subscription having been down while this socket stayed up. Only
+  the first is visible from the browser, which is why the second has to be told.
+  Pub/sub has no replay, so a fill or a halt published in either window reached
+  nobody and is not coming. While
   the dashboard polled, the next poll repaired that within five minutes without
   anyone deciding it should; nothing polls now (ADR 0022), so the repair is
   deliberate or it does not happen. One aggregate read *is* the current state of
