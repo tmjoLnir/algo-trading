@@ -525,7 +525,7 @@ def _validated_spec(
     # reader to the wrong layer to look for it.
     #
     # Every other caller of `registry.get` in this platform already guards its
-    # own blank and says what was blank in its own terms — `WORKER_STRATEGY is
+    # own blank and says what was blank in its own terms — `no strategy is
     # unset` in `worker.trading` and both preflights. Only the caller knows what
     # the name came from, which is why the message lives here and not in the
     # registry. This endpoint was the one that did not.

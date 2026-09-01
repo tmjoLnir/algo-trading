@@ -195,8 +195,16 @@ export interface paths {
          *     dashboard applies to the book: a write that cannot land must not stop the
          *     action, but a read that cannot happen must not be rendered as "nothing
          *     happened". An empty page and an unreachable record are different sentences,
-         *     and only one of them is safe to believe — so a missing database is the 503
-         *     `get_session_factory` already answers with.
+         *     and only one of them is safe to believe.
+         *
+         *     So an unreachable database has to be a 503, and it is — from
+         *     `atp_api.errors`, which now answers that for every route rather than only
+         *     this one. This handler used to catch it itself, and the two things wrong
+         *     with doing it here are why it no longer does. It caught `Exception`, so a
+         *     bug in the query below reported itself as an outage; and it put `str(exc)`
+         *     in the response, where a driver's connection error is free to quote the DSN
+         *     it failed to connect with — and the DSN carries the password (CLAUDE.md
+         *     §1.6).
          */
         get: operations["list_audit_entries_api_v1_audit_get"];
         put?: never;
@@ -1160,7 +1168,7 @@ export interface paths {
          *
          *     One response rather than two endpoints, because the useful fact is the
          *     *difference*: a class in the registry with no row has never been loaded by a
-         *     worker, and with `WORKER_STRATEGY` empty by default that is the ordinary
+         *     worker, and with no strategy configured by default that is the ordinary
          *     state of a fresh install. Making a client fetch both and diff them would
          *     leave every client computing the same thing, and a screen that showed only
          *     the table would answer "nothing is running" with an empty list that looks
@@ -1209,7 +1217,7 @@ export interface paths {
          *
          *     409 on a name that is taken, and the name may well have been taken by
          *     something nobody authored: a worker writes a row for whatever
-         *     `WORKER_STRATEGY` names at its first session open, and `scripts/seed.py`
+         *     the worker configuration names at its first session open, and `scripts/seed.py`
          *     writes one per registered class. The refusal says so, because "already
          *     exists" about a strategy you have never created is otherwise a puzzle.
          */
@@ -1331,6 +1339,37 @@ export interface paths {
          *     its pawl removed, which is why it waits rather than shipping half.
          */
         post: operations["promote_strategy_api_v1_strategies__strategy_id__promote_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/worker/config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Worker Config
+         * @description The saved configuration, the running one, and the options for both.
+         */
+        get: operations["get_worker_config_api_v1_worker_config_get"];
+        /**
+         * Update Worker Config
+         * @description Replace the configuration. Validated, audited, and password-gated on one field.
+         *
+         *     The order is deliberate. Validate first, so a bad request never reaches the
+         *     password prompt and an operator is not asked to authenticate a save that was
+         *     going to be refused anyway. Step up second, so the credential is checked
+         *     against the act it authorises. Write third. Audit last, after the row
+         *     exists, so an entry never claims a change that did not take — the same rule
+         *     the halt verbs follow.
+         */
+        put: operations["update_worker_config_api_v1_worker_config_put"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2203,6 +2242,18 @@ export interface components {
             timezone: string;
         };
         /**
+         * OptionView
+         * @description One entry in a dropdown, with the prose that says when to pick it.
+         */
+        OptionView: {
+            /** Help */
+            help: string;
+            /** Label */
+            label: string;
+            /** Value */
+            value: string;
+        };
+        /**
          * OrderHistoryView
          * @description One order, as the history screen reads it.
          *
@@ -2461,8 +2512,10 @@ export interface components {
          *     while a symbol halt stands leaves trading partly stopped, which matters — but
          *     answering it here means a second read of the store on a path whose first
          *     write has already landed, so a failed read would report failure for a resume
-         *     that actually happened. The banner re-reads every halt on the next poll and
-         *     stays up if any remain; that is the honest place for the question.
+         *     that actually happened. The halt reaches every connected client over the
+         *     socket, and the banner re-reads the full list when it does — staying up if
+         *     any remain. That is the honest place for the question, and it is why halts
+         *     were left on a push path rather than a schedule the reader controls.
          */
         ResumedView: {
             /** Cleared By */
@@ -2541,6 +2594,42 @@ export interface components {
             limits: components["schemas"]["LimitUsageView"][];
             /** Unmarked Symbols */
             unmarked_symbols?: string[];
+        };
+        /**
+         * RunningConfigView
+         * @description What a worker last reported booting with.
+         *
+         *     `started_at` is the freshness signal, exactly as `book_as_of` is on the
+         *     dashboard: this is a fact about a process that may since have died, and a
+         *     screen that presented it as current would explain a stale configuration as a
+         *     live one.
+         */
+        RunningConfigView: {
+            config: components["schemas"]["WorkerConfigView"];
+            /** Reason */
+            reason: string;
+            /** Revision */
+            revision: number;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /** Trading */
+            trading: boolean;
+        };
+        /**
+         * SavedConfigView
+         * @description What is stored, and who stored it.
+         */
+        SavedConfigView: {
+            config: components["schemas"]["WorkerConfigView"];
+            /** Revision */
+            revision: number;
+            /** Updated At */
+            updated_at: string | null;
+            /** Updated By */
+            updated_by: string | null;
         };
         /**
          * SessionView
@@ -2770,6 +2859,31 @@ export interface components {
             universe?: string[];
         };
         /**
+         * StrategyOptionView
+         * @description A registered strategy class, with what it accepts.
+         *
+         *     `params_schema` and `default_params` are here so the form can show what a
+         *     strategy takes without a second request, and so the operator writing JSON
+         *     into the parameters box has the field names in front of them rather than in
+         *     the source.
+         */
+        StrategyOptionView: {
+            /** Default Params */
+            default_params: {
+                [key: string]: unknown;
+            };
+            /** Help */
+            help: string;
+            /** Label */
+            label: string;
+            /** Params Schema */
+            params_schema: {
+                [key: string]: unknown;
+            };
+            /** Value */
+            value: string;
+        };
+        /**
          * StrategyState
          * @enum {string}
          */
@@ -2862,6 +2976,115 @@ export interface components {
             scope: string;
             /** User */
             user: string;
+        };
+        /**
+         * WorkerConfigScreen
+         * @description Everything the settings screen renders, in one request.
+         *
+         *     One aggregate rather than four, for the reason the dashboard's is one: the
+         *     saved row, the running report and the option catalogue assembled from three
+         *     instants could disagree about which strategies exist, and the reader could
+         *     not tell which to trust.
+         */
+        WorkerConfigScreen: {
+            /** Allow Live Trading */
+            allow_live_trading: boolean;
+            /** Live Orders Require Password */
+            live_orders_require_password: boolean;
+            options: components["schemas"]["WorkerOptionsView"];
+            /** Pending Restart */
+            pending_restart: boolean;
+            /** Run Mode */
+            run_mode: string;
+            running: components["schemas"]["RunningConfigView"] | null;
+            saved: components["schemas"]["SavedConfigView"];
+        };
+        /**
+         * WorkerConfigUpdate
+         * @description A configuration as the form sends it.
+         *
+         *     Every field is required. A partial update would make the form's "save"
+         *     depend on which inputs the browser considered dirty, and a stop multiplier
+         *     silently retaining an old value because a field was not touched is the kind
+         *     of surprise this row must not have.
+         */
+        WorkerConfigUpdate: {
+            /** Allow Live Orders */
+            allow_live_orders: boolean;
+            /** Max Silence Seconds */
+            max_silence_seconds: number;
+            /**
+             * Password
+             * @default
+             */
+            password: string;
+            /** Sizing Method */
+            sizing_method: string;
+            /** Sizing Value */
+            sizing_value: number | string;
+            /** Stop Multiplier */
+            stop_multiplier: number | string;
+            /** Stop Period */
+            stop_period: number;
+            /** Stop Type */
+            stop_type: string;
+            /** Strategy */
+            strategy: string;
+            /** Strategy Params */
+            strategy_params: {
+                [key: string]: unknown;
+            };
+            /** Symbols */
+            symbols: string[];
+        };
+        /**
+         * WorkerConfigView
+         * @description The ten parameters, as the wire carries them.
+         *
+         *     The two decimals are strings for the reason every decimal on this API is
+         *     (docs/DASHBOARD.md): `sizing_value` scales every order and `stop_multiplier`
+         *     decides where the protective stop sits, and neither should pass through a
+         *     JSON float on the way to a screen.
+         */
+        WorkerConfigView: {
+            /** Allow Live Orders */
+            allow_live_orders: boolean;
+            /** Max Silence Seconds */
+            max_silence_seconds: number;
+            /** Sizing Method */
+            sizing_method: string;
+            /** Sizing Value */
+            sizing_value: string;
+            /** Stop Multiplier */
+            stop_multiplier: string;
+            /** Stop Period */
+            stop_period: number;
+            /** Stop Type */
+            stop_type: string;
+            /** Strategy */
+            strategy: string;
+            /** Strategy Params */
+            strategy_params: {
+                [key: string]: unknown;
+            };
+            /** Symbols */
+            symbols: string[];
+        };
+        /**
+         * WorkerOptionsView
+         * @description Everything the form needs to render its selects.
+         */
+        WorkerOptionsView: {
+            /** Multiplier Stops */
+            multiplier_stops: string[];
+            /** Period Stops */
+            period_stops: string[];
+            /** Sizing Methods */
+            sizing_methods: components["schemas"]["OptionView"][];
+            /** Stop Types */
+            stop_types: components["schemas"]["OptionView"][];
+            /** Strategies */
+            strategies: components["schemas"]["StrategyOptionView"][];
         };
     };
     responses: never;
@@ -4221,6 +4444,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["StoredStrategyView"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_worker_config_api_v1_worker_config_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerConfigScreen"];
+                };
+            };
+        };
+    };
+    update_worker_config_api_v1_worker_config_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkerConfigUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerConfigScreen"];
                 };
             };
             /** @description Validation Error */

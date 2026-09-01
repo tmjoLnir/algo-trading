@@ -43,6 +43,7 @@ from atp_core.errors import (
 from atp_core.execution.ports import StoredBook
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
 from atp_core.strategy.ports import StoredStrategy
+from atp_core.worker.config import StoredWorkerConfig, WorkerConfig
 
 if TYPE_CHECKING:
     from typing import Any
@@ -53,6 +54,7 @@ if TYPE_CHECKING:
     from atp_core.domain import Signal
     from atp_core.execution.ports import EquityPoint
     from atp_core.strategy.ports import NewStrategy, SignalOutcome, StrategyRecord
+    from atp_core.worker.ports import RunningWorkerConfig
 
 
 def a_totals(**overrides: object) -> dict[str, object]:
@@ -726,6 +728,56 @@ class FakeSnapshotStore:
     async def get(self, run_mode: object) -> LiveSnapshot | None:
         if self.get_error is not None:
             raise self.get_error
+        return self.stored.get(getattr(run_mode, "value", str(run_mode)))
+
+
+class FakeWorkerConfigRepository:
+    """In-memory `WorkerConfigRepository`.
+
+    Mirrors the Postgres adapter's one behaviour a test can get wrong: **the
+    revision is allocated on save and increments on every one**, including a
+    save that changed nothing. A fake that only bumped it on a diff would let a
+    test pass that the real adapter fails, and the number is what the
+    restart notice is derived from.
+    """
+
+    def __init__(self, stored: StoredWorkerConfig | None = None) -> None:
+        self.stored = stored
+        self.saves: list[WorkerConfig] = []
+        #: Set by a test to stand for an unreachable database. The worker must
+        #: refuse to start rather than fall back to the defaults, and the API
+        #: must answer 503 rather than render an empty form over a stored row.
+        self.load_error: Exception | None = None
+
+    async def load(self) -> StoredWorkerConfig | None:
+        if self.load_error is not None:
+            raise self.load_error
+        return self.stored
+
+    async def save(self, config: WorkerConfig, *, actor: str, at: datetime) -> StoredWorkerConfig:
+        self.saves.append(config)
+        revision = 1 if self.stored is None else self.stored.revision + 1
+        self.stored = StoredWorkerConfig(
+            config=config, revision=revision, updated_at=at, updated_by=actor
+        )
+        return self.stored
+
+
+class FakeWorkerStatusStore:
+    """In-memory `WorkerStatusStore`.
+
+    `get` returns None until a worker has published, which is the state a
+    settings screen meets on a platform that has never run one — and which must
+    render as "nobody has reported" rather than as "running nothing".
+    """
+
+    def __init__(self) -> None:
+        self.stored: dict[str, RunningWorkerConfig] = {}
+
+    async def put(self, run_mode: object, running: RunningWorkerConfig) -> None:
+        self.stored[getattr(run_mode, "value", str(run_mode))] = running
+
+    async def get(self, run_mode: object) -> RunningWorkerConfig | None:
         return self.stored.get(getattr(run_mode, "value", str(run_mode)))
 
 

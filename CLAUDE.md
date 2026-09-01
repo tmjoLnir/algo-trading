@@ -33,7 +33,13 @@ comment, not a nit.
    `ATP_RUN_MODE == "live"`. Broker interactions in tests use the in-memory fake.
 8. **Live mode is opt-in and loud.** `ATP_RUN_MODE=live` additionally requires
    `ATP_ALLOW_LIVE_TRADING=true`; the worker logs a `CRITICAL` banner at startup. Never
-   change the default, and never widen the guard to make a test pass.
+   change the default, and never widen the guard to make a test pass. A **third** lock,
+   `worker_config.allow_live_orders`, decides separately whether the unattended loop may
+   place those orders. It is the one live control an operator changes at runtime, so it
+   lives in the database and is edited on the dashboard — and arming it costs the
+   operator's password, is refused to a read-only session, and is audited. Turning it off
+   asks for nothing. Do not collapse the three into fewer, and do not move the other two
+   anywhere a browser can reach.
 
 ## 2. Repository map
 
@@ -65,6 +71,7 @@ Inside `libs/core/src/atp_core/`:
 | `metrics/` | Operational metrics. Every metric name in the platform, declared once. |
 | `backtest/` | Historical event loop, portfolio simulation, cost models, metrics. |
 | `analytics/` | Performance statistics and report generation. |
+| `worker/` | What the worker trades, as a validated value object and two ports. Configuration an operator owns at runtime — not `Settings`, which is what the *process* is. |
 | `persistence/` | SQLAlchemy models, repositories, session management. |
 
 **Dependency rule:** `apps/*` → `libs/core`. Never the reverse. Within core:

@@ -207,13 +207,21 @@ Fill in, at minimum:
 | `ATP_WEB_BIND_ADDR` | The `tailscale ip -4` address. Left empty the dashboard is reachable from the host only |
 | `ATP_LOG_FORMAT=json` | The default is `console`, which is for a terminal |
 | `ATP_ENV=production` | |
-| `WORKER_SYMBOLS` | The watchlist. Empty means the worker idles |
 | `ALERT_NTFY_TOPIC` | Where halts reach a phone. Empty means log-only — see below |
 | `ALERT_TELEGRAM_TOKEN` / `_CHAT_ID` | The other transport. Set both, or neither |
 
 `ATP_RUN_MODE` and the two live locks are the ones to be deliberate about.
 `paper` is where a host starts and where it stays for at least the four weeks
 `docs/SAFETY.md` asks for.
+
+**The watchlist and the strategy are not in this file.** What the worker trades
+— the symbols, the strategy and its parameters, the sizing, the protective stop,
+the feed watchdog and the third live lock — is a row in the database, edited on
+the dashboard's **Worker** tab. Nothing is defaulted into it, so a freshly
+deployed host ingests nothing and places no orders until somebody opens that tab
+and says what to trade. Configuration is read once at worker start, so a save
+takes effect on `docker compose restart worker`; the tab says so, and says which
+revision the running process is on.
 
 ### Secrets
 
@@ -288,7 +296,7 @@ bundle can acquire one later through `sops` directly or a hand edit:
 |---|---|
 | `ATP_RUN_MODE` | `docs/SAFETY.md` layer 1 |
 | `ATP_ALLOW_LIVE_TRADING` | layer 2 |
-| `WORKER_ALLOW_LIVE_ORDERS` | the worker's own lock |
+| `WORKER_ALLOW_LIVE_ORDERS` | the worker's own lock — no longer read from the environment (it is a `worker_config` column now), and still refused here so a dead key cannot sit in a bundle looking like it works |
 
 These are host configuration, not secrets. A bundle is a thing that gets copied
 between hosts, restored from a backup and re-synced by tooling, and none of

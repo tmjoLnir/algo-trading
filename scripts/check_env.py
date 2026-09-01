@@ -143,6 +143,32 @@ def describe(problem: ConfigProblem, lines: dict[str, int]) -> list[str]:
     return out
 
 
+#: Keys that USED to be read and are not any more, with where they went.
+#: Without this an operator upgrading past ADR 0023 gets ten lines saying
+#: "nothing reads it" — which is the wording this check reserves for a
+#: misspelling, and it would send them looking for a typo that is not there.
+#:
+#: "Nothing reads it" is still the *finding*; only the sentence changes, because
+#: the consequence is the same one and it is the dangerous one: the value in the
+#: file is being ignored and the operator believes it is in force.
+MOVED = dict.fromkeys(
+    (
+        "WORKER_SYMBOLS",
+        "WORKER_MAX_SILENCE_SECONDS",
+        "WORKER_STRATEGY",
+        "WORKER_STRATEGY_PARAMS",
+        "WORKER_SIZING_METHOD",
+        "WORKER_SIZING_VALUE",
+        "WORKER_STOP_TYPE",
+        "WORKER_STOP_MULTIPLIER",
+        "WORKER_STOP_PERIOD",
+        "WORKER_ALLOW_LIVE_ORDERS",
+    ),
+    "moved to the dashboard's Worker tab (ADR 0023) — this line does nothing; "
+    "copy the value across and delete it",
+)
+
+
 def unread_keys(lines: dict[str, int]) -> list[tuple[str, int, str]]:
     """Keys assigned in `.env` that nothing will read, worst-first by line.
 
@@ -160,6 +186,10 @@ def unread_keys(lines: dict[str, int]) -> list[tuple[str, int, str]]:
     found: list[tuple[str, int, str]] = []
     for key, line in sorted(lines.items(), key=lambda kv: kv[1]):
         if key in known or key in READ_ELSEWHERE:
+            continue
+        moved = MOVED.get(key)
+        if moved is not None:
+            found.append((key, line, moved))
             continue
         near = difflib.get_close_matches(key, sorted(known), n=1, cutoff=0.8)
         note = f"did you mean {near[0]}?" if near else "nothing in this platform reads it"

@@ -39,13 +39,14 @@ from atp_core.domain.enums import StopType
 from atp_core.errors import ATPError
 from atp_core.risk.rules import position_size
 from atp_core.strategy import registry
-from atp_worker.trading import resolve_stop_config, strategy_params
+from atp_worker.trading import resolve_stop_config
 
 if TYPE_CHECKING:
     from datetime import datetime
 
     from atp_core.config import RiskLimits, Settings
     from atp_core.risk.killswitch import HaltRecord
+    from atp_core.worker.config import WorkerConfig
     from atp_worker.trading import TradingDecision
 
 #: The clause of docs/SAFETY.md's go-live checklist a failing check maps to,
@@ -193,11 +194,11 @@ def check_locks(decision: TradingDecision) -> Check:
         "trading locks",
         Status.FAIL,
         decision.reason,
-        fix="set WORKER_STRATEGY and WORKER_SYMBOLS" if not decision.blocked else "",
+        fix="choose a strategy and a watchlist on the Worker tab" if not decision.blocked else "",
     )
 
 
-def check_strategy(settings: Settings) -> Check:
+def check_strategy(config: WorkerConfig) -> Check:
     """The named strategy exists and accepts the parameters it was given.
 
     Constructed, not merely looked up. A strategy validates its own parameters
@@ -205,9 +206,14 @@ def check_strategy(settings: Settings) -> Check:
     and a typo that survives to the worker starts a strategy on its defaults
     while the operator believes it is running what they set.
     """
-    name = settings.worker_strategy
+    name = config.strategy
     if not name:
-        return Check("strategy", Status.FAIL, "WORKER_STRATEGY is unset", fix="WORKER_STRATEGY=...")
+        return Check(
+            "strategy",
+            Status.FAIL,
+            "no strategy is configured",
+            fix="choose one on the dashboard's Worker tab",
+        )
     try:
         strategy_cls = registry.get(name)
     except ATPError as exc:
@@ -215,19 +221,18 @@ def check_strategy(settings: Settings) -> Check:
         return Check("strategy", Status.FAIL, str(exc), fix=f"one of: {known}")
 
     try:
-        params = strategy_params(settings)
-        strategy = strategy_cls(params)
+        strategy = strategy_cls(dict(config.strategy_params) or None)
     except (ATPError, TypeError, ValueError) as exc:
         return Check(
             "strategy",
             Status.FAIL,
             f"{name} rejected its parameters: {exc}",
-            fix="fix WORKER_STRATEGY_PARAMS",
+            fix="fix the strategy parameters on the Worker tab",
         )
     return Check("strategy", Status.PASS, f"{name} constructs, warmup_bars={strategy.warmup_bars}")
 
 
-def check_stop_config(settings: Settings) -> Check:
+def check_stop_config(config: WorkerConfig) -> Check:
     """The configured stop is one `StopManager` can actually place.
 
     A `time` stop is the case worth naming. It is a real stop type and it has no
@@ -237,29 +242,32 @@ def check_stop_config(settings: Settings) -> Check:
     of refusals.
     """
     try:
-        config = resolve_stop_config(settings)
+        stop = resolve_stop_config(config)
     except (ATPError, ValueError) as exc:
-        return Check("stop type", Status.FAIL, str(exc), fix="WORKER_STOP_TYPE=atr")
-    stop_type = config.stop_type
-    if stop_type is StopType.TIME:
+        return Check("stop type", Status.FAIL, str(exc), fix="set the stop type to ATR")
+    if stop.stop_type is StopType.TIME:
         return Check(
             "stop type",
             Status.WARN,
-            "WORKER_STOP_TYPE=time places no price level — nothing rests at the venue, "
+            "a time stop places no price level — nothing rests at the venue, "
             "so SAFETY.md layer 5 is not exercised by this run",
             source=SAFETY_CHECKLIST,
         )
-    if settings.worker_stop_multiplier <= 0:
+    # A non-positive multiplier is refused by `WorkerConfig` itself now, so this
+    # cannot be reached from a stored row. Kept because a caller can construct
+    # the value object in other ways, and a stop at or through the entry price
+    # is the one misconfiguration here that loses money rather than time.
+    if config.stop_multiplier <= 0:
         return Check(
             "stop type",
             Status.FAIL,
-            f"WORKER_STOP_MULTIPLIER={settings.worker_stop_multiplier} is not positive",
-            fix="WORKER_STOP_MULTIPLIER=2",
+            f"stop multiplier {config.stop_multiplier} is not positive",
+            fix="set the stop multiplier to 2",
         )
     return Check(
         "stop type",
         Status.PASS,
-        f"{stop_type.value} x {settings.worker_stop_multiplier}",
+        f"{stop.stop_type.value} x {config.stop_multiplier}",
     )
 
 
@@ -386,7 +394,7 @@ def check_not_halted(halts: list[HaltRecord]) -> Check:
 
 
 def check_sizing_is_reachable(
-    settings: Settings,
+    config: WorkerConfig,
     limits: RiskLimits,
     *,
     equity: Decimal,
@@ -413,8 +421,8 @@ def check_sizing_is_reachable(
     has to be the number the router computes, or the prediction is about a
     different platform (ADR 0006).
     """
-    method = settings.worker_sizing_method
-    value = settings.worker_sizing_value
+    method = config.sizing_method
+    value = config.sizing_value
     try:
         qty = position_size(method, equity, price, stop_price=stop_price, risk_pct=value)
     except ValueError as exc:
@@ -422,7 +430,7 @@ def check_sizing_is_reachable(
             "sizing",
             Status.FAIL,
             f"{method} cannot size an entry here: {exc}",
-            fix="WORKER_SIZING_METHOD=fixed_qty with WORKER_SIZING_VALUE=1 for a first run",
+            fix="on the Worker tab, set sizing to fixed_qty with a value of 1 for a first run",
             source="docs/FIRST_PAPER_RUN.md, 'Stage 2'",
         )
     if qty <= 0:
@@ -430,7 +438,7 @@ def check_sizing_is_reachable(
             "sizing",
             Status.FAIL,
             f"{method} sizes the first entry at {qty} shares — nothing would be submitted",
-            fix="raise WORKER_SIZING_VALUE, or use fixed_qty for a first run",
+            fix="raise the sizing value on the Worker tab, or use fixed_qty for a first run",
         )
 
     notional = qty * price
@@ -444,7 +452,7 @@ def check_sizing_is_reachable(
             f"RISK_MAX_POSITION_PCT caps a position at {limits.max_position_pct:.0%} — "
             f"max_position_size would refuse every entry, and the week would look silent",
             fix=(
-                f"lower WORKER_SIZING_VALUE (about "
+                f"lower the sizing value on the Worker tab (about "
                 f"{value * limits.max_position_pct * equity / notional:.4f} fits), "
                 f"or use fixed_qty for a first run"
             ),

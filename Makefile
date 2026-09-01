@@ -28,7 +28,8 @@ up: .env  ## Start the full stack
 	@echo "api  → http://localhost:8000/docs"
 	@echo "web  → http://localhost:5173"
 	@echo "worker → market-data ingestion + scheduled jobs"
-	@echo "         it places no orders yet; set WORKER_SYMBOLS to give it a watchlist"
+	@echo "         what it trades is set on the dashboard's Worker tab, not in .env;"
+	@echo "         with nothing saved it ingests nothing and places no orders"
 	@echo "queue  → runs the backtests the dashboard queues"
 
 up-prod: .env check-bindings  ## Start the stack with the BUILT dashboard behind nginx

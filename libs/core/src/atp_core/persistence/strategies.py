@@ -25,7 +25,7 @@ running is not a draft" conflates *running* with *promoted*. `state` is the
 rung a strategy has been promoted to on the ratchet (draft → backtesting →
 paper → live), and every rung above the first is a human decision the API is
 supposed to gate. A booting worker has been granted nothing by anybody; it is
-running because somebody set `WORKER_STRATEGY`, which is a fact about the
+running because somebody named it on the dashboard's Worker tab, which is a fact about the
 deployment rather than an authorisation. A worker that wrote itself onto a
 higher rung would be the ratchet with its pawl removed.
 

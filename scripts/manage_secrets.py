@@ -23,15 +23,21 @@ bundles live, what may not go in one, and how the plaintext lands on disk.
 rather than as one opaque blob. Which secret was rotated is exactly what a
 reviewer needs to see, and exactly what must not be readable is the value.
 
-**Three keys may never be in a bundle** (`FORBIDDEN_KEYS`). `ATP_RUN_MODE`,
-`ATP_ALLOW_LIVE_TRADING` and `WORKER_ALLOW_LIVE_ORDERS` are docs/SAFETY.md's
-layers 1 and 2 — the locks that decide whether this platform can trade real
-money. They are host configuration, not secrets, and a bundle is a thing that
-gets copied between hosts, restored from a backup and re-synced by tooling.
-None of those events may be able to turn on live trading as a side effect.
-ADR 0011 named the latter two; `ATP_RUN_MODE` is added here for the same
-reason, and is flagged in docs/DEPLOYMENT.md as an extension a reviewer should
-either accept or strike.
+**Three keys may never be in a bundle** (`FORBIDDEN_KEYS`). `ATP_RUN_MODE`
+and `ATP_ALLOW_LIVE_TRADING` are the two live-money locks that still live in
+the environment — host configuration, not secrets — and a bundle is a thing
+that gets copied between hosts, restored from a backup and re-synced by
+tooling. None of those events may be able to turn on live trading as a side
+effect. ADR 0011 named `ATP_ALLOW_LIVE_TRADING`; `ATP_RUN_MODE` is here for the
+same reason, and is flagged in docs/DEPLOYMENT.md as an extension a reviewer
+should either accept or strike.
+
+`WORKER_ALLOW_LIVE_ORDERS` is the third of the three and is no longer read from
+the environment at all — the lock moved into the `worker_config` row, where
+arming it costs the operator's password. It stays on this list anyway, and the
+reason is worth stating: a key nothing reads, sitting in an encrypted bundle
+named after the thing that authorises real orders, is a line a future reader
+will believe. Refusing it keeps the bundle honest.
 
 **Nothing here ever prints a secret.** Failures report `sops`'s stderr and the
 *names* of offending keys; decrypted plaintext goes to the target file and
@@ -75,8 +81,10 @@ DEFAULT_TARGET = REPO / ".env"
 
 SOPS_CONFIG = REPO / ".sops.yaml"
 
-#: The run-mode locks. See the module docstring — these are host configuration,
-#: and a bundle must not be able to carry them from one host to another.
+#: The run-mode locks, plus one that is no longer a setting. See the module
+#: docstring: the first two are host configuration a bundle must not carry
+#: between hosts, and the third is refused so a dead key cannot sit in a bundle
+#: looking like it still does something.
 FORBIDDEN_KEYS = frozenset({"ATP_RUN_MODE", "ATP_ALLOW_LIVE_TRADING", "WORKER_ALLOW_LIVE_ORDERS"})
 
 #: Reported by `check` when absent, never fatal. Which of these a host needs
@@ -453,7 +461,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     print(f"Wrote {len(values)} key(s) to {target} (mode 0600)")
     print()
     print("The run-mode locks are deliberately not in the bundle and are not written")
-    print("here. Set ATP_RUN_MODE, and ATP_ALLOW_LIVE_TRADING / WORKER_ALLOW_LIVE_ORDERS")
+    print("here. Set ATP_RUN_MODE and ATP_ALLOW_LIVE_TRADING")
     print("if this host trades live, in the host's own configuration.")
     return 0
 

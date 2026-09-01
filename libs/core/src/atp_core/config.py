@@ -77,60 +77,23 @@ class Settings(BaseSettings):
     dashboard_stale_after_seconds: int = 300
 
     # ── worker ──────────────────────────────────────────────────────────────
-    #: The ingestor's watchlist, comma-separated (`WORKER_SYMBOLS=SPY,QQQ`).
-    #: No default universe: subscribing a process to symbols nobody asked for
-    #: spends the one market-data connection and writes bars for a watchlist
-    #: that was never chosen. Empty means the worker reports that it has nothing
-    #: to ingest rather than opening a socket to subscribe to nothing.
-    #:
-    #: Unaliased, like every setting here that is not one of the four `ATP_`
-    #: process switches: the env var is the field name upper-cased. An alias
-    #: would also make `Settings(worker_symbols=...)` silently do nothing under
-    #: this model's `extra="ignore"`.
-    worker_symbols: str = ""
-    #: How long the feed may be silent *during a session* before the watchdog
-    #: halts trading. Distinct from `risk.max_quote_age_seconds`, which is how
-    #: old a quote may be when an order is priced against it: this one is about
-    #: a connection that has stopped delivering, and is necessarily the looser
-    #: of the two — a symbol can legitimately go a minute without printing.
-    worker_max_silence_seconds: int = 60
-
-    #: The strategy this worker trades, by registry name (`WORKER_STRATEGY=
-    #: sma_crossover`). **Empty means it places no orders** — the same posture
-    #: as an empty `worker_symbols`: a worker that starts trading because it was
-    #: deployed, rather than because somebody chose to, is the accident this
-    #: default exists to prevent. Ingestion and the schedule run either way.
-    worker_strategy: str = ""
-
-    #: Strategy parameters as JSON (`WORKER_STRATEGY_PARAMS={"fast":20}`). Empty
-    #: means the strategy's own defaults.
-    worker_strategy_params: str = ""
-
-    #: How the runner sizes an order: one of the `PositionSizeSpec` methods and
-    #: its value. `risk_pct` with 0.01 is docs/RISK.md's default pair — size so
-    #: that hitting the stop loses 1% of equity.
-    worker_sizing_method: Literal[
-        "fixed_qty", "fixed_notional", "equity_pct", "risk_pct", "volatility_target"
-    ] = "risk_pct"
-    worker_sizing_value: Decimal = Decimal("0.01")
-
-    #: The protective stop armed on every entry. ATR at 2× is docs/RISK.md's
-    #: recommendation over a fixed percentage, which is too tight on a volatile
-    #: name and too loose on a dull one.
-    worker_stop_type: Literal[
-        "fixed_pct", "fixed_amount", "trailing_pct", "atr", "time", "chandelier"
-    ] = "atr"
-    worker_stop_multiplier: Decimal = Decimal("2")
-    worker_stop_period: int = 14
-
-    #: The **third** lock, and it exists only for live. `ATP_RUN_MODE=live` and
-    #: `ATP_ALLOW_LIVE_TRADING=true` between them say "this process may trade
-    #: real money"; this one says "this worker, specifically, may place the
-    #: orders". They are different decisions made by different people at
-    #: different times — enabling live mode is a deployment choice, and letting
-    #: an unattended loop act on it is an operational one. Paper is unaffected:
-    #: `worker_strategy` alone is the opt-in there.
-    worker_allow_live_orders: bool = False
+    # **The ten trading parameters are not here any more.** The watchlist, the
+    # strategy and its parameters, the sizing pair, the stop triple, the feed
+    # watchdog and the live-orders lock moved to the `worker_config` row that
+    # the dashboard writes (`atp_core.worker`). They were the only settings in
+    # this class that an operator changed *while the platform was running*, and
+    # an environment variable is the wrong home for such a thing three times
+    # over: changing one needs shell access to the host, nothing records who
+    # changed it, and the API cannot read it to explain why nothing is trading.
+    #
+    # `WORKER_METRICS_PORT` and `WORKER_METRICS_ADDR` stayed, and the split is
+    # the same one this class draws everywhere: a listener's address is what the
+    # *process* is, fixed by its container, and changing it is a deploy.
+    #
+    # `extra="ignore"` means an old `.env` still loads with the ten keys in it.
+    # `make check-env` reports them as keys nothing reads, which is the same
+    # thing it says about a misspelling and the right thing to say here: the
+    # value is being ignored, and the dashboard is where it lives now.
 
     # ── api ─────────────────────────────────────────────────────────────────
     api_host: str = "0.0.0.0"
@@ -295,19 +258,6 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.api_cors_origins.split(",") if o.strip()]
-
-    @property
-    def worker_symbol_list(self) -> list[str]:
-        """The watchlist, normalised.
-
-        Upper-cased because `symbol` is always an uppercase ticker here and the
-        ingestor rejects anything else — `ATP_WORKER_SYMBOLS=spy` is a shell
-        convenience, not a different instrument. De-duplicated in first-seen
-        order: a symbol listed twice would otherwise be subscribed twice and
-        counted twice against the vendor's symbol limit.
-        """
-        seen = [s.strip().upper() for s in self.worker_symbols.split(",") if s.strip()]
-        return list(dict.fromkeys(seen))
 
     def redacted(self) -> dict[str, Any]:
         """Safe to log: secrets replaced with '***'."""

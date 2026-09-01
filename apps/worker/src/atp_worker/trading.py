@@ -7,16 +7,27 @@ one function rather than infer it from a wiring block.
 
 The three locks, in the order they are checked:
 
-1. `WORKER_STRATEGY` names a strategy. Empty means no orders — the same posture
-   as an empty `WORKER_SYMBOLS`. A worker that starts trading because it was
-   deployed, rather than because somebody chose to, is the accident this
-   prevents.
+1. The configuration names a strategy. Empty means no orders — the same posture
+   as an empty watchlist. A worker that starts trading because it was deployed,
+   rather than because somebody chose to, is the accident this prevents.
 2. `ATP_RUN_MODE` / `ATP_ALLOW_LIVE_TRADING` — rule §1.8, enforced in
    `Settings` itself, which refuses to construct a live configuration without
    both.
-3. `WORKER_ALLOW_LIVE_ORDERS` — live only. Locks 1 and 2 say "this process may
-   trade real money"; this says "this unattended loop may place the orders".
+3. `allow_live_orders` — live only. Locks 1 and 2 say "this process may trade
+   real money"; this says "this unattended loop may place the orders".
    Different decisions, made by different people at different times.
+
+**Locks 1 and 3 moved out of the environment** and into `worker_config`, which
+the dashboard edits (`atp_core.worker`). Lock 2 did not and must not: a run mode
+editable from a browser would put the whole live ratchet behind one form. What
+the move changes here is only where the values come from — the checks, their
+order, and the sentence each failure produces are unchanged, because the point
+of them was never that they were environment variables.
+
+The two configurations are also the reason `decide` takes a `WorkerConfig`
+rather than reading one. A worker reads its configuration once, at start, and
+publishes what it read; a decision made against a freshly-loaded row would be a
+decision about a configuration this process is not running.
 
 A watchlist is a fourth requirement and deliberately not called a lock: it is
 not a safety control, it is the data the strategy needs. Trading without one
@@ -25,13 +36,11 @@ would mean a strategy deciding on a repository that nothing is updating.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from atp_core.domain import Portfolio, RunMode, StopType, Timeframe
-from atp_core.errors import ConfigError
 from atp_core.execution.reconciliation import Reconciler
 from atp_core.execution.router import OrderRouter
 from atp_core.logging import get_logger
@@ -40,6 +49,7 @@ from atp_core.risk.stops import StopConfig, StopManager
 from atp_core.strategy import examples as _examples  # noqa: F401 — populates the registry
 from atp_core.strategy import registry
 from atp_core.strategy.rules import PositionSizeSpec
+from atp_core.worker.config import MULTIPLIER_STOPS, WorkerConfig
 from atp_worker.runner import StrategyRunner
 
 if TYPE_CHECKING:
@@ -71,34 +81,43 @@ class TradingDecision:
     reason: str
     #: True when the configuration *wanted* to trade and a lock stopped it, as
     #: opposed to nobody having asked. The distinction decides log level: an
-    #: unset `WORKER_STRATEGY` is a choice, a live strategy without its third
+    #: unconfigured strategy is a choice, a live strategy without its third
     #: lock is a thwarted intention and belongs at CRITICAL.
     blocked: bool = False
 
 
-def decide(settings: Settings, symbols: list[str]) -> TradingDecision:
-    """Read the locks. Pure — no adapters, no I/O, no side effects."""
-    if not settings.worker_strategy:
+def decide(settings: Settings, config: WorkerConfig) -> TradingDecision:
+    """Read the locks. Pure — no adapters, no I/O, no side effects.
+
+    Every reason names the dashboard now rather than an environment variable,
+    because that is where the reader has to go to change it. A sentence telling
+    an operator to set `WORKER_STRATEGY` would send them to a file nothing reads
+    any more, which is worse than saying nothing.
+    """
+    if not config.strategy:
         return TradingDecision(
             enabled=False,
-            reason="WORKER_STRATEGY is unset — this worker places no orders",
+            reason=(
+                "no strategy is configured — this worker places no orders. "
+                "Choose one on the dashboard's Worker tab."
+            ),
         )
 
     if settings.run_mode is RunMode.BACKTEST:
         return TradingDecision(
             enabled=False,
             reason=(
-                f"WORKER_STRATEGY={settings.worker_strategy} is set but ATP_RUN_MODE=backtest; "
+                f"strategy {config.strategy} is configured but ATP_RUN_MODE=backtest; "
                 "a backtest has no venue to trade against — run scripts/run_backtest.py"
             ),
             blocked=True,
         )
 
-    if not symbols:
+    if not config.symbols:
         return TradingDecision(
             enabled=False,
             reason=(
-                f"WORKER_STRATEGY={settings.worker_strategy} is set but WORKER_SYMBOLS is empty; "
+                f"strategy {config.strategy} is configured but the watchlist is empty; "
                 "a strategy with no watchlist would decide on data nothing is updating"
             ),
             blocked=True,
@@ -108,20 +127,21 @@ def decide(settings: Settings, symbols: list[str]) -> TradingDecision:
         return TradingDecision(
             enabled=False,
             reason=(
-                f"WORKER_STRATEGY={settings.worker_strategy} is set but ALPACA_API_KEY is "
+                f"strategy {config.strategy} is configured but ALPACA_API_KEY is "
                 f"empty, and ATP_RUN_MODE={settings.run_mode.value} trades against Alpaca; "
                 "there is no venue to send an order to"
             ),
             blocked=True,
         )
 
-    if settings.is_live and not settings.worker_allow_live_orders:
+    if settings.is_live and not config.allow_live_orders:
         return TradingDecision(
             enabled=False,
             reason=(
-                "live mode is enabled but WORKER_ALLOW_LIVE_ORDERS is false — this worker "
-                "will not place real orders. Set it only when you intend an unattended loop "
-                "to trade real money."
+                "live mode is enabled but live order placement is not permitted — this worker "
+                "will not place real orders. Arm it on the dashboard's Worker tab, which asks "
+                "for your password, and only when you intend an unattended loop to trade real "
+                "money."
             ),
             blocked=True,
         )
@@ -129,13 +149,13 @@ def decide(settings: Settings, symbols: list[str]) -> TradingDecision:
     venue = "REAL MONEY" if settings.is_live else "paper money"
     return TradingDecision(
         enabled=True,
-        reason=f"trading {settings.worker_strategy} with {venue} against {settings.broker_base_url}",
+        reason=f"trading {config.strategy} with {venue} against {settings.broker_base_url}",
     )
 
 
 def build_runner(
     settings: Settings,
-    symbols: list[str],
+    config: WorkerConfig,
     *,
     broker: AlpacaBroker,
     kill_switch: KillSwitch,
@@ -157,8 +177,8 @@ def build_runner(
     `TradeUpdatesReconnected` is a demand for a REST catch-up, and the thing
     that performs it is the same object the runner warms up with.
     """
-    strategy_cls = registry.get(settings.worker_strategy)
-    strategy = strategy_cls(strategy_params(settings))
+    strategy_cls = registry.get(config.strategy)
+    strategy = strategy_cls(dict(config.strategy_params) or None)
 
     stop_manager = StopManager()
     risk_engine = RiskEngine(
@@ -169,7 +189,7 @@ def build_runner(
 
     runner = StrategyRunner(
         strategy=strategy,
-        symbols=symbols,
+        symbols=list(config.symbols),
         router=router,
         stop_manager=stop_manager,
         kill_switch=kill_switch,
@@ -178,10 +198,8 @@ def build_runner(
         clock=clock,
         calendar=calendar,
         reconciler=reconciler,
-        sizing=PositionSizeSpec(
-            type=settings.worker_sizing_method, value=settings.worker_sizing_value
-        ),
-        stop_config=resolve_stop_config(settings),
+        sizing=PositionSizeSpec(type=config.sizing_method, value=config.sizing_value),
+        stop_config=resolve_stop_config(config),
         timeframe=Timeframe.D1,
         run_mode=settings.run_mode,
         order_repo=order_repo,
@@ -195,42 +213,22 @@ def build_runner(
     return runner, reconciler
 
 
-def strategy_params(settings: Settings) -> dict[str, Any] | None:
-    """Parse `WORKER_STRATEGY_PARAMS`, refusing anything malformed.
-
-    A typo here would otherwise start a strategy on its defaults while the
-    operator believes it is running the parameters they set — which is the
-    quietest possible way to trade the wrong thing.
-    """
-    raw = settings.worker_strategy_params.strip()
-    if not raw:
-        return None
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ConfigError(f"WORKER_STRATEGY_PARAMS is not valid JSON: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise ConfigError(
-            f"WORKER_STRATEGY_PARAMS must be a JSON object, got {type(parsed).__name__}"
-        )
-    return parsed
-
-
-def resolve_stop_config(settings: Settings) -> StopConfig:
+def resolve_stop_config(config: WorkerConfig) -> StopConfig:
     """The protective stop every entry is armed with.
 
-    `multiplier` and `value` are populated from the same setting because the
-    two families of stop read it differently — an ATR stop is a multiple, a
-    fixed-percentage stop is a fraction — and giving each its own environment
-    variable would let an operator set the one the configured type ignores.
+    `multiplier` and `value` are populated from the same field because the two
+    families of stop read it differently — an ATR stop is a multiple, a
+    fixed-percentage stop is a fraction — and giving each its own would let an
+    operator fill in the one the configured type ignores. The dashboard relabels
+    the input from `MULTIPLIER_STOPS` for the same reason, so the screen and this
+    function cannot disagree about which meaning is in force.
     """
-    stop_type = StopType(settings.worker_stop_type)
-    multiplier_types = (StopType.ATR, StopType.CHANDELIER)
+    stop_type = StopType(config.stop_type)
     return StopConfig(
         stop_type=stop_type,
-        value=None if stop_type in multiplier_types else settings.worker_stop_multiplier,
-        multiplier=settings.worker_stop_multiplier if stop_type in multiplier_types else None,
-        period=settings.worker_stop_period,
+        value=None if config.stop_type in MULTIPLIER_STOPS else config.stop_multiplier,
+        multiplier=config.stop_multiplier if config.stop_type in MULTIPLIER_STOPS else None,
+        period=config.stop_period,
     )
 
 

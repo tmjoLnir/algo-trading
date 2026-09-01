@@ -43,6 +43,7 @@ from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.db import create_engine, create_session_factory, is_auth_failure
 from atp_core.persistence.quotes import RedisQuoteCache
 from atp_core.persistence.redis_client import close_redis, create_redis, create_sync_redis
+from atp_core.persistence.worker_config import PostgresWorkerConfigRepository
 from atp_core.risk.killswitch import RedisKillSwitch
 
 if TYPE_CHECKING:
@@ -60,7 +61,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--symbols",
         default=None,
-        help="comma-separated; defaults to WORKER_SYMBOLS",
+        help="comma-separated; defaults to the watchlist saved on the Worker tab",
     )
     p.add_argument("--timeframe", default="1d", help="which bar series to report on")
     p.add_argument(
@@ -69,6 +70,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="skip the venue — local state only, and no credentials needed",
     )
     return p.parse_args(argv)
+
+
+async def _saved_symbols(settings: Settings) -> list[str]:
+    """The watchlist a worker would boot with.
+
+    A read failure is an empty watchlist rather than a traceback: this is the
+    script somebody runs when the stack is half up, and it has plenty else to
+    report. The database checks below say so in their own words.
+    """
+    engine = create_engine(settings.database_url)
+    try:
+        stored = await PostgresWorkerConfigRepository(create_session_factory(engine)).load()
+    except Exception:
+        return []
+    finally:
+        await engine.dispose()
+    return [] if stored is None else list(stored.config.symbols)
 
 
 async def main(argv: list[str] | None = None) -> int:
@@ -95,7 +113,7 @@ async def main(argv: list[str] | None = None) -> int:
     symbols = (
         [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
         if args.symbols
-        else settings.worker_symbol_list
+        else await _saved_symbols(settings)
     )
 
     print(f"run mode   {settings.run_mode.value}")
@@ -106,7 +124,7 @@ async def main(argv: list[str] | None = None) -> int:
 
     _print_halts(settings)
     if not symbols:
-        print("\nno symbols — set WORKER_SYMBOLS or pass --symbols\n")
+        print("\nno symbols — set a watchlist on the dashboard's Worker tab, or pass --symbols\n")
     else:
         await _print_local(settings, symbols, timeframe)
 

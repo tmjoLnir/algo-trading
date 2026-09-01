@@ -61,7 +61,18 @@ as the cleanup takes.
   `ATP_RUN_MODE`, `ATP_ALLOW_LIVE_TRADING`, `WORKER_ALLOW_LIVE_ORDERS`. A bundle
   is copied between hosts and restored from backups; none of that may switch on
   live trading. `scripts/manage_secrets.py` refuses them on import and again on
-  install, so this is enforced rather than remembered.
+  install, so this is enforced rather than remembered. The third is no longer an
+  environment variable at all — it is a column in `worker_config`, armed through
+  `PUT /api/v1/worker/config`, which demands the operator's password to turn it
+  on and records the change in the audit log. It stays on the refused list so a
+  dead key cannot sit in a bundle looking like it still does something.
+- **The dashboard can now arm the third live lock.** That is a deliberate
+  widening and it comes with three conditions: the session must be able to act
+  (a read-only session is refused before the handler runs), the operator must
+  re-enter their password with the request (ADR 0009 — a cookie proves somebody
+  signed in this morning, not that anybody is at the keyboard now), and the
+  change is written to the audit log with its before and after. Turning the lock
+  *off* asks for nothing, for the same reason `/risk/halt` asks for nothing.
 - Losing the age private key makes every bundle encrypted to it unreadable.
   Back it up offline. It is the one item here with no recovery path.
 - **Both alert transports are addressed by a credential.**

@@ -178,7 +178,7 @@ class LiveSnapshot:
     recent_signals: tuple[SignalSummary, ...] = ()
     working_orders: tuple[OrderSummary, ...] = ()
     #: Which strategy produced this. None when the worker is running without
-    #: one, which is the default posture (`WORKER_STRATEGY` is empty).
+    #: one, which is the default posture (no strategy is configured).
     strategy: str | None = None
     #: The newest market-data timestamp the worker has seen. Not the time it
     #: was received: a feed that is connected and frozen keeps receiving

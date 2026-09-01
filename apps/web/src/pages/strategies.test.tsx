@@ -13,7 +13,7 @@ import type { AvailableStrategyView, StoredStrategyView, StrategiesResponse } fr
  * say.
  *
  * 1. **A class nothing has ever run is called out**, because with
- *    `WORKER_STRATEGY` empty by default that is the ordinary state of a fresh
+ *    no strategy configured by default that is the ordinary state of a fresh
  *    install and no other screen could say so.
  * 2. **An empty table is not an empty platform.** "No worker has registered a
  *    strategy" and "there are no strategies" are different sentences.

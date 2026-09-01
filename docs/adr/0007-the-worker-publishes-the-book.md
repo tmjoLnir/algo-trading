@@ -73,7 +73,7 @@ poll — one minute by default. That is well inside the five-minute cadence
 requirement #7 asks for, and the WebSocket carries fills, signals and halts in
 between.
 
-**A worker that is not trading publishes nothing.** `WORKER_STRATEGY` is empty
+**A worker that is not trading publishes nothing.** No strategy is configured
 by default, so the ordinary state of a fresh deployment is a dashboard with no
 book. This is reported as itself rather than as an empty account.
 

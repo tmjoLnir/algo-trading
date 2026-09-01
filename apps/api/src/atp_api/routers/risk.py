@@ -15,7 +15,6 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, model_validator
 
-from atp_api.auth import authenticate
 from atp_api.deps import (
     CurrentUser,
     get_audit_sink,
@@ -28,6 +27,7 @@ from atp_api.deps import (
     get_snapshot_store,
 )
 from atp_api.routers.dashboard import day_pnl_since_open
+from atp_api.stepup import require_step_up
 from atp_core.audit.ports import Action, AuditEntry, AuditSink
 from atp_core.brokers import BrokerPort
 from atp_core.clock import Clock, TradingCalendar
@@ -190,64 +190,6 @@ class FlattenAllRequest(BaseModel):
 
     confirm: str
     password: str = Field(min_length=1, max_length=1024)
-
-
-async def _require_step_up(
-    password: str,
-    actor: str,
-    settings: Settings,
-    audit: AuditSink,
-    clock: Clock,
-    target: str,
-) -> None:
-    """Demand the password again, for an act that cannot be taken back.
-
-    This is what finally enforces docs/RISK.md's "clearing requires a named
-    human". A session cookie proves someone logged in at some point in the last
-    twelve hours; it does not prove anyone is at the keyboard now. For halting
-    that distinction does not matter — hesitation is the expensive part, and
-    `/halt` deliberately asks for nothing. For clearing a halt and for
-    liquidating the book it is the whole point.
-
-    Deliberately no elevation window. A "recently authenticated" period would be
-    a stretch of minutes during which a walked-away laptop can flatten the book,
-    which is the exact situation this exists to prevent. The proof travels with
-    the act instead.
-
-    403 rather than 401: the session is valid and stays valid. Answering 401
-    would send the dashboard to a login screen, which is not what went wrong.
-
-    **A failure is recorded before it is raised.** `Action.FORBIDDEN` has always
-    described itself as covering "a read-only session attempting a write, or a
-    failed step-up (ADR 0009)", and `deps.require_write_scope` wrote the first
-    of those from the start; this end wrote nothing, so the record has been
-    claiming a coverage it did not have. The gap matters more here than there:
-    a wrong password against `/resume` or `/flatten-all` is either the operator
-    mistyping or somebody working through guesses with a stolen cookie, those
-    look identical at the moment of refusal, and `rate_limited` only ever
-    counted attempts at the *login* form. Without this row the second case
-    leaves no trace anywhere.
-    """
-    if authenticate(actor, password, settings) is not None:
-        return
-
-    await audit.record(
-        AuditEntry(
-            at=clock.now(),
-            actor=actor,
-            action=Action.FORBIDDEN,
-            target=target,
-            # Named so this is distinguishable from a read-only session's
-            # refusal, which shares the verb and would otherwise be indistinct
-            # on the audit screen — one is a session in the wrong mode, the
-            # other is a credential that did not check out.
-            detail={"reason": "step_up_failed"},
-        )
-    )
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="password required for this action",
-    )
 
 
 class RiskLimitsView(BaseModel):
@@ -808,7 +750,7 @@ async def clear_kill_switch(
     resumed. There is no partial state to recover from: `clear` is a single
     DELETE, so it either happened or it did not.
     """
-    await _require_step_up(payload.password, actor, settings, audit, clock, "/api/v1/risk/resume")
+    await require_step_up(payload.password, actor, settings, audit, clock, "/api/v1/risk/resume")
 
     try:
         cleared = await asyncio.to_thread(
@@ -916,7 +858,7 @@ async def flatten_all(
     symbol came back non-200 — so a 502 here means *some positions may still be
     open*, and says so.
     """
-    await _require_step_up(
+    await require_step_up(
         payload.password, actor, settings, audit, clock, "/api/v1/risk/flatten-all"
     )
     if payload.confirm != FLATTEN_CONFIRMATION:

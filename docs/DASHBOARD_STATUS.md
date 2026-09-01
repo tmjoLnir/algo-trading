@@ -78,7 +78,7 @@ totals understate exposure.
 - Clearing a halt is on the halt banner (#75), not on this tab's own controls:
   one `Resume…` per halt, because a halt is keyed on (scope, target) and a
   single button could only ever clear one of the halts on screen while looking
-  like it cleared the lot. The nav still has seven tabs and none is Risk, which
+  like it cleared the lot. The nav has eight tabs and none is Risk, which
   is not where the risk reads ended up. `/risk/status` and `/risk/limits` are
   built and read by a panel on the **Strategies** tab (#75) rather than by a
   tab of their own — `/status` is what a person checks before promoting a

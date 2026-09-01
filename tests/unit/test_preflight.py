@@ -27,6 +27,7 @@ import pytest
 
 from atp_core.config import RiskLimits, Settings
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
+from atp_core.worker import WorkerConfig
 from atp_worker import preflight, trading
 from atp_worker.preflight import Check, Preflight, Status
 
@@ -43,11 +44,23 @@ def settings(**overrides: object) -> Settings:
         "ATP_RUN_MODE": "paper",
         "alpaca_api_key": SECRET,
         "alpaca_api_secret": SECRET,
-        "worker_strategy": "sma_crossover",
-        "worker_symbols": "SPY",
     }
     base.update(overrides)
     return Settings(**base)  # type: ignore[arg-type]
+
+
+def config(**overrides: object) -> WorkerConfig:
+    """A worker configuration that would trade, so each test changes one thing.
+
+    The trading parameters are no longer part of `Settings` — they are the
+    `worker_config` row the dashboard writes — so the two fixtures are separate
+    and the checks take whichever they actually depend on. That separation is
+    the point rather than an inconvenience: `check_run_mode` cannot accidentally
+    be influenced by a stop multiplier now, because it is not handed one.
+    """
+    base: dict[str, object] = {"strategy": "sma_crossover", "symbols": ("SPY",)}
+    base.update(overrides)
+    return WorkerConfig(**base)  # type: ignore[arg-type]
 
 
 def a_halt(scope: HaltScope = HaltScope.GLOBAL, target: str | None = None) -> HaltRecord:
@@ -92,26 +105,26 @@ class TestTheConfigurationItself:
     def test_the_locks_come_from_decide_rather_than_a_second_copy(self) -> None:
         """A preflight that passed while the worker declined would be the exact
         bug this module exists to stop an operator spending a week on."""
-        decision = trading.decide(settings(worker_strategy=""), ["SPY"])
+        decision = trading.decide(settings(), config(strategy=""))
         check = preflight.check_locks(decision)
         assert check.status is Status.FAIL
         assert check.detail == decision.reason
 
     def test_a_strategy_that_rejects_its_params_fails_here_not_at_0931(self) -> None:
         check = preflight.check_strategy(
-            settings(worker_strategy_params='{"fast_period": 30, "slow_period": 10}')
+            config(strategy_params={"fast_period": 30, "slow_period": 10})
         )
         assert check.status is Status.FAIL
         # The strategy's own words, so the operator knows which pair.
         assert "fast_period" in check.detail
 
     def test_an_unknown_strategy_names_the_registered_ones(self) -> None:
-        check = preflight.check_strategy(settings(worker_strategy="nope"))
+        check = preflight.check_strategy(config(strategy="nope"))
         assert check.status is Status.FAIL
         assert "sma_crossover" in check.fix
 
     def test_a_good_strategy_reports_the_warmup_the_history_check_will_use(self) -> None:
-        check = preflight.check_strategy(settings())
+        check = preflight.check_strategy(config())
         assert check.status is Status.PASS
         assert "warmup_bars=" in check.detail
 
@@ -119,7 +132,7 @@ class TestTheConfigurationItself:
         """A real stop type that places no level. The run is valid and it does
         not demonstrate the thing SAFETY.md's layer 5 is about, which is worth
         knowing before rather than after."""
-        check = preflight.check_stop_config(settings(worker_stop_type="time"))
+        check = preflight.check_stop_config(config(stop_type="time"))
         assert check.status is Status.WARN
         assert "layer 5" in check.detail
 
@@ -164,7 +177,7 @@ class TestTheExpensiveFailures:
         allows, so `max_position_size` refuses every entry and the week looks
         silent."""
         check = preflight.check_sizing_is_reachable(
-            settings(worker_sizing_method="risk_pct", worker_sizing_value=Decimal("0.01")),
+            config(sizing_method="risk_pct", sizing_value=Decimal("0.01")),
             RiskLimits(),
             equity=Decimal(100_000),
             price=Decimal("96.76"),
@@ -174,11 +187,11 @@ class TestTheExpensiveFailures:
         assert "max_position_size" in check.detail
         # And it says what would fit, rather than leaving the arithmetic to
         # somebody at 09:29.
-        assert "WORKER_SIZING_VALUE" in check.fix
+        assert "sizing value" in check.fix
 
     def test_a_size_that_fits_passes_and_shows_the_headroom(self) -> None:
         check = preflight.check_sizing_is_reachable(
-            settings(worker_sizing_method="risk_pct", worker_sizing_value=Decimal("0.003")),
+            config(sizing_method="risk_pct", sizing_value=Decimal("0.003")),
             RiskLimits(),
             equity=Decimal(100_000),
             price=Decimal("96.76"),
@@ -191,7 +204,7 @@ class TestTheExpensiveFailures:
         """`position_size` refuses to invent a stop, and this reports that
         refusal now rather than as a week of `SIZING` rejections."""
         check = preflight.check_sizing_is_reachable(
-            settings(worker_sizing_method="risk_pct"),
+            config(sizing_method="risk_pct"),
             RiskLimits(),
             equity=Decimal(100_000),
             price=Decimal(100),
@@ -213,7 +226,7 @@ class TestTheExpensiveFailures:
             risk_pct=Decimal("0.001"),
         )
         check = preflight.check_sizing_is_reachable(
-            settings(worker_sizing_method="risk_pct", worker_sizing_value=Decimal("0.001")),
+            config(sizing_method="risk_pct", sizing_value=Decimal("0.001")),
             RiskLimits(),
             equity=Decimal(100_000),
             price=Decimal(100),
@@ -329,7 +342,7 @@ class TestTheVerdict:
         preflight.check_run_mode(settings(ATP_RUN_MODE="live", ATP_ALLOW_LIVE_TRADING=True)),
         preflight.check_credentials(settings()),
         preflight.check_credentials(settings(alpaca_api_key="")),
-        preflight.check_strategy(settings()),
+        preflight.check_strategy(config()),
         preflight.check_alert_transport(settings(alert_ntfy_topic=SECRET)),
     ],
 )

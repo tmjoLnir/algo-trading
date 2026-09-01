@@ -69,7 +69,7 @@ That is more honest than one, not less. The concern behind "one `as_of`" is six
 parts of the *book* from six instants; the book still has exactly one.
 
 **Nothing published is not an empty book.** A worker that is not trading — the
-default, since `WORKER_STRATEGY` is empty — publishes nothing, and the endpoint
+default, since no strategy is configured — publishes nothing, and the endpoint
 reports that as itself: `book_as_of`, `account` and `data_feed_healthy` are all
 null, and the banners, the halt list and the kill switch still render. "You hold
 nothing" and "nobody has said what you hold" are different sentences and only one
@@ -369,7 +369,7 @@ registered at import time; a `strategies` row is written by the runner at its
 first session open — or by a create, by `scripts/seed.py`, or by the first
 backtest queued for the class, which is why the registry table says *stored*
 rather than "a worker has run this". The absence of a row is the half that still
-means exactly one thing. `WORKER_STRATEGY` is empty by default, so a platform with
+means exactly one thing. No strategy is configured by default, so a platform with
 strategies in it and nothing running is the ordinary state of a fresh install —
 and no screen could say so. "I wrote a strategy and nothing is happening" had no
 answer anywhere in this UI. The response carries `never_run` computed
@@ -423,10 +423,64 @@ is written to the audit trail against the session's user (`strategy_created`),
 because this is where a strategy's name — the key every later signal and order
 carries — comes into existence.
 
+## The worker page
+
+`/worker`, over `GET` and `PUT /api/v1/worker/config` — the newest of the eight
+tabs, and the first screen in this app that **writes something a running process
+will act on**.
+Everything else either reads, halts trading, or queues a backtest.
+
+The ten settings it edits — the watchlist, the strategy and its parameters, the
+sizing pair, the stop triple, the feed watchdog, and whether the worker may place
+live orders — were environment variables until ADR 0023. What that ADR argues is
+why they are here at all; what this section is about is the two things the screen
+has to get right.
+
+**Saved and running are two different facts, and the screen shows both.** A
+worker reads its configuration once, at start, so what is stored and what is in
+force can differ for as long as nobody restarts. There are three states and they
+are rendered differently on purpose:
+
+| State | What it means |
+|---|---|
+| **In force** | a worker is reporting, and its revision is the saved one |
+| **Saved, not running** | a worker is reporting an older revision — restart to apply |
+| **No worker has reported** | nothing has published: none has started, or the store was cleared |
+
+The third is not "running nothing". The response carries `running: null` rather
+than an empty configuration for the same reason `/dashboard/live` sends nulls
+rather than zeroes for an unpublished book (ADR 0007): "nobody has said" and "it
+is running nothing" are different sentences, and only one of them is safe to act
+on.
+
+**Every dropdown comes from the server.** Strategies come from the registry with
+their JSON Schema and defaults; the sizing methods and stop types come from the
+same catalogue the value object validates against, each carrying the prose that
+says when to pick it. A `<select>` of six stop types tells a reader nothing about
+which to choose, and docs/RISK.md's argument for ATR over a fixed percentage
+belongs on the screen where the choice is made.
+
+**The stop input relabels itself.** One field carries both a multiple and a
+fraction, because the two families of stop read it differently — and the list of
+which is which comes from the server rather than a copy in the browser. An input
+still labelled "multiple" beside a `fixed_pct` stop is how somebody types 2 and
+arms a stop 200% below entry. The server refuses that too; the label is what
+stops them typing it.
+
+**Arming live orders asks for the password.** It is the one field on this screen
+that can lose real money, and it is the third of `docs/SAFETY.md`'s live locks.
+Checking the box reveals a password box and the save cannot be submitted without
+one; unchecking it asks for nothing at all. Same asymmetry as the halt and resume
+buttons, same reason.
+
+Both decimals — the sizing value and the stop multiplier — are sent back as the
+strings that were typed. Neither passes through `Number` anywhere in this
+component.
+
 ## The backtests page
 
-`/backtests`, over `POST /api/v1/backtests` and its four reads — the last of the
-seven tabs, and **the only screen in this app that starts work**. Everything else
+`/backtests`, over `POST /api/v1/backtests` and its four reads — the largest of the
+eight tabs, and **the only screen in this app that starts work**. Everything else
 either reads something already computed or halts trading.
 
 It is also the only screen with a form, and most of that form's design is about
@@ -727,8 +781,8 @@ remaining Phase 6 items are the difference — see docs/SAFETY.md.
 
 Stated here rather than left to be discovered:
 
-- **All seven tabs are built.** Backtests was the last and the largest; it is
-  above. What it unblocked elsewhere is still being built separately:
+- **All eight tabs are built.** Backtests was the largest and Worker is the
+  newest; both are above. What it unblocked elsewhere is still being built separately:
   `/analytics/live-vs-backtest` is now an endpoint and has no screen — it wants a
   *run picker* rather than a date range, because the choice it turns on is which
   backtest, which is a different shape from the three date-ranged panels the
@@ -744,6 +798,12 @@ Stated here rather than left to be discovered:
   run with the strategy's configured parameters. Building the editor means
   rendering a form from a JSON Schema, and one that silently dropped the fields it
   could not render would report a result for parameters nobody chose.
+- **A saved configuration needs a worker restart to take effect**, and this
+  screen cannot perform one — it says so, names the revision the worker is on,
+  and leaves `docker compose restart worker` to the operator. Applying a subset
+  of the fields live was considered and rejected in ADR 0023; a form where half
+  the inputs take effect immediately is harder to reason about than one where
+  none do.
 - **No screen places an order.** The three tabs that are built are all reads.
   Every write handler across `orders.py` and `positions.py` is still a stub,
   because they place things and there is one path from an intent to a venue

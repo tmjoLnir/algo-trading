@@ -133,6 +133,19 @@ class Action:
     #: Written *after* the row exists, like the two halt verbs, so an entry never
     #: claims a strategy that was refused.
     STRATEGY_CREATED = "strategy_created"
+    #: The worker's trading configuration was saved — `PUT /worker/config`.
+    #: The watchlist, the strategy and its parameters, the sizing, the stop and
+    #: the live-orders lock all live in one row now, and this is the only thing
+    #: that writes it. Before that row existed they were environment variables
+    #: and a change left no trace anywhere: `.env` records neither an author nor
+    #: a time, so "who widened the risk per trade, and when" was unanswerable.
+    #:
+    #: `detail` carries the fields that changed and their before/after values —
+    #: none of them is a secret, and a row saying only "something changed" would
+    #: not answer the question this verb exists for. `allow_live_orders` moving
+    #: to true is the entry a post-mortem looks for, and it is the one field
+    #: whose change required the operator's password on the way in.
+    WORKER_CONFIG_UPDATED = "worker_config_updated"
     #: One working order cancelled by a human, through `DELETE /orders/{id}` or
     #: as part of `POST /orders/cancel-all`. Written *after* the venue confirms,
     #: like the halt verbs: an entry claiming a cancel that did not take would

@@ -211,3 +211,24 @@ export interface BacktestTrade {
   holding_period_hours?: number
   exit_reason?: string
 }
+
+/**
+ * `/worker/config` — what the worker trades, and what it is actually running.
+ *
+ * Two configurations, and the pair is the point. `saved` is the row the form
+ * writes; `running` is what the worker published at its last start, or null if
+ * none ever has. They differ for as long as nobody restarts the process, and a
+ * screen that showed only the first would report settings no process is using.
+ *
+ * `sizing_value` and `stop_multiplier` are strings for the reason every decimal
+ * on this API is: the server sends `Decimal` as a string so a JSON float cannot
+ * corrupt it. The form edits them as text and sends them back as text — nothing
+ * here calls `parseFloat` on either.
+ */
+export type WorkerConfigScreen = Schemas['WorkerConfigScreen']
+export type WorkerConfigView = Schemas['WorkerConfigView']
+export type SavedConfigView = Schemas['SavedConfigView']
+export type RunningConfigView = Schemas['RunningConfigView']
+export type WorkerOptionsView = Schemas['WorkerOptionsView']
+export type StrategyOptionView = Schemas['StrategyOptionView']
+export type WorkerOption = Schemas['OptionView']

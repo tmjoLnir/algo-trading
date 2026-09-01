@@ -1,5 +1,5 @@
 /**
- * Backtests — the last of the seven tabs, and the only one that starts work.
+ * Backtests — the largest of the eight tabs, and the only one that starts work.
  *
  * Every other screen in this app reads something that already happened. This one
  * queues a job, watches it run, and then shows what it produced. Three
