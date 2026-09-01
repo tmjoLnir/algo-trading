@@ -27,9 +27,9 @@ fix it here in the PR that discovered it.
 
 ## Where this stands
 
-**21 of 48 items ticked — and the other 27 are not a measure of what is
+**21 of 49 items ticked — and the other 27 are not a measure of what is
 unbuilt.** Reading them as one is the specific mistake this section exists to
-prevent. Twenty of the twenty-seven sit in Phases 4 and 5, whose *Verifiable:*
+prevent. Twenty-one of the twenty-eight sit in Phases 4 and 5, whose *Verifiable:*
 lines both come down to the same event: a strategy trading the paper account for
 a week. The code is written and tested. The week has not happened.
 
@@ -40,16 +40,16 @@ a week. The code is written and tested. The week has not happened.
 | 2 — Backtesting | 7 / 7 | 0 | — |
 | 3 — Risk | 2 / 4 | 2 | A strategy that tries to breach every limit, refused by name |
 | 4 — Execution & paper trading | 0 / 10 | 10 | **The paper week.** A strategy trades the paper account for a week and reconciles clean |
-| 5 — Dashboard & analytics | 0 / 10 | 10 | **The same paper week**, read back through the screens and the analytics |
+| 5 — Dashboard & analytics | 0 / 11 | 11 | **The same paper week**, read back through the screens and the analytics |
 | 6 — Production readiness | 5 / 8 | 3 | A scrape from a real deployment, a restore actually performed, the chosen host with the stack actually on it |
-| **Total** | **21 / 48** | **27** | |
+| **Total** | **21 / 49** | **28** | |
 
-The twenty-seven open items are in three different states, and the difference
+The twenty-eight open items are in three different states, and the difference
 matters more than the count:
 
 | State | Count | Means |
 |---|---:|---|
-| Claimed, in progress (`wip`) | 20 | Somebody is on it, or has been |
+| Claimed, in progress (`wip`) | 21 | Somebody is on it, or has been |
 | Built, awaiting the phase line | 6 | All Phase 5. Code merged, screen shipped, nothing left but the demonstration |
 | Unclaimed | 1 | **Daily report** (Phase 5) — the only item in this file nobody has started |
 
@@ -1342,6 +1342,12 @@ above.
      Paper ignores it deliberately — requiring it there would train operators
      to set it, which is how a lock stops working.
 
+  *(Locks 1 and 3 are no longer environment variables — they are columns on the
+  `worker_config` row the dashboard writes, and arming the third costs the
+  operator's password. See "Worker configuration endpoint and screen" in Phase
+  5. The checks, their order and their reasoning are unchanged; only where the
+  values come from is.)*
+
   Every branch is tested in both directions, and the third lock was verified by
   removing it, which lets a live configuration through and fails the test.
 
@@ -1768,7 +1774,7 @@ wording if it is not the demonstration you want.
 
   **What it answers that nothing else could.** A strategy class is registered at
   import time; a `strategies` row is written by the runner at its first session
-  open. Those two sets can differ, and with `WORKER_STRATEGY` empty by default
+  open. Those two sets can differ, and with no strategy configured by default
   the ordinary state of a fresh install is a platform with strategies in it and
   nothing running. No screen could say so — "I wrote a strategy and nothing is
   happening" had no answer anywhere in this UI. The endpoint returns both halves
@@ -1810,6 +1816,60 @@ wording if it is not the demonstration you want.
   and 13 web — but every row in all of them is a fixture, and the property this
   screen exists for is about a *real* worker having or not having booted a
   strategy.
+
+- [ ] Worker configuration endpoint and screen — @claude (wip #124).
+  **An item this phase was missing**, added in the PR that built it. `GET` and
+  `PUT /api/v1/worker/config`, a `worker_config` table, and the `/worker` tab —
+  the newest of the eight tabs, and the first one that *writes* something a
+  running process will act on. ADR 0023 has the decision and the four alternatives it rejected.
+
+  **Ten environment variables became a row.** `WORKER_SYMBOLS`,
+  `WORKER_MAX_SILENCE_SECONDS`, `WORKER_STRATEGY`, `WORKER_STRATEGY_PARAMS`, the
+  sizing pair, the stop triple and `WORKER_ALLOW_LIVE_ORDERS` are gone from
+  `.env.example` and from `Settings`. They were the only settings in that class
+  an operator changed while the platform was *running*, and an environment
+  variable is the wrong home for such a thing three times over: changing one
+  needed shell access to the host, nothing recorded who changed it or when, and
+  the API could not read them — so every screen that wanted to explain why
+  nothing was trading had to say "go and look at a file". `WORKER_METRICS_PORT`
+  and `_ADDR` stayed, because a listener's address is what the process is.
+
+  **Two configurations, and the screen shows both.** A worker reads this row
+  once, at start — rebuilding a strategy, a stop manager and a market-data
+  subscription underneath a half-finished evaluation is not a thing to do while
+  holding positions — so saved and running can differ until somebody restarts.
+  The worker publishes what it actually loaded (`WorkerStatusStore`, Redis,
+  the same shape and reasoning as the book's snapshot store), the API serves it
+  beside the saved row, and the tab states the difference. A settings page
+  showing only what it can edit would report a stop multiplier no process is
+  using, which is the same class of lie as a dashboard rendering an empty book
+  because Redis blinked.
+
+  **The third live lock is now armable from a browser, and that is the decision
+  to review.** `allow_live_orders` is `docs/SAFETY.md` layer 2a — added to that
+  table in this PR, where it had been missing since it was written. Moving it out
+  of `.env` moved it within reach of anything holding a session cookie, so it
+  arrives with ADR 0009's answer attached: a read-only session cannot touch it,
+  arming it demands the operator's password *with the request* (the same
+  `require_step_up` `/resume` and `/flatten-all` use, lifted into
+  `atp_api.stepup` when it acquired a second caller), and the change is audited
+  with its before and after. Turning it **off** asks for nothing, which is the
+  asymmetry `/risk/halt` already has and the property that makes the widening
+  safe. `ATP_RUN_MODE` and `ATP_ALLOW_LIVE_TRADING` deliberately did not move.
+
+  **Validation lives in one place**, `WorkerConfig.__post_init__`, because the
+  API refuses a bad edit and the worker refuses to boot on a bad row and those
+  two must agree — a value the API accepts and the worker rejects saves cleanly
+  and then kills the process at its next restart, discovered by an operator who
+  has just been told the save worked. The rules it enforces are the ones that
+  were previously nowhere: a `fixed_pct` stop of 2 is refused as a stop 200%
+  below entry, and a `risk_pct` above 0.10 is refused as the misplaced decimal
+  point docs/RISK.md's 0.5–2% range makes it.
+
+  Unticked. 31 unit tests on the value object, 21 on the API including every
+  branch of the step-up, and 11 on the panel — but every one of them is a
+  fixture, and the property this screen exists for is an operator changing a
+  setting and a *real* worker booting on it.
 
 - [ ] Backtest queue, endpoints and screen — @claude.
   **An item this phase was missing**, added in the PR that built it. `POST
@@ -2154,13 +2214,13 @@ requirement #7 asks for; the analytics items above will want their own, and
 agreement between what the worker believes and what the screen says, which is
 the only property that makes the screen worth reading.
 
-*Verifiable (strategy listing, proposed):* on a clean stack with
-`WORKER_STRATEGY` unset, the `/strategies` tab lists `sma_crossover` as a class
-that exists and has never run, and the stored table is empty. Set
-`WORKER_STRATEGY=sma_crossover`, restart the worker, and the same screen moves it
-across: a row appears with the universe and parameters the worker was configured
-with, and "a worker last started this" matches the runner's own session-open log
-line. Restart again and only that timestamp moves.
+*Verifiable (strategy listing, proposed):* on a clean stack with no strategy
+configured, the `/strategies` tab lists `sma_crossover` as a class that exists
+and has never run, and the stored table is empty. Choose `sma_crossover` on the
+`/worker` tab, restart the worker, and the same screen moves it across: a row
+appears with the universe and parameters the worker was configured with, and "a
+worker last started this" matches the runner's own session-open log line.
+Restart again and only that timestamp moves.
 **Not yet shown** — @claude. Proposed because no line above distinguishes a
 strategy that exists from one that has run, which is the single thing this
 screen is for.

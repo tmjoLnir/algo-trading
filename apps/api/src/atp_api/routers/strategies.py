@@ -43,8 +43,8 @@ is the one worth building for:
   a row is no longer evidence that anything has *run* the strategy; the absence
   of one still means nothing has.
 - Which strategy classes exist in the code but have *never* run? That is the
-  registry minus the table, and it is invisible everywhere else. `WORKER_STRATEGY`
-  is empty by default, so "I wrote a strategy and nothing is happening" is the
+  registry minus the table, and it is invisible everywhere else. No strategy
+  is configured by default, so "I wrote a strategy and nothing is happening" is the
   expected first experience of this platform, and until now no screen could tell
   a reader whether the thing they configured was ever picked up.
 """
@@ -297,7 +297,7 @@ async def list_strategies(
 
     One response rather than two endpoints, because the useful fact is the
     *difference*: a class in the registry with no row has never been loaded by a
-    worker, and with `WORKER_STRATEGY` empty by default that is the ordinary
+    worker, and with no strategy configured by default that is the ordinary
     state of a fresh install. Making a client fetch both and diff them would
     leave every client computing the same thing, and a screen that showed only
     the table would answer "nothing is running" with an empty list that looks
@@ -480,7 +480,7 @@ def _authored_ruleset(payload: StrategyCreate, name: str) -> NewStrategy:
     **A rule set may not take a registered class's name.** `registry.register`
     already refuses a duplicate, in its own words to keep backtest results
     unambiguous; this is that rule across the two namespaces rather than a new
-    one. `WORKER_STRATEGY=x` would load the class while `POST /backtests` for
+    one. A configured strategy would load the class while `POST /backtests` for
     the same `x` would run the rules, and both would file their signals under
     one `strategy_id` — two strategies whose attribution had silently merged.
     """
@@ -599,7 +599,7 @@ async def create_strategy(
 
     409 on a name that is taken, and the name may well have been taken by
     something nobody authored: a worker writes a row for whatever
-    `WORKER_STRATEGY` names at its first session open, and `scripts/seed.py`
+    the worker configuration names at its first session open, and `scripts/seed.py`
     writes one per registered class. The refusal says so, because "already
     exists" about a strategy you have never created is otherwise a puzzle.
     """

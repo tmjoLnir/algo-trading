@@ -137,7 +137,7 @@ reason. `StrategyRunner` derives a level for a live signal and
 rather than comparing prices themselves.
 
 Until a backtest could be given a `StopConfig`, only the live half of that
-existed. A strategy configured behind `WORKER_STOP_TYPE=atr` was backtested
+existed. A strategy configured behind an ATR stop was backtested
 naked, because no shipped strategy emits a level of its own — so the backtest
 measured a strategy nobody was going to run. `--stop` on the CLI, the **Stop**
 field on the Backtests tab, and `stop_type` on a `BacktestRunSpec` are the same

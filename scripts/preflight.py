@@ -45,9 +45,11 @@ from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.db import create_engine, create_session_factory, is_auth_failure
 from atp_core.persistence.quotes import RedisQuoteCache
 from atp_core.persistence.redis_client import close_redis, create_redis, create_sync_redis
+from atp_core.persistence.worker_config import PostgresWorkerConfigRepository
 from atp_core.risk.killswitch import RedisKillSwitch
 from atp_core.risk.stops import StopManager
 from atp_core.strategy import registry
+from atp_core.worker.config import DEFAULT_WORKER_CONFIG, WorkerConfig
 from atp_worker import preflight, trading
 from atp_worker.preflight import Check, Preflight, Status
 
@@ -70,7 +72,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--symbols",
         default="",
-        help="override the watchlist (default: WORKER_SYMBOLS)",
+        help="override the watchlist (default: the one saved on the Worker tab)",
     )
     p.add_argument("--timeframe", default="1d", help="which bar series the strategy runs on")
     p.add_argument("--json", action="store_true", help="machine-readable, for a CI job or a log")
@@ -91,20 +93,32 @@ async def main(argv: list[str] | None = None) -> int:
         return 1
 
     settings = get_settings()
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    symbols = symbols or settings.worker_symbol_list
+
+    # The configuration a worker would boot with, read from the same row it
+    # reads. An unreachable database is reported as itself rather than crashing
+    # the one script somebody runs *because* nothing is working.
+    try:
+        config = await _stored_config(settings)
+    except Exception as exc:
+        print(f"cannot read the worker configuration: {_why(exc)}")
+        print("run `make up && make migrate`, then try again")
+        return 1
+
+    override = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    if override:
+        config = config.with_symbols(override)
     timeframe = _timeframe(args.timeframe)
 
     checks: list[Check] = [
         preflight.check_run_mode(settings),
         preflight.check_credentials(settings),
-        preflight.check_locks(trading.decide(settings, symbols)),
-        preflight.check_strategy(settings),
-        preflight.check_stop_config(settings),
+        preflight.check_locks(trading.decide(settings, config)),
+        preflight.check_strategy(config),
+        preflight.check_stop_config(config),
         preflight.check_alert_transport(settings),
     ]
-    checks.extend(await _local_checks(settings, symbols, timeframe))
-    checks.extend(await _venue_checks(settings, symbols, timeframe, skip=args.no_broker))
+    checks.extend(await _local_checks(settings, config, timeframe))
+    checks.extend(await _venue_checks(settings, config, timeframe, skip=args.no_broker))
 
     report = Preflight(checks)
     if args.json:
@@ -182,7 +196,7 @@ def _timeframe(raw: str) -> Timeframe:
 
 
 async def _local_checks(
-    settings: Settings, symbols: list[str], timeframe: Timeframe
+    settings: Settings, config: WorkerConfig, timeframe: Timeframe
 ) -> list[Check]:
     """Redis and Postgres. Each source is caught separately, because a Redis
     that is down must not stop the history checks from running — an operator
@@ -198,11 +212,11 @@ async def _local_checks(
             Check("kill switch", Status.SKIP, f"Redis unreachable ({_why(exc)})", fix="make up")
         )
 
-    required = _warmup_bars(settings)
+    required = _warmup_bars(config)
     engine = create_engine(settings.database_url)
     try:
         bars = PostgresBarRepository(create_session_factory(engine))
-        for symbol in symbols:
+        for symbol in config.symbols:
             checks.append(await _history_check(bars, symbol, timeframe, required))
     except Exception as exc:
         checks.append(_database_check("history", exc, fix="make up && make migrate"))
@@ -213,7 +227,7 @@ async def _local_checks(
         redis = create_redis(settings.redis_url)
         quotes = RedisQuoteCache(redis)
         now = datetime.now(UTC)
-        for symbol in symbols:
+        for symbol in config.symbols:
             quote = await quotes.get_quote(symbol)
             age = None if quote is None else (now - quote.ts).total_seconds()
             checks.append(
@@ -242,17 +256,33 @@ async def _history_check(
     )
 
 
-def _warmup_bars(settings: Settings) -> int:
+async def _stored_config(settings: Settings) -> WorkerConfig:
+    """What the worker would load, or the defaults when nothing is saved.
+
+    Read here rather than from `Settings` because that is where it lives now:
+    the ten trading parameters are a row the dashboard writes, so a preflight
+    reading environment variables would be checking a configuration no worker
+    is going to run.
+    """
+    engine = create_engine(settings.database_url)
+    try:
+        stored = await PostgresWorkerConfigRepository(create_session_factory(engine)).load()
+    finally:
+        await engine.dispose()
+    return DEFAULT_WORKER_CONFIG if stored is None else stored.config
+
+
+def _warmup_bars(config: WorkerConfig) -> int:
     """What the configured strategy needs before it will decide anything.
 
     Zero when the strategy cannot be constructed — `check_strategy` has already
     said so in its own line, and raising a second time here would report one
     misconfiguration as two.
     """
-    if not settings.worker_strategy:
+    if not config.strategy:
         return 0
     try:
-        strategy = registry.get(settings.worker_strategy)(trading.strategy_params(settings))
+        strategy = registry.get(config.strategy)(dict(config.strategy_params) or None)
     except (ATPError, TypeError, ValueError):
         return 0
     return strategy.warmup_bars
@@ -262,7 +292,7 @@ def _warmup_bars(settings: Settings) -> int:
 
 
 async def _venue_checks(
-    settings: Settings, symbols: list[str], timeframe: Timeframe, *, skip: bool
+    settings: Settings, config: WorkerConfig, timeframe: Timeframe, *, skip: bool
 ) -> list[Check]:
     """The account, and the one arithmetic question that needs it.
 
@@ -311,12 +341,12 @@ async def _venue_checks(
             is_paper_host="paper" in settings.broker_base_url,
         )
     ]
-    checks.append(await _sizing_check(settings, symbols, timeframe, equity=account.equity))
+    checks.append(await _sizing_check(settings, config, timeframe, equity=account.equity))
     return checks
 
 
 async def _sizing_check(
-    settings: Settings, symbols: list[str], timeframe: Timeframe, *, equity: Decimal
+    settings: Settings, config: WorkerConfig, timeframe: Timeframe, *, equity: Decimal
 ) -> Check:
     """Price the first entry the way the router will, and see if it clears the cap.
 
@@ -324,14 +354,14 @@ async def _sizing_check(
     `StopManager`, same config, same ATR — because a prediction computed any
     other way is a prediction about a different platform.
     """
-    if not symbols:
+    if not config.symbols:
         return Check("sizing", Status.SKIP, "no symbols to price against")
 
-    symbol = symbols[0]
+    symbol = config.symbols[0]
     engine = create_engine(settings.database_url)
     try:
         bars_repo = PostgresBarRepository(create_session_factory(engine))
-        series = await bars_repo.get_last_n_bars(symbol, timeframe, settings.worker_stop_period + 1)
+        series = await bars_repo.get_last_n_bars(symbol, timeframe, config.stop_period + 1)
     except Exception as exc:
         return _database_check("sizing", exc, fix="make up && make migrate")
     finally:
@@ -341,20 +371,20 @@ async def _sizing_check(
         return Check("sizing", Status.SKIP, f"no stored bars for {symbol} to price against")
 
     price = series[-1].close
-    stop_price = _derived_stop(settings, series, price)
+    stop_price = _derived_stop(config, series, price)
     return preflight.check_sizing_is_reachable(
-        settings, settings.risk, equity=equity, price=price, stop_price=stop_price
+        config, settings.risk, equity=equity, price=price, stop_price=stop_price
     )
 
 
-def _derived_stop(settings: Settings, series: list, price: Decimal) -> Decimal | None:
+def _derived_stop(config: WorkerConfig, series: list, price: Decimal) -> Decimal | None:
     from atp_core.domain import Side
 
     try:
-        config = trading.resolve_stop_config(settings)
-        atr = dispatch.compute("atr", series, config.period)
+        stop = trading.resolve_stop_config(config)
+        atr = dispatch.compute("atr", series, stop.period)
         return StopManager().initial_stop(
-            price, Side.BUY, config, None if atr is None else Decimal(str(atr))
+            price, Side.BUY, stop, None if atr is None else Decimal(str(atr))
         )
     except (ATPError, ValueError):
         # No stop derivable — which `check_sizing_is_reachable` reports as the

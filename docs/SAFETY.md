@@ -21,12 +21,28 @@ No single control is trusted. Each layer assumes the ones above it have failed.
 |---|---|---|
 | 1 | `ATP_RUN_MODE` defaults to `paper` | someone edits the default |
 | 2 | `ATP_ALLOW_LIVE_TRADING` must also be `true` | someone sets both |
+| 2a | `allow_live_orders` on the worker's configuration | someone arms it as well as the two above |
 | 3 | Paper and live use different Alpaca keys | live keys deployed to the paper env |
 | 4 | Every order passes `RiskEngine.validate()` | a code path bypasses `OrderRouter` |
 | 5 | Broker-side stops on every position | stop never placed after the entry fill |
 | 6 | Kill switch, checked before every order | Redis unreachable — **fail closed** |
 | 7 | Reconciliation every 5 min, halts on mismatch | reconciliation itself is not running |
 | 8 | Broker-side account limits | — |
+
+**Layer 2a is the third lock, and it is numbered `2a` rather than `3` because
+the layers below it are referred to by number in code and in the runbook.** It
+was enforced by `trading.decide` from the start and was missing from this table,
+which is the kind of omission that makes a table worse than no table: a reader
+counting locks got two. Layers 1 and 2 say *this process may trade real money*;
+2a says *this unattended loop may place the orders*. Different decisions, made
+by different people at different times.
+
+It is the one lock that lives in the database rather than the environment
+(`worker_config.allow_live_orders`, edited on the dashboard's Worker tab), and
+that widening comes with its own conditions: a read-only session cannot touch
+it, arming it demands the operator's password with the request, and every change
+is written to the audit log with its before and after. Turning it **off** asks
+for nothing — the same asymmetry `/risk/halt` has, and for the same reason.
 
 Layer 8 matters and is outside this codebase: **set position and loss limits in
 your broker's own controls too.** They are the only limits that still apply when
@@ -95,7 +111,10 @@ people deploy without checking.
    session. Deploy pre-market with time to watch it.
 5. **Never run an untested strategy in live "just to see".** That is what paper
    mode is for, and paper mode uses the same live data.
-6. **Two independent locks stay two.** Do not "simplify" the double flag.
+6. **Three independent locks stay three.** Do not "simplify" the flags, and do
+   not make any of them imply another. `ATP_RUN_MODE`, `ATP_ALLOW_LIVE_TRADING`
+   and the worker's `allow_live_orders` answer three different questions, and
+   the third one deliberately lives somewhere the other two do not.
 
 ## Access control
 

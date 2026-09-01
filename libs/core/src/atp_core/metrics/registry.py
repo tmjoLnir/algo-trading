@@ -324,7 +324,7 @@ def strategy_evaluated(strategy: str, outcome: str, seconds: float) -> None:
 
     `strategy` is a label because a platform running two of them needs to know
     which one stopped, and the strategy set is configuration rather than input —
-    `WORKER_STRATEGY` names one. It is not the symbol, which would multiply this
+    the worker configuration names one. It is not the symbol, which would multiply this
     by the watchlist for no question anybody asks.
     """
     _m.strategy_evaluations.labels(strategy=strategy, outcome=outcome).inc()

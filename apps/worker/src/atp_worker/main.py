@@ -12,12 +12,20 @@ more dangerous than one that is plainly down, because monitoring still sees a
 live process while positions go unmanaged.
 
 **All three can run now**, but the third is opt-in and stays off unless somebody
-turns it on. `WORKER_STRATEGY` names the strategy to trade and is empty by
-default; live additionally needs `WORKER_ALLOW_LIVE_ORDERS`. The locks and the
-reasoning behind them are in `trading.py`, and whichever way they land is stated
-in the startup log rather than left for a reader to infer from a quiet process
-— because "the worker is up" and "the worker is trading" must never be the same
-observation.
+turns it on. What to trade comes from the `worker_config` row the dashboard
+edits (`atp_core.worker`): no strategy is configured by default, and live
+additionally needs `allow_live_orders`, which the API arms only against the
+operator's password. The locks and the reasoning behind them are in
+`trading.py`, and whichever way they land is stated in the startup log rather
+than left for a reader to infer from a quiet process — because "the worker is
+up" and "the worker is trading" must never be the same observation.
+
+**The configuration is read once, here, and then published.** A running worker
+does not watch the row: rebuilding a strategy, a stop manager and a market-data
+subscription underneath a half-finished evaluation is not a thing to do while
+holding positions. So an edit takes effect at the next start, and this process
+publishes what it actually loaded — `WorkerStatusStore` — so the dashboard can
+show the difference rather than implying a saved change is in force.
 """
 
 from __future__ import annotations
@@ -48,7 +56,11 @@ from atp_core.persistence.quotes import RedisQuoteCache
 from atp_core.persistence.redis_client import close_redis, create_redis, create_sync_redis
 from atp_core.persistence.signals import PostgresSignalRepository
 from atp_core.persistence.strategies import PostgresStrategyRepository
+from atp_core.persistence.worker_config import PostgresWorkerConfigRepository
+from atp_core.persistence.worker_status import RedisWorkerStatusStore
 from atp_core.risk.killswitch import HaltReason, HaltScope, RedisKillSwitch
+from atp_core.worker.config import DEFAULT_WORKER_CONFIG
+from atp_core.worker.ports import RunningWorkerConfig
 from atp_worker import trading
 from atp_worker.metrics_server import start_metrics_server
 from atp_worker.scheduler import SessionJobs, build_schedule, run_scheduler
@@ -117,8 +129,6 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
     closes its own stream on the way out; the stack below is what covers the
     paths that never reached it.
     """
-    symbols = settings.worker_symbol_list
-
     async with AsyncExitStack() as stack:
         # Registered first, so it is torn down last: the shutdown path is
         # exactly when somebody wants to know what this process was doing, and a
@@ -148,6 +158,53 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
         # phone rather than only a log file (docs/SAFETY.md).
         kill_switch = RedisKillSwitch(sync_redis, alerts=build_alert_sink(settings))
         session_factory = create_session_factory(engine)
+
+        # What to trade, from the row the dashboard writes.
+        #
+        # **A read failure raises rather than falling back to the defaults**,
+        # and the consequence is a process that will not start while the
+        # database is unreachable. That is deliberate and it is the safer of the
+        # two failures: defaulting would mean a worker that quietly ingests
+        # nothing and trades nothing because Postgres blinked, and stays that
+        # way until somebody notices — the same class of mistake as adopting the
+        # broker's book over our own (`restore_or_adopt`). Refusing is
+        # self-healing under `restart: unless-stopped`; a silent default is not.
+        try:
+            stored = await PostgresWorkerConfigRepository(session_factory).load()
+        except Exception as exc:
+            # Said in words before the traceback, because "the worker will not
+            # start" and "the worker cannot read its configuration" are the same
+            # incident and only the second one tells an operator where to look.
+            log.critical(
+                "worker.config_unreadable",
+                error=str(exc),
+                msg="cannot read the worker configuration — refusing to start on defaults",
+                hint="check the database is up (`docker compose ps`) and migrated",
+            )
+            raise
+        config = stored.config if stored is not None else DEFAULT_WORKER_CONFIG
+        revision = stored.revision if stored is not None else 0
+        symbols = list(config.symbols)
+        if stored is None:
+            log.warning(
+                "worker.no_stored_config",
+                msg="nothing has been saved on the Worker tab — running the defaults",
+                hint="open the dashboard's Worker tab to set a watchlist and a strategy",
+            )
+        # What it loaded, in full. `.env` used to be readable on the host, so an
+        # operator could always see what a worker was configured with; now that
+        # it is a row, this line is that.
+        log.info(
+            "worker.config_loaded",
+            revision=revision,
+            symbols=symbols,
+            strategy=config.strategy or None,
+            strategy_params=config.strategy_params or None,
+            sizing=f"{config.sizing_method} {config.sizing_value}",
+            stop=f"{config.stop_type} x{config.stop_multiplier} period={config.stop_period}",
+            max_silence_seconds=config.max_silence_seconds,
+            allow_live_orders=config.allow_live_orders,
+        )
         bar_repo = PostgresBarRepository(session_factory)
         portfolio_repo = PostgresPortfolioRepository(session_factory)
         quote_cache = RedisQuoteCache(redis)
@@ -169,7 +226,7 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
                 publisher=publisher,
                 kill_switch=kill_switch,
             )
-            monitor = StalenessMonitor(settings.worker_max_silence_seconds, kill_switch=kill_switch)
+            monitor = StalenessMonitor(config.max_silence_seconds, kill_switch=kill_switch)
             responsibilities["ingestor"] = lambda: ingestor.run(symbols)
             responsibilities["staleness_monitor"] = lambda: monitor.watch(ingestor)
         else:
@@ -179,11 +236,11 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
             # the thing an operator would most like to have been told.
             log.error(
                 "worker.no_watchlist",
-                msg="WORKER_SYMBOLS is empty — ingesting no market data",
-                hint="set WORKER_SYMBOLS=SPY,QQQ to give the ingestor a watchlist",
+                msg="the watchlist is empty — ingesting no market data",
+                hint="add symbols on the dashboard's Worker tab, then restart this worker",
             )
 
-        decision = trading.decide(settings, symbols)
+        decision = trading.decide(settings, config)
         if decision.enabled:
             # `ingestor` is bound whenever `symbols` is non-empty, which
             # `trading.decide` has already made a condition of trading.
@@ -193,7 +250,7 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
 
             runner, reconciler = trading.build_runner(
                 settings,
-                symbols,
+                config,
                 broker=broker,
                 kill_switch=kill_switch,
                 bar_repo=bar_repo,
@@ -242,10 +299,37 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
         else:
             log.info("worker.not_trading", msg=decision.reason)
 
+        # Published before the responsibilities start, so a worker that dies
+        # during warm-up has still said what it was trying to run — which is
+        # exactly the case where the settings screen is the thing being read.
+        #
+        # Failure to publish is logged and swallowed. This decorates a settings
+        # screen; it does not decide anything. A worker that refused to start
+        # because a status blob would not write would be trading stopped by its
+        # own telemetry, which is the wrong way round.
+        try:
+            await RedisWorkerStatusStore(redis).put(
+                settings.run_mode,
+                RunningWorkerConfig(
+                    config=config,
+                    revision=revision,
+                    started_at=SystemClock().now(),
+                    trading=decision.enabled,
+                    reason=decision.reason,
+                ),
+            )
+        except Exception as exc:
+            log.warning(
+                "worker.status_not_published",
+                error=str(exc),
+                msg="the Worker tab will report no worker running; trading is unaffected",
+            )
+
         log.info(
             "worker.ready",
             run_mode=settings.run_mode,
             symbols=symbols,
+            config_revision=revision,
             responsibilities=sorted(responsibilities),
             trading=decision.enabled,
             msg=decision.reason,

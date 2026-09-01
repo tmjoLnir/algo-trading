@@ -4,8 +4,8 @@ These cannot be unit tests. What is under test is the database's behaviour, not
 Python's:
 
 - whether the **foreign key** actually refuses a run naming a strategy nothing
-  has registered — the state a fresh install is in, since `WORKER_STRATEGY` is
-  empty by default;
+  has registered — the state a fresh install is in, since no strategy is
+  configured by default;
 - whether `started_at` is genuinely nullable, which is the whole of migration
   `d7a1c9f4b208` and is what lets a queued run exist at all;
 - whether the **conditional transitions** hold under the real `UPDATE ... WHERE

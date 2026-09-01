@@ -3,7 +3,7 @@
  *
  * **The gap between those two is the reason this screen exists.** A strategy
  * class is registered at import time; a `strategies` row is written by the
- * runner at its first session open. `WORKER_STRATEGY` is empty by default, so
+ * runner at its first session open. No strategy is configured by default, so
  * the ordinary state of a fresh install is a platform with strategies in it and
  * nothing running — and until now no screen could tell a reader whether the
  * thing they configured had ever been picked up. "I wrote a strategy and
@@ -42,7 +42,7 @@
  * before promoting to live", and this is the screen that promotion decision is
  * made on — so "has this ever run" and "how much of the exposure ceiling is
  * already spent" belong in one view rather than one nav click apart. The nav
- * stays at seven tabs.
+ * stays at eight tabs.
  */
 
 import { useState } from 'react'
@@ -266,9 +266,10 @@ export default function Strategies() {
           {neverRun.length === 1 ? 'has' : 'have'} never been run by a worker.
           <span className="mt-1 block text-xs text-amber-200/70">
             A strategy gets a row here the first time a worker loads it, an author creates it, or a
-            backtest is queued for it. <code className="text-amber-100">WORKER_STRATEGY</code> is
-            empty by default, so on a fresh install this is expected rather than a fault — and these
-            are still backtestable: the Backtests tab offers them and stores the row itself.
+            backtest is queued for it. No strategy is chosen by default — the{' '}
+            <strong>Worker</strong> tab is where one is — so on a fresh install this is expected
+            rather than a fault. These are still backtestable: the Backtests tab offers them and
+            stores the row itself.
           </span>
         </p>
       ) : null}

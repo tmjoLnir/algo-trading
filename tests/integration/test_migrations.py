@@ -58,8 +58,15 @@ STRATEGY = "retime-probe"
 RUN_ID = "retime-run"
 QUEUED_ID = "retime-queued"
 
-#: Tables the initial migration owns. `alembic_version` is alembic's own
-#: bookkeeping and survives a downgrade to base, so it is not in this list.
+#: Tables the migrations own, and therefore the tables a downgrade to base must
+#: remove. `alembic_version` is alembic's own bookkeeping and survives a
+#: downgrade to base, so it is not in this list.
+#:
+#: It was "tables the initial migration owns" until `worker_config` arrived in a
+#: later one. The set is what the two tests below assert against — every table
+#: exists at head, and none survives `downgrade base` — and neither question is
+#: about which revision created it. A migration that cannot be rolled back is a
+#: one-way door whichever revision it is.
 EXPECTED_TABLES = {
     "audit_log",
     "backtest_runs",
@@ -70,6 +77,7 @@ EXPECTED_TABLES = {
     "position_snapshots",
     "signals",
     "strategies",
+    "worker_config",
 }
 
 

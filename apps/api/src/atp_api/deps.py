@@ -44,8 +44,11 @@ from atp_core.persistence.positions import PostgresPortfolioRepository
 from atp_core.persistence.quotes import RedisQuoteCache
 from atp_core.persistence.signals import PostgresSignalRepository
 from atp_core.persistence.strategies import PostgresStrategyRepository
+from atp_core.persistence.worker_config import PostgresWorkerConfigRepository
+from atp_core.persistence.worker_status import RedisWorkerStatusStore
 from atp_core.risk.killswitch import KillSwitch
 from atp_core.strategy.ports import SignalRepository, StrategyRepository
+from atp_core.worker.ports import WorkerConfigRepository, WorkerStatusStore
 
 #: `Redis` and the SQLAlchemy session types are imported at RUNTIME, not behind
 #: `if TYPE_CHECKING`. FastAPI resolves a dependency's annotations when it wires
@@ -213,6 +216,34 @@ async def get_snapshot_store(
 ) -> SnapshotStore:
     """Where the worker publishes the live book (`atp_core.dashboard`)."""
     return RedisSnapshotStore(redis)
+
+
+async def get_worker_config_repository(
+    session_factory: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
+) -> WorkerConfigRepository:
+    """What the worker trades, as an operator saved it.
+
+    The **second** repository this process writes, after `backtest_runs`, and
+    the exception is as narrow as that one's: `PUT /worker/config` is the only
+    writer of this row anywhere in the platform. That is not the two-writer
+    problem ADR 0007 refuses — the worker never writes here, it only reads at
+    start and publishes what it read through `get_worker_status_store` below.
+    One process owns the intention, the other owns the report, and neither
+    computes the other's number.
+    """
+    return PostgresWorkerConfigRepository(session_factory)
+
+
+async def get_worker_status_store(
+    redis: Annotated[Redis, Depends(get_redis)],
+) -> WorkerStatusStore:
+    """What the worker last reported booting with.
+
+    Read-only from this process. The worker is the only writer, once per start,
+    for the same reason it is the only writer of the live book: it is the only
+    thing that knows.
+    """
+    return RedisWorkerStatusStore(redis)
 
 
 async def get_portfolio_repository(

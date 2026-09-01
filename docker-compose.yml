@@ -159,8 +159,11 @@ services:
     # reports that it has no watchlist and runs the schedule, which is an idle
     # process rather than a failing one.
     #
-    # It does not trade. `StrategyRunner` is still a stub, so this ingests market
-    # data and runs scheduled jobs; give it a watchlist with WORKER_SYMBOLS.
+    # Whether it trades is not decided here. The watchlist, the strategy and
+    # the rest of what it trades live in the database and are edited on the
+    # dashboard's Worker tab; with nothing saved this ingests no market data,
+    # places no orders, and runs the schedule. Changes there take effect at the
+    # worker's next start — `docker compose restart worker`.
     build:
       context: .
       dockerfile: infra/docker/worker.Dockerfile

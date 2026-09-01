@@ -122,8 +122,10 @@ confusing.
 
 ## Stage 1 — up, ingesting, and deliberately not trading
 
-Leave `WORKER_STRATEGY` unset. This stage proves the data path before anything
-can place an order.
+Choose no strategy on the dashboard's **Worker** tab — which is where these
+settings live now, rather than in `.env`. Nothing has been saved on a fresh
+install, so this stage needs no setup at all: it proves the data path before
+anything can place an order.
 
 ```bash
 make up
@@ -135,7 +137,7 @@ Expect, in order:
 | Event | Means |
 |---|---|
 | `worker.starting` `run_mode=paper` | not live — check this every time |
-| `worker.not_trading` | `WORKER_STRATEGY is unset` — the opt-in is working |
+| `worker.not_trading` | `no strategy is configured` — the opt-in is working |
 | `worker.ready` `trading=False` | the locks held |
 | `data.stream.started` | the market-data socket is up |
 
@@ -158,16 +160,21 @@ hypertable. A strategy started on a stale cache will be refused by
 
 ## Stage 2 — one strategy, one symbol, smallest size
 
-Set in `.env`:
+On the dashboard's **Worker** tab, set:
 
-```bash
-WORKER_SYMBOLS=SPY
-WORKER_STRATEGY=sma_crossover
-WORKER_SIZING_METHOD=fixed_qty     # not risk_pct, for the first run
-WORKER_SIZING_VALUE=1              # one share
-WORKER_STOP_TYPE=atr
-WORKER_STOP_MULTIPLIER=2
-```
+| Field | Value |
+|---|---|
+| Watchlist | `SPY` |
+| Strategy | `sma_crossover` |
+| Position sizing | Fixed quantity |
+| Sizing value | `1` — one share |
+| Protective stop | ATR multiple |
+| Stop multiple | `2` |
+
+Then press **Save configuration**. The row is written immediately and the screen
+says so; the worker is still running the previous one until it restarts, which
+is what the banner at the top of that tab is for. The save is recorded in the
+audit log against whoever made it.
 
 `fixed_qty` at one share on purpose. The default is `risk_pct`, which is the
 right way to size a real strategy and the wrong way to learn whether the wiring

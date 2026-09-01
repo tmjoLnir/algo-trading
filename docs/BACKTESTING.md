@@ -291,7 +291,7 @@ in every daily backtest.
 **Stop** field) exists on a run, the engine watches only the levels a `Signal`
 itself carries — and none of the shipped strategies emits one, so every run this
 platform had produced was an unprotected one. If that strategy is configured
-live behind `WORKER_STOP_TYPE=atr`, the backtest and the live worker are running
+live behind an ATR stop on the Worker tab, the backtest and the live worker are running
 two different strategies, and the number on the screen belongs to the one you
 are not going to trade. That is CLAUDE.md §5's divergence in its purest form: no
 error, no warning, just a result about something else.

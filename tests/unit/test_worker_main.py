@@ -19,8 +19,9 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from atp_core.config import Settings
 from atp_core.risk.killswitch import HaltReason, HaltScope
+from atp_core.worker import DEFAULT_WORKER_CONFIG, WorkerConfig
+from atp_core.worker.config import parse_symbol_list
 from atp_worker.main import HALT_ACTOR, WorkerError, supervise
 from tests.fakes import FakeKillSwitch
 
@@ -173,28 +174,36 @@ class TestSomethingDied:
 
 
 class TestWatchlist:
-    """`Settings.worker_symbol_list` — what the ingestor is told to subscribe."""
+    """`normalise_symbols` / `parse_symbol_list` — what the ingestor subscribes.
+
+    On `WorkerConfig` rather than `Settings` now: the watchlist is a stored row
+    the dashboard writes, and its text box hands over the same comma-separated
+    string the environment variable used to. The normalisation is unchanged, and
+    so is every reason for it.
+    """
 
     def test_empty_by_default(self) -> None:
         """No default universe: a worker that invented one would spend the
         single market-data connection on symbols nobody chose."""
-        assert Settings().worker_symbol_list == []
+        assert DEFAULT_WORKER_CONFIG.symbols == ()
 
     def test_upper_cased_and_stripped(self) -> None:
         """`symbol` is always an uppercase ticker here, and the ingestor rejects
-        anything else — so `spy` from a shell is normalised, not refused."""
-        assert Settings(worker_symbols=" spy, QQQ ,iwm ").worker_symbol_list == [
-            "SPY",
-            "QQQ",
-            "IWM",
-        ]
+        anything else — so `spy` typed into the box is normalised, not refused."""
+        assert parse_symbol_list(" spy, QQQ ,iwm ") == ("SPY", "QQQ", "IWM")
 
     def test_deduplicated_in_first_seen_order(self) -> None:
         """A symbol listed twice would be subscribed twice and counted twice
         against the vendor's symbol limit."""
-        assert Settings(worker_symbols="SPY,QQQ,spy").worker_symbol_list == ["SPY", "QQQ"]
+        assert parse_symbol_list("SPY,QQQ,spy") == ("SPY", "QQQ")
 
     def test_blank_entries_are_dropped(self) -> None:
         """A trailing comma is not a symbol, and `""` would fail the ingestor's
         uppercase check with a confusing message."""
-        assert Settings(worker_symbols="SPY,,QQQ,").worker_symbol_list == ["SPY", "QQQ"]
+        assert parse_symbol_list("SPY,,QQQ,") == ("SPY", "QQQ")
+
+    def test_a_normalised_list_is_what_the_value_object_accepts(self) -> None:
+        """The two halves have to agree: `WorkerConfig` refuses a lowercase
+        ticker, so a parse that let one through would move the failure from the
+        save to the worker's next boot."""
+        assert WorkerConfig(symbols=parse_symbol_list("spy, qqq")).symbols == ("SPY", "QQQ")

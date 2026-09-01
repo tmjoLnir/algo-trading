@@ -8,7 +8,7 @@ What is worth holding on the read side is the *difference* between the two
 halves, which is the reason the endpoint returns both:
 
 1. **A registered class with no row has never been loaded by a worker**, and
-   that is invisible anywhere else. `WORKER_STRATEGY` is empty by default, so
+   that is invisible anywhere else. No strategy is configured by default, so
    this is the ordinary state of a fresh install.
 2. **The registry is populated by an import side effect.** A process that never
    imports the strategy modules reports, with total confidence, that this
@@ -153,7 +153,7 @@ class TestTheRegistry:
     ) -> None:
         """The question this endpoint exists for.
 
-        With `WORKER_STRATEGY` empty by default, a strategy that exists in the
+        With no strategy configured by default, a strategy that exists in the
         code and has never been loaded is the ordinary state of a fresh install
         — and no other screen can say so.
         """

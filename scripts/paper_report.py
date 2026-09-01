@@ -46,6 +46,7 @@ from atp_core.config import get_settings
 from atp_core.persistence.db import create_engine, create_session_factory
 from atp_core.persistence.orders import PostgresOrderRepository
 from atp_core.persistence.positions import PostgresPortfolioRepository
+from atp_core.persistence.worker_config import PostgresWorkerConfigRepository
 
 if TYPE_CHECKING:
     from atp_core.analytics.paper_run import PaperRunReport
@@ -69,7 +70,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--strategy",
         default=None,
-        help="which strategy's record to read (default: WORKER_STRATEGY)",
+        help="which strategy's record to read (default: the one on the Worker tab)",
     )
     p.add_argument(
         "--logs",
@@ -85,11 +86,17 @@ async def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     settings = get_settings()
     since = _since(args.since)
-    strategy_id = args.strategy if args.strategy is not None else settings.worker_strategy
-
     engine = create_engine(settings.database_url)
     try:
         sessions = create_session_factory(engine)
+        if args.strategy is not None:
+            strategy_id = args.strategy
+        else:
+            # The strategy the worker is configured to trade, from the row it
+            # reads. Empty when nothing is saved, which the report handles as
+            # "every strategy" exactly as an empty `--strategy` always did.
+            stored = await PostgresWorkerConfigRepository(sessions).load()
+            strategy_id = "" if stored is None else stored.config.strategy
         orders = await PostgresOrderRepository(sessions).recent_orders(
             settings.run_mode, since=since, limit=args.limit
         )

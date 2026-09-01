@@ -186,10 +186,9 @@ export default function RiskLimitsPanel() {
       ) : status.data && !status.data.book_published ? (
         <p className="mx-4 mb-3 rounded border border-slate-700 bg-slate-900/60 px-3 py-2 text-xs text-slate-400">
           No worker has published a book, so there is nothing to measure against these ceilings.
-          Ordinary on a fresh install and while{' '}
-          <code className="text-slate-300">WORKER_STRATEGY</code> is empty — but it is <em>not</em>{' '}
-          the same as a compliant book, which is why every reading below is {UNKNOWN} rather than
-          zero.
+          Ordinary on a fresh install and while no strategy is chosen on the <strong>Worker</strong>{' '}
+          tab — but it is <em>not</em> the same as a compliant book, which is why every reading
+          below is {UNKNOWN} rather than zero.
         </p>
       ) : null}
 

@@ -644,6 +644,28 @@ which no amount of waiting resolves.
 3. Positions are safe if broker-side stops are in place — verify.
 4. Fix, then restart. `warmup()` will reconcile and adopt open positions.
 
+`worker.config_unreadable` at CRITICAL is a specific and common shape of this:
+the worker reads what it trades from the `worker_config` row (ADR 0023) and
+**refuses to start rather than falling back to the defaults**, because a worker
+that quietly ingested nothing and traded nothing because Postgres blinked would
+stay that way until somebody noticed. Bring the database up and the next restart
+succeeds on its own. `make check-env` and `docker compose ps db` are the two
+things to look at.
+
+## A saved configuration has not taken effect
+
+Expected, not a fault. The worker reads its configuration **once, at start**, so
+a save on the dashboard's Worker tab applies at the next restart:
+
+```bash
+docker compose restart worker
+```
+
+The tab says which revision the running worker is on and which is saved, and the
+worker logs `worker.config_loaded` with the whole configuration at every start —
+that line is the answer to "what is it actually running", and it is the one to
+quote in an incident rather than a screenshot of the form.
+
 ## A backtest is stuck, or the queue is not running
 
 **Nothing here touches trading.** Backtests run in the `queue` container, which

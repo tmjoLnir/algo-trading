@@ -124,7 +124,7 @@ class BacktestRunSpec:
     #: unconditionally before stops were configurable — so a spec stored without
     #: it still reproduces exactly.
     #:
-    #: Not a default of `atr`, even though that is `WORKER_STOP_TYPE`'s default
+    #: Not a default of `atr`, even though that is the worker's own default
     #: and docs/RISK.md's recommendation. Changing the protection on a stored run
     #: would change its result, and a spec is a record of what was asked for.
     stop_type: str = ""

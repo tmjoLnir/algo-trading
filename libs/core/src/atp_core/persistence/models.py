@@ -37,6 +37,9 @@ from atp_core.domain import StrategyState
 
 MONEY = Numeric(20, 8)
 
+#: The only key `worker_config` may hold. See `WorkerConfigRow`.
+WORKER_CONFIG_ID = "default"
+
 #: JSON columns hold arbitrary decoded JSON. Naming the shape beats a bare
 #: `dict`, which mypy --strict rejects as an untyped generic.
 type JsonDict = dict[str, Any]
@@ -341,6 +344,53 @@ class BacktestRunRow(Base):
     #: Null until a worker claims it. A queued run has not started.
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class WorkerConfigRow(Base):
+    """What the worker trades, as an operator last saved it. Exactly one row.
+
+    Single-row by construction rather than by convention: the primary key is
+    CHECKed against one literal, so a second configuration cannot be inserted
+    even by hand. The alternative — a table with a `SELECT ... LIMIT 1` on it —
+    reads identically until the day two rows exist, at which point the worker
+    and the dashboard can silently disagree about which is in force.
+
+    `revision` is what makes "saved" and "running" comparable. The worker reads
+    this row at start and publishes the number it read; the dashboard compares
+    the two and says so when they differ. It is a plain counter and not a
+    timestamp because two saves in the same second must still be distinct, and
+    because a clock that steps backwards would make the comparison lie.
+
+    Numerics, not floats, for the two fields that scale money (rule §1.1):
+    `sizing_value` decides order size and `stop_multiplier` decides where the
+    protective stop sits.
+    """
+
+    __tablename__ = "worker_config"
+    __table_args__ = (
+        CheckConstraint(f"id = '{WORKER_CONFIG_ID}'", name="ck_worker_config_single_row"),
+    )
+
+    id: Mapped[str] = mapped_column(String(20), primary_key=True, default=WORKER_CONFIG_ID)
+    symbols: Mapped[JsonList] = mapped_column(JSON, default=list)
+    max_silence_seconds: Mapped[int] = mapped_column(default=60)
+    #: `String(36)` because a strategy's id is its name and `strategies.id` is
+    #: that wide. Empty means this worker places no orders.
+    strategy: Mapped[str] = mapped_column(String(36), default="")
+    strategy_params: Mapped[JsonDict] = mapped_column(JSON, default=dict)
+    sizing_method: Mapped[str] = mapped_column(String(20), default="risk_pct")
+    sizing_value: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0.01"))
+    stop_type: Mapped[str] = mapped_column(String(20), default="atr")
+    stop_multiplier: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("2"))
+    stop_period: Mapped[int] = mapped_column(default=14)
+    #: The third live lock. Stored, and changed only through an endpoint that
+    #: re-asks for the operator's password.
+    allow_live_orders: Mapped[bool] = mapped_column(Boolean, default=False)
+    revision: Mapped[int] = mapped_column(BigInteger, default=1)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    #: The signed-in operator who saved it. Every write comes from an
+    #: authenticated request, so this is never a process name.
+    updated_by: Mapped[str] = mapped_column(String(100))
 
 
 class AuditLogRow(Base):

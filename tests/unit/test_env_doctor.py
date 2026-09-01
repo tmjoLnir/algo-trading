@@ -257,6 +257,25 @@ class TestKeysNothingReads:
         lines = dict.fromkeys(check_env.READ_ELSEWHERE, 1)
         assert check_env.unread_keys(lines) == []
 
+    def test_a_key_that_moved_says_where_it_went(self) -> None:
+        """Ten keys left `.env` for the database in ADR 0023. Reported as
+        unread — because they are, and the consequence is the dangerous one —
+        but not as a *typo*: an operator upgrading would otherwise get ten
+        lines saying "nothing reads it" and go looking for a misspelling that
+        is not there."""
+        found = check_env.unread_keys({"WORKER_STRATEGY": 12})
+
+        assert [k for k, _, _ in found] == ["WORKER_STRATEGY"]
+        assert "Worker tab" in found[0][2]
+        assert "did you mean" not in found[0][2]
+
+    def test_every_moved_key_is_one_settings_really_stopped_reading(self) -> None:
+        """The list fails *open* if it goes stale: a key added back to
+        `Settings` and left here would be reported as moved while being read,
+        which is the same lie in the opposite direction."""
+        known = known_env_vars()
+        assert not (set(check_env.MOVED) & known)
+
     def test_reported_in_file_order(self) -> None:
         found = check_env.unread_keys({"ZZZ_LATE": 90, "AAA_EARLY": 3})
         assert [k for k, _, _ in found] == ["AAA_EARLY", "ZZZ_LATE"]

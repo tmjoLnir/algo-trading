@@ -37,6 +37,7 @@ from atp_api.routers import (
     positions,
     risk,
     strategies,
+    worker,
 )
 from atp_api.ws import manager as ws_manager
 from atp_api.ws import redis_bridge
@@ -271,6 +272,7 @@ def create_app() -> FastAPI:
         marketdata.router,
         analytics.router,
         risk.router,
+        worker.router,
         ws_router,
     ):
         app.include_router(

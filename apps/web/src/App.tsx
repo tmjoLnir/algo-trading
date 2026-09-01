@@ -1,6 +1,7 @@
 import { Routes, Route, NavLink } from 'react-router-dom'
 import Dashboard from './pages/Dashboard'
 import Strategies from './pages/Strategies'
+import Worker from './pages/Worker'
 import Backtests from './pages/Backtests'
 import Positions from './pages/Positions'
 import Orders from './pages/Orders'
@@ -18,6 +19,7 @@ const NAV = [
   { to: '/backtests', label: 'Backtests' },
   { to: '/positions', label: 'Positions' },
   { to: '/orders', label: 'Orders' },
+  { to: '/worker', label: 'Worker' },
   { to: '/analytics', label: 'Analytics' },
   { to: '/audit', label: 'Audit' },
 ]
@@ -58,7 +60,7 @@ export default function App() {
       {/* Renders nothing; holds the live socket open for as long as somebody is
           signed in. Here rather than on the dashboard because `HaltBanner`
           below is on every screen, and a banner fed by a socket that exists on
-          one route cannot interrupt anybody on the other six. */}
+          one route cannot interrupt anybody on the other screens. */}
       <LiveStream />
 
       {/* Both banners are above the nav on purpose: whether this is real money,
@@ -118,6 +120,7 @@ export default function App() {
           <Route path="/backtests" element={<Backtests />} />
           <Route path="/positions" element={<Positions />} />
           <Route path="/orders" element={<Orders />} />
+          <Route path="/worker" element={<Worker />} />
           <Route path="/analytics" element={<Analytics />} />
           <Route path="/audit" element={<Audit />} />
         </Routes>
