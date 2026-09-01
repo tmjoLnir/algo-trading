@@ -42,7 +42,7 @@ from atp_core.domain import Timeframe
 from atp_core.errors import ATPError
 from atp_core.indicators import dispatch
 from atp_core.persistence.bars import PostgresBarRepository
-from atp_core.persistence.db import create_engine, create_session_factory
+from atp_core.persistence.db import create_engine, create_session_factory, is_auth_failure
 from atp_core.persistence.quotes import RedisQuoteCache
 from atp_core.persistence.redis_client import close_redis, create_redis, create_sync_redis
 from atp_core.risk.killswitch import RedisKillSwitch
@@ -115,7 +115,7 @@ async def main(argv: list[str] | None = None) -> int:
 
 
 def _why(exc: Exception) -> str:
-    """The exception's type, and deliberately nothing else.
+    """The driver exception's type name, and deliberately nothing else.
 
     A library's error text can embed a `repr` of whatever it was handed — and
     the thing handed to a database driver here is `Settings`, which carries
@@ -125,7 +125,49 @@ def _why(exc: Exception) -> str:
     anyone acts on regardless; the traceback is still there for whoever needs
     more, where it belongs.
     """
-    return type(exc).__name__
+    # `DatabaseUnavailableError` carries the driver's class name as `cause_type`
+    # precisely so a caller need not walk `__cause__` for it. Without this the
+    # line reads "database unreachable (DatabaseUnavailableError)" — the same
+    # word twice, and `InvalidPasswordError`, which errors.py rightly calls most
+    # of the diagnosis, dropped on the floor.
+    return getattr(exc, "cause_type", None) or type(exc).__name__
+
+
+#: What to do about a database that answered and refused the credentials. Not
+#: `make up`, which starts a stack that is already up, and emphatically not
+#: `make migrate`, which fails with this same error against this same password.
+#: `check-env` catches the half that is decidable from `.env` alone — a password
+#: that cannot survive being interpolated into a DSN — and the runbook section
+#: on the `source` line carries the other half, a password rotated against a
+#: volume that still holds the old one, which nothing static can see.
+DB_AUTH_FIX = "make check-env"
+
+
+def _database_check(name: str, exc: Exception, fix: str) -> Check:
+    """An unreachable database, as one of the two verdicts it can deserve.
+
+    SKIP is the honest answer for a database that is not up yet, and it does not
+    fail the command — an operator bringing the stack up a piece at a time runs
+    this against a half-started machine on purpose.
+
+    **A refused password is not that**, and reporting it as a skip was wrong in
+    the direction this whole tool exists to prevent. The stack is up; the fault
+    is a configuration disagreement that no amount of waiting or restarting
+    resolves; and the week the operator is about to spend would be spent against
+    a platform that cannot persist a bar, an order or a fill. `make preflight`
+    exited 0 on it, which is a go-live signal for a run that could only produce
+    the same silence a correct run produces (see this module's header on why
+    that is the expensive failure here).
+    """
+    if is_auth_failure(exc):
+        return Check(
+            name,
+            Status.FAIL,
+            f"database refused the credentials ({_why(exc)}) — it is up, and it said no",
+            fix=DB_AUTH_FIX,
+            source='docs/RUNBOOK.md, "password authentication failed"',
+        )
+    return Check(name, Status.SKIP, f"database unreachable ({_why(exc)})", fix=fix)
 
 
 def _timeframe(raw: str) -> Timeframe:
@@ -163,14 +205,7 @@ async def _local_checks(
         for symbol in symbols:
             checks.append(await _history_check(bars, symbol, timeframe, required))
     except Exception as exc:
-        checks.append(
-            Check(
-                "history",
-                Status.SKIP,
-                f"database unreachable ({_why(exc)})",
-                fix="make up && make migrate",
-            )
-        )
+        checks.append(_database_check("history", exc, fix="make up && make migrate"))
     finally:
         await engine.dispose()
 
@@ -298,7 +333,7 @@ async def _sizing_check(
         bars_repo = PostgresBarRepository(create_session_factory(engine))
         series = await bars_repo.get_last_n_bars(symbol, timeframe, settings.worker_stop_period + 1)
     except Exception as exc:
-        return Check("sizing", Status.SKIP, f"database unreachable ({_why(exc)})")
+        return _database_check("sizing", exc, fix="make up && make migrate")
     finally:
         await engine.dispose()
 

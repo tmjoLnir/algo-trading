@@ -38,9 +38,9 @@ from typing import TYPE_CHECKING
 from atp_core.brokers.alpaca import AlpacaBroker
 from atp_core.config import config_problem_summary, get_settings
 from atp_core.domain import RunMode, Timeframe
-from atp_core.errors import ATPError
+from atp_core.errors import ATPError, DatabaseUnavailableError
 from atp_core.persistence.bars import PostgresBarRepository
-from atp_core.persistence.db import create_engine, create_session_factory
+from atp_core.persistence.db import create_engine, create_session_factory, is_auth_failure
 from atp_core.persistence.quotes import RedisQuoteCache
 from atp_core.persistence.redis_client import close_redis, create_redis, create_sync_redis
 from atp_core.risk.killswitch import RedisKillSwitch
@@ -162,17 +162,31 @@ async def _print_local(settings: Settings, symbols: list[str], timeframe: Timefr
             )
 
         print(f"\nbars       {timeframe.value}")
-        for symbol in symbols:
-            stored = await repo.get_last_n_bars(symbol, timeframe, 1)
-            if not stored:
-                print(f"           {symbol:<8} {MISSING} — nothing stored")
-                continue
-            bar = stored[-1]
-            age_h = (now - bar.ts).total_seconds() / 3600
-            print(
-                f"           {symbol:<8} last {bar.ts.isoformat()}  "
-                f"({age_h:.1f}h ago)  close {bar.close}"
-            )
+        try:
+            for symbol in symbols:
+                stored = await repo.get_last_n_bars(symbol, timeframe, 1)
+                if not stored:
+                    print(f"           {symbol:<8} {MISSING} — nothing stored")
+                    continue
+                bar = stored[-1]
+                age_h = (now - bar.ts).total_seconds() / 3600
+                print(
+                    f"           {symbol:<8} last {bar.ts.isoformat()}  "
+                    f"({age_h:.1f}h ago)  close {bar.close}"
+                )
+        # As `_print_broker` below, and for its reason: a source we cannot reach
+        # *is* the status. This did not catch, so during an outage of the one
+        # store it reads the script exited here with a traceback — before the
+        # halt state and the broker's positions, which are the two things an
+        # operator opens this for at the moment Postgres is down.
+        # docs/RUNBOOK.md promised this tool still worked then. It did not.
+        except DatabaseUnavailableError as exc:
+            print(f"           UNREACHABLE — {exc}")
+            if is_auth_failure(exc):
+                print("           The database is up and refused the credentials; it will keep")
+                print("           refusing them. Run `make check-env`, then docs/RUNBOOK.md,")
+                print('           "password authentication failed".')
+            print("           Everything below reads Redis or the venue and is unaffected.")
     finally:
         await close_redis(redis)
         await engine.dispose()
