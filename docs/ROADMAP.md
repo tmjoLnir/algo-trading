@@ -72,6 +72,16 @@ from them, which is the failure `CLAUDE.md` §6 is about.
 so updating an item without updating this table breaks the build rather than
 the record.
 
+That test can only compare this file against itself, and one thing here is a
+claim about the outside world: `wip #12` says a pull request is still open.
+Every one of the twenty-one `wip` markers in this file was false on 2026-09-02
+— one of them naming a PR that had never merged at all — and the summary test
+passed on every one of those days, because "is somebody still working on this?"
+is not a question about the document (#125). `scripts/check_roadmap_wip.py`
+asks GitHub instead: its format half runs offline in the unit suite, and CI
+runs the half that reads PR state. A state it cannot read is a note rather than
+a failure, so the check is red only when it can name a finished PR.
+
 ## Phase 0 — Foundations (skeleton is here)
 - [x] Repo structure, tooling, docs, CI (#1, #2)
 - [x] `make install` and `make up` work end to end — @claude (#7, #35).
