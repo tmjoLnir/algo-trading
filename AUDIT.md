@@ -4,6 +4,11 @@
 **Commit:** `a71ae8f` (branch `claude/repo-audit-fu1irg`)  
 **Findings:** 82 (14 high, 40 medium, 28 low)
 
+**State reviewed:** 2026-09-02 against `4f68cf4`, under the record conventions
+`docs/ROADMAP.md` sets for a file of this kind. 7 closed, 1 half-closed, 74
+open; 27 citations no longer resolve. What that review found, and why this file
+needed one at all, is §10.
+
 ---
 
 ## 1. What this is
@@ -29,10 +34,27 @@ a guard with a hole in it, a docstring that describes behaviour the code does no
 
 Each entry states the claim, the evidence, and the concrete consequence.
 
-| Mark | Meaning |
+Every finding carries two marks, and they answer different questions. The
+**evidence** mark says how well the claim was established *when it was written*;
+the **state** mark says whether it is still true *today*. A finding can be ✅
+Verified and 🟢 Closed at once — well established, and since fixed.
+
+| Evidence | Meaning |
 |---|---|
 | ✅ **Verified** | I re-read the source myself and confirmed it, in several cases by executing the code. |
 | ⚠️ **Reported** | Raised by a subsystem reviewer with file-and-line evidence, but **not** independently re-checked. |
+
+| State | Meaning |
+|---|---|
+| 🔴 **Open** | The defect is in the tree at the review commit. |
+| 🟡 **Half-closed** — @who (#12) | Part of the finding was fixed in that PR; the rest is named in a record note beneath it. |
+| 🟢 **Closed** — @who (#12) | Fixed and merged in that PR. Terminal — the finding stays here as history. |
+
+This axis did not exist until §10. It is modelled on `docs/ROADMAP.md`'s four
+line states for the same reason that file gives: a record with no terminal state
+cannot distinguish work that was done from work nobody has looked at, and reads
+as an accusation long after it stopped being one. A state is annotated with the
+PR that earned it, in the same diff, exactly as a roadmap tick is.
 
 The adversarial verification pass was **not run** — the audit was wrapped up early, and it
 would have spawned one agent per finding at 2-way concurrency. Treat ⚠️ entries as leads with
@@ -49,6 +71,22 @@ claims turned out to be false (see §7), so expect some of the ⚠️ set not to
 | 🟠 Medium | 16 | 22 | 2 | **40** |
 | 🟡 Low | 4 | 12 | 12 | **28** |
 | **Total** | **32** | **36** | **14** | **82** |
+
+### By state, as at 2026-09-02 (`4f68cf4`)
+
+Derived from the state marks on the findings below and worth nothing if it
+disagrees with them. `docs/ROADMAP.md` has a test for exactly this
+(`tests/unit/test_roadmap_summary.py`); this file does not — see §10.
+
+| | 🟢 Closed | 🟡 Half-closed | 🔴 Open | Total |
+|---|---:|---:|---:|---:|
+| 🔴 High | 1 | 0 | 13 | **14** |
+| 🟠 Medium | 5 | 1 | 34 | **40** |
+| 🟡 Low | 1 | 0 | 27 | **28** |
+| **Total** | **7** | **1** | **74** | **82** |
+
+Of the 74 still open, **51 have never been re-checked by anyone** — they were
+⚠️ Reported on 2026-08-27 and are ⚠️ Reported now.
 
 ### By area
 
@@ -101,7 +139,7 @@ safety guarantee untrue.
 
 #### 1. The dashboard's "close position" never cancels the broker-side stop, despite the module docstring saying it does
 
-`apps/api/src/atp_api/execution.py:87` · Broken · 🔴 High · ✅ Verified
+`apps/api/src/atp_api/execution.py:87` · Broken · 🔴 High · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -127,7 +165,7 @@ Traced end to end. `build_router` (execution.py:98) returns a fresh `OrderRouter
 
 #### 2. The run list and run detail label spec.qty "shares per entry" for every run, including runs the engine never sized by share count
 
-`apps/web/src/components/BacktestRunList.tsx:241` · Broken · 🔴 High · ⚠️ Reported
+`apps/web/src/components/BacktestRunList.tsx:241` · Broken · 🔴 High · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -153,7 +191,7 @@ Queue a run with Sizing = "Percent of equity" and value 0.05. The engine sizes e
 
 #### 3. The queue's interrupted-run sweep is startup-only with a 2-hour threshold, so a normal container restart never sweeps and the row stays `running` forever
 
-`apps/worker/src/atp_worker/queue.py:152` · Broken · 🔴 High · ⚠️ Reported
+`apps/worker/src/atp_worker/queue.py:152` · Broken · 🔴 High · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -165,7 +203,7 @@ The row is stranded at `running` permanently — the exact outcome the module's 
 
 #### 4. The live runner marks only open positions, so every entry into a symbol the book does not already hold is refused at sizing
 
-`apps/worker/src/atp_worker/runner.py:712` · Broken · 🔴 High · ✅ Verified
+`apps/worker/src/atp_worker/runner.py:712` · Broken · 🔴 High · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -204,7 +242,7 @@ Reproduced directly. `_mark` iterates `portfolio.open_positions` only, so a symb
 
 #### 5. Trailing-stop ratchets are computed and then discarded: `_exit_reason` short-circuits on `broker_side`, which is always True in the worker
 
-`apps/worker/src/atp_worker/runner.py:820` · Broken · 🔴 High · ✅ Verified
+`apps/worker/src/atp_worker/runner.py:820` · Broken · 🔴 High · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -236,7 +274,9 @@ Confirmed, and worse than stated. `update_trailing` (runner.py:754) moves the le
 
 #### 6. The live runner is pinned to daily bars while the only live writer stores minute bars, so `strategy.on_bar` never fires
 
-`apps/worker/src/atp_worker/trading.py:185` · Broken · 🔴 High · ✅ Verified
+`apps/worker/src/atp_worker/trading.py:203` · Broken · 🔴 High · ✅ Verified · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:185` on 2026-08-27; the code is at `:203` today.*
 
 **Evidence**
 
@@ -254,7 +294,9 @@ Confirmed. `StreamIngestor` is constructed at `main.py:164` without `bar_timefra
 
 #### 7. DASHBOARD.md says every order/position write handler is still a stub; three of them are fully implemented, as DASHBOARD_STATUS.md states
 
-`docs/DASHBOARD.md:247` · Inconsistency · 🔴 High · ⚠️ Reported
+`docs/DASHBOARD.md:808` · Inconsistency · 🔴 High · ⚠️ Reported · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:247` on 2026-08-27; the code is at `:808` today.*
 
 **Evidence**
 
@@ -270,7 +312,9 @@ docs/RUNBOOK.md:154 tells an operator handling runaway order submission to `POST
 
 #### 8. DASHBOARD.md states login rate limiting is not built and "nothing slowing down guesses but bcrypt"; the limiter is implemented and wired
 
-`docs/DASHBOARD.md:713` · Inconsistency · 🔴 High · ✅ Verified
+`docs/DASHBOARD.md:766` · Inconsistency · 🔴 High · ✅ Verified · 🟢 **Closed** — @claude (#113)
+
+*Record note (§10, 2026-09-02): Cited `:713` on 2026-08-27; the code is at `:766` today.*
 
 **Evidence**
 
@@ -290,7 +334,7 @@ Confirmed. `auth.py:86` injects a `RateLimiter` dependency and `auth.py:103` cal
 
 #### 9. RISK.md names `flatten_at_close` as one of only two defences against overnight gap risk, but the rule compiler refuses any spec that sets it
 
-`docs/RISK.md:167` · Broken · 🔴 High · ⚠️ Reported
+`docs/RISK.md:167` · Broken · 🔴 High · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -311,7 +355,7 @@ An operator reading the platform's risk specification is told that a strategy ho
 
 #### 10. STRATEGY_AUTHORING.md claims the draft→backtesting→paper→live ratchet is "enforced by the API"; every promotion handler is a NotImplementedError stub
 
-`docs/STRATEGY_AUTHORING.md:226` · Broken · 🔴 High · ✅ Verified
+`docs/STRATEGY_AUTHORING.md:226` · Broken · 🔴 High · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -333,7 +377,7 @@ Confirmed. `STRATEGY_AUTHORING.md:226` reads ‘Each gate is enforced by the API
 
 #### 11. A stop/target firing on the same bar as a resting exit order leaves the backtest holding a phantom reversed position
 
-`libs/core/src/atp_core/backtest/engine.py:983` · Broken · 🔴 High · ⚠️ Reported
+`libs/core/src/atp_core/backtest/engine.py:983` · Broken · 🔴 High · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -369,7 +413,7 @@ Any run that arms stops (`--stop atr`, or a strategy that emits `stop_loss_price
 
 #### 12. The nightly sweep never re-fetches reconnect-backfilled bars, so "nothing is permanently raw-only" is false and those windows become un-backtestable
 
-`libs/core/src/atp_core/data/stream.py:271` · Broken · 🔴 High · ✅ Verified
+`libs/core/src/atp_core/data/stream.py:271` · Broken · 🔴 High · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -400,7 +444,7 @@ Confirmed. The nightly sweep is `backfill_missing_bars` (scheduler.py:118), whic
 
 #### 13. tests/integration/test_kill_switch.py has no `pytest.mark.integration`, so its 5 tests are deselected by CI and by `make test-integration`
 
-`tests/integration/test_kill_switch.py:28` · Broken · 🔴 High · ✅ Verified
+`tests/integration/test_kill_switch.py:28` · Broken · 🔴 High · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -436,7 +480,7 @@ Confirmed by collection. `pytest tests/integration --collect-only` gathers 196 t
 
 #### 14. `test_money_fields_serialise_as_strings` cannot fail for `unrealized_pnl` or `market_value` — the only test guarding CLAUDE.md §1.1 on the wire is vacuous for nullable fields
 
-`tests/unit/test_api_contract.py:89` · Broken · 🔴 High · ⚠️ Reported
+`tests/unit/test_api_contract.py:89` · Broken · 🔴 High · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -481,7 +525,7 @@ do not by themselves break trading.
 
 #### 15. `_realised_curve` anchors the curve at the *mean* trade notional while its docstring says the *summed* magnitude
 
-`apps/api/src/atp_api/routers/analytics.py:368` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`apps/api/src/atp_api/routers/analytics.py:368` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -498,7 +542,7 @@ do not by themselves break trading.
 
 #### 16. `login`'s docstring says there is no rate limit, in a handler whose first action is the rate limit
 
-`apps/api/src/atp_api/routers/auth.py:91` · Inconsistency · 🟠 Medium · ✅ Verified
+`apps/api/src/atp_api/routers/auth.py:91` · Inconsistency · 🟠 Medium · ✅ Verified · 🟢 **Closed** — @claude (#113)
 
 **Evidence**
 
@@ -524,7 +568,7 @@ Confirmed — the docstring and the code it documents are eleven lines apart and
 
 #### 17. Thirteen unbuilt endpoints are published in the OpenAPI schema and return HTTP 500, not 501
 
-`apps/api/src/atp_api/routers/marketdata.py:29` · Broken · 🟠 Medium · ✅ Verified
+`apps/api/src/atp_api/routers/marketdata.py:29` · Broken · 🟠 Medium · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -536,7 +580,7 @@ A 500 is 'the server broke', not 'this is not built'. Every call to an unbuilt e
 
 #### 18. GET /orders accepts a naive `since` and feeds it straight into a TIMESTAMPTZ comparison, while the sibling backtest endpoint rejects exactly that
 
-`apps/api/src/atp_api/routers/orders.py:204` · Broken · 🟠 Medium · ✅ Verified
+`apps/api/src/atp_api/routers/orders.py:204` · Broken · 🟠 Medium · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -571,7 +615,9 @@ Proven by execution. With a spy repository, `GET /api/v1/orders?since=2026-08-27
 
 #### 19. `unsubscribe` from the last watched symbol turns the quote filter into a firehose
 
-`apps/api/src/atp_api/ws.py:203` · Broken · 🟠 Medium · ⚠️ Reported
+`apps/api/src/atp_api/ws.py:245` · Broken · 🟠 Medium · ⚠️ Reported · 🟢 **Closed** — @claude (#121)
+
+*Record note (§10, 2026-09-02): Cited `:203` on 2026-08-27; the code is at `:245` today.*
 
 **Evidence**
 
@@ -595,7 +641,9 @@ A client that sends `{"type":"unsubscribe","symbols":[...]}` for its last symbol
 
 #### 20. A client dropped on the send deadline is never closed, so it is muted permanently and never reconnects
 
-`apps/api/src/atp_api/ws.py:228` · Broken · 🟠 Medium · ⚠️ Reported
+`apps/api/src/atp_api/ws.py:359` · Broken · 🟠 Medium · ⚠️ Reported · 🟢 **Closed** — @claude (#120)
+
+*Record note (§10, 2026-09-02): Cited `:228` on 2026-08-27; the code is at `:359` today.*
 
 **Evidence**
 
@@ -609,7 +657,7 @@ A browser on a bad connection that misses one 2s `SEND_TIMEOUT_SECONDS` deadline
 
 #### 21. The 204 test passes with the 204 branch deleted, so the logout path it guards is untested
 
-`apps/web/src/api/client.test.ts:104` · Broken · 🟠 Medium · ⚠️ Reported
+`apps/web/src/api/client.test.ts:104` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -629,7 +677,7 @@ A browser on a bad connection that misses one 2s `SEND_TIMEOUT_SECONDS` deadline
 
 #### 22. The two "reports a failure that never reached the API" web tests stub a valid JSON body, so they exercise the opposite branch of client.ts and assert nothing about it
 
-`apps/web/src/components/killswitch.test.tsx:118` · Broken · 🟠 Medium · ⚠️ Reported
+`apps/web/src/components/killswitch.test.tsx:118` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -664,7 +712,9 @@ Both files claim to pin the behaviour of the emergency-stop and resume controls 
 
 #### 23. The audit screen can only filter 6 of the 11 actions the platform writes, and its docstring claims the missing handlers are stubs
 
-`apps/web/src/pages/Audit.tsx:38` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`apps/web/src/pages/Audit.tsx:38` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Its own count has drifted: the platform now writes **12** audit verbs, not 11, so the screen filters 6 of 12.*
 
 **Evidence**
 
@@ -684,7 +734,9 @@ Both files claim to pin the behaviour of the emergency-stop and resume controls 
 
 #### 24. Preflight's remedy for missing bar history is a command that cannot run — `--start` is required
 
-`apps/worker/src/atp_worker/preflight.py:311` · Broken · 🟠 Medium · ⚠️ Reported
+`apps/worker/src/atp_worker/preflight.py:319` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:311` on 2026-08-27; the code is at `:319` today.*
 
 **Evidence**
 
@@ -705,7 +757,7 @@ Both files claim to pin the behaviour of the emergency-stop and resume controls 
 
 #### 25. `queue.run`'s docstring claims the container waits for the in-flight backtest on SIGTERM, but no `stop_grace_period` is set so Docker kills it after 10s
 
-`apps/worker/src/atp_worker/queue.py:237` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`apps/worker/src/atp_worker/queue.py:237` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -719,7 +771,7 @@ On every `docker compose restart queue`, `make deploy`, or host reboot, a backte
 
 #### 26. README.md points requirement #5 (paper trading) at `brokers/paper.py`, a file that does not exist and that ADR 0003 deliberately rejected
 
-`README.md:20` · Broken · 🟠 Medium · ✅ Verified
+`README.md:20` · Broken · 🟠 Medium · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -733,7 +785,7 @@ The README's capability table is the first map a new contributor or agent reads,
 
 #### 27. README.md says switching to live requires "an explicit env flag plus a typed confirmation"; no typed confirmation exists anywhere on the live-mode path
 
-`README.md:74` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`README.md:74` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -747,7 +799,9 @@ The README's Safety section is what a reader consults before deciding how carefu
 
 #### 28. DASHBOARD.md says the audit trail records only authentication and refusals because the other handlers are stubs; six more verbs are wired
 
-`docs/DASHBOARD.md:174` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`docs/DASHBOARD.md:233` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:174` on 2026-08-27; the code is at `:233` today.*
 
 **Evidence**
 
@@ -761,7 +815,7 @@ The audit page is what an operator opens after an incident to answer "who stoppe
 
 #### 29. DASHBOARD_STATUS.md says `donchian_breakout` and `opening_range_breakout` "exist in code"; neither appears anywhere in the repository
 
-`docs/DASHBOARD_STATUS.md:96` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`docs/DASHBOARD_STATUS.md:96` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -775,7 +829,7 @@ This sentence is the doc's evidence for what the Strategies tab is for — the g
 
 #### 30. PARKING_LOT.md declares nothing is parked while ADR 0017 documents a diagnosed, deliberately deferred defect in shipped code
 
-`docs/PARKING_LOT.md:34` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`docs/PARKING_LOT.md:34` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -791,7 +845,7 @@ The parking lot is where CLAUDE.md's process routes exactly this class of item, 
 
 #### 31. RISK_IMPLEMENTATION_NOTES.md states StrategyRunner and the trade-updates stream do not exist; both are built and call OrderRouter
 
-`docs/RISK_IMPLEMENTATION_NOTES.md:15` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`docs/RISK_IMPLEMENTATION_NOTES.md:15` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -805,7 +859,7 @@ README.md:87 points implementers at this file as the live guide for "where RISK.
 
 #### 32. RISK_IMPLEMENTATION_NOTES.md item 8 says `flatten_at_close` is never referenced and gives "silent no-op protection"; it is referenced and now raises
 
-`docs/RISK_IMPLEMENTATION_NOTES.md:241` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`docs/RISK_IMPLEMENTATION_NOTES.md:241` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -819,7 +873,9 @@ README.md:87 markets this file as the authority on where RISK.md and the code di
 
 #### 33. ROADMAP's ticked Phase 2 item still states the backtest risk chain is empty and sizing is fixed-qty-only; both changed and BACKTESTING.md says so
 
-`docs/ROADMAP.md:337` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`docs/ROADMAP.md:365` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:337` on 2026-08-27; the code is at `:365` today.*
 
 **Evidence**
 
@@ -833,7 +889,9 @@ CLAUDE.md §6 makes ROADMAP.md "the only record of what this platform has and ha
 
 #### 34. SAFETY.md's layered-defences table and go-live checklist omit `WORKER_ALLOW_LIVE_ORDERS`, the third lock the worker actually enforces
 
-`docs/SAFETY.md:23` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`docs/SAFETY.md:24` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🟡 **Half-closed** — @claude (#124)
+
+*Record note (§10, 2026-09-02): Re-pointed from `:23` to `:24`, the row #124 added. The table half of this finding is closed; the go-live checklist in the same file still does not list the lock, which is the open half. The finding also names `WORKER_ALLOW_LIVE_ORDERS`, an environment variable #124 removed — the lock now lives in `worker_config.allow_live_orders`.*
 
 **Evidence**
 
@@ -854,7 +912,9 @@ SAFETY.md is the page CLAUDE.md §1.8 and README.md make mandatory reading befor
 
 #### 35. ATP_DB_PASSWORD is required by the deploy overlay and documented as a fill-in, but has no entry in .env.example
 
-`.env.example:67` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`.env.example:112` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🟢 **Closed** — @claude (#113)
+
+*Record note (§10, 2026-09-02): Cited `:67` on 2026-08-27; the code is at `:112` today.*
 
 **Evidence**
 
@@ -881,7 +941,9 @@ An operator following docs/DEPLOYMENT.md verbatim copies .env.example, works dow
 
 #### 36. make check-tracked runs in no CI job, contradicting .gitignore's claim that it makes a swallowed SOPS bundle "fail the build"
 
-`.github/workflows/ci.yml:163` · Inconsistency · 🟠 Medium · ✅ Verified
+`.github/workflows/ci.yml:163` · Inconsistency · 🟠 Medium · ✅ Verified · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): The citation points at an absence, not a line — `ci.yml:163` is whatever step happens to sit there, and the finding is that no step runs `make check-tracked`. Still true at `4f68cf4`: CI calls `ruff`, `mypy` and `pytest` directly and never `make check`, which is the only target `check-tracked` hangs off.*
 
 **Evidence**
 
@@ -905,7 +967,7 @@ check-tracked is the only thing standing between an over-broad .gitignore rule a
 
 #### 37. pre-commit pins ruff v0.5.5 while the lockfile and CI run ruff 0.16.3, and the hooks are never installed by any documented step
 
-`.pre-commit-config.yaml:3` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`.pre-commit-config.yaml:3` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -933,7 +995,9 @@ The gitleaks hook is labelled "Last line of defence before a broker key reaches 
 
 #### 38. docker-compose and the Makefile still tell operators the worker cannot place orders, three locks after it can
 
-`docker-compose.yml:160` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`docker-compose.yml:204` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🟢 **Closed** — @claude (#124)
+
+*Record note (§10, 2026-09-02): Cited `:160` on 2026-08-27; the code is at `:204` today.*
 
 **Evidence**
 
@@ -947,7 +1011,7 @@ These two lines are what an operator reads when bringing the stack up. Someone w
 
 #### 39. `comparability_warnings` tells every live-vs-backtest reader the backtest used flat share sizing, which stopped being true when backtests moved onto `position_size`
 
-`libs/core/src/atp_core/analytics/performance.py:611` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`libs/core/src/atp_core/analytics/performance.py:611` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -970,7 +1034,7 @@ A `risk_pct` backtest compared against a `risk_pct` live run is annotated with a
 
 #### 40. `turnover` is computed against starting equity in the backtest and against mean equity in analytics, then the two are subtracted as a divergence
 
-`libs/core/src/atp_core/backtest/engine.py:724` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`libs/core/src/atp_core/backtest/engine.py:724` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -991,7 +1055,7 @@ A `risk_pct` backtest compared against a `risk_pct` live run is annotated with a
 
 #### 41. `periods_per_year_for` floor-divides the session, so a 4h backtest is annualised at 252 — the daily basis
 
-`libs/core/src/atp_core/backtest/metrics.py:60` · Broken · 🟠 Medium · ⚠️ Reported
+`libs/core/src/atp_core/backtest/metrics.py:60` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1021,7 +1085,7 @@ This value feeds `compute_all` for CAGR (`years = len(returns) / periods_per_yea
 
 #### 42. `RiskLimits` applies no bounds to any of the ceilings the whole platform's safety rests on
 
-`libs/core/src/atp_core/config.py:29` · Broken · 🟠 Medium · ⚠️ Reported
+`libs/core/src/atp_core/config.py:29` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1050,7 +1114,7 @@ This value feeds `compute_all` for CAGR (`years = len(returns) / periods_per_yea
 
 #### 43. ALPACA_DATA_FEED does not control the WebSocket feed, and the stream logs a feed it is not connected to
 
-`libs/core/src/atp_core/data/providers/alpaca.py:722` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`libs/core/src/atp_core/data/providers/alpaca.py:722` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1075,7 +1139,9 @@ An operator who buys the SIP subscription and sets `ALPACA_DATA_FEED=sip` gets S
 
 #### 44. StalenessMonitor re-arms itself at the closing bell and logs "market data is flowing again" while the feed is still dead
 
-`libs/core/src/atp_core/data/stream.py:528` · Broken · 🟠 Medium · ⚠️ Reported
+`libs/core/src/atp_core/data/stream.py:533` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:528` on 2026-08-27; the code is at `:533` today.*
 
 **Evidence**
 
@@ -1103,7 +1169,9 @@ A feed that dies at 15:00 Tuesday and stays dead produces, at 16:00 that day, a 
 
 #### 45. `submit_protective_orders` states a "load-bearing" caller contract that no production caller implements, leaving two public router methods dead outside tests
 
-`libs/core/src/atp_core/execution/router.py:387` · Redundancy · 🟠 Medium · ✅ Verified
+`libs/core/src/atp_core/execution/router.py:397` · Redundancy · 🟠 Medium · ✅ Verified · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:387` on 2026-08-27; the code is at `:397` today.*
 
 **Evidence**
 
@@ -1127,7 +1195,9 @@ Confirmed. `broker_side_protected_qty` and `has_broker_side_protection` have no 
 
 #### 46. `OrderRouter.flatten` says four risk rules can refuse an exit; ADR 0005, the API and the runner all say six — and six is correct
 
-`libs/core/src/atp_core/execution/router.py:683` · Inconsistency · 🟠 Medium · ✅ Verified
+`libs/core/src/atp_core/execution/router.py:700` · Inconsistency · 🟠 Medium · ✅ Verified · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:683` on 2026-08-27; the code is at `:700` today.*
 
 **Evidence**
 
@@ -1153,7 +1223,9 @@ Confirmed. `rg` finds ‘Six of the nine’ at `runner.py:741`, `positions.py:18
 
 #### 47. Four ORM relationship() declarations in models.py are used nowhere and would raise MissingGreenlet if they ever were
 
-`libs/core/src/atp_core/persistence/models.py:225` · Redundancy · 🟠 Medium · ⚠️ Reported
+`libs/core/src/atp_core/persistence/models.py:227` · Redundancy · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:225` on 2026-08-27; the code is at `:227` today.*
 
 **Evidence**
 
@@ -1177,7 +1249,7 @@ Dead declarations that read as a supported access path. A maintainer who writes 
 
 #### 48. `RedisKillSwitch.engage` is GET-then-SET, so its documented idempotence and alert deduplication break under concurrent halts
 
-`libs/core/src/atp_core/risk/killswitch.py:214` · Broken · 🟠 Medium · ⚠️ Reported
+`libs/core/src/atp_core/risk/killswitch.py:214` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1201,7 +1273,7 @@ The realistic trigger is the ordinary incident shape: the feed drops and `Stalen
 
 #### 49. RedisKillSwitch stamps the halt record from the wall clock inside libs/core, where every sibling adapter takes an injected Clock for exactly this reason
 
-`libs/core/src/atp_core/risk/killswitch.py:221` · Inconsistency · 🟠 Medium · ✅ Verified
+`libs/core/src/atp_core/risk/killswitch.py:221` · Inconsistency · 🟠 Medium · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -1240,7 +1312,9 @@ Confirmed. This is the only `datetime.now()` in `libs/core` outside `SystemClock
 
 #### 50. check_deployed_shape only guards api and worker, so the queue service can silently deploy host source
 
-`scripts/check_port_bindings.py:101` · Broken · 🟠 Medium · ⚠️ Reported
+`scripts/check_port_bindings.py:108` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:101` on 2026-08-27; the code is at `:108` today.*
 
 **Evidence**
 
@@ -1268,7 +1342,7 @@ Confirmed. This is the only `datetime.now()` in `libs/core` outside `SystemClock
 
 #### 51. `scripts/halt.py` tells an operator that `/risk/resume` is a stub and that flattening has no operator path; both are implemented
 
-`scripts/halt.py:15` · Inconsistency · 🟠 Medium · ⚠️ Reported
+`scripts/halt.py:15` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1289,7 +1363,7 @@ This file is what an operator reads during an incident — its own header calls 
 
 #### 52. `halt.py status` accepts and validates `--scope`/`--target` and then ignores them
 
-`scripts/halt.py:78` · Broken · 🟠 Medium · ⚠️ Reported
+`scripts/halt.py:78` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1301,7 +1375,7 @@ This file is what an operator reads during an incident — its own header calls 
 
 #### 53. `scripts/halt.py clear` discards the record `KillSwitch.clear` returns and reports success when nothing was halted
 
-`scripts/halt.py:132` · Broken · 🟠 Medium · ⚠️ Reported
+`scripts/halt.py:132` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1319,7 +1393,7 @@ An operator running `halt.py clear --by jo` against the wrong scope or target �
 
 #### 54. `test_reconstructed_pnl_equals_the_pnl_of_the_fills` checks equality in ~1% of generated examples; the other 99% hit a bound so loose it cannot fail
 
-`tests/unit/test_analytics_performance.py:874` · Broken · 🟠 Medium · ⚠️ Reported
+`tests/unit/test_analytics_performance.py:874` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1362,7 +1436,9 @@ are how a codebase stops being trustworthy to read.
 
 #### 55. The middleware-ordering comment sits on the `add_middleware` call it does not describe
 
-`apps/api/src/atp_api/main.py:208` · Inconsistency · 🟡 Low · ⚠️ Reported
+`apps/api/src/atp_api/main.py:216` · Inconsistency · 🟡 Low · ⚠️ Reported · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:208` on 2026-08-27; the code is at `:216` today.*
 
 **Evidence**
 
@@ -1383,7 +1459,9 @@ middleware.py's docstring says the ordering "is set in `main.create_app`" and th
 
 #### 56. The API version is a literal in two places; `/` can report a version the OpenAPI doc and `atp_build_info` do not
 
-`apps/api/src/atp_api/main.py:286` · Redundancy · 🟡 Low · ⚠️ Reported
+`apps/api/src/atp_api/main.py:295` · Redundancy · 🟡 Low · ⚠️ Reported · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:286` on 2026-08-27; the code is at `:295` today.*
 
 **Evidence**
 
@@ -1401,7 +1479,7 @@ A version bump that touches one literal and not the other leaves `GET /` disagre
 
 #### 57. `MAX_COMPARE`'s comment names `POST /compare`, a method the endpoint deliberately does not use
 
-`apps/api/src/atp_api/routers/backtests.py:101` · Inconsistency · 🟡 Low · ⚠️ Reported
+`apps/api/src/atp_api/routers/backtests.py:101` · Inconsistency · 🟡 Low · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1415,7 +1493,7 @@ The constant's comment restates the rejected design as if it were current. A rea
 
 #### 58. lightweight-charts is a declared runtime dependency that nothing in the repo imports
 
-`apps/web/package.json:19` · Redundancy · 🟡 Low · ⚠️ Reported
+`apps/web/package.json:19` · Redundancy · 🟡 Low · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1433,7 +1511,7 @@ It is installed by `npm ci` in every image stage of infra/docker/web.Dockerfile 
 
 #### 59. apiPatch and apiDelete are exported and called nowhere in the app
 
-`apps/web/src/api/client.ts:83` · Redundancy · 🟡 Low · ⚠️ Reported
+`apps/web/src/api/client.ts:83` · Redundancy · 🟡 Low · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1452,7 +1530,7 @@ Two unexercised verbs on the app's single fetch choke point. They are not covere
 
 #### 60. api/types.ts exports a RunMode union documented as the single restatement of the enum, and nothing imports it
 
-`apps/web/src/api/types.ts:47` · Redundancy · 🟡 Low · ⚠️ Reported
+`apps/web/src/api/types.ts:47` · Redundancy · 🟡 Low · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1475,7 +1553,7 @@ The union is dead weight that reads as a live invariant. The two banners each ho
 
 #### 61. The risk panel's client-side ceiling fallback re-implements the server's row set and disagrees with it on rate_limit
 
-`apps/web/src/components/RiskLimitsPanel.tsx:126` · Inconsistency · 🟡 Low · ⚠️ Reported
+`apps/web/src/components/RiskLimitsPanel.tsx:126` · Inconsistency · 🟡 Low · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1491,7 +1569,7 @@ When /risk/status returns 503 the panel falls back to /risk/limits and renders t
 
 #### 62. Analytics justifies its typed strategy field with "/strategies is still a stub", which is false
 
-`apps/web/src/pages/Analytics.tsx:192` · Inconsistency · 🟡 Low · ⚠️ Reported
+`apps/web/src/pages/Analytics.tsx:192` · Inconsistency · 🟡 Low · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1507,7 +1585,7 @@ The premise for making this the only free-text strategy field in the app is gone
 
 #### 63. Strategies page tells operators the promotion preconditions cannot be checked, naming two that now can
 
-`apps/web/src/pages/Strategies.tsx:361` · Inconsistency · 🟡 Low · ⚠️ Reported
+`apps/web/src/pages/Strategies.tsx:361` · Inconsistency · 🟡 Low · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1525,7 +1603,7 @@ This is user-facing copy, not a code comment. It tells an operator two capabilit
 
 #### 64. apscheduler is declared as a worker dependency but is never imported — the scheduler is hand-rolled
 
-`apps/worker/pyproject.toml:9` · Redundancy · 🟡 Low · ⚠️ Reported
+`apps/worker/pyproject.toml:9` · Redundancy · 🟡 Low · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1552,7 +1630,7 @@ It is installed into both the worker and queue containers (both built from infra
 
 #### 65. README.md's documentation index links to docs/API.md, which does not exist
 
-`README.md:89` · Broken · 🟡 Low · ✅ Verified
+`README.md:89` · Broken · 🟡 Low · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -1564,7 +1642,9 @@ The README's documentation table is the routing layer for every other page, and 
 
 #### 66. DASHBOARD_STATUS.md's provenance paragraph cites a `StrategyKind` enum that does not exist and undercounts the audit verbs by six
 
-`docs/DASHBOARD_STATUS.md:17` · Inconsistency · 🟡 Low · ⚠️ Reported
+`docs/DASHBOARD_STATUS.md:17` · Inconsistency · 🟡 Low · ⚠️ Reported · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Its own count has drifted: the file names five verbs against **12**, so it undercounts by seven, not six.*
 
 **Evidence**
 
@@ -1578,7 +1658,9 @@ This paragraph is the doc's warrant — it tells the reader how much to trust ev
 
 #### 67. RUNBOOK.md tells the operator `make status` works; there is no such Makefile target
 
-`docs/RUNBOOK.md:325` · Broken · 🟡 Low · ⚠️ Reported
+`docs/RUNBOOK.md:349` · Broken · 🟡 Low · ⚠️ Reported · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:325` on 2026-08-27; the code is at `:349` today.*
 
 **Evidence**
 
@@ -1592,7 +1674,9 @@ This is the incident runbook, and `scripts/status.py` is the tool it recommends 
 
 #### 68. TESTING.md documents a `sample_bars` fixture that does not exist
 
-`docs/TESTING.md:58` · Broken · 🟡 Low · ✅ Verified
+`docs/TESTING.md:69` · Broken · 🟡 Low · ✅ Verified · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:58` on 2026-08-27; the code is at `:69` today.*
 
 **Evidence**
 
@@ -1606,7 +1690,7 @@ A contributor writing a bar-driven test — the most common kind in this repo �
 
 #### 69. The .gitignore rule apps/web/dist/ is dead, already covered by the unanchored dist/ five lines above it
 
-`.gitignore:46` · Redundancy · 🟡 Low · ⚠️ Reported
+`.gitignore:46` · Redundancy · 🟡 Low · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1625,7 +1709,7 @@ Line 46 has no effect — line 37 already excludes apps/web/dist at any depth �
 
 #### 70. .PHONY omits check-tracked, preflight and paper-report
 
-`Makefile:2` · Inconsistency · 🟡 Low · ✅ Verified
+`Makefile:2` · Inconsistency · 🟡 Low · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -1650,7 +1734,9 @@ Make treats an undeclared target as a file rule. A file or directory named `chec
 
 #### 71. Nothing verifies the generated TS types are current, though the contract depends on it
 
-`Makefile:246` · Inconsistency · 🟡 Low · ✅ Verified
+`Makefile:265` · Inconsistency · 🟡 Low · ✅ Verified · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:246` on 2026-08-27; the code is at `:265` today.*
 
 **Evidence**
 
@@ -1664,7 +1750,7 @@ A contributor who changes a response model and forgets `make gen-types` gets a g
 
 #### 72. ADR 0019 enumerates nine fields for `backtest_runs.totals`; the writer and the API model both have ten — `starting_equity` is missing from the ADR
 
-`libs/core/src/atp_core/backtest/engine.py:264` · Inconsistency · 🟡 Low · ✅ Verified
+`libs/core/src/atp_core/backtest/engine.py:264` · Inconsistency · 🟡 Low · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -1697,7 +1783,7 @@ Confirmed by execution: `BacktestTotalsView` has 10 required fields, and validat
 
 #### 73. `BacktestEngine._fill_pending` is unreachable — the loop calls `_fill_pending_for` directly
 
-`libs/core/src/atp_core/backtest/engine.py:951` · Redundancy · 🟡 Low · ⚠️ Reported
+`libs/core/src/atp_core/backtest/engine.py:951` · Redundancy · 🟡 Low · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1716,7 +1802,9 @@ It is a wrapper that adds nothing, and it carries the documented statement of th
 
 #### 74. `NO_RISK_RULES_WARNING` is dead, and `build_engine`'s docstring promises it is attached when it never is
 
-`libs/core/src/atp_core/backtest/runner.py:93` · Redundancy · 🟡 Low · ⚠️ Reported
+`libs/core/src/atp_core/backtest/runner.py:99` · Redundancy · 🟡 Low · ⚠️ Reported · 🟢 **Closed** — @claude (#111)
+
+*Record note (§10, 2026-09-02): Cited `:93` on 2026-08-27; the code is at `:99` today.*
 
 **Evidence**
 
@@ -1743,7 +1831,9 @@ The docstring is a promise the code does not keep: a caller that takes `build_en
 
 #### 75. `StaleDataError` and `KillSwitchEngagedError` are never raised or caught anywhere
 
-`libs/core/src/atp_core/errors.py:41` · Redundancy · 🟡 Low · ✅ Verified
+`libs/core/src/atp_core/errors.py:74` · Redundancy · 🟡 Low · ✅ Verified · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:41` on 2026-08-27; the code is at `:74` today.*
 
 **Evidence**
 
@@ -1757,7 +1847,7 @@ Refusing by return value is the deliberate design (`router.py` header: 'A refusa
 
 #### 76. `ta.crossed_above` / `crossed_below` are dead, and `sma_crossover` reimplements them inline
 
-`libs/core/src/atp_core/indicators/ta.py:285` · Redundancy · 🟡 Low · ✅ Verified
+`libs/core/src/atp_core/indicators/ta.py:285` · Redundancy · 🟡 Low · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -1776,7 +1866,7 @@ Two implementations of one predicate, and the one with no test (`crossed_below`,
 
 #### 77. PostgresBacktestRunRepository.create() writes every backtest_runs column except `totals`
 
-`libs/core/src/atp_core/persistence/backtests.py:76` · Inconsistency · 🟡 Low · ⚠️ Reported
+`libs/core/src/atp_core/persistence/backtests.py:76` · Inconsistency · 🟡 Low · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1801,7 +1891,7 @@ Latent today only because `new_run()` (backtests.py:292) is the sole producer fe
 
 #### 78. _reject_floats recurses into nested dicts but not into lists, so a float inside any list is published unchecked
 
-`libs/core/src/atp_core/persistence/events.py:79` · Broken · 🟡 Low · ✅ Verified
+`libs/core/src/atp_core/persistence/events.py:79` · Broken · 🟡 Low · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -1834,7 +1924,7 @@ Proven by execution. `_reject_floats('ch', {'prices': [101.25]})` and `_reject_f
 
 #### 79. `--adjusted` in the backfill script is a dead flag: never read, and it cannot be false
 
-`scripts/backfill_bars.py:52` · Redundancy · 🟡 Low · ⚠️ Reported
+`scripts/backfill_bars.py:52` · Redundancy · 🟡 Low · ⚠️ Reported · 🔴 **Open**
 
 **Evidence**
 
@@ -1855,7 +1945,9 @@ Proven by execution. `_reject_floats('ch', {'prices': [101.25]})` and `_reject_f
 
 #### 80. `_parse_day` is duplicated verbatim across two scripts, and seed.py's copy claims a uniqueness that is false
 
-`scripts/run_backtest.py:135` · Redundancy · 🟡 Low · ⚠️ Reported
+`scripts/run_backtest.py:142` · Redundancy · 🟡 Low · ⚠️ Reported · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Cited `:135` on 2026-08-27; the code is at `:142` today.*
 
 **Evidence**
 
@@ -1869,7 +1961,9 @@ Four places parse the same operator-facing date format with the same error messa
 
 #### 81. The e2e tier is documented, marker-registered and directory-scaffolded, but holds zero tests and no target or CI job runs one
 
-`tests/e2e/__init__.py:1` · Inconsistency · 🟡 Low · ✅ Verified
+`tests/e2e/__init__.py:1` · Inconsistency · 🟡 Low · ✅ Verified · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): This citation has never resolved. `tests/e2e/__init__.py` has been zero bytes since it was committed, so there is no line 1 and never was. Read it as "the directory these tests are missing from".*
 
 **Evidence**
 
@@ -1885,7 +1979,9 @@ docs/TESTING.md is the page a contributor reads to learn what the suite covers, 
 
 #### 82. `CORE_SUBPACKAGES` says it is "every subpackage the platform is built from" but omits four of the fourteen, including two named in CLAUDE.md's package table
 
-`tests/unit/test_repo_integrity.py:21` · Inconsistency · 🟡 Low · ⚠️ Reported
+`tests/unit/test_repo_integrity.py:21` · Inconsistency · 🟡 Low · ⚠️ Reported · 🔴 **Open**
+
+*Record note (§10, 2026-09-02): Its own count has drifted: `atp_core` now has **15** subpackages, so the list omits five, not four.*
 
 **Evidence**
 
@@ -1932,7 +2028,7 @@ design. Recording them stops the next audit re-deriving them.
 Stated plainly, because an audit that overstates its coverage is worse than a
 shorter one.
 
-1. **The adversarial verification pass did not run.** 60 of the 82 findings are
+1. **The adversarial verification pass did not run.** 57 of the 82 findings are
    marked ⚠️ and have not been independently re-checked. I verified 25 myself,
    including 8 of the 14 high-severity findings. Verify before acting, and
    especially before changing risk or execution code.
@@ -1948,9 +2044,13 @@ shorter one.
    CLAUDE.md §1.7, but it means the reconnect, reconciliation and partial-fill
    paths were read rather than exercised.
 5. **Severities are mine, and assume the platform reaches production.** Several
-   high findings are latent: Phase 4 is 0/10 on the roadmap and nothing has traded
-   a paper account, so the execution defects have not yet had the chance to cost
-   anything. That is a statement about timing, not about severity.
+   high findings are latent: Phase 4 is entirely unticked on the roadmap and
+   nothing has traded a paper account, so the execution defects have not yet had
+   the chance to cost anything. That is a statement about timing, not about
+   severity. (This read "Phase 4 is 0/10" until §10. It was true on 2026-08-27
+   and false six days later, when #127 split an item and made it 0/11 — a count
+   copied out of another document drifts the moment that document is edited, so
+   the count is gone and the fact is stated instead.)
 
 ## 9. Suggested order of work
 
@@ -1974,10 +2074,175 @@ Nothing here was changed — this is a read-only audit. If it were mine to fix:
    cheap to fix and it is what a new contributor reads first.
 5. **The low-severity dead code**, opportunistically.
 
+## 10. The record review — 2026-09-02
+
+This section is the result of auditing the 82 findings above against the record
+conventions `docs/ROADMAP.md` sets out under *How this file is maintained*, and
+`CLAUDE.md` §6 requires. Reviewed at `4f68cf4`, six days and nineteen merged
+pull requests (#109–#127) after the audit commit.
+
+The premise is the roadmap's own: **a status document is worthless the moment it
+lags the code.** That sentence was written about `docs/ROADMAP.md`, but nothing
+in it is specific to a roadmap. This file is a status document too — 82 claims
+about what is wrong with a tree — and it had none of the machinery the roadmap
+has grown to keep such claims honest.
+
+### 10.1 The conventions, and how this file scored
+
+| | Convention (`docs/ROADMAP.md`, `CLAUDE.md` §6) | Before | Now |
+|---|---|---|---|
+| C1 | Every entry carries a state, and one of them is **terminal** | ✗ two evidence marks, no state at all, nothing that can mean *fixed* | ✓ §2, stamped on all 82 |
+| C2 | A claimed or finished entry names **who** | ✗ | ✓ on the 8 that changed state |
+| C3 | A finished entry names **the PR that finished it** | ✗ | ✓ |
+| C4 | The derived summary **agrees with the body**, and a test says so | ~ §3 agreed; §8.1 and §8.5 did not | ~ corrected, still untested |
+| C5 | A marker that claims something **outside the document** is checked there | ✗ 82 `file:line` citations, unchecked | ~ re-resolved by hand, still unautomated |
+| C6 | An entry found wrong is corrected **in the diff that discovers it** | ✗ | ✓ this diff |
+
+### 10.2 C1 — seven findings were fixed and nothing said so
+
+Seven findings were closed by PRs that never mentioned this file, because there
+was no state to put a closure in:
+
+| # | Finding | Closed by |
+|---:|---|---|
+| 8 | DASHBOARD.md said login rate limiting was not built | #113 |
+| 16 | `login`'s docstring said there was no rate limit | #113 |
+| 19 | `unsubscribe` from the last symbol turned the filter into a firehose | #121 |
+| 20 | A client dropped on the send deadline was never closed | #120 |
+| 35 | `ATP_DB_PASSWORD` had no `.env.example` entry | #113 |
+| 38 | compose and the Makefile said the worker cannot place orders | #124 |
+| 74 | `NO_RISK_RULES_WARNING` was dead | #111 |
+
+Finding **34** is half-closed and is the case that argues for the middle state
+existing at all. #124 moved the third live lock out of the environment and into
+`worker_config.allow_live_orders`, and added it to SAFETY.md's layered-defences
+table as row `2a` — but the go-live checklist in the same file still does not
+list it. "Fixed" and "not fixed" are both false; the roadmap has a line shape for
+precisely this and now so does this file.
+
+Note what half-closing it also did to the finding's own wording: finding 34
+names `WORKER_ALLOW_LIVE_ORDERS`, an environment variable #124 removed. A
+finding can be overtaken by its own fix, not just left behind by the code.
+
+### 10.3 C4 — two derived numbers had drifted, in opposite ways
+
+§3's severity and area tables were rebuilt from the 82 entries and **agree
+exactly**. Two other derived numbers did not:
+
+- §8.1 said *"60 of the 82 findings are marked ⚠️"*. There are 57. It was wrong
+  on the day it was written — 60 + the 25 verified in the same sentence is 85,
+  three more findings than the document contains.
+- §8.5 said *"Phase 4 is 0/10 on the roadmap"*. True on 2026-08-27; false since
+  #127 split the strategy endpoint out of the lifecycle, making it 0/11. Nothing
+  could have noticed: it is a number copied out of a file this one has no link
+  to.
+
+The first is an arithmetic error a test would have caught. The second is the
+failure mode `tests/unit/test_roadmap_summary.py` exists to prevent, one document
+over. Both are corrected above; §8.5 now states the fact without the count, so it
+cannot drift again.
+
+Three **findings** carry the same defect in their own text — a count that was
+right on the day and is wrong now, because the thing counted kept growing:
+
+| # | Said | Says today |
+|---:|---|---|
+| 23 | the screen filters 6 of the **11** actions the platform writes | 6 of **12** — #124 added `worker_config_updated` |
+| 66 | DASHBOARD_STATUS.md undercounts the audit verbs by **six** | by **seven**, same cause |
+| 82 | `CORE_SUBPACKAGES` omits **four of the fourteen** | **five of fifteen** — #124 added `atp_core.worker` |
+
+All three findings are still open and still right in substance. Each now carries
+a record note. A finding that states a count is a derived summary with no test
+behind it, which is the whole of C4 restated at the level of one entry.
+
+### 10.4 C5 — 27 of the 82 citations no longer resolve
+
+Every finding's `file:line` is a claim about a tree, in the same way `wip #12` is
+a claim about GitHub: true when written, checkable only against something outside
+the document, and silently false afterwards. `scripts/check_roadmap_wip.py`
+exists because that gap was not hypothetical for the roadmap. It was not
+hypothetical here either.
+
+Resolving all 82 citations at `a71ae8f` and again at `4f68cf4`:
+
+- **55** resolve to the same text they did on the day.
+- **26** resolve to something else. Some are near-misses (finding 47 cites
+  `models.py:225`; the first of the four dead `relationship()` declarations is at
+  `:227`). Some are unrecognisable (finding 7 cited `DASHBOARD.md:247` for a
+  claim that is at `:808`, and `:247` is now a sentence about round trips).
+- **1** never resolved at all: finding 81 cites `tests/e2e/__init__.py:1`, and
+  that file has been zero bytes since it was committed. There is no line 1 and
+  there never was — the citation was decorative on the day it was written.
+
+Of the 26, **23** have been re-pointed by anchor text to the line that holds the
+subject today, each with a record note giving the old line so the finding stays
+checkable against `a71ae8f`. Finding 16 drifted because the defect at that line
+was fixed. Finding 63's line still holds its subject, shifted. Finding 36 cites
+`ci.yml:163` for a CI step that *is not there*, so — like finding 81 — it now
+says plainly that it points at an absence rather than a line.
+
+One more citation was re-pointed without having drifted: finding 34's `:23` still
+reads what it read, but the row that half-closes it was inserted beneath, at
+`:24`.
+
+### 10.5 C6 — the sharpest result
+
+Finding **33** says `docs/ROADMAP.md`'s ticked Phase 2 item still claims the
+backtest risk chain is empty and sizing is fixed-qty-only, when both had changed.
+
+Since that was written, **#110, #111 and #112 each landed and each edited
+`docs/ROADMAP.md`** — and #111 and #112 are the very PRs that finished the
+sizing and risk-chain work the stale sentence denies. The lines survived all
+three. They are at `docs/ROADMAP.md:362–365` today:
+
+> Sizing is a fixed share count (`--qty`), so the return is a property of that
+> share count […] And no pre-trade rule refuses anything: orders are routed
+> through `RiskEngine`, but the chain is empty.
+
+`CLAUDE.md` §6 says an item found wrong is fixed *in the PR that discovered it*.
+The PR that discovered it was #108, which wrote this file. It is still wrong.
+Finding 33 is left open here rather than fixed, because correcting the roadmap
+is a change to the roadmap and belongs in a diff that says so — but it is the
+clearest evidence in this review that a finding nobody is required to read is a
+finding nobody reads.
+
+### 10.6 What is still missing
+
+Two of the six conventions are met by hand in this diff and by nothing
+afterwards:
+
+- **C4 has no test.** `tests/unit/test_roadmap_summary.py` fails the build when
+  the roadmap's summary disagrees with its boxes. Nothing does that for §3's
+  tables against the 82 findings, so the state table added in this diff is true
+  today and unguarded tomorrow — the same standing this file's §3 already had
+  when §8.1 was three findings out.
+- **C5 has no check.** `scripts/check_roadmap_wip.py` runs in CI and asks GitHub
+  whether a `wip` marker is still true. Nothing asks whether a citation still
+  resolves — which is a cheaper question, because the answer is in the tree and
+  needs no network and no token.
+
+Both are deliberately left undone: this was a review, and writing the two checks
+is a change to the test suite and to CI that should arrive in a diff of its own.
+They are the obvious next work, in that order.
+
+There is also a plainer gap underneath all six. **Nothing in this repository
+references this file** — not a test, not a Makefile target, not a CI job, not
+`CLAUDE.md`, not another document. `docs/ROADMAP.md` has two tests, a CI gate, a
+Makefile target and a §6 in `CLAUDE.md` pointing at it, which is why its
+conventions were enforceable enough to audit against. A record with no reader is
+the condition every finding in §10.2 through §10.5 is a symptom of.
+
 ---
 
 *Audit produced by Claude Code. Method: repository-wide static review across 13
 subsystem dimensions, plus direct execution of the repository's own gates and
 targeted probes (route enumeration under a `TestClient`, an AST-based
 ORM/migration differ, an unused-symbol scan, and a regeneration diff of the
-OpenAPI-derived TypeScript types).*
+OpenAPI-derived TypeScript types).
+
+*§10 added 2026-09-02 by Claude Code. Method: every finding's severity, kind and
+evidence mark re-parsed from the body and cross-footed against §3; every
+`file:line` citation resolved twice, once against `a71ae8f` and once against
+`4f68cf4`, and re-anchored by text where it had moved; every finding whose cited
+file changed in #109–#127 re-read against the current source, and the closing
+commit identified with `git log -S` on the text that fixed it.*
