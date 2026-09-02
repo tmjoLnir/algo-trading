@@ -323,8 +323,8 @@ def db_credential_problems(values: dict[str, str], lines: dict[str, int]) -> lis
                     "DATABASE_URL",
                     "carries a different password from ATP_DB_PASSWORD. The containers "
                     "get the one compose builds and will be fine; the host-side tools "
-                    "read THIS url, so `make migrate`, `seed`, `backfill` and "
-                    "`scripts/halt.py` will fail against the database the stack is "
+                    "read THIS url, so `make migrate`, `seed`, `backfill`, `status` "
+                    "and `preflight` will fail against the database the stack is "
                     "using (.env.example, 'datastores')",
                 )
             )

@@ -501,6 +501,25 @@ half that still works and makes the stack look alive: `/dashboard/live`,
 `/risk/status` and `/auth/me` read Redis or a session, never Postgres, so they
 answer `200` beside neighbours that cannot.
 
+**First, check whether anything but `make migrate` is actually failing.** If the
+dashboard is fine, `/readyz` says `database: ok`, and the only command refusing
+you is `make migrate`, this is not the fault below — it is one that lived in
+`infra/alembic/env.py` until it started reading `Settings`. Alembic resolved its
+url from the process environment alone, and neither `make` nor `uv run` puts
+`.env` into it, so a host-side migration fell through to a hardcoded
+`atp:atp@localhost` no matter what the operator had written. `.env` correct, the
+containers happy, and the one command every deploy and every upgrade begins with
+failing against a password nobody typed. On a build from before that fix, export
+the url for the command and it will run:
+
+```
+DATABASE_URL="$(grep '^DATABASE_URL=' .env | cut -d= -f2-)" make migrate
+```
+
+That is a workaround for an old build, not the procedure. On a current build
+`make migrate` reads `.env` like every other host-side tool, and the sections
+below are about the fault where the database genuinely refuses everyone.
+
 **Ask `make check-env` first — it now names this fault outright.** It reads
 `.env`, and then, if nothing in the file could account for a refusal, asks the
 database whether it actually accepts the password the file carries:
@@ -635,6 +654,32 @@ command — an operator bringing the stack up a piece at a time runs preflight
 against a half-started machine on purpose. The line between the two is the
 SQLSTATE: class `28` is the server answering and refusing these credentials,
 which no amount of waiting resolves.
+
+**And `make migrate` names it too, instead of the traceback this section opens
+with.** It is the fourth tool to act on the same SQLSTATE, after the API's
+`503`, `preflight` and `status`, and the last one that still answered this
+question with sixty frames of connection-pool machinery above one meaningful
+line:
+
+```
+$ make migrate
+alembic: the database refused these credentials. The migration did not run.
+
+  postgresql+asyncpg://atp:***@localhost:5432/atp
+    answered, read this password, and refused it (InvalidPasswordError,
+    SQLSTATE 28P01). The server is up and it said no, so nothing here
+    is waiting on a container: retrying, `make up` and `make migrate` again
+    all fail identically until a password changes on one side or the other.
+
+  make check-env
+    says which side moved. ...
+```
+
+The url is printed because the answer is only as good as the target — an
+unrelated Postgres on 5432 gets you a true statement about the wrong server —
+and the password is not, for the reason §1.6 gives. A `.env` that will not load
+at all is reported the same way, naming the variables and withholding their
+values, rather than migrating on a fallback nobody asked for.
 
 
 ## Worker crash-looping

@@ -2683,6 +2683,48 @@ has met a database holding a real strategy's history.
   uptime on a provisioned host; this is one more thing that host will not need a
   human to diagnose, not the host.
 
+  **And the fifth tool in that family turned out to be the one causing the
+  fault, not reporting it.** Every entry above treats a refused password as
+  something an operator did — a rotation against an existing volume, a `%` that
+  does not survive the trip — and improves how the platform says so.
+  `infra/alembic/env.py` was producing it on its own. It read
+  `os.environ.get("DATABASE_URL", "postgresql+asyncpg://atp:atp@localhost:5432/atp")`
+  under a docstring that said the url comes from `Settings`, and neither `make`
+  nor `uv run` puts `.env` into the environment — so host-side `make migrate`
+  sent the development password to whatever database was on 5432, whatever the
+  operator had written. `seed`, `backfill`, `status` and `preflight` all read the
+  file through `Settings` and did not.
+
+  What that costs is worse than a wrong url, because of *where* the command sits.
+  `make migrate` is the first line of the deploy procedure and of every upgrade
+  after it, and `.env.example`, `docs/DEPLOYMENT.md` and `check_env`'s own advice
+  all named it as a reader of `DATABASE_URL`. So an operator who followed the
+  deployment doc exactly — generate a password, set `ATP_DB_PASSWORD`, carry it
+  into `DATABASE_URL` — got `password authentication failed for user "atp"` for a
+  password they had never typed, from the only command that had to work before
+  anything else could, with three documents telling them the value they had set
+  was the one being used. `make check-env` would then open a connection with that
+  same url, be *accepted*, and report the file clean.
+
+  It survived because the fallback is correct on the two machines anyone tests
+  on: a laptop running the base compose file, whose password is `atp`, and CI,
+  whose service container is also `atp`. The url is only wrong where nobody was
+  looking, which is the deployed host. `tests/integration/test_alembic_env.py`
+  covers it the one way that works — a password in `.env` the database will
+  *refuse*, so the assertion fails whenever the file is not being read, rather
+  than passing on a fallback that happens to be right.
+
+  A refused password is now diagnosed rather than raised, the way `preflight` and
+  `status` were taught to in the entries above and off the same `is_auth_failure`
+  predicate: the url without its password, the SQLSTATE, `make check-env`, and
+  the sentence that a `28` does not end by waiting. The url no longer goes
+  through `config.set_main_option` either — that hands it to `ConfigParser`,
+  where a `%` in a password is an interpolation symbol and the resulting
+  `ValueError` quotes the whole DSN, which is §1.6 in a terminal.
+
+  Ticks nothing. It is a fix, like the four above it — and unlike them, one to
+  something this file's own Phase 0 tick already claimed worked.
+
   So **each process exports its own `/metrics` and the worker does not push**,
   which is the decision worth arguing with. The natural alternative was for the
   worker to write its numbers into Redis — already the cross-process bus for the
