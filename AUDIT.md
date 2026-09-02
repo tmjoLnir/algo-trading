@@ -75,8 +75,9 @@ claims turned out to be false (see §7), so expect some of the ⚠️ set not to
 ### By state, as at 2026-09-02 (`4f68cf4`)
 
 Derived from the state marks on the findings below and worth nothing if it
-disagrees with them. `docs/ROADMAP.md` has a test for exactly this
-(`tests/unit/test_roadmap_summary.py`); this file does not — see §10.
+disagrees with them, which `tests/unit/test_audit_summary.py` fails the build
+over — the same standing `tests/unit/test_roadmap_summary.py` gives the
+roadmap's summary. §10.6 said this was missing; it is not any more (#129).
 
 | | 🟢 Closed | 🟡 Half-closed | 🔴 Open | Total |
 |---|---:|---:|---:|---:|
@@ -111,22 +112,22 @@ Of the 74 still open, **51 have never been re-checked by anyone** — they were
 
 ### The high-severity findings at a glance
 
-| # | Finding | Location |
-|---:|---|---|
-| 1 | The dashboard's "close position" never cancels the broker-side stop, despite the module docstring saying it does | `apps/api/src/atp_api/execution.py:87` |
-| 2 | The run list and run detail label spec.qty "shares per entry" for every run, including runs the engine never sized by share count | `apps/web/src/components/BacktestRunList.tsx:241` |
-| 3 | The queue's interrupted-run sweep is startup-only with a 2-hour threshold, so a normal container restart never sweeps and the row stays `running` forever | `apps/worker/src/atp_worker/queue.py:152` |
-| 4 | The live runner marks only open positions, so every entry into a symbol the book does not already hold is refused at sizing | `apps/worker/src/atp_worker/runner.py:712` |
-| 5 | Trailing-stop ratchets are computed and then discarded: `_exit_reason` short-circuits on `broker_side`, which is always True in the worker | `apps/worker/src/atp_worker/runner.py:820` |
-| 6 | The live runner is pinned to daily bars while the only live writer stores minute bars, so `strategy.on_bar` never fires | `apps/worker/src/atp_worker/trading.py:185` |
-| 7 | DASHBOARD.md says every order/position write handler is still a stub; three of them are fully implemented, as DASHBOARD_STATUS.md states | `docs/DASHBOARD.md:247` |
-| 8 | DASHBOARD.md states login rate limiting is not built and "nothing slowing down guesses but bcrypt"; the limiter is implemented and wired | `docs/DASHBOARD.md:713` |
-| 9 | RISK.md names `flatten_at_close` as one of only two defences against overnight gap risk, but the rule compiler refuses any spec that sets it | `docs/RISK.md:167` |
-| 10 | STRATEGY_AUTHORING.md claims the draft→backtesting→paper→live ratchet is "enforced by the API"; every promotion handler is a NotImplementedError stub | `docs/STRATEGY_AUTHORING.md:226` |
-| 11 | A stop/target firing on the same bar as a resting exit order leaves the backtest holding a phantom reversed position | `libs/core/src/atp_core/backtest/engine.py:983` |
-| 12 | The nightly sweep never re-fetches reconnect-backfilled bars, so "nothing is permanently raw-only" is false and those windows become un-backtestable | `libs/core/src/atp_core/data/stream.py:271` |
-| 13 | tests/integration/test_kill_switch.py has no `pytest.mark.integration`, so its 5 tests are deselected by CI and by `make test-integration` | `tests/integration/test_kill_switch.py:28` |
-| 14 | `test_money_fields_serialise_as_strings` cannot fail for `unrealized_pnl` or `market_value` — the only test guarding CLAUDE.md §1.1 on the wire is vacuous for nullable fields | `tests/unit/test_api_contract.py:89` |
+| # | Finding | Location | State |
+|---:|---|---|---|
+| 1 | The dashboard's "close position" never cancels the broker-side stop, despite the module docstring saying it does | `apps/api/src/atp_api/execution.py:87` | 🔴 |
+| 2 | The run list and run detail label spec.qty "shares per entry" for every run, including runs the engine never sized by share count | `apps/web/src/components/BacktestRunList.tsx:241` | 🔴 |
+| 3 | The queue's interrupted-run sweep is startup-only with a 2-hour threshold, so a normal container restart never sweeps and the row stays `running` forever | `apps/worker/src/atp_worker/queue.py:152` | 🔴 |
+| 4 | The live runner marks only open positions, so every entry into a symbol the book does not already hold is refused at sizing | `apps/worker/src/atp_worker/runner.py:712` | 🔴 |
+| 5 | Trailing-stop ratchets are computed and then discarded: `_exit_reason` short-circuits on `broker_side`, which is always True in the worker | `apps/worker/src/atp_worker/runner.py:820` | 🔴 |
+| 6 | The live runner is pinned to daily bars while the only live writer stores minute bars, so `strategy.on_bar` never fires | `apps/worker/src/atp_worker/trading.py:203` | 🔴 |
+| 7 | DASHBOARD.md says every order/position write handler is still a stub; three of them are fully implemented, as DASHBOARD_STATUS.md states | `docs/DASHBOARD.md:808` | 🔴 |
+| 8 | DASHBOARD.md states login rate limiting is not built and "nothing slowing down guesses but bcrypt"; the limiter is implemented and wired | `docs/DASHBOARD.md:766` | 🟢 |
+| 9 | RISK.md names `flatten_at_close` as one of only two defences against overnight gap risk, but the rule compiler refuses any spec that sets it | `docs/RISK.md:167` | 🔴 |
+| 10 | STRATEGY_AUTHORING.md claims the draft→backtesting→paper→live ratchet is "enforced by the API"; every promotion handler is a NotImplementedError stub | `docs/STRATEGY_AUTHORING.md:226` | 🔴 |
+| 11 | A stop/target firing on the same bar as a resting exit order leaves the backtest holding a phantom reversed position | `libs/core/src/atp_core/backtest/engine.py:983` | 🔴 |
+| 12 | The nightly sweep never re-fetches reconnect-backfilled bars, so "nothing is permanently raw-only" is false and those windows become un-backtestable | `libs/core/src/atp_core/data/stream.py:271` | 🔴 |
+| 13 | tests/integration/test_kill_switch.py has no `pytest.mark.integration`, so its 5 tests are deselected by CI and by `make test-integration` | `tests/integration/test_kill_switch.py:28` | 🔴 |
+| 14 | `test_money_fields_serialise_as_strings` cannot fail for `unrealized_pnl` or `market_value` — the only test guarding CLAUDE.md §1.1 on the wire is vacuous for nullable fields | `tests/unit/test_api_contract.py:89` | 🔴 |
 
 ---
 
@@ -943,7 +944,7 @@ An operator following docs/DEPLOYMENT.md verbatim copies .env.example, works dow
 
 `.github/workflows/ci.yml:163` · Inconsistency · 🟠 Medium · ✅ Verified · 🔴 **Open**
 
-*Record note (§10, 2026-09-02): The citation points at an absence, not a line — `ci.yml:163` is whatever step happens to sit there, and the finding is that no step runs `make check-tracked`. Still true at `4f68cf4`: CI calls `ruff`, `mypy` and `pytest` directly and never `make check`, which is the only target `check-tracked` hangs off.*
+*Record note (§10, 2026-09-02): **Cites an absence.** Not a line — `ci.yml:163` is whatever step happens to sit there, and the finding is that no step runs `make check-tracked`. Still true at `4f68cf4`: CI calls `ruff`, `mypy` and `pytest` directly and never `make check`, which is the only target `check-tracked` hangs off.*
 
 **Evidence**
 
@@ -1963,7 +1964,7 @@ Four places parse the same operator-facing date format with the same error messa
 
 `tests/e2e/__init__.py:1` · Inconsistency · 🟡 Low · ✅ Verified · 🔴 **Open**
 
-*Record note (§10, 2026-09-02): This citation has never resolved. `tests/e2e/__init__.py` has been zero bytes since it was committed, so there is no line 1 and never was. Read it as "the directory these tests are missing from".*
+*Record note (§10, 2026-09-02): **Cites an absence.** This citation has never resolved. `tests/e2e/__init__.py` has been zero bytes since it was committed, so there is no line 1 and never was. Read it as "the directory these tests are missing from".*
 
 **Evidence**
 
@@ -2094,8 +2095,8 @@ has grown to keep such claims honest.
 | C1 | Every entry carries a state, and one of them is **terminal** | ✗ two evidence marks, no state at all, nothing that can mean *fixed* | ✓ §2, stamped on all 82 |
 | C2 | A claimed or finished entry names **who** | ✗ | ✓ on the 8 that changed state |
 | C3 | A finished entry names **the PR that finished it** | ✗ | ✓ |
-| C4 | The derived summary **agrees with the body**, and a test says so | ~ §3 agreed; §8.1 and §8.5 did not | ~ corrected, still untested |
-| C5 | A marker that claims something **outside the document** is checked there | ✗ 82 `file:line` citations, unchecked | ~ re-resolved by hand, still unautomated |
+| C4 | The derived summary **agrees with the body**, and a test says so | ~ §3 agreed; §8.1 and §8.5 did not | ✓ `tests/unit/test_audit_summary.py` (#129) |
+| C5 | A marker that claims something **outside the document** is checked there | ✗ 82 `file:line` citations, unchecked | ✓ `tests/unit/test_audit_citations.py` (#129) |
 | C6 | An entry found wrong is corrected **in the diff that discovers it** | ✗ | ✓ this diff |
 
 ### 10.2 C1 — seven findings were fixed and nothing said so
@@ -2104,7 +2105,7 @@ Seven findings were closed by PRs that never mentioned this file, because there
 was no state to put a closure in:
 
 | # | Finding | Closed by |
-|---:|---|---|
+|---:|---|---|---|
 | 8 | DASHBOARD.md said login rate limiting was not built | #113 |
 | 16 | `login`'s docstring said there was no rate limit | #113 |
 | 19 | `unsubscribe` from the last symbol turned the filter into a firehose | #121 |
@@ -2146,7 +2147,7 @@ Three **findings** carry the same defect in their own text — a count that was
 right on the day and is wrong now, because the thing counted kept growing:
 
 | # | Said | Says today |
-|---:|---|---|
+|---:|---|---|---|
 | 23 | the screen filters 6 of the **11** actions the platform writes | 6 of **12** — #124 added `worker_config_updated` |
 | 66 | DASHBOARD_STATUS.md undercounts the audit verbs by **six** | by **seven**, same cause |
 | 82 | `CORE_SUBPACKAGES` omits **four of the fourteen** | **five of fifteen** — #124 added `atp_core.worker` |
@@ -2206,31 +2207,66 @@ is a change to the roadmap and belongs in a diff that says so — but it is the
 clearest evidence in this review that a finding nobody is required to read is a
 finding nobody reads.
 
-### 10.6 What is still missing
+### 10.6 The two checks — added in #129
 
-Two of the six conventions are met by hand in this diff and by nothing
-afterwards:
+§10 first said C4 and C5 were met by hand in that diff and by nothing
+afterwards, and left both for a diff of their own. This is that diff.
 
-- **C4 has no test.** `tests/unit/test_roadmap_summary.py` fails the build when
-  the roadmap's summary disagrees with its boxes. Nothing does that for §3's
-  tables against the 82 findings, so the state table added in this diff is true
-  today and unguarded tomorrow — the same standing this file's §3 already had
-  when §8.1 was three findings out.
-- **C5 has no check.** `scripts/check_roadmap_wip.py` runs in CI and asks GitHub
-  whether a `wip` marker is still true. Nothing asks whether a citation still
-  resolves — which is a cheaper question, because the answer is in the tree and
-  needs no network and no token.
+- **C4 — `tests/unit/test_audit_summary.py`.** Every number in the header, §3
+  and §8.1 is recomputed from the 82 findings and compared. It also holds the
+  two annotation rules §2 states but nothing enforced: a closed or half-closed
+  finding must name `— @who (#12)`, and an open one must name nobody, so an
+  annotation left behind when a state is walked back cannot go on reading as
+  work that was done.
 
-Both are deliberately left undone: this was a review, and writing the two checks
-is a change to the test suite and to CI that should arrive in a diff of its own.
-They are the obvious next work, in that order.
+  **It failed on its first run, on this file, for a reason worth recording.**
+  §3's glance table carries a *second copy* of each high-severity finding's
+  title and location. #128 re-anchored 24 citations in the finding bodies and
+  never touched that table, so findings 6, 7 and 8 cited two different lines of
+  the same file from two places in the same document — from the moment the
+  review that was supposed to fix exactly this merged. The rows are corrected
+  here and now carry the finding's state as well, because a reader glancing down
+  a list of high-severity defects should not have to scroll to learn that one of
+  them is closed.
 
-There is also a plainer gap underneath all six. **Nothing in this repository
-references this file** — not a test, not a Makefile target, not a CI job, not
-`CLAUDE.md`, not another document. `docs/ROADMAP.md` has two tests, a CI gate, a
-Makefile target and a §6 in `CLAUDE.md` pointing at it, which is why its
-conventions were enforceable enough to audit against. A record with no reader is
-the condition every finding in §10.2 through §10.5 is a symptom of.
+- **C5 — `tests/unit/test_audit_citations.py`.** Every `file:line` must name a
+  file that exists and a line inside it. A unit test rather than a CI gate, and
+  that is the whole difference between this and `scripts/check_roadmap_wip.py`:
+  a `wip` marker's truth lives on GitHub, so reading it needs a network and a
+  check that reddens when the network is down teaches people to re-run it
+  (ADR 0024). A citation's target is in the checkout. There is no unreachable
+  state, so there is no reason to be lenient — it runs offline on every commit
+  and is red when a citation is broken.
+
+  It cannot check that a line still holds what a finding says it holds; that
+  needs a person. What it catches is the failure that actually happened
+  twenty-six times. Findings 36 and 81 point at a file rather than a line —
+  the finding *is* that something is missing from it — and now say so with an
+  explicit `**Cites an absence.**` in their record note rather than earning the
+  exemption by how their prose happens to read. The test holds that set against
+  a literal, so granting a third is a decision somebody makes on purpose.
+
+Neither check knows anything about trading, and both are ninety lines. The cost
+of not having had them was six days of a file that read as current, three
+citations that disagreed with themselves inside one document, and a §8.1 that
+was wrong by three on the day it was written.
+
+### 10.7 What is still missing
+
+There is a plainer gap underneath all six, and #129 only half closes it. Until
+that PR, **nothing in this repository referenced this file** — not a test, not a
+Makefile target, not a CI job, not `CLAUDE.md`, not another document. Two tests
+read it now and `docs/TESTING.md` names them, which is most of the way: `make
+check` reaches them through the unit suite on every commit. What is still true
+is that no Makefile target is about this file, no CI step names it, and
+`CLAUDE.md` §6 — the section that makes the roadmap somebody's job to update —
+still points only at `docs/ROADMAP.md`. The roadmap has all four, which is why
+its conventions were enforceable enough to audit against.
+
+That asymmetry is defensible — the roadmap is the record the working agreement
+is built on and this is a snapshot of one review — but it is worth naming rather
+than discovering. A record with no reader is the condition every finding in
+§10.2 through §10.5 is a symptom of, and two tests are a reader, not a habit.
 
 ---
 
@@ -2238,11 +2274,13 @@ the condition every finding in §10.2 through §10.5 is a symptom of.
 subsystem dimensions, plus direct execution of the repository's own gates and
 targeted probes (route enumeration under a `TestClient`, an AST-based
 ORM/migration differ, an unused-symbol scan, and a regeneration diff of the
-OpenAPI-derived TypeScript types).
+OpenAPI-derived TypeScript types).*
 
 *§10 added 2026-09-02 by Claude Code. Method: every finding's severity, kind and
 evidence mark re-parsed from the body and cross-footed against §3; every
 `file:line` citation resolved twice, once against `a71ae8f` and once against
 `4f68cf4`, and re-anchored by text where it had moved; every finding whose cited
 file changed in #109–#127 re-read against the current source, and the closing
-commit identified with `git log -S` on the text that fixed it.*
+commit identified with `git log -S` on the text that fixed it. §10.6 and the two
+checks it describes added in #129, after the first of them failed on §3's glance
+table.*

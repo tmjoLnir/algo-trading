@@ -16,6 +16,24 @@ make test-unit          # run constantly
 make test               # everything
 ```
 
+**Some unit tests have a Markdown file as their subject.** They are ordinary
+tests in `tests/unit/`, and they are here because two of this repository's
+records — what is built, and what is wrong with what is built — are documents
+that go stale silently and are believed while they do:
+
+| Test | Holds |
+|---|---|
+| `test_roadmap_summary.py` | `docs/ROADMAP.md`'s summary tables against its checkboxes |
+| `test_roadmap_wip_markers.py` | the *format* of its `wip` markers (`scripts/check_roadmap_wip.py` asks GitHub about their truth, in CI) |
+| `test_audit_summary.py` | `AUDIT.md`'s tables, header and §8 against its 82 findings |
+| `test_audit_citations.py` | that every `file:line` in `AUDIT.md` still names a file and a line inside it |
+
+None of them can check whether a document is *right* — only whether it still
+agrees with itself and with the tree. That is a narrower claim than it sounds
+and it is worth having: `AUDIT.md` §10 exists because six days of drift went
+unnoticed, and §10.6 records that the first of these two failed on its first
+run, on a disagreement `AUDIT.md` had with itself.
+
 ## Non-negotiable
 
 **Tests never touch a live endpoint.** `conftest.py` hard-fails any session
