@@ -18,6 +18,14 @@ COPY libs/ libs/
 COPY apps/api/ apps/api/
 RUN uv sync --package atp-api
 
+# The migration scripts, and the only reason they are in this image: the
+# `migrate` service in docker-compose.yml runs `alembic upgrade head` from it.
+# alembic.ini's `script_location` and `prepend_sys_path` are relative to /app,
+# which is where both `libs/` and this land. Copied after the sync above so a
+# new revision does not reinstall the dependency tree, and before the chown so
+# it ends up owned by `atp` like everything else.
+COPY infra/alembic/ infra/alembic/
+
 # Non-root: this process holds broker credentials.
 RUN useradd --create-home --uid 1000 atp && chown -R atp:atp /app
 USER atp
