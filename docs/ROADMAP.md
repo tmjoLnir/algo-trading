@@ -358,11 +358,43 @@ that yet, so it stays **not shown**.
   restatement.
 
   Two caveats the CLI prints on every run rather than burying here, because a
-  number a human has already read is a number they have already believed.
-  Sizing is a fixed share count (`--qty`), so the return is a property of that
-  share count — real sizing is risk-based and equalises risk per trade. And no
-  pre-trade rule refuses anything: orders are routed through `RiskEngine`, but
-  the chain is empty. Both are Phase 3, which the build order puts after this.
+  number a human has already read is a number they have already believed. **Both
+  narrowed in #81, and this paragraph went on denying it until #129.** It used to
+  say that sizing was a fixed share count and the rule chain was empty, and that
+  both were Phase 3 work still to come. By 2026-09-02 forty-four commits had
+  edited this file since #81 and eighteen since `AUDIT.md` finding 33 named the
+  sentence, and none of them touched it. It is corrected rather than deleted
+  because the caveats did not disappear — they narrowed, and what is left is
+  worth a reader's attention.
+
+  **Sizing goes through `risk.rules.position_size`**, the function the live
+  router calls, with the same arguments: `--sizing` picks the method and
+  `--sizing-value` supplies what it reads. `fixed_qty` is still the default, so a
+  spec stored before those fields existed reproduces exactly — and a run using it
+  still prints the caveat it always did, because sizing every entry identically
+  really does make the return a property of that share count. What changed is
+  that the warning is now a statement about a choice rather than about the
+  platform. `risk_pct` needs a stop, and a signal without one is booked as a
+  **refused order** naming the sizing stage rather than dropped silently.
+
+  **The rule chain is live**, as `risk.engine.backtest_rules()` — five of the
+  nine. The four that are absent are absent by decision: a kill switch, a session
+  calendar, a rate limit and a feed-staleness check each measure something a
+  replay over stored bars does not have. That is itself a caveat, and it is
+  attached to every run that keeps its chain rather than to none of them, because
+  all four only ever refuse — a live account would be stopped more often than a
+  backtest was, never less. A run that deliberately asks for no rules says that
+  instead.
+
+  Neither is Phase 3 work still to come. Both are built, and the Phase 3 boxes
+  they belong to sit in the third row of the conventions table at the top of this
+  file — built and unticked, waiting on a demonstration rather than on code. The
+  sizing item is waiting on a reviewer to accept the *Verifiable:* line it
+  proposes; the phase's own line is waiting on a strategy that tries to breach
+  every limit and is refused by name. "Unticked" and "not built" are different
+  sentences, and confusing them is precisely what this paragraph used to do.
+  docs/BACKTESTING.md's "Sizing, and what the chain refuses" is the account in
+  full.
 
   `POST /api/v1/backtests` and its worker task are built as of Phase 5's
   backtests tab (#67), which is where they belonged — they were never Phase 2
