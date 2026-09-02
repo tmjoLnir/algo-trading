@@ -27,7 +27,7 @@ fix it here in the PR that discovered it.
 
 ## Where this stands
 
-**21 of 49 items ticked — and the other 27 are not a measure of what is
+**21 of 49 items ticked — and the other 28 are not a measure of what is
 unbuilt.** Reading them as one is the specific mistake this section exists to
 prevent. Twenty-one of the twenty-eight sit in Phases 4 and 5, whose *Verifiable:*
 lines both come down to the same event: a strategy trading the paper account for
@@ -49,8 +49,8 @@ matters more than the count:
 
 | State | Count | Means |
 |---|---:|---|
-| Claimed, in progress (`wip`) | 21 | Somebody is on it, or has been |
-| Built, awaiting the phase line | 6 | All Phase 5. Code merged, screen shipped, nothing left but the demonstration |
+| Claimed, in progress (`wip`) | 1 | **Strategy creation endpoint** (Phase 4) — the only item with unbuilt code inside its own scope |
+| Built, awaiting the phase line | 26 | Phases 1, 3, 4, 5 and 6. Code merged and tested, nothing left but the demonstration |
 | Unclaimed | 1 | **Daily report** (Phase 5) — the only item in this file nobody has started |
 
 Two things a reader should take from this rather than from the counts:
@@ -58,7 +58,8 @@ Two things a reader should take from this rather than from the counts:
 - **Phase 4 and Phase 5 being at zero is one fact, not twenty.** Both phases
   hinge on the paper week; neither has an item blocked on anything else. A
   reader who wants to know what is genuinely missing should look at the three
-  Phase 6 items and the one unclaimed Phase 5 item, which is the whole of it.
+  Phase 6 items, the one unclaimed Phase 5 item, and the one item still marked
+  `wip`, which is the whole of it.
 - **A tick here is expensive on purpose.** Phase 1 is the only phase whose
   *Verifiable:* line has been shown against live data, and it took real egress,
   real credentials and a real hypertable to earn three boxes. That is the
@@ -138,7 +139,7 @@ A line they can be ticked against is proposed below.
   could not fill — landed in #16. Verified end to end against five years of
   stored SPY dailies. `1h`/`4h` gap detection stays deliberately refused rather
   than guessed (docs/DATA.md 'Gaps').
-- [ ] Real-time WS ingestor, reconnect + gap backfill — @claude (wip).
+- [ ] Real-time WS ingestor, reconnect + gap backfill — @claude (#18).
   Both halves are built and unit-tested against scripted fakes.
   `AlpacaRealtimeFeed` owns the socket — auth handshake, subscription replay,
   exponential backoff with jitter, and a refusal to loop on an error another
@@ -186,7 +187,7 @@ A line they can be ticked against is proposed below.
   decides whether a dropped connection trades across a hole — are still pinned by
   tests alone, because nothing has yet dropped the socket on purpose during a
   session with the stack up.
-- [ ] Redis quote cache, pub/sub publisher, staleness monitor — @claude (wip).
+- [ ] Redis quote cache, pub/sub publisher, staleness monitor — @claude (#21).
   All three are built. `RedisQuoteCache` (one key per symbol, `MGET` for a
   watchlist, every number stored as a string, TTL as garbage collection rather
   than as freshness) and `RedisEventPublisher` (which refuses to publish a
@@ -539,7 +540,7 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   it — one projection, so no rule knows in-flight orders exist. Found by
   checking a benchmark export rather than by reading the code: the run said 542%
   and the turnover said it had borrowed to get there. ADR 0020.
-- [ ] Position sizing, all methods — @claude (wip #30).
+- [ ] Position sizing, all methods — @claude (#30).
   All five implemented: `fixed_qty`, `fixed_notional`, `equity_pct`, `risk_pct`
   and `volatility_target`. `risk_pct` and `volatility_target` each refuse the
   input they are defined by — a stop, an instrument volatility — rather than
@@ -593,7 +594,7 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   and is not mine to overturn — proposing your own bar and declaring you cleared
   it is not a demonstration, it is a decision about what counts as one, and that
   belongs to a reviewer. The box is one review away rather than one PR away.
-- [ ] `StopManager` — fixed, ATR, trailing, chandelier, time — @claude (wip #31).
+- [ ] `StopManager` — fixed, ATR, trailing, chandelier, time — @claude (#31).
   All six `StopType`s, including `fixed_amount`, which was in the enum but
   missing from docs/RISK.md's table — the row is added rather than the member
   dropped, because it is a real stop type. 41 tests, every level checked long
@@ -847,7 +848,7 @@ shown, whereas wiring it to real orders is Phase 4 and is tracked on the item
 above.
 
 ## Phase 4 — Execution & paper trading (requirements #1, #5)
-- [ ] `BrokerPort` + Alpaca adapter (paper first) — @claude (wip #36).
+- [ ] `BrokerPort` + Alpaca adapter (paper first) — @claude (#36).
   `AlpacaBroker` is implemented over REST: account, submit, cancel, order and
   position reads, the venue clock, and both flatten paths. Paper and live are
   the same adapter on different hosts, which is the whole of requirement #5 at
@@ -880,7 +881,7 @@ above.
   Unticked. Every test is against recorded responses through `respx`; nothing
   in this item has yet been pointed at Alpaca's paper endpoint, and the phase's
   *Verifiable:* line is a week of paper trading.
-- [ ] `OrderRouter`, order state machine — @claude (wip #33).
+- [ ] `OrderRouter`, order state machine — @claude (#33).
   Both halves are implemented, and Phase 3's standing caveat — "nothing routes
   live orders through this chain" — is closed at the router: `RiskEngine
   .validate()` gates every path through it (entries, exits, protective stops,
@@ -932,7 +933,7 @@ above.
   documented default pair, and no `Signal` carries an ATR-derived level, so
   every entry from a default-configured strategy is refused at sizing.
   `StrategyRunner` holds the `BarRepository` and owns closing that.
-- [ ] `SimulatedBroker` — @claude (wip #36).
+- [ ] `SimulatedBroker` — @claude (#36).
   Implemented, both halves: `on_bar` for bar-driven fills and `on_quote` for
   tick-level ones, plus the whole `BrokerPort` surface over a local book.
 
@@ -968,7 +969,7 @@ above.
   Unticked, and the reason is the same as the item above: the phase's
   *Verifiable:* line is a paper week, and this has only ever met synthetic
   bars.
-- [ ] Reconciliation — @claude (wip #38).
+- [ ] Reconciliation — @claude (#38).
   `Reconciler.reconcile` and `adopt_broker_state` are implemented — docs/SAFETY
   .md's layer 7. All four documented checks: every broker position matched on
   **signed** quantity, no local position the broker does not have, every open
@@ -1035,7 +1036,7 @@ above.
   halts, and it halts without raising, because a job that reported its own
   success as a failure would put a traceback in the log every five minutes for
   as long as the halt stood.
-- [ ] Declarative rule sets compile and run — @claude (wip #93).
+- [ ] Declarative rule sets compile and run — @claude (#93).
   `compile_ruleset` and `RuleSet.required_warmup` were the two
   `NotImplementedError` stubs standing between a fully specified, fully
   validated rule DSL and one that could execute. The spec models had shipped;
@@ -1185,7 +1186,15 @@ above.
   `POST /{id}/pause`, `GET /{id}`. There is **no authoring form** either — the
   Strategies tab is still read-only, so a rule set is posted from a client. That
   is the next piece of this item rather than a separate one.
-- [ ] `StrategyRunner` live loop — @claude (wip #39).
+
+  **This is the one item on this page still carrying `wip`, and deliberately.**
+  Everything else marked `wip` was finished work waiting on a *Verifiable:*
+  line; this one has unbuilt code inside its own scope — the four stubs and the
+  authoring form named above, which this entry calls "the next piece of this
+  item rather than a separate one". `CLAUDE.md` §6 says a half-built subsystem
+  is claimed as work-in-progress so nobody builds it twice, so `wip` stays.
+  #97 remains the PR the claim rests on: it is where the built half landed.
+- [ ] `StrategyRunner` live loop — @claude (#39).
   Implemented: `warmup`, `run`, `evaluate`, `on_fill_event` and `shutdown`, plus
   `LiveContext` — the live counterpart of `BacktestContext`, serving a strategy
   from a rolling in-memory window of completed bars.
@@ -1277,7 +1286,7 @@ above.
 
   Unticked. Phase 4's *Verifiable:* line is a paper week, and this loop has
   never been pointed at a venue — every test drives it off fakes.
-- [ ] Trade-updates WS with reconnect — @claude (wip #37).
+- [ ] Trade-updates WS with reconnect — @claude (#37).
   `AlpacaBroker.stream_trade_updates` is implemented, and so is the consumer
   that makes it mean anything. Both gaps this item existed to close are closed:
 
@@ -1320,7 +1329,7 @@ above.
   has been pointed at a live account stream — which is exactly the caveat #34
   turned into a finding when the market-data wire disagreed with the docs three
   ways at once. What is tested is our handling, not the vendor's shape.
-- [ ] Worker wired to trade — @claude (wip #40).
+- [ ] Worker wired to trade — @claude (#41).
   `atp_worker.main` now constructs a `StrategyRunner`, a `Reconciler` and an
   `OrderRouter` over the Alpaca adapter, and supervises two new
   responsibilities: the strategy loop and the trade-updates consumer. The
@@ -1370,7 +1379,12 @@ above.
   run against the paper account — no credentials and no session from this
   environment — so what is shown is that the wiring assembles and the locks
   hold, not that a strategy traded.
-- [ ] Order and position persistence — @claude (wip #44).
+
+  **The PR number on this line was #40, which never merged.** It was closed at
+  01:21:07 and #41 — same branch, same title — merged at 01:57:46. The work
+  landed; the marker pointed at the abandoned attempt, which reads as work
+  dropped rather than work done. Corrected to #41.
+- [ ] Order and position persistence — @claude (#44).
   `OrderRepository` and `PortfolioRepository` in `execution/ports.py`, with
   PostgreSQL adapters over the `orders`, `fills`, `position_snapshots` and
   `equity_snapshots` tables that had been sitting there with no reader.
@@ -1490,7 +1504,7 @@ demonstrated can disagree with the wire in three ways at once. Adjust the
 wording if it is not the demonstration you want.
 
 ## Phase 5 — Dashboard & analytics (requirements #6, #7)
-- [ ] `/dashboard/live` aggregate endpoint — @claude (wip #45).
+- [ ] `/dashboard/live` aggregate endpoint — @claude (#45).
   Implemented, along with `/dashboard/equity-curve` and the WebSocket that
   carries events between polls. The decision is ADR 0007 and it is the part to
   review: the **worker** computes the book once, at the end of the evaluation it
@@ -1533,7 +1547,7 @@ wording if it is not the demonstration you want.
   `TradingCalendar` in-process, without an HTTP round trip. It is for the
   charting views that will grey out non-trading days, and it wants a
   *Verifiable:* line of its own when one of those exists.
-- [ ] React dashboard, on-demand refresh + WS — @claude (wip #45).
+- [ ] React dashboard, on-demand refresh + WS — @claude (#45).
   The six stub components render the book now, and `src/api/types.ts` stopped
   being a hand-written copy of a server contract: `make gen-types` dumps the
   OpenAPI document straight from the app — no running server, which is what
@@ -1593,7 +1607,7 @@ wording if it is not the demonstration you want.
   book, because pub/sub has no replay and with nothing polling a gap nobody
   repairs is permanent. Neither changes what this line asks for, or whether it
   has been shown — the worker still has not published a book.
-- [ ] Trade reconstruction, attribution, MAE/MFE — @claude (wip #58).
+- [ ] Trade reconstruction, attribution, MAE/MFE — @claude (#58).
   Built: `PerformanceAnalyzer` folds stored fills into round trips, measures
   MAE/MFE against bars, and groups P&L five ways; `/analytics/performance`,
   `/analytics/trades` and `/analytics/attribution` serve it. docs/ANALYTICS.md
@@ -1817,7 +1831,7 @@ wording if it is not the demonstration you want.
   screen exists for is about a *real* worker having or not having booted a
   strategy.
 
-- [ ] Worker configuration endpoint and screen — @claude (wip #124).
+- [ ] Worker configuration endpoint and screen — @claude (#124).
   **An item this phase was missing**, added in the PR that built it. `GET` and
   `PUT /api/v1/worker/config`, a `worker_config` table, and the `/worker` tab —
   the newest of the eight tabs, and the first one that *writes* something a
@@ -2488,7 +2502,7 @@ has met a database holding a real strategy's history.
   `order.position_unprotected`, both `CRITICAL` in docs/RUNBOOK.md and neither
   of which halts. They are reachable from the same port when somebody decides
   they should be; ADR 0012 does not decide it for them.
-- [ ] Metrics/tracing — @claude (wip #53). Built, wired and driven against
+- [ ] Metrics/tracing — @claude (#53). Built, wired and driven against
   running processes; unticked, and the reason is narrower than "not finished".
   **The tracing half is done. The metrics half is an exporter nothing has ever
   collected from**, and a counter nothing samples over time is a number without
@@ -2678,7 +2692,7 @@ has met a database holding a real strategy's history.
   made from reading the code rather than from a week of trading. The gauges —
   the halt state, the per-symbol last tick — are useful from one `curl` today,
   and that is the honest extent of it.
-- [ ] Backups and a tested restore — @claude (wip #57).
+- [ ] Backups and a tested restore — @claude (#57).
   **The tooling is built and the restore is genuinely tested. Nothing in this
   repository schedules it** — so this stays unticked.
 
@@ -2778,7 +2792,7 @@ has met a database holding a real strategy's history.
   a broker as of now. That is the opposite of the posture everything else here
   takes, it is not something the backup tooling can fix, and it is now step 4 of
   the restore procedure and a paragraph in docs/DEPLOYMENT.md.
-- [ ] Deployment target chosen; secrets manager — @claude (wip #50, #51, #100).
+- [ ] Deployment target chosen; secrets manager — @claude (#50, #51, #100).
   **The shape and the host are both chosen now. Nothing is deployed, which is
   the whole of why this stays open.** ADR 0011: one always-on VM per run mode in
   a US-East region, the existing compose stack, reached over a private network,
