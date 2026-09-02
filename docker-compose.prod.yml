@@ -74,6 +74,35 @@ services:
     restart: unless-stopped
     logging: *log_rotation
 
+  migrate:
+    # **The one service in this file that `make deploy` does not start.** It
+    # stays behind the base file's `migrate` profile, which is the whole of ADR
+    # 0024: applying a migration on a deployed host is a decision an operator
+    # makes inside a halt window, not something compose does at whatever moment
+    # it happens to start a container. Overriding it here does not change *when*
+    # it runs — it changes what happens when someone runs it.
+    #
+    # Without this the base file's `atp:atp@db` survived into the deployed
+    # configuration while `db` above was initialised with ATP_DB_PASSWORD, so
+    # the schema step — the one command that has to work before anything else —
+    # authenticated with the development password against a database that had
+    # never heard of it. Same fault, and the same `password authentication
+    # failed for user "atp"`, as the host-side `make migrate` that read the
+    # process environment instead of `.env`.
+    #
+    # `check_database_credentials` in scripts/check_port_bindings.py is what
+    # holds this now, for every service at once rather than this one: the
+    # resolved configuration is asked whether each DATABASE_URL carries the
+    # password `db` was built with. That check could not see this service until
+    # it started resolving the `migrate` profile, which is the same blind spot
+    # the restart-policy check had over `web`.
+    environment:
+      DATABASE_URL: postgresql+asyncpg://atp:${ATP_DB_PASSWORD}@db:5432/atp
+    # Deliberately no `logging: *log_rotation`. Rotation is here because a
+    # long-running container's logs grow without bound; this one runs once,
+    # prints one migration, and exits, and `restart: "no"` in the base file
+    # keeps it that way.
+
   api:
     restart: unless-stopped
     # The image's own CMD is already the correct production command —

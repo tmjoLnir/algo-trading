@@ -79,8 +79,16 @@ services:
       - path: .env
         required: false
     environment:
-      # `db`, not localhost: this runs on the compose network, unlike the
-      # host-side `make migrate` that alembic/env.py's fallback is written for.
+      # `db`, not localhost: this runs on the compose network, where the
+      # host-side `make migrate` reaches the published loopback port instead.
+      #
+      # Set here rather than left to `env_file` on purpose, and this is the half
+      # that has to be said: compose's `environment:` outranks `.env`, so a
+      # developer whose `.env` points at `localhost` for their own `make migrate`
+      # does not thereby point this container at a host it cannot resolve. That
+      # is also why the deployed password needs an explicit override in
+      # docker-compose.prod.yml rather than arriving through `.env` — it is
+      # there, and `make check-bindings` now fails the build if it goes missing.
       DATABASE_URL: postgresql+asyncpg://atp:atp@db:5432/atp
     depends_on:
       db: {condition: service_healthy}

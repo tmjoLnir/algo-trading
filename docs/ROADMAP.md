@@ -2722,6 +2722,35 @@ has met a database holding a real strategy's history.
   where a `%` in a password is an interpolation symbol and the resulting
   `ValueError` quotes the whole DSN, which is §1.6 in a terminal.
 
+  **The same fault had a second half, in the deployed compose configuration.**
+  `docker-compose.prod.yml` overrides `DATABASE_URL` for `api`, `worker` and
+  `queue` and had no `migrate` service at all, so the overlay initialised
+  Postgres with `ATP_DB_PASSWORD` and left the schema step carrying the base
+  file's `atp:atp@db`. Nothing in the Makefile runs that combination — ADR 0024
+  keeps the migrate profile out of `make deploy` deliberately, and the runbook
+  sends an operator to the host-side command — so it was a trap rather than an
+  outage, and it is the same trap: one variable that has to reach both ends of a
+  connection, written out once per service, with one copy missed.
+
+  So the override is there now, and the thing worth keeping is the check rather
+  than the two lines. `scripts/check_port_bindings.py` already asserts the
+  deployed *shape* against the resolved configuration, on the argument that
+  reading a compose file tells you what was intended and not what compose did
+  with it; `check_database_credentials` asks the same question of the
+  credentials, for every service at once, and fails the build when a client
+  would authenticate with a password `db` was not built with. It compares raw
+  strings deliberately — a password that cannot survive the trip into a url is
+  `make check-env`'s finding (`db_password_problem`), and reporting it here too
+  would be one fault twice with the vaguer half last.
+
+  Both configurations now resolve the `migrate` profile, which nothing did
+  before: `docker compose config` omits a profiled service entirely, so the
+  service with the wrong password was in neither configuration under test. That
+  is the blind spot the restart-policy check had over `web`, in a second place,
+  and the reason it is worth naming twice is that a profile is how this
+  repository says "this exists and is not started by default" — which is a
+  statement about when it runs, never a reason to stop checking what it does.
+
   Ticks nothing. It is a fix, like the four above it — and unlike them, one to
   something this file's own Phase 0 tick already claimed worked.
 

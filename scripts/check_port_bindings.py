@@ -65,6 +65,28 @@ API through `sh -c` so that a configuration it cannot import is an exit rather
 than a reloader idling forever with nothing bound, and an element test against
 `["sh", "-c", "... --reload"]` is False — the check would have gone on passing
 while the flag it exists to catch sat one level down inside the string.
+
+**The database credentials are checked the same way, and for the same reason
+the shape is.** The overlay hands `db` a password and then hands every service
+that connects to it a url built from the same variable — four separate
+assertions that compose has to actually have delivered, in a file where getting
+one of them wrong is invisible until something reads a table. It was wrong:
+`migrate` had no override here at all, so the deployed configuration
+initialised Postgres with `ATP_DB_PASSWORD` and told the schema step to
+authenticate with the development `atp`. Reading the files tells you what was
+intended; only the resolved configuration says what the stack would send.
+
+That check is about the *wiring* — one variable reaching both ends — and
+deliberately not about the value. A password that cannot survive the trip into a
+url is a different fault with a different diagnosis, and `make check-env` owns
+it (`db_password_problem`); comparing the raw strings here keeps the two apart
+rather than reporting one fault twice.
+
+Both configurations resolve the `migrate` profile, which nothing here used to
+ask for. A service compose has been told to leave out is a service this file
+cannot check, and the last time that happened it was `web` and a missing restart
+policy — the one service in the repository that needed the check was the one no
+configuration under test contained.
 """
 
 from __future__ import annotations
@@ -74,6 +96,7 @@ import json
 import os
 import subprocess
 import sys
+from urllib.parse import urlsplit
 
 #: A port bound to any of these is reachable from off the machine. `None` is in
 #: the list because compose omits `host_ip` entirely for the `"8080:80"` short
@@ -84,8 +107,28 @@ WILDCARD_HOSTS = {None, "", "0.0.0.0", "::"}
 #: one asks for the `prod` profile so that `web-prod` is included; the deployed
 #: one does not, because the overlay takes that service out of its profile and
 #: puts the dev server into one.
+#:
+#: **Both ask for `migrate`.** `docker compose config` omits a profiled service
+#: entirely, so until this flag was here the schema step was in neither
+#: configuration under test — and it was the service with the wrong database
+#: password in one of them. A profile is how this repository says "this exists
+#: and is not started by default" (ADR 0024); it is not a reason to stop
+#: checking what it would do when it is.
 CONFIGS = (
-    ("development", ("docker", "compose", "--profile", "prod", "config", "--format", "json")),
+    (
+        "development",
+        (
+            "docker",
+            "compose",
+            "--profile",
+            "prod",
+            "--profile",
+            "migrate",
+            "config",
+            "--format",
+            "json",
+        ),
+    ),
     (
         "deployed",
         (
@@ -95,6 +138,8 @@ CONFIGS = (
             "docker-compose.yml",
             "-f",
             "docker-compose.prod.yml",
+            "--profile",
+            "migrate",
             "config",
             "--format",
             "json",
@@ -222,6 +267,83 @@ def check_restart_policies(label: str, services: dict) -> list[str]:
     return problems
 
 
+#: The service that owns the database, and the key initdb reads its password
+#: from. Named rather than inferred: a check that went looking for "whichever
+#: service has a POSTGRES_PASSWORD" would quietly pass a configuration that had
+#: lost the database altogether.
+DATABASE_SERVICE = "db"
+DATABASE_PASSWORD_KEY = "POSTGRES_PASSWORD"
+
+
+def check_database_credentials(label: str, services: dict) -> list[str]:
+    """Report every service told to authenticate with a password `db` does not have.
+
+    One variable reaches Postgres and every client of it by two different
+    routes — `POSTGRES_PASSWORD`, which initdb stores verbatim, and a
+    `DATABASE_URL` each service is handed — and the overlay writes that
+    interpolation out once per service. Four correct copies and one stale
+    literal is a configuration that starts perfectly and then refuses every
+    query, which is exactly what `migrate` was: no override in the overlay, so
+    the deployed stack initialised the database with `ATP_DB_PASSWORD` and told
+    the schema step to use the development `atp`.
+
+    Compared as raw strings, deliberately. This is a question about *wiring* —
+    did one value reach both ends — and not about the value: a password
+    containing `%` or `@` disagrees with itself after a url is parsed, which is
+    a real fault with a specific diagnosis and belongs to `make check-env`
+    (`db_password_problem`). Decoding here would report that one fault a second
+    time, in a vaguer voice, from a command that is about compose.
+
+    Silent when a service has no `DATABASE_URL`: `redis` and `web-prod` are not
+    clients of the database and have nothing to disagree about.
+    """
+    database = services.get(DATABASE_SERVICE)
+    if database is None:
+        # Not a mismatch — there is nothing to mismatch with. Reported anyway,
+        # because a configuration with no database is not one to pass in silence.
+        print(f"ERROR [{label}]: no `{DATABASE_SERVICE}` service in this configuration.")
+        return [f"{DATABASE_SERVICE} is missing from the {label} configuration"]
+
+    stored = (database.get("environment") or {}).get(DATABASE_PASSWORD_KEY)
+    if not stored:
+        print(f"ERROR [{label}]: `{DATABASE_SERVICE}` has no {DATABASE_PASSWORD_KEY}.")
+        return [f"{DATABASE_SERVICE} has no {DATABASE_PASSWORD_KEY} in the {label} configuration"]
+
+    problems: list[str] = []
+    agree: list[str] = []
+    for name, service in sorted(services.items()):
+        url = (service.get("environment") or {}).get("DATABASE_URL")
+        if not url:
+            continue
+        sent = urlsplit(url).password
+        if sent is None:
+            # A url that carries no password at all, or one this cannot parse.
+            # Refuse rather than guess, as the host-address check above does.
+            problems.append(f"{name} has a DATABASE_URL with no readable password")
+        elif sent != stored:
+            problems.append(
+                f"{name} would authenticate with a password `{DATABASE_SERVICE}` was not built with"
+            )
+        else:
+            agree.append(name)
+
+    if problems:
+        print(f"ERROR [{label}]: a service disagrees with the database about the password.")
+        for line in problems:
+            print(f"  {line}")
+        print()
+        print(f"{DATABASE_PASSWORD_KEY} is read at initdb and never again, so the database")
+        print("keeps whatever it was created with and refuses everything else. A service")
+        print("in this state starts, passes its healthcheck, and fails every query —")
+        print('docs/RUNBOOK.md, "password authentication failed".')
+        print("values withheld — these are credentials (CLAUDE.md §1.6)")
+    else:
+        print(f"database credentials [{label}]: every client uses the password `db` was built with")
+        for name in agree:
+            print(f"  {name}")
+    return problems
+
+
 def check_deployed_shape(services: dict) -> list[str]:
     """Report anything that would deploy the checkout instead of the image.
 
@@ -264,6 +386,7 @@ def main() -> int:
         services = _resolve(command).get("services", {})
         failures += check_bindings(label, services)
         failures += check_restart_policies(label, services)
+        failures += check_database_credentials(label, services)
         if label == "deployed":
             failures += check_deployed_shape(services)
         print()

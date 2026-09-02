@@ -114,3 +114,115 @@ class TestDeployedShape:
     def test_a_missing_code_service_is_reported(self) -> None:
         problems = check.check_deployed_shape({"worker": {}})
         assert any("api is missing" in p for p in problems)
+
+
+#: Stands in for ATP_DB_PASSWORD. Carried through every case below and looked
+#: for in the output, because the one thing this check must never print is the
+#: thing it is comparing (CLAUDE.md §1.6).
+DEPLOY_PASSWORD = "b8f1c0d4e7a2deadbeef"
+
+
+def _db(password: str = DEPLOY_PASSWORD) -> dict[str, Any]:
+    return {"environment": {"POSTGRES_PASSWORD": password}}
+
+
+def _client(password: str) -> dict[str, Any]:
+    return {"environment": {"DATABASE_URL": f"postgresql+asyncpg://atp:{password}@db:5432/atp"}}
+
+
+class TestDatabaseCredentials:
+    """One value has to reach Postgres and every client of it by two routes.
+
+    `POSTGRES_PASSWORD`, which initdb stores verbatim, and a `DATABASE_URL` per
+    service — and the overlay writes that interpolation out once per service, so
+    four correct copies and one stale literal is a stack that starts perfectly
+    and refuses every query.
+    """
+
+    def test_a_service_using_a_different_password_is_reported(self) -> None:
+        problems = check.check_database_credentials(
+            "deployed",
+            {"db": _db(), "api": _client(DEPLOY_PASSWORD), "migrate": _client("atp")},
+        )
+        assert len(problems) == 1
+        assert "migrate" in problems[0]
+
+    def test_every_client_agreeing_passes(self) -> None:
+        assert (
+            check.check_database_credentials(
+                "deployed",
+                {
+                    "db": _db(),
+                    "api": _client(DEPLOY_PASSWORD),
+                    "worker": _client(DEPLOY_PASSWORD),
+                    "queue": _client(DEPLOY_PASSWORD),
+                    "migrate": _client(DEPLOY_PASSWORD),
+                },
+            )
+            == []
+        )
+
+    def test_a_service_that_does_not_use_the_database_is_not_a_finding(self) -> None:
+        """`redis` and `web-prod` have nothing to disagree about."""
+        assert (
+            check.check_database_credentials(
+                "deployed", {"db": _db(), "redis": {}, "web-prod": {"environment": {}}}
+            )
+            == []
+        )
+
+    def test_a_url_with_no_readable_password_is_reported(self) -> None:
+        """Refused rather than guessed, as the host-address check above does."""
+        problems = check.check_database_credentials(
+            "deployed",
+            {
+                "db": _db(),
+                "api": {"environment": {"DATABASE_URL": "postgresql+asyncpg://atp@db/atp"}},
+            },
+        )
+        assert any("no readable password" in p for p in problems)
+
+    def test_a_configuration_with_no_database_is_reported(self) -> None:
+        problems = check.check_database_credentials("deployed", {"api": _client(DEPLOY_PASSWORD)})
+        assert any("db is missing" in p for p in problems)
+
+    def test_a_database_with_no_password_is_reported(self) -> None:
+        problems = check.check_database_credentials(
+            "deployed", {"db": {"environment": {}}, "api": _client(DEPLOY_PASSWORD)}
+        )
+        assert any("POSTGRES_PASSWORD" in p for p in problems)
+
+    def test_the_password_is_never_printed(self, capsys: Any) -> None:
+        """§1.6, in both directions: the failing report and the passing one.
+
+        The passing case matters as much — `make check-bindings` runs on an
+        operator's terminal with their real ATP_DB_PASSWORD interpolated in, and
+        a check that listed what it compared would put it on screen every time
+        it succeeded.
+        """
+        check.check_database_credentials(
+            "deployed", {"db": _db(), "api": _client(DEPLOY_PASSWORD), "migrate": _client("atp")}
+        )
+        check.check_database_credentials("deployed", {"db": _db(), "api": _client(DEPLOY_PASSWORD)})
+        assert DEPLOY_PASSWORD not in capsys.readouterr().out
+
+    def test_the_comparison_is_raw_rather_than_url_decoded(self) -> None:
+        """A `%` that does not survive a url is `make check-env`'s finding, not
+        this one's. Decoding here would report one fault twice, and the vaguer
+        half would land second — the gate `check_env.should_ask_the_database`
+        draws for the same reason."""
+        problems = check.check_database_credentials(
+            "deployed", {"db": _db("p%40ss"), "api": _client("p%40ss")}
+        )
+        assert problems == []
+
+    def test_both_configurations_resolve_the_migrate_profile(self) -> None:
+        """The regression that put this function here.
+
+        `docker compose config` omits a profiled service entirely, so the schema
+        step was in neither configuration under test — and it was the service
+        with the wrong password in one of them. The same blind spot the
+        restart-policy check had over `web`.
+        """
+        for _, command in check.CONFIGS:
+            assert "migrate" in command, command
