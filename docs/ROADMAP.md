@@ -27,9 +27,9 @@ fix it here in the PR that discovered it.
 
 ## Where this stands
 
-**21 of 49 items ticked — and the other 28 are not a measure of what is
+**21 of 50 items ticked — and the other 29 are not a measure of what is
 unbuilt.** Reading them as one is the specific mistake this section exists to
-prevent. Twenty-one of the twenty-eight sit in Phases 4 and 5, whose *Verifiable:*
+prevent. Twenty-two of the twenty-nine sit in Phases 4 and 5, whose *Verifiable:*
 lines both come down to the same event: a strategy trading the paper account for
 a week. The code is written and tested. The week has not happened.
 
@@ -39,27 +39,26 @@ a week. The code is written and tested. The week has not happened.
 | 1 — Data | 3 / 5 | 2 | A forced disconnect against the live stream, and a quote proving its own age |
 | 2 — Backtesting | 7 / 7 | 0 | — |
 | 3 — Risk | 2 / 4 | 2 | A strategy that tries to breach every limit, refused by name |
-| 4 — Execution & paper trading | 0 / 10 | 10 | **The paper week.** A strategy trades the paper account for a week and reconciles clean |
+| 4 — Execution & paper trading | 0 / 11 | 11 | **The paper week.** A strategy trades the paper account for a week and reconciles clean |
 | 5 — Dashboard & analytics | 0 / 11 | 11 | **The same paper week**, read back through the screens and the analytics |
 | 6 — Production readiness | 5 / 8 | 3 | A scrape from a real deployment, a restore actually performed, the chosen host with the stack actually on it |
-| **Total** | **21 / 49** | **28** | |
+| **Total** | **21 / 50** | **29** | |
 
-The twenty-eight open items are in three different states, and the difference
+The twenty-nine open items are in three different states, and the difference
 matters more than the count:
 
 | State | Count | Means |
 |---|---:|---|
-| Claimed, in progress (`wip`) | 1 | **Strategy creation endpoint** (Phase 4) — the only item with unbuilt code inside its own scope |
-| Built, awaiting the phase line | 26 | Phases 1, 3, 4, 5 and 6. Code merged and tested, nothing left but the demonstration |
-| Unclaimed | 1 | **Daily report** (Phase 5) — the only item in this file nobody has started |
+| Claimed, in progress (`wip`) | 0 | Nobody has an open PR against an item here right now |
+| Built, awaiting the phase line | 27 | Phases 1, 3, 4, 5 and 6. Code merged and tested, nothing left but the demonstration |
+| Unclaimed | 2 | **Daily report** (Phase 5) and **strategy lifecycle verbs** (Phase 4) — nobody has started either |
 
 Two things a reader should take from this rather than from the counts:
 
 - **Phase 4 and Phase 5 being at zero is one fact, not twenty.** Both phases
   hinge on the paper week; neither has an item blocked on anything else. A
   reader who wants to know what is genuinely missing should look at the three
-  Phase 6 items, the one unclaimed Phase 5 item, and the one item still marked
-  `wip`, which is the whole of it.
+  Phase 6 items and the two unclaimed ones, which is the whole of it.
 - **A tick here is expensive on purpose.** Phase 1 is the only phase whose
   *Verifiable:* line has been shown against live data, and it took real egress,
   real credentials and a real hypertable to earn three boxes. That is the
@@ -1149,7 +1148,7 @@ above.
   gap #93 named, now with a concrete case: without that stop, `risk_pct` refuses
   every entry at sizing, which `test_without_that_stop_every_entry_is_refused_at_sizing`
   pins so the failure is a documented refusal rather than a surprise.
-- [ ] Strategy creation endpoint — @claude (wip #97).
+- [ ] Strategy creation endpoint — @claude (#97).
   **An item this phase was missing**, added in the PR that built it. Requirement
   #1 is "strategy CRUD and lifecycle"; the roadmap tracked the listing screen
   (Phase 5) and the rule-set compiler (above) and nothing tracked the write half
@@ -1207,19 +1206,30 @@ above.
   through this endpoint being picked up by a worker, which is the whole point of
   storing one and needs a running stack to demonstrate.
 
-  Still stubs, deliberately: `PATCH /strategies/{id}` (editing a live strategy
-  needs pausing it first, and pausing is a stub), `POST /{id}/promote`,
-  `POST /{id}/pause`, `GET /{id}`. There is **no authoring form** either — the
-  Strategies tab is still read-only, so a rule set is posted from a client. That
-  is the next piece of this item rather than a separate one.
+  **The rest of the lifecycle is now its own item, below.** This entry used to
+  end by calling the four stubs and the missing authoring form "the next piece
+  of this item rather than a separate one", and carried `wip #97` on the
+  strength of it — one item describing a built endpoint and an unbuilt half at
+  the same time, so no single marker could be true of it. #97 merged, which
+  makes `wip` false; the endpoint is built, which makes "not started" false.
+  Splitting it lets both halves say what they are: this one is built and waiting
+  on the phase's *Verifiable:* line, and the work that is genuinely unbuilt is
+  unclaimed rather than dressed as in progress (#127).
+- [ ] Strategy lifecycle verbs and an authoring form.
+  Split out of the item above, where it had been described as its next piece.
+  Nobody is on it.
 
-  **This is the one item on this page still carrying `wip`, and deliberately.**
-  Everything else marked `wip` was finished work waiting on a *Verifiable:*
-  line; this one has unbuilt code inside its own scope — the four stubs and the
-  authoring form named above, which this entry calls "the next piece of this
-  item rather than a separate one". `CLAUDE.md` §6 says a half-built subsystem
-  is claimed as work-in-progress so nobody builds it twice, so `wip` stays.
-  #97 remains the PR the claim rests on: it is where the built half landed.
+  `PATCH /strategies/{id}` (editing a live strategy needs pausing it first, and
+  pausing is a stub), `POST /{id}/promote`, `POST /{id}/pause` and `GET /{id}`
+  are all still stubs, and there is **no authoring form** — the Strategies tab
+  is read-only, so a rule set is posted from a client rather than written on the
+  screen that lists it.
+
+  Promotion is the one with a prerequisite rather than just work: ADR 0010 wants
+  an audit entry naming a human for a lifecycle transition, and #97 wired and
+  demonstrated that mechanism, which removed one of the two reasons the stub
+  gives for staying a stub. What it still needs is a verb per transition and a
+  paper-trading period nothing yet records the start of.
 - [ ] `StrategyRunner` live loop — @claude (#39).
   Implemented: `warmup`, `run`, `evaluate`, `on_fill_event` and `shutdown`, plus
   `LiveContext` — the live counterpart of `BacktestContext`, serving a strategy

@@ -207,7 +207,14 @@ def main() -> int:
         print("because GitHub was unreachable would teach everyone to re-run it.")
 
     if not problems:
-        print("every `wip` marker names a PR that is still open")
+        if markers:
+            print("every `wip` marker names a PR that is still open")
+        else:
+            # Said as its own sentence rather than folded into the line above:
+            # "every marker is fine" and "there are no markers" are different
+            # readings, and a check that reports the second as the first is the
+            # shape of a check that has quietly stopped looking at anything.
+            print("no `wip` markers in docs/ROADMAP.md — nothing claims to be in progress")
         return 0
 
     print()
