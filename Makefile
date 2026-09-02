@@ -2,7 +2,7 @@
 .PHONY: help install up up-prod deploy down logs migrate revision seed backfill \
         secrets-check secrets-install backup backup-verify backup-list backup-restore \
         test test-unit \
-        test-integration lint typecheck fmt check check-bindings check-env gen-types build-web \
+        test-integration lint typecheck fmt check check-bindings check-roadmap check-env gen-types build-web \
         dev-api dev-worker dev-web clean
 
 WEB := apps/web
@@ -244,6 +244,14 @@ check-tracked:  ## Fail if any source file is excluded by .gitignore
 	  exit 1; \
 	fi; \
 	echo "check-tracked: no source files are gitignored"
+
+check-roadmap:  ## Fail if a `wip` marker names a PR that is no longer open
+	@# Two halves, and only one of them needs a network. The format half is also
+	@# a unit test (tests/unit/test_roadmap_wip_markers.py) and runs offline on
+	@# every commit; this target adds the half that asks GitHub whether the PRs
+	@# a `wip` marker claims against are still open. A state it cannot read is a
+	@# note, never a failure — see the script's docstring for why that matters.
+	python3 scripts/check_roadmap_wip.py
 
 check-bindings:  ## Fail if any compose service publishes a port on every interface
 	@# Not part of `check`, which deliberately needs no Docker daemon. CI runs
