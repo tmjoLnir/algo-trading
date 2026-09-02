@@ -781,19 +781,19 @@ remaining Phase 6 items are the difference — see docs/SAFETY.md.
 
 Stated here rather than left to be discovered:
 
-- **All eight tabs are built.** Backtests was the largest and Worker is the
-  newest; both are above. What it unblocked elsewhere is still being built separately:
-  `/analytics/live-vs-backtest` is now an endpoint and has no screen — it wants a
-  *run picker* rather than a date range, because the choice it turns on is which
-  backtest, which is a different shape from the three date-ranged panels the
-  analytics page is (docs/ANALYTICS.md). The promotion ratchet on the strategies
-  page could now check "a completed backtest on record" and still cannot write
-  the audit entry naming a human (ADR 0010).
-- **A divergence table needs its labels to be worth rendering.** Whenever the
-  comparison does get a screen: the response carries a `comparability` per metric
-  and warnings above them, and a table that dropped either would reintroduce
-  exactly the misreading they exist to prevent — most often a live Sharpe that
-  looks better than the backtest because the two were annualised differently.
+- **All eight tabs are built**, and so is the comparison that used to be listed
+  here as missing. Backtests was the largest and Worker is the newest; both are
+  above. `/analytics/live-vs-backtest` has a screen too — `LiveVsBacktest` on the
+  analytics page, driven by a *run picker* rather than a date range, because the
+  choice it turns on is which backtest, which is a different shape from the three
+  date-ranged panels beside it (docs/ANALYTICS.md). It renders `comparability`
+  against every row and the warnings above them, which is what a divergence table
+  has to do to be worth rendering at all: dropping either reintroduces exactly the
+  misreading they exist to prevent — most often a live Sharpe that looks better
+  than the backtest because the two were annualised differently.
+- **What that comparison unblocked elsewhere is still unbuilt.** The promotion
+  ratchet on the strategies page could now check "a completed backtest on record"
+  and still cannot write the audit entry naming a human (ADR 0010).
 - **Strategy parameters cannot be edited per run.** The backtests form queues a
   run with the strategy's configured parameters. Building the editor means
   rendering a form from a JSON Schema, and one that silently dropped the fields it
@@ -804,7 +804,7 @@ Stated here rather than left to be discovered:
   of the fields live was considered and rejected in ADR 0023; a form where half
   the inputs take effect immediately is harder to reason about than one where
   none do.
-- **No screen places an order.** The three tabs that are built are all reads.
+- **No screen places an order.** Every tab that is built is a read.
   Every write handler across `orders.py` and `positions.py` is still a stub,
   because they place things and there is one path from an intent to a venue
   (rule §1.5, ADR 0005) — the path that also carries the audit events ADR 0010
@@ -826,7 +826,7 @@ Stated here rather than left to be discovered:
   does is name the strategy running the whole book, because the published
   snapshot is built from the runner's live `Portfolio` and a `Position` carries
   no strategy of its own.
-- **Sign-in and scopes exist; rate limiting and revocation do not.** Signing in
+- **Sign-in, scopes and rate limiting exist; revocation does not.** Signing in
   is one operator against a bcrypt hash, with the session in an `HttpOnly` cookie
   the WebSocket handshake carries by itself (ADR 0008). Sessions are `full` or
   `read`, chosen at sign-in (ADR 0009): a read-only session reads everything, may
