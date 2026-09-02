@@ -199,12 +199,46 @@ jobs:
       - name: Every default service is up, and none is restarting
         # Catches the failure mode this job was written for: a container that
         # boots, dies and is restarted forever still looks "started" to compose.
+        #
+        # Sampling `.State` once could not do it, and the gap is not theoretical.
+        # A crash-looping container is `running` for most of every cycle — it
+        # boots, works for a moment, dies, waits out the backoff — so one reading
+        # catches it or misses it by luck. #124 merged a worker that could not
+        # boot at all because this step read `running` on the sample it happened
+        # to take; the identical tree then failed twice on the next PR. Two green,
+        # two red, same code. A check that is right half the time is worse than
+        # no check, because it teaches everyone that the red one was the flake.
+        #
+        # So ask Docker for its own restart counter instead, twice, with a
+        # settling window in between. A looping container increments it; a
+        # healthy one does not, whatever `.State` happens to say at either
+        # instant. The window is longer than it looks it needs to be on purpose:
+        # Docker backs off exponentially between restarts, so by the time this
+        # step runs a container that has been failing since boot may be a good
+        # few seconds into its next wait.
         run: |
           docker compose ps
+          restart_counts() {
+            for c in $(docker compose ps -aq); do
+              docker inspect -f '{{.Name}} {{.RestartCount}}' "$c"
+            done | sort
+          }
+          before=$(restart_counts)
+          sleep 30
+          after=$(restart_counts)
+          if [ "$before" != "$after" ]; then
+            echo "::error::a container restarted during a 30s window -- it is crash-looping, not running"
+            diff <(echo "$before") <(echo "$after") || true
+            docker compose ps
+            docker compose logs --tail=60
+            exit 1
+          fi
+          echo "no container restarted in 30s"
           not_running=$(docker compose ps --format '{{.Service}} {{.State}}' \
             | awk '$2 != "running" { print $1 " is " $2 }')
           if [ -n "$not_running" ]; then
             echo "::error::expected every service to be running -- $not_running"
+            docker compose logs --tail=60
             exit 1
           fi
 

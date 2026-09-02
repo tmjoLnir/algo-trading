@@ -49,6 +49,46 @@ services:
     # platform that comes back halted.
     restart: unless-stopped
 
+  migrate:
+    # `alembic upgrade head`, from inside the network, against `db`. One shot:
+    # it runs, it exits, and nothing depends on it staying up.
+    #
+    # **Why this exists.** The worker reads its `worker_config` row at boot and
+    # refuses to start without it (ADR 0023, and `atp_worker.main` says why).
+    # That row lives in a table only a migration creates, and until now the only
+    # thing that ran a migration was `make migrate` — from the *host*, needing
+    # uv and a Python toolchain. So a clean `git clone && make up` produced a
+    # worker in a permanent crash-loop, which is the thing Phase 0's "make up
+    # works end to end" claims does not happen.
+    #
+    # **Why it is behind a profile and not a `depends_on`.** Making api, worker
+    # and queue depend on this would migrate the database automatically wherever
+    # the stack comes up — including `make deploy`. On a deployed host applying
+    # a migration is a decision an operator makes inside a halt window, between
+    # stopping new risk and clearing the halt (docs/DEPLOYMENT.md, "Every deploy
+    # after that"). A container that quietly reshapes the schema of a database
+    # holding open positions, at whatever moment compose happens to start it, is
+    # not a convenience. So the profile keeps it out of every `up`, and `make
+    # up` / `make up-prod` invoke it as an explicit step; `make deploy` does not,
+    # and the runbook's `make migrate` stays exactly where it is.
+    profiles: ["migrate"]
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # `db`, not localhost: this runs on the compose network, unlike the
+      # host-side `make migrate` that alembic/env.py's fallback is written for.
+      DATABASE_URL: postgresql+asyncpg://atp:atp@db:5432/atp
+    depends_on:
+      db: {condition: service_healthy}
+    command: ["alembic", "-c", "infra/alembic/alembic.ini", "upgrade", "head"]
+    # A migration that fails must stay failed and be seen. Restarting it would
+    # retry a broken revision until the log scrolled past the reason.
+    restart: "no"
+
   api:
     build:
       context: .
