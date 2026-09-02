@@ -80,8 +80,24 @@ the record.
   that held it back is gone, because the condition stated here for removing it —
   that its entry point stop raising `NotImplementedError` — is met (#35). On a
   clean checkout the worker comes up in backtest mode with no watchlist, reports
-  that it is ingesting nothing, and runs its schedule; the `stack` job's
-  "none is restarting" step now covers it without needing a new check.
+  that it is ingesting nothing, and runs its schedule.
+
+  **Both halves of that stopped being true and are repaired here (#126).** #124
+  gave the worker a `worker_config` row to read at boot, and refusing to start
+  without one is deliberate (ADR 0023) — but nothing in `make up` had ever run a
+  migration, so on a clean checkout that table did not exist and the worker
+  crash-looped instead of idling. `make up` now applies the schema before it
+  starts anything; `make deploy` deliberately still does not, because on a host
+  that is an operator's decision inside a halt window (ADR 0024).
+
+  The sentence that used to end this entry — that the `stack` job's "none is
+  restarting" step covered the worker "without needing a new check" — is the
+  more expensive half to have got wrong, so it is removed rather than reworded.
+  That step sampled container state once, and a crash-looping container reads
+  `running` for most of each cycle: the same tree passed on #124 and on its merge,
+  then failed twice on #125. It now asserts Docker's restart counter across a
+  settling window, which is a fact about an interval rather than a guess taken at
+  an instant.
 - [x] Alembic initial migration; TimescaleDB hypertable created — @claude (#6)
 - [x] `Position.apply_fill` + `Order.apply_fill` implemented and property-tested — @claude (#4)
 

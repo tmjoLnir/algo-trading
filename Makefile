@@ -24,6 +24,18 @@ install:  ## Install Python + Node dependencies
 	@echo "before switching ATP_RUN_MODE off backtest."
 
 up: .env  ## Start the full stack
+	@# Schema before processes. The worker reads its `worker_config` row at boot
+	@# and refuses to start without it (ADR 0023), so a stack brought up against
+	@# an unmigrated database is a worker in a crash-loop rather than the idle one
+	@# Phase 0 promises. This starts `db`, waits for its healthcheck, applies every
+	@# revision and exits; it is a no-op on every run after the first.
+	@#
+	@# Deliberately not a `depends_on` in the compose file: that would migrate the
+	@# database wherever the stack comes up, `make deploy` included, and on a
+	@# deployed host that is an operator's decision inside a halt window
+	@# (docs/DEPLOYMENT.md). ADR 0024.
+	docker compose --profile migrate build migrate
+	docker compose --profile migrate run --rm migrate
 	docker compose up -d --build
 	@echo "api  → http://localhost:8000/docs"
 	@echo "web  → http://localhost:5173"
@@ -37,6 +49,10 @@ up-prod: .env check-bindings  ## Start the stack with the BUILT dashboard behind
 	@# instead, which is the bundle `npm run build` produces served by nginx
 	@# with /api and /ws proxied onto the same origin. Services are named
 	@# explicitly so the dev server does not come up alongside it on 5173.
+	@# Schema before processes, as `up` above and for the same reason: this starts
+	@# the worker, and a worker cannot boot against an unmigrated database.
+	docker compose --profile migrate build migrate
+	docker compose --profile migrate run --rm migrate
 	docker compose --profile prod up -d --build db redis api worker queue web-prod
 	@# Asked of compose rather than recomputed here. ATP_WEB_BIND_ADDR is
 	@# usually set in .env, which compose reads for interpolation and make does
