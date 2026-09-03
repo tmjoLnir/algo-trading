@@ -17,7 +17,7 @@ trading strategies against live market data.
 | 2 | **Backtesting** on historical data | `libs/core/.../backtest/` |
 | 3 | **Risk management** — stops, sizing, exposure caps, kill switch | `libs/core/.../risk/` |
 | 4 | **Real-time data** for execution | `libs/core/.../data/`, Redis pub/sub |
-| 5 | **Paper trading** on live data, no real money | `libs/core/.../brokers/paper.py` + Alpaca paper endpoint |
+| 5 | **Paper trading** on live data, no real money | `libs/core/.../brokers/alpaca.py` against the Alpaca paper endpoint — same adapter, different host (ADR 0003) |
 | 6 | **Analytics & reporting** | `libs/core/.../analytics/` |
 | 7 | **Dashboard**, refreshed on demand | `apps/web/` |
 

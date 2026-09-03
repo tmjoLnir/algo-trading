@@ -43,8 +43,16 @@ HEADING = re.compile(r"^#### (\d+)\. ")
 #: about where the finding points.
 LOCATION = re.compile(r"^`([^`]+):(\d+)` · ")
 
-#: A finding may carry one italic note beneath its meta line, added by §10.
-RECORD_NOTE = re.compile(r"^\*Record note \(§10, [\d-]+\): (.+)\*$")
+#: A finding may carry italic notes beneath its meta line, one per review that
+#: touched it. The section number is a capture rather than a literal `10`: a
+#: second review has to be able to leave a note the same way the first did, and
+#: pinning it to §10 would have meant either rewriting §10's notes — deleting
+#: the history they exist to keep — or leaving the new ones unparsed, which is
+#: the same as not writing them. The assertions below are unchanged.
+#:
+#: The *first* note under a finding wins, so notes are written newest-first and
+#: the current position is the one this checks.
+RECORD_NOTE = re.compile(r"^\*Record note \(§\d+, [\d-]+\): (.+)\*$")
 
 #: The declaration that a citation addresses a *file* rather than a line — the
 #: finding is that something is missing from it, so the number is decoration.

@@ -122,7 +122,7 @@ confusing.
 
 ## Stage 1 — up, ingesting, and deliberately not trading
 
-Choose no strategy on the dashboard's **Worker** tab — which is where these
+Choose no strategy on the dashboard's **Config** tab — which is where these
 settings live now, rather than in `.env`. Nothing has been saved on a fresh
 install, so this stage needs no setup at all: it proves the data path before
 anything can place an order.
@@ -150,7 +150,8 @@ uv run python scripts/status.py --no-broker
 
 It prints halts, quote freshness against the saved `max_quote_age_seconds` — the
 same budget `StaleDataRule` refuses orders on, read from the `worker_config` row
-the Config tab writes — and the latest stored bar per symbol. `--no-broker` keeps it to local state, so it needs no credentials.
+the Config tab writes — and the latest stored bar per symbol. `--no-broker`
+keeps it to local state, so it needs no credentials.
 
 **Do not proceed** until quotes are landing in Redis and bars are landing in the
 hypertable. A strategy started on a stale cache will be refused by
@@ -160,7 +161,7 @@ hypertable. A strategy started on a stale cache will be refused by
 
 ## Stage 2 — one strategy, one symbol, smallest size
 
-On the dashboard's **Worker** tab, set:
+On the dashboard's **Config** tab, set:
 
 | Field | Value |
 |---|---|

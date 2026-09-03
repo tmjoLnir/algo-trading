@@ -197,7 +197,7 @@ default value — both are required fields. Every rule set must state them expli
 documented defaults exist nowhere in code.
 
 Worse, the one stop default that *does* exist contradicts the doc:
-`RiskLimits.default_stop_loss_pct = Decimal("0.02")` (`config.py:33`) is a fixed 2% stop —
+`RiskLimits.default_stop_loss_pct = Decimal("0.02")` (`risk/limits.py:145`) is a fixed 2% stop —
 the exact thing `RISK.md:54-56` singles out as "far too tight on a volatile small-cap … you
 are stopped out by ordinary noise". Either make the field's name and role explicit (a
 fallback only, not a recommendation) or replace it with an ATR-based default.
@@ -226,8 +226,8 @@ a human reads is not a control.
 ### 7. `.env.example` omits `RISK_MAX_OPEN_POSITIONS`
 
 Four of the five documented limits are in the operator template; the 20-position cap is not.
-It still applies — `RiskLimits` defaults it (`config.py:32`) — but an operator reading the
-template sees no sprawl limit and cannot tune it without reading the source.
+It still applies — `RiskLimits` defaults it (`risk/limits.py:127`) — but an operator reading
+the template sees no sprawl limit and cannot tune it without reading the source.
 
 `config.py` and `RISK.md` agree exactly on all five values otherwise (0.10 / 1.00 / 0.03 /
 30 / 20), which is the one place doc and code are already in sync. Keep it that way.
@@ -295,7 +295,7 @@ until Phase 4.
 - **`RuleSet.max_concurrent_positions`** (default 5, `strategy/rules.py:148`) is a
   per-strategy limit that `RISK.md` does not mention alongside the account-wide
   `max_open_positions` of 20. The relationship — strategy limits may be tighter, never looser
-  (`config.py:21-23`) — is stated for `RiskLimits` but not enforced anywhere.
+  (`risk/limits.py:12-14`) — is stated for `RiskLimits` but not enforced anywhere.
 
 ---
 

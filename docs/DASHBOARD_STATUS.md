@@ -14,8 +14,8 @@ one**: there is no Docker daemon in the environment this was done in, so
 That bounds what the reading is worth. Every fixture response was shaped from
 `apps/web/src/api/schema.d.ts` — the types generated from the app's own OpenAPI
 document — and every enum value checked against the domain rather than guessed
-(`OrderStatus`, `SignalAction`, `StrategyKind`, the four backtest statuses in
-`atp_core.backtest.ports`, and the five audit verbs in `atp_core.audit.ports`).
+(`OrderStatus`, `SignalAction`, `StrategyState`, the four backtest statuses in
+`atp_core.backtest.ports`, and the twelve audit verbs in `atp_core.audit.ports`).
 So what follows describes **what the front end renders for a given contract**,
 and says nothing whatever about whether the server can produce that contract
 from a real database. Phase 5's *Verifiable:* line — a book a real worker
@@ -23,11 +23,11 @@ published — is still unshown, and nothing here is evidence toward it.
 
 Read this as: *this is the screen*. Not: *this is the system working*.
 
-The screenshots this was written from are not committed. Rendered PNGs of seven
-tabs weigh several megabytes, they go stale the first time a component changes,
-and git keeps them for good — so the descriptions below carry the findings
-instead, and anyone who wants the pictures can point a browser at a running
-stack.
+The screenshots this was written from are not committed. Rendered PNGs of the
+seven tabs that existed then weigh several megabytes, they go stale the first
+time a component changes, and git keeps them for good — so the descriptions
+below carry the findings instead, and anyone who wants the pictures can point a
+browser at a running stack.
 
 ---
 
@@ -82,9 +82,10 @@ totals understate exposure.
   is not where the risk reads ended up. `/risk/status` and `/risk/limits` are
   built and read by a panel on the **Strategies** tab (#75) rather than by a
   tab of their own — `/status` is what a person checks before promoting a
-  strategy, so it sits on the screen that decision is made on and the nav stays
-  at seven. `/risk/rejections` joined them there (#77), reading `signals`
-  rather than `orders` for the reason below.
+  strategy, so it sits on the screen that decision is made on and no eighth tab
+  was added for it. (The eighth is Config, which arrived later and for another
+  reason — ADR 0023, then ADR 0025.) `/risk/rejections` joined them there
+  (#77), reading `signals` rather than `orders` for the reason below.
 - `/dashboard/health` is stubbed (`dashboard.py:567`). Nothing calls it —
   `FeedStatus` reads `data_feed_healthy` off the aggregate instead — so it is a
   dead route rather than a missing feature.
@@ -325,6 +326,55 @@ the record.
 
 ---
 
+## 8. Config — `/worker`
+
+**Read from source, not rendered.** Every section above describes a screen that
+was driven in a browser against a fixture server; this one was not. The tab did
+not exist when that reading was done — it arrived with ADR 0023 (#124) and was
+renamed from Worker to Config by ADR 0025 (#132) — and the constraint that
+stopped the original reading using a real API has not lifted. What follows is
+read off `apps/web/src/pages/Worker.tsx`, `components/WorkerConfigPanel.tsx`
+and `apps/api/src/atp_api/routers/worker.py`, so it says what the code builds
+and claims nothing about what a browser shows. Treat it as a weaker warrant
+than §§1–7, not an equal one.
+
+The screen is one panel over one endpoint. `GET /worker/config` returns the
+whole of it in a single query — the saved row, the running worker's report of
+what it booted with, and the option lists the form renders from — so the form
+cannot show a strategy the server would reject.
+
+- **Two halves, one save.** The worker settings (watchlist, strategy and its
+  parameters, sizing, protective stop, feed watchdog) and the eight account-wide
+  risk ceilings are edited together and written by one `PUT`, producing one
+  revision and one audit row. That is the ADR 0025 decision showing through: a
+  tightened position limit and a widened stop are one operator decision and are
+  recorded as one.
+- **The risk section is rendered from the server's field list**, not from a list
+  the front end keeps — so a ceiling added to `RiskLimits` appears on the screen
+  without a front-end change, and cannot appear with a different label than the
+  API validates against.
+- **One field asks for a password.** `allow_live_orders` is the third of the
+  three live locks (CLAUDE.md §1.8). Ticking it reveals a password box and the
+  save carries the operator's password; the ceilings and the worker settings do
+  not ask, and turning the lock back off does not either. A read-only session is
+  refused before the handler runs.
+- **Saved is not running.** The worker binds its configuration at start, so the
+  panel renders the saved revision against the revision the running process
+  reported and says a restart is owed when they differ. A worker that booted
+  before anything was ever saved reports a distinct sentinel rather than
+  revision 1, so "nothing is stored" and "stored, and it happens to equal the
+  defaults" are not shown as the same state.
+- **Nothing is defaulted into the worker half.** A fresh install trades nothing
+  until somebody opens this tab, which is the same posture an empty
+  `WORKER_STRATEGY` always had. The migration does backfill the eight ceilings
+  with the values `.env.example` used to ship.
+- **This screen has never been driven against a real API**, and nor has any
+  other. It is covered by component tests against a stubbed `fetch`
+  (`components/workerconfig.test.tsx`) and by handler tests
+  (`tests/unit/test_worker_config_api.py`).
+
+---
+
 ## Endpoint coverage
 
 | Endpoint | Server | Screen |
@@ -348,19 +398,29 @@ the record.
 | `/audit` | built | Audit |
 | `/market-data/calendar` | built | **none** |
 | `/market-data/{bars,quote,search}` | **stub** | none |
-| `/risk/halt` | built (#70) | Dashboard button |
+| `/risk/halt` | built (#70) | Kill switch, on the pinned tab bar (#131) |
 | `/risk/resume` | built (#75) | Halt banner |
-| `/risk/limits`, `/risk/status` | built (#75) | Strategies |
+| `/risk/limits`, `/risk/status` | built (#75) | Strategies (read) |
 | `/risk/rejections` | built (#77) | Strategies |
 | `/risk/flatten-all` | built | none |
+| `/worker/config` (GET) | built (#124) | Config — one query: saved row, running worker's report, options |
+| `/worker/config` (PUT) | built (#124, #132) | Config — **the app's one write into trading** |
 
 ## Cross-cutting
 
-- **Two live write paths, and they are the same one.** Of four mutations in the
-  whole app — halt, resume, queue a backtest, log in/out — only the kill switch
-  touches trading, and now in both directions (#70, #75). That is a statement
-  about the *app*, and it still holds: nothing the browser renders can place an
-  order, close a position, or move a stop.
+- **Three live write paths now, and the third is the widest.** Of five mutations
+  in the whole app — halt, resume, save the configuration, queue a backtest,
+  log in/out — the kill switch touches trading in both directions (#70, #75),
+  and `PUT /worker/config` decides what trading *is*: the watchlist, the
+  strategy, the sizing, the stop, the eight account-wide ceilings (#132) and
+  `allow_live_orders`, which is the third of the three live locks. Arming that
+  one costs the operator's password and is refused to a read-only session; the
+  rest of the row is an ordinary save.
+
+  The narrower claim this bullet used to make still holds, and is worth keeping
+  separate from the one above: nothing the browser renders can place an order,
+  close a position, or move a stop. It can decide what the worker will do, and
+  it cannot do it itself.
 
   It is no longer a statement about the *API*. Closing one position, cancelling
   orders and flattening the book are all built and all reachable by `curl`, so

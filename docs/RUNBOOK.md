@@ -346,8 +346,8 @@ source and it does not win: compose sets `DATABASE_URL` and `REDIS_URL` in
 both exported and written in `.env` is being read from the export, and editing
 the line you can see will not change it.
 
-`make preflight` and `make status` no longer die on this. They used to call
-`get_settings()` and exit with the same traceback they were being run to
+`make preflight` and `scripts/status.py` no longer die on this. They used to
+call `get_settings()` and exit with the same traceback they were being run to
 explain; they now say which variable will not load and point here.
 
 **It reports a second thing, and that one is worse.** A key `.env` assigns that
@@ -628,7 +628,8 @@ value loads" to.
 read the database, so it wrote nothing to it either; positions, stops and the
 halt state are whatever they were, and broker-side stops are held by the venue
 regardless. `scripts/halt.py` reads Redis and the venue, not Postgres, so it is
-unaffected, and `make halt` is available if you would have halted anyway.
+unaffected, and `uv run python scripts/halt.py engage` is available if you would
+have halted anyway.
 
 > **This section used to say `scripts/status.py` was unaffected too, and that
 > was wrong.** It reads Redis *and* Postgres — the bars section is a database

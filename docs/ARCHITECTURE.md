@@ -178,4 +178,4 @@ symbols on daily or minute bars comfortably.
 | A strategy metric (Sharpe, drawdown) | `backtest/metrics.py` | shared with analytics automatically |
 | An attribution dimension | `analytics/performance.py` | `docs/ANALYTICS.md` |
 | An operational metric | `metrics/registry.py` — nowhere else | `docs/OBSERVABILITY.md` |
-| An endpoint | `apps/api/routers/` | `make gen-types` |
+| An endpoint | `apps/api/src/atp_api/routers/` | `make gen-types` |
