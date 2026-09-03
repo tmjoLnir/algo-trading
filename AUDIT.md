@@ -194,7 +194,8 @@ Queue a run with Sizing = "Percent of equity" and value 0.05. The engine sizes e
 
 `apps/worker/src/atp_worker/queue.py:161` · Broken · 🔴 High · ⚠️ Reported · 🔴 **Open**
 
-*Record note (§11, 2026-09-03): Re-pointed from `:152` to `:161`; #130's rewrite of the alembic entrypoint shifted this module.*
+*Record note (§11, 2026-09-03): Re-pointed from `:152` to `:161`; #132 shifted this module (+6 in `db5d381`, +3 in `cd17c4d`). §11 first credited #130, which never touched this file.*
+
 **Evidence**
 
 > `on_startup` sweeps with `await sweep_interrupted(ctx["runs"], clock.now() - STALE_AFTER, at=clock.now())` (queue.py:152) where `STALE_AFTER = timedelta(seconds=JOB_TIMEOUT_SECONDS * 2)` = 2 hours (queue.py:111). `stale_running` matches only `BacktestRunRow.started_at < older_than` (persistence/backtests.py:214-217). `sweep_interrupted` has exactly one caller — `grep -rn sweep_interrupted` returns only queue.py:152 (the call) and queue.py:171 (the definition) outside tests — and its docstring says "Runs at startup rather than on a schedule" (queue.py:175). Meanwhile docker-compose.yml sets `restart: unless-stopped` on the `queue` service, so the replacement process starts seconds after the old one dies. Concrete scenario: a backtest is 3 minutes into a run when `make deploy` recreates the container (or the process is OOM-killed). The row is left `status='running', started_at = 3 minutes ago`. The new worker starts ~1s later and asks for rows with `started_at < now - 2h`; the row is 3 minutes old, so it is not returned. `MAX_TRIES = 1` and `retry_jobs = False` (queue.py:94, 228) mean arq never redelivers the job, and nothing else in the platform writes a terminal status for a `running` row (`grep STATUS_RUNNING` finds only the repository and `tasks.py:81`).
@@ -318,7 +319,7 @@ docs/RUNBOOK.md:154 tells an operator handling runaway order submission to `POST
 
 `docs/DASHBOARD.md:818` · Inconsistency · 🔴 High · ✅ Verified · 🟢 **Closed** — @claude (#113)
 
-*Record note (§11, 2026-09-03): Re-pointed from `:766` to `:818`; #131 and #132 added 52 lines above it. `:766` had become a line about port binding — a closed finding's citation rots exactly like an open one's.*
+*Record note (§11, 2026-09-03): Re-pointed from `:766` to `:818`; #131 and #132 added 52 lines above it. `:766` is a blank line inside a passage about port binding — a closed finding's citation rots exactly like an open one's.*
 *Record note (§10, 2026-09-02): Cited `:713` on 2026-08-27; the code is at `:766` today.*
 
 **Evidence**
@@ -588,6 +589,7 @@ A 500 is 'the server broke', not 'this is not built'. Every call to an unbuilt e
 `apps/api/src/atp_api/routers/orders.py:205` · Broken · 🟠 Medium · ✅ Verified · 🔴 **Open**
 
 *Record note (§11, 2026-09-03): Re-pointed from `:204` to `:205`; #132 added a line above it.*
+
 **Evidence**
 
 > apps/api/src/atp_api/routers/orders.py:204 declares the query parameter with no timezone check and no `Annotated[..., Query(...)]` validator:
@@ -766,7 +768,8 @@ Both files claim to pin the behaviour of the emergency-stop and resume controls 
 
 `apps/worker/src/atp_worker/queue.py:246` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
-*Record note (§11, 2026-09-03): Re-pointed from `:237` to `:246`; #130 shifted this module.*
+*Record note (§11, 2026-09-03): Re-pointed from `:237` to `:246`; #132 shifted this module. §11 first credited #130, which never touched this file.*
+
 **Evidence**
 
 > queue.py:236-237: "`Worker.run` installs its own signal handlers and finishes the job in flight before exiting, which is why the container sends SIGTERM and waits." The `queue` service in docker-compose.yml (lines 186-224) declares `build`, `env_file`, `environment`, `depends_on`, `volumes`, `command: python -m atp_worker.queue` and `restart: unless-stopped` — `grep -n stop_grace docker-compose.yml` returns nothing, so Docker's default 10-second grace period applies. `JOB_TIMEOUT_SECONDS = 3600` (queue.py:83) and the module header describes the work as "a multi-year minute-bar run [that] is minutes of solid Python".
@@ -782,6 +785,7 @@ On every `docker compose restart queue`, `make deploy`, or host reboot, a backte
 `README.md:20` · Broken · 🟠 Medium · ✅ Verified · 🟢 **Closed** — @claude (#133)
 
 *Record note (§11, 2026-09-03): Closed by this diff. README.md now points requirement #5 at `brokers/alpaca.py` and says paper and live are one adapter on different endpoints, which is what ADR 0003 and ARCHITECTURE.md have always said.*
+
 **Evidence**
 
 > README.md:20: "| 5 | **Paper trading** on live data, no real money | `libs/core/.../brokers/paper.py` + Alpaca paper endpoint |"
@@ -810,7 +814,7 @@ The README's Safety section is what a reader consults before deciding how carefu
 
 `docs/DASHBOARD.md:265` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
-*Record note (§11, 2026-09-03): Re-pointed from `:233` to `:265`; #131 and #132 added 32 lines above it.*
+*Record note (§11, 2026-09-03): Re-pointed from `:233` to `:265`; #131 added all 32 lines above it (+26, +6). §11 first credited #132 as well; #132's edit to this file was entirely below the citation.*
 *Record note (§10, 2026-09-02): Cited `:174` on 2026-08-27; the code is at `:233` today.*
 
 **Evidence**
@@ -828,6 +832,7 @@ The audit page is what an operator opens after an incident to answer "who stoppe
 `docs/DASHBOARD_STATUS.md:97` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 *Record note (§11, 2026-09-03): Re-pointed from `:96` to `:97`; this diff added a line to the paragraph above it.*
+
 **Evidence**
 
 > docs/DASHBOARD_STATUS.md:95-97: "The stored rows against the registered classes, which is the point of the screen: `donchian_breakout` and `opening_range_breakout` exist in code and have never run."
@@ -873,6 +878,7 @@ README.md:87 points implementers at this file as the live guide for "where RISK.
 `docs/RISK_IMPLEMENTATION_NOTES.md:250` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
 
 *Record note (§11, 2026-09-03): Re-pointed from `:241` to `:250`; #132 appended a **SUPERSEDED (ADR 0025)** note to item 7 and pushed item 8 down nine lines. The finding is unaffected — item 8 still carries no resolution.*
+
 **Evidence**
 
 > docs/RISK_IMPLEMENTATION_NOTES.md:239-247: "### 8. `flatten_at_close` is a field nobody reads / `RiskSpec.flatten_at_close` (`strategy/rules.py:132`) exists and is never referenced anywhere else in the repo… A strategy author can set it today and get silent no-op protection… Either implement it with the session calendar or mark it explicitly unsupported until Phase 4." The file's summary at :13 lists item 8 as one of two still open.
@@ -1010,7 +1016,7 @@ The gitleaks hook is labelled "Last line of defence before a broker key reaches 
 
 `docker-compose.yml:212` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🟢 **Closed** — @claude (#124)
 
-*Record note (§11, 2026-09-03): Re-pointed from `:204` to `:212`; #132 renamed the tab named in the cited comment and moved it.*
+*Record note (§11, 2026-09-03): Re-pointed from `:204` to `:212`; #130 moved it (+8 above the citation), and #132 separately rewrote the cited comment when it renamed the tab. §11 first credited the move to #132.*
 *Record note (§10, 2026-09-02): Cited `:160` on 2026-08-27; the code is at `:204` today.*
 
 **Evidence**
@@ -2002,11 +2008,7 @@ docs/TESTING.md is the page a contributor reads to learn what the suite covers, 
 
 `tests/unit/test_repo_integrity.py:21` · Inconsistency · 🟡 Low · ⚠️ Reported · 🔴 **Open**
 
-*Record note (§11, 2026-09-03): Still open, and the title's second clause is now
-worse: this diff added `audit/` and `dashboard/` to CLAUDE.md §2's package table,
-which had never listed them either. Four of the five omissions are now named in
-that table — `alerts`, `audit`, `dashboard`, `metrics` — against one, `worker`,
-that is not. Verified by `ls` at `f9eef10`.*
+*Record note (§11, 2026-09-03): Still open, and the title's second clause is now worse: this diff added `audit/` and `dashboard/` to CLAUDE.md §2's package table, so four of the five omissions — `alerts`, `audit`, `dashboard`, `metrics` — are now named there, against one, `worker`, that is not.*
 
 *Record note (§10, 2026-09-02): Its own count has drifted: `atp_core` now has **15** subpackages, so the list omits five, not four.*
 
@@ -2331,7 +2333,7 @@ commit §10 reviewed.
 The premise is unchanged and is the roadmap's: a status document is worthless
 the moment it lags the code. §10 proved that of a file describing the tree.
 Nothing in the argument was ever specific to `AUDIT.md`, and `docs/` is
-twenty-one files and twenty-six ADRs making the same kind of claim.
+twenty-one files and twenty-five ADRs making the same kind of claim.
 
 ### 11.1 What moved underneath the documentation
 
@@ -2346,14 +2348,14 @@ object between packages, moved eight settings between *storage layers*, and
 renamed a screen. Each of those is a documentation change as much as a code one,
 and only the first is something a compiler or a type-checker can chase.
 
-### 11.2 A rename is a documentation change, and three pointers did not get it
+### 11.2 A rename is a documentation change, and four pointers did not get it
 
 ADR 0025 states the intent plainly:
 
 > Every operator-facing pointer at "the Worker tab" — in the runbook, the
 > preflight fixes, the worker's own startup hints — moved with it.
 
-Three did not:
+Four did not:
 
 | Where | What it said |
 |---|---|
@@ -2434,11 +2436,40 @@ next one does not have to re-derive it.
 
 Each re-anchored finding now carries a `§11` record note giving its previous
 line and the PR that moved it, beneath the `§10` note rather than replacing it.
-That required one change to `test_audit_citations.py`: `RECORD_NOTE` matched the
-literal `§10`, so a second review's notes would have been invisible to the very
-check they exist to satisfy. It now captures the section number. The assertion
-is unchanged — a relocation note must still agree with the citation above it —
-and notes are written newest-first so the current position is the one checked.
+
+That required changing `test_audit_citations.py`, and the first attempt at the
+change was wrong in three ways worth recording, because all three are the
+failure this section is about, committed inside the fix for it.
+
+`RECORD_NOTE` matched the literal `§10`. **Left alone, the check does not merely
+fail to see a §11 note — it goes red**: the §10 note beneath still says "the code
+is at `:203` today" while the citation above it now reads `:205`, and the
+relocation assertion compares exactly those two. So the regex change is
+load-bearing. It is what turns a red test green, and saying only that new notes
+"would have been invisible" understated it.
+
+Capturing the section number was not enough on its own. The parser read the
+*first* note inside a three-line window, which left two holes:
+
+- **A note wrapped across lines matched nothing.** `RECORD_NOTE` is anchored to
+  one line. Finding 82's §11 note was written across five, so it parsed as
+  absent — and it also pushed that finding's §10 note past the window. Finding
+  82 ended up with two notes on the page and none under any assertion, and every
+  check stayed green.
+- **An older note shadowed by a newer one was read by nothing.** With notes
+  newest-first, 14 of the 49 note lines in this file fell outside what the parser
+  reached, against 30 of 30 before. Those 14 are §10 notes stating line numbers
+  this review superseded — stale sentences the guard could no longer see, which
+  is the precise condition §10 was written about.
+
+§11 first claimed the only alternatives were rewriting §10's notes or leaving the
+new ones unparsed. That was false: a third design is strictly stronger and needs
+no document edits. The parser now reads **every** note under a finding, up to its
+Evidence block; the relocation assertion uses the newest; and two new assertions
+close the holes — `test_every_note_is_readable` fails when a note is present but
+unparseable, and `test_notes_run_newest_first` fails when the order that makes
+"newest" meaningful is broken. Both were confirmed to fail against the defect
+they describe before being kept.
 
 ### 11.5 Three findings closed, and one of them was under-stated
 
@@ -2490,6 +2521,53 @@ so is what it *omits*.
   quietly appending an eighth section in the same voice would have made the
   whole document's provenance a little less true.
 
+### 11.7 What an adversarial re-review of this section found
+
+§11 was re-reviewed against the tree by a second pass whose only instruction was
+to break it. It found eleven defects in the diff that wrote this section. They
+are corrected above and recorded here rather than quietly amended, which is what
+C6 asks.
+
+The result worth stating first: **§11 shipped a fabricated number.** Its method
+paragraph reported `make check` green over "2,161 pytest tests". That is §3's
+figure, measured on 2026-08-27 against `tests/unit` alone. `make check` runs the
+whole suite, and the real result is 2,587 passed and 227 skipped. The number was
+copied from one table into another and presented as a fresh measurement; no
+command produced it. That is the defect this document exists to catch, one
+section after the document was rewritten to catch it better, in a paragraph whose
+whole purpose was to say the work had been verified. A count nobody re-derived is
+the same claim as a citation nobody re-resolved.
+
+| # | Defect | Corrected |
+|---:|---|---|
+| 1 | `2,161 pytest tests` was a copied figure, never measured | real numbers, and the copy named |
+| 2 | Four §11 record notes misattributed the PR that moved the citation — findings 3 and 25 credited #130 for a shift entirely #132's, 28 credited #132 for one entirely #131's, 38 credited #132 for a move that was #130's | each corrected, with the wrong attribution named |
+| 3 | Finding 82's §11 note was written across five lines, so it parsed as absent *and* hid the §10 note beneath it — that finding carried two notes and no assertion | note reflowed; `test_every_note_is_readable` added |
+| 4 | Newest-first notes left 14 of 49 note lines outside the parser, against 30 of 30 before — stale line numbers the guard could no longer see | parser reads every note; §11.4 rewritten |
+| 5 | §11.4 claimed only two designs were available; a third is strictly stronger | implemented, and the claim withdrawn |
+| 6 | §11.4 said the old check would not *see* the new notes; it goes **red** — the change is load-bearing | stated plainly |
+| 7 | §11.2's heading and lede said **three** pointers missed the rename, above a table of four and a sentence saying "all four" | four throughout |
+| 8 | §11's premise said "twenty-six ADRs"; there are 25 and a README index | corrected |
+| 9 | Finding 8's note said `:766` "had become a line about port binding"; it is blank, as §11.4 says four pages later | corrected |
+| 10 | Six §11 notes sat directly above `**Evidence**` with no blank line, so note and heading render as one paragraph | blank lines restored |
+| 11 | `DASHBOARD_STATUS.md` §8 said "nothing is defaulted into the worker half"; six of the ten fields carry real defaults — what is absent is a stored row | rewritten, and `DASHBOARD.md:863`, which still called the kill switch the only acting control, corrected with it |
+
+Defects 3 through 6 are one story. §11.4 argues that a citation rots because its
+check asks whether a line exists rather than whether it still holds its subject.
+The fix written in the same diff had the identical shape: a note-parser asking
+whether *a* note sat in a three-line window rather than whether *every* note was
+readable — and it reported green over a finding whose notes it could not see.
+Knowing a failure mode is not the same as not repeating it.
+
+**What this re-review could not establish.** It ran as ten parallel adversaries;
+five died on API errors and every verification agent died with them. Half the
+intended surface — the correctness of the other doc edits, the staleness the
+sweep missed, whether findings 26, 66 and 67 are wholly closed, and whether the
+process obligations in `CLAUDE.md` §6 were met — was never examined, and none of
+the eleven above was independently refuted before being accepted; they were
+confirmed by hand instead. Treat this list as what one pass caught, not as what
+is there.
+
 ---
 
 
@@ -2516,4 +2594,11 @@ checked against the OpenAPI document `scripts/dump_openapi.py` produces; and all
 82 of this file's citations resolved twice, once against `4f68cf4` and once
 against `f9eef10`, with the drifted ones re-found by searching the current file
 for the text they used to name. `make check` green on the result — ruff, eslint,
-mypy, tsc, 2,161 pytest tests and 321 vitest tests.*
+mypy, tsc, 2,587 pytest tests passed (227 skipped: the Postgres integration tier,
+no daemon here) and 321 vitest tests.*
+
+*§11 corrected 2026-09-03 by Claude Code, after an adversarial re-review of its
+own diff. What that review found is §11.7 — including a fabricated number in the
+paragraph directly above this one, which had reported `2,161 pytest tests`. That
+figure is §3's, measured on 2026-08-27; it was copied here and presented as a
+fresh result. Nothing measured it until the review asked.*

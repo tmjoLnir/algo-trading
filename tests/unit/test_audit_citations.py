@@ -52,7 +52,14 @@ LOCATION = re.compile(r"^`([^`]+):(\d+)` · ")
 #:
 #: The *first* note under a finding wins, so notes are written newest-first and
 #: the current position is the one this checks.
-RECORD_NOTE = re.compile(r"^\*Record note \(§\d+, [\d-]+\): (.+)\*$")
+RECORD_NOTE = re.compile(r"^\*Record note \(§(\d+), [\d-]+\): (.+)\*$")
+
+#: A line that *starts* a note, whether or not it is well formed. The gap
+#: between this and RECORD_NOTE is what `test_every_note_is_readable` asserts
+#: away: a note wrapped across two lines matches this and not RECORD_NOTE, so
+#: without it a note can be present, look right in a browser, and be read by
+#: nothing. That is exactly what happened to finding 82.
+NOTE_OPENS = re.compile(r"^\*Record note \(§\d+")
 
 #: The declaration that a citation addresses a *file* rather than a line — the
 #: finding is that something is missing from it, so the number is decoration.
@@ -80,15 +87,32 @@ CITES_AN_ABSENCE = frozenset({36, 81})
 
 
 class Citation:
-    def __init__(self, number: int, path: str, line: int, note: str | None) -> None:
+    def __init__(
+        self, number: int, path: str, line: int, notes: list[tuple[int, str]], note_lines: int
+    ) -> None:
         self.number = number
         self.path = path
         self.line = line
-        self.note = note
+        #: (section number, text) for each note that parsed, in document order.
+        self.notes = notes
+        #: How many lines *look* like a note, parsed or not. A gap between this
+        #: and len(notes) is a note no assertion can read.
+        self.note_lines = note_lines
+
+    @property
+    def note(self) -> str | None:
+        """The newest note — the one that describes the citation as it stands.
+
+        Notes are written newest-first, so this is the highest section number,
+        not the first in the file. Taking the max rather than the first entry
+        means a note accidentally filed out of order still reads correctly here,
+        and `test_notes_run_newest_first` is what complains about the ordering.
+        """
+        return max(self.notes)[1] if self.notes else None
 
     @property
     def declares_an_absence(self) -> bool:
-        return self.note is not None and ABSENCE in self.note
+        return any(ABSENCE in text for _, text in self.notes)
 
     @property
     def target(self) -> Path:
@@ -111,15 +135,30 @@ def citations() -> list[Citation]:
             f"finding {heading.group(1)} does not open with a `path:line` citation: "
             f"{lines[index + 2]!r}"
         )
-        note = next(
-            (
-                match.group(1)
-                for candidate in lines[index + 3 : index + 6]
-                if (match := RECORD_NOTE.match(candidate))
-            ),
-            None,
+        # Every note under this finding, in document order, up to its Evidence
+        # block. A fixed lookahead window was what stood here, and it had two
+        # holes that showed up the first time a second review left notes: a
+        # multi-line note matched nothing (RECORD_NOTE is anchored on one line),
+        # and an older note pushed past the window vanished silently. Both are
+        # now failures rather than blind spots — see TestTheRecordNotes.
+        raw: list[str] = []
+        parsed: list[tuple[int, str]] = []
+        for candidate in lines[index + 3 :]:
+            if candidate.startswith("**Evidence**") or candidate.startswith("####"):
+                break
+            if NOTE_OPENS.match(candidate):
+                raw.append(candidate)
+            if match := RECORD_NOTE.match(candidate):
+                parsed.append((int(match.group(1)), match.group(2)))
+        out.append(
+            Citation(
+                int(heading.group(1)),
+                location.group(1),
+                int(location.group(2)),
+                parsed,
+                len(raw),
+            )
         )
-        out.append(Citation(int(heading.group(1)), location.group(1), int(location.group(2)), note))
     assert out, "no findings parsed out of AUDIT.md"
     return out
 
@@ -175,6 +214,32 @@ class TestTheRecordNotes:
     """§10 re-anchored 24 citations and left a note under each one saying where
     it used to point. The notes are a third copy of the line number, so they
     drift like the other two."""
+
+    def test_every_note_is_readable(self, citations: list[Citation]) -> None:
+        """A note the parser cannot read is a note no assertion can hold.
+
+        It renders correctly in a browser, so nothing about it looks wrong; only
+        this comparison says so. Finding 82's §11 note was wrapped across five
+        lines on the day this check did not exist, which silently took *both* of
+        that finding's notes out of every assertion below.
+        """
+        for citation in citations:
+            assert citation.note_lines == len(citation.notes), (
+                f"{citation} has {citation.note_lines} record-note line(s) but "
+                f"{len(citation.notes)} that parse — a note wrapped across lines, or "
+                f"otherwise malformed, is read by nothing. Keep each note on one line."
+            )
+
+    def test_notes_run_newest_first(self, citations: list[Citation]) -> None:
+        """The newest note describes the citation as it stands; older ones are
+        history beneath it. Out of order, a reader meets a superseded line
+        number first and has no way to know it is superseded."""
+        for citation in citations:
+            sections = [section for section, _ in citation.notes]
+            assert sections == sorted(sections, reverse=True), (
+                f"{citation}'s notes are in section order {sections}; they must run "
+                f"newest-first (highest section number at the top)"
+            )
 
     def test_a_relocation_note_matches_the_citation_above_it(
         self, citations: list[Citation]

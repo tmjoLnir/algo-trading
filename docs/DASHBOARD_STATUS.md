@@ -364,7 +364,9 @@ cannot show a strategy the server would reject.
   before anything was ever saved reports a distinct sentinel rather than
   revision 1, so "nothing is stored" and "stored, and it happens to equal the
   defaults" are not shown as the same state.
-- **Nothing is defaulted into the worker half.** A fresh install trades nothing
+- **Nothing is *stored* for the worker half.** `WorkerConfig` does carry defaults —
+  `risk_pct` sizing at 1%, a 2×ATR stop, a 60-second feed watchdog — but the
+  watchlist and strategy default to empty, so a fresh install trades nothing
   until somebody opens this tab, which is the same posture an empty
   `WORKER_STRATEGY` always had. The migration does backfill the eight ceilings
   with the values `.env.example` used to ship.
