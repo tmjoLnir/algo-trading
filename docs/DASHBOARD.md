@@ -102,6 +102,32 @@ Top to bottom, in the order a person needs it:
 Positions before signals: what you are exposed to matters more than what the
 system is thinking about.
 
+Items 1 and 2, and the tab bar beneath them, are *pinned* to the top of the
+viewport rather than merely placed there first. "Above everything else" was a
+claim about the top of the document, and every screen here is a long table: an
+operator reading row 200 of the order history had scrolled the run mode, the
+halt list and the navigation off the top together. A banner only visible from a
+scroll position nobody acting is at states nothing to the person it exists to
+interrupt.
+
+Two consequences of pinning, both load-bearing:
+
+- **The pinned block carries its own opaque background.** Both banners are
+  alpha-blended against the page, so without one the rows sliding underneath
+  are legible through the words LIVE TRADING.
+- **A tab change returns to the top of the screen you asked for.** The nav is
+  now reachable from the bottom of a table, and React Router does not reset the
+  window's scroll offset across a route change — carrying it over opens the
+  audit log part-way down, at whatever row happens to be there. This is
+  deliberately held by an effect in `App` rather than left to the browser: on a
+  *first* visit the destination's loading state makes the document shorter than
+  the offset and the browser clamps to the top by itself, so the bug hides from
+  anyone who tests it once. It returns on every revisit, where TanStack Query
+  renders the cached screen at full height with nothing to clamp against. A
+  *re-render* is not a tab change either: the book re-reads on every socket
+  frame, and a halt engaged elsewhere in the system must not jump the page of
+  whoever is mid-table when it lands.
+
 ## Rules for this UI
 
 - **Never show a price without its age.** Grey out anything stale. The book's
