@@ -217,9 +217,11 @@ Fill in, at minimum:
 **The watchlist and the strategy are not in this file.** What the worker trades
 — the symbols, the strategy and its parameters, the sizing, the protective stop,
 the feed watchdog and the third live lock — is a row in the database, edited on
-the dashboard's **Worker** tab. Nothing is defaulted into it, so a freshly
-deployed host ingests nothing and places no orders until somebody opens that tab
-and says what to trade. Configuration is read once at worker start, so a save
+the dashboard's **Config** tab. The eight account-wide risk ceilings joined that
+same row in ADR 0025, so the tab is no longer only about the worker: those bind
+an order this dashboard places while no worker is running. Nothing is defaulted
+into the worker half, so a freshly deployed host ingests nothing and places no
+orders until somebody opens that tab and says what to trade. Configuration is read once at worker start, so a save
 takes effect on `docker compose restart worker`; the tab says so, and says which
 revision the running process is on.
 

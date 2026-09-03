@@ -64,13 +64,15 @@ Inside `libs/core/src/atp_core/`:
 | `strategy/` | `Strategy` base class, the declarative rule spec, the registry. |
 | `indicators/` | Pure functions over price series. |
 | `data/` | Market-data ports, bar storage, the realtime stream consumer. |
-| `brokers/` | `BrokerPort` + adapters (Alpaca live, Alpaca paper, simulated, fake). |
+| `brokers/` | `BrokerPort` + adapters: Alpaca (paper and live are the same adapter on different endpoints, ADR 0003) and simulated. The in-memory fake is a test double in `tests/fakes.py`. |
 | `execution/` | Order router, order state machine, broker reconciliation. |
 | `risk/` | Pre-trade validation, stop management, the kill switch. |
 | `alerts/` | The alert port and its transports — reaching a human off-screen. |
+| `audit/` | The audit port and its verb vocabulary — who did what, and when. |
 | `metrics/` | Operational metrics. Every metric name in the platform, declared once. |
 | `backtest/` | Historical event loop, portfolio simulation, cost models, metrics. |
 | `analytics/` | Performance statistics and report generation. |
+| `dashboard/` | The read models the dashboard is served from — the live aggregate and the equity curve. |
 | `worker/` | What the worker trades, as a validated value object and two ports. Configuration an operator owns at runtime — not `Settings`, which is what the *process* is. |
 | `persistence/` | SQLAlchemy models, repositories, session management. |
 

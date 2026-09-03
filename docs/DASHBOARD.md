@@ -860,7 +860,9 @@ Stated here rather than left to be discovered:
   Every write handler across `orders.py` and `positions.py` is still a stub,
   because they place things and there is one path from an intent to a venue
   (rule §1.5, ADR 0005) — the path that also carries the audit events ADR 0010
-  is waiting on. The kill switch remains the only acting control in this UI.
+  is waiting on. The kill switch is the only control in this UI that *acts on the
+  book*; since ADR 0023 the Config tab also writes what the worker will trade,
+  including the third live lock (docs/DASHBOARD_STATUS.md §8).
 - **The signal feed on *this screen* does not survive a restart**, though the
   signals themselves now do. The feed is still a bounded in-memory ring on the
   strategy runner, so a deploy empties what the dashboard shows;

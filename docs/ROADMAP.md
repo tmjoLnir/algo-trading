@@ -2024,7 +2024,7 @@ wording if it is not the demonstration you want.
   that process's event loop for the whole run — no ticks consumed, no bars
   stored, and `StalenessMonitor` eventually halting trading because the feed
   looked dead. It is not dead; the process is busy being a calculator. So
-  `apps/worker/queue.py` runs in its own container, one job at a time, and the
+  `apps/worker/src/atp_worker/queue.py` runs in its own container, one job at a time, and the
   engine runs in a thread even there so arq can keep answering its own health
   check.
 
