@@ -1987,13 +1987,13 @@ wording if it is not the demonstration you want.
   round across its own bound and leave the row unloadable by everything that
   reads it — the endpoint that would repair it included.
 
-  **Finding #42 stays marked Open in AUDIT.md, deliberately.** That file's
-  convention is that a state is annotated with the PR that earned it, in the same
-  diff. It is marked closed — and its citation re-pointed away from
-  `config.py:29`, which now addresses unrelated code — when this work has a PR
-  number to annotate it with. Claiming closure here while the audit still reads
-  Open would put the two records in disagreement, which is the failure the
-  audit's own state axis exists to prevent.
+  **Finding #42 is marked Closed in AUDIT.md against #132**, with its citation
+  re-pointed off `config.py:29` — which now addresses unrelated code — onto the
+  `_check_fraction` that carries the bounds it said were absent, and a record
+  note saying so. That file's convention is that a state is annotated with the PR
+  that earned it, in the same diff; this is that diff. Its ⚠️ mark became ✅,
+  because the defect was reproduced before it was fixed, which moved §3's state
+  table and §8.1's count with it.
 
   **They do not ask for the password, and that is deliberate.**
   `allow_live_orders` grants a capability to an unattended loop; these bound

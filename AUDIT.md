@@ -5,7 +5,7 @@
 **Findings:** 82 (14 high, 40 medium, 28 low)
 
 **State reviewed:** 2026-09-02 against `4f68cf4`, under the record conventions
-`docs/ROADMAP.md` sets for a file of this kind. 8 closed, 1 half-closed, 73
+`docs/ROADMAP.md` sets for a file of this kind. 9 closed, 1 half-closed, 72
 open; 27 citations no longer resolve. What that review found, and why this file
 needed one at all, is §10.
 
@@ -82,11 +82,11 @@ roadmap's summary. §10.6 said this was missing; it is not any more (#129).
 | | 🟢 Closed | 🟡 Half-closed | 🔴 Open | Total |
 |---|---:|---:|---:|---:|
 | 🔴 High | 1 | 0 | 13 | **14** |
-| 🟠 Medium | 6 | 1 | 33 | **40** |
+| 🟠 Medium | 7 | 1 | 32 | **40** |
 | 🟡 Low | 1 | 0 | 27 | **28** |
-| **Total** | **8** | **1** | **73** | **82** |
+| **Total** | **9** | **1** | **72** | **82** |
 
-Of the 73 still open, **50 have never been re-checked by anyone** — they were
+Of the 72 still open, **49 have never been re-checked by anyone** — they were
 ⚠️ Reported on 2026-08-27 and are ⚠️ Reported now.
 
 ### By area
@@ -1086,7 +1086,9 @@ This value feeds `compute_all` for CAGR (`years = len(returns) / periods_per_yea
 
 #### 42. `RiskLimits` applies no bounds to any of the ceilings the whole platform's safety rests on
 
-`libs/core/src/atp_core/config.py:29` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
+`libs/core/src/atp_core/risk/limits.py:197` · Broken · 🟠 Medium · ✅ Verified · 🟢 **Closed** — @claude (#132)
+
+*Record note (§10, 2026-09-03): Re-pointed from `:29` to `:197`, and to a different file — `RiskLimits` moved out of `atp_core.config` into `atp_core.risk.limits` when the ceilings became a `worker_config` row (ADR 0025), so the citation now addresses the `_check_fraction` that carries the bounds this finding said were absent. Verified by execution before the fix: `RISK_MAX_POSITION_PCT=10` loaded cleanly and `max_orders_per_minute=0` denied every order, exactly as reported. The fix also closes a case the finding did not reach — `NUMERIC(20, 8)` rounds rather than refusing, so a ceiling accepted at nine decimal places could round across its own bound and leave the row unloadable by everything that reads it.*
 
 **Evidence**
 
@@ -2029,10 +2031,11 @@ design. Recording them stops the next audit re-deriving them.
 Stated plainly, because an audit that overstates its coverage is worse than a
 shorter one.
 
-1. **The adversarial verification pass did not run.** 57 of the 82 findings are
-   marked ⚠️ and have not been independently re-checked. I verified 25 myself,
-   including 8 of the 14 high-severity findings. Verify before acting, and
-   especially before changing risk or execution code.
+1. **The adversarial verification pass did not run.** 56 of the 82 findings are
+   marked ⚠️ and have not been independently re-checked. I verified 26 myself,
+   including 8 of the 14 high-severity findings — 25 in the original pass, and
+   #42 later, by reproduction, in the change that closed it (#132). Verify
+   before acting, and especially before changing risk or execution code.
 2. **One of thirteen reviewers did not finish** — the repository-wide dead-code
    and duplication sweep over `libs/core`. Partial coverage of that dimension came
    from my own AST-based unused-symbol scan, which is how findings 75 and 76 were
