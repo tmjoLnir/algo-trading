@@ -628,8 +628,9 @@ value loads" to.
 read the database, so it wrote nothing to it either; positions, stops and the
 halt state are whatever they were, and broker-side stops are held by the venue
 regardless. `scripts/halt.py` reads Redis and the venue, not Postgres, so it is
-unaffected, and `uv run python scripts/halt.py engage` is available if you would
-have halted anyway.
+unaffected, and `uv run python scripts/halt.py engage --by "<your name>" --detail
+"postgres outage"` is available if you would have halted anyway (`--by` is
+required — the halt is attributed).
 
 > **This section used to say `scripts/status.py` was unaffected too, and that
 > was wrong.** It reads Redis *and* Postgres — the bars section is a database

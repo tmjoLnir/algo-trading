@@ -2339,7 +2339,7 @@ twenty-one files and twenty-five ADRs making the same kind of claim.
 
 | PR | Change | What it invalidated |
 |---|---|---|
-| #130 | The alembic entrypoint reads `.env`, and the deployed migrate service stops using the development password | Line numbers in `queue.py` and `check_port_bindings.py` |
+| #130 | The alembic entrypoint reads `.env`, and the deployed migrate service stops using the development password | Line numbers in `check_port_bindings.py` and `docker-compose.yml` |
 | #131 | Banners, tab bar and kill switch pinned to the top of every screen | The kill switch is no longer "on the Dashboard tab" |
 | #132 | The eight account-wide ceilings move out of `.env` into `worker_config`; `RiskLimits` moves out of `atp_core.config` into `atp_core.risk.limits`; the **Worker** tab is renamed **Config** | Every pointer at the old tab, the old class location, and `.env` as the place a ceiling is set |
 
@@ -2400,10 +2400,12 @@ TSX array and a bolded word in prose, and nothing relates the two.
 
 §10.4 resolved all 82 citations at two commits and re-anchored 23. #129 then
 added `tests/unit/test_audit_citations.py` so it could not happen silently
-again. It happened again, silently, in the five PRs since:
+again. It happened again, silently, over the PRs that check has existed for:
 
 **Fourteen of the 82 citations no longer resolved to the text they named**, and
-`test_audit_citations.py` was green on every one of those commits. Two of them —
+`test_audit_citations.py` was green on every commit it existed for — #129, which
+created it, onward. (#128 predates it; §11 first said "every one of those
+commits", which claimed a check for a commit that did not have one.) Two of them —
 findings **8** and **80** — pointed at blank lines. Finding 7's, a high-severity
 entry, had drifted 52 lines and carried its stale copy in §3's glance table with
 it. A fifteenth, finding 29's, moved by one line in *this* diff, when a sentence
@@ -2559,14 +2561,45 @@ whether *a* note sat in a three-line window rather than whether *every* note was
 readable — and it reported green over a finding whose notes it could not see.
 Knowing a failure mode is not the same as not repeating it.
 
-**What this re-review could not establish.** It ran as ten parallel adversaries;
-five died on API errors and every verification agent died with them. Half the
-intended surface — the correctness of the other doc edits, the staleness the
-sweep missed, whether findings 26, 66 and 67 are wholly closed, and whether the
-process obligations in `CLAUDE.md` §6 were met — was never examined, and none of
-the eleven above was independently refuted before being accepted; they were
-confirmed by hand instead. Treat this list as what one pass caught, not as what
-is there.
+**The five dimensions that died were re-run**, and found eight more defects. Two
+are worse than anything in the first list.
+
+| # | Defect | Corrected |
+|---:|---|---|
+| 12 | `RUNBOOK.md:631` replaced a command that does not exist with **one that fails**: `scripts/halt.py engage` aborts on a missing `--by`. In the Postgres-outage procedure, so it fails exactly when it is read | full command, `--by` and all |
+| 13 | §11.1's table credited #130 with `queue.py`'s line numbers — the same false attribution as findings 3 and 25, and the row those two notes were derived from. Three instances of one wrong premise | row corrected to the files #130 actually touched |
+| 14 | §11.4 said `test_audit_citations.py` "was green on every one of those commits" across #128–#132. It did not exist at #128; #129 created it | scoped to the commits it existed for |
+| 15 | `DASHBOARD_STATUS.md:73` still said `HALT TRADING` "is the whole of the tab's write surface, and it is the whole of the app's" — false since ADR 0023, in the file this diff rewrote for that exact claim | scoped to the tab, pointing at §8 |
+| 16 | `DASHBOARD_STATUS.md:110` still called `/risk/limits` the fallback that "reads config and touches no store". Since ADR 0025 it reads the `worker_config` row and needs Postgres | narrowed, with what it does and does not survive |
+| 17 | The provenance paragraph was corrected to "twelve audit verbs" while §7's enumeration four pages down still said eleven and listed eleven — the same file asserting two counts of one set | twelve, with `worker_config_updated` named |
+| 18 | Four citations in `RISK_IMPLEMENTATION_NOTES.md` resolved to **blank lines** — the one docs file where this diff did re-anchor citations, and it swept only the three it was already looking at | re-anchored |
+| 19 | Re-marking findings 66 and 67 ✅ Verified at the moment of closing them moved §8.1's coverage headline, which is a claim about how much of this document is a lead rather than a defect | the objection is recorded below rather than silently kept |
+
+Defect 12 is the sharpest thing either round found. §11.3 lists `make halt` as a
+command that "fails at the moment it is read"; the correction printed a command
+that also fails at the moment it is read, for a different reason, and the review
+that caught it was refuted by two of its own three verifiers before being checked
+by hand. Defect 18 is the same shape one level up: this diff argued that
+citations rot silently, re-anchored fifteen in `AUDIT.md`, opened the one docs
+file whose citations it also touched, and did not sweep the rest of it.
+
+On defect 19, stated rather than resolved: §2 defines ✅ as "I re-read the source
+myself and confirmed it", which is what happened, so the marks are defensible on
+the letter. What they also did was move §8.1's "N of the 82 findings are marked
+⚠️" — the sentence telling a reader how much of this file to trust — by counting
+a re-read performed *in order to close* a finding as independent verification of
+it. A closure and a verification are not the same act, and a future review should
+decide whether the evidence axis may move at closure at all.
+
+**What neither round established.** Every verification agent in the first run
+died, and the second lost the verifiers for three dimensions to a session limit,
+so of the nineteen defects above only some were independently refuted before
+being accepted; the rest were confirmed by hand. `RISK_IMPLEMENTATION_NOTES.md`
+has had four dead citations re-anchored and has **not** had the full sweep defect
+18 shows it needs — at least `order.py:40-43`, cited for a docstring, addresses a
+field. No dimension re-examined findings 26 and 67's closures after defect 12,
+and none checked the other docs the sweep never opened. Treat this list as what
+two passes caught, not as what is there.
 
 ---
 

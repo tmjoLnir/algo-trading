@@ -70,8 +70,9 @@ totals understate exposure.
 
 **Outstanding**
 
-- `HALT TRADING` is the whole of the tab's write surface, and it is the whole of
-  the app's. It works now (#70), including the 503 it answers when the switch
+- `HALT TRADING` is the whole of *this tab's* write surface. It stopped being the
+  whole of the app's when the Config tab arrived (ADR 0023, then ADR 0025) — see
+  §8 and the cross-cutting note below. It works now (#70), including the 503 it answers when the switch
   cannot be written — a state that is neither "stopped" nor "trading", because
   the switch fails closed but records nothing, so trading resumes when the store
   recovers. The button renders that message rather than swallowing it.
@@ -108,9 +109,11 @@ Three states that deliberately do not look alike: a published book gives real
 readings; **no published book gives the ceilings with every reading `—` and no
 bar drawn at all**, since an empty bar and a bar at zero are the same picture
 and one of them means nobody knows what the book holds; and a `/risk/status`
-that fails falls back to `/risk/limits`, which reads config and touches no
-store, so the ceilings still render with the reason for the missing readings
-stated above them.
+that fails falls back to `/risk/limits`, so the ceilings still render with the
+reason for the missing readings stated above them. **That fallback is narrower
+than it was.** It read `Settings` and touched no store when this was written;
+since ADR 0025 the ceilings are a `worker_config` row, so `/risk/limits` needs
+Postgres too — it survives a broker or Redis outage, not a database one.
 
 **Outstanding**
 
@@ -268,11 +271,13 @@ labelled as such.
 
 ## 7. Audit — `/audit`
 
-**The screen was very nearly the finding.** The audit trail records eleven
+**The screen was very nearly the finding.** The audit trail records twelve
 verbs: five about who was signed in — `login`, `login_failed`, `logout`,
 `rate_limited`, `forbidden` — two about the kill switch, `halt_engaged` (#70)
-and `halt_cleared` (#75), one about authoring, `strategy_created`, and three
-about closing out: `order_cancelled`, `position_closed` and `flatten_all`. Each
+and `halt_cleared` (#75), one about authoring, `strategy_created`, three about
+closing out — `order_cancelled`, `position_closed` and `flatten_all` — and one
+about configuration, `worker_config_updated` (#124), which also carries every
+risk-ceiling change since ADR 0025. Each
 arrived with the endpoint that emits it, because the class docstring's rule is
 that a constant for an event nothing emits is a claim the record does not
 support. `POST /orders` and strategy promotion are still stubs, so there is
