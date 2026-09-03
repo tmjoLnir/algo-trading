@@ -13,6 +13,12 @@
  * WebSocket is not here either, and for the same reason** — it feeds those
  * banners, so it belongs to the session rather than to this page
  * (`components/LiveStream.tsx`).
+ *
+ * **The kill switch has joined them** (`App`'s `PinnedKillSwitch`). It was the
+ * odd one out: a control whose own docstring promises it is always visible,
+ * mounted on this route alone and scrolling away with the positions table. It
+ * is not a dashboard control — it is a session one, like the banners that say
+ * why you would reach for it.
  */
 
 import { useLiveDashboard, useLiveQuotes } from '@/hooks/useLiveDashboard'
@@ -23,7 +29,6 @@ import OrdersTable from '@/components/OrdersTable'
 import EquityChart from '@/components/EquityChart'
 import FeedStatus from '@/components/FeedStatus'
 import RefreshIndicator from '@/components/RefreshIndicator'
-import KillSwitchButton from '@/components/KillSwitchButton'
 
 export default function Dashboard() {
   const { data, isLoading, error, dataUpdatedAt, refetch, isFetching } = useLiveDashboard()
@@ -52,14 +57,11 @@ export default function Dashboard() {
           stale={Boolean(error)}
           bookAgeSeconds={data?.book_age_seconds ?? null}
         />
-        <div className="flex items-center gap-3">
-          <FeedStatus
-            healthy={data?.data_feed_healthy ?? null}
-            lastDataAt={data?.last_data_at ?? null}
-            marketOpen={data?.market_open ?? false}
-          />
-          <KillSwitchButton halted={(data?.active_halts?.length ?? 0) > 0} />
-        </div>
+        <FeedStatus
+          healthy={data?.data_feed_healthy ?? null}
+          lastDataAt={data?.last_data_at ?? null}
+          marketOpen={data?.market_open ?? false}
+        />
       </div>
 
       {error ? (
