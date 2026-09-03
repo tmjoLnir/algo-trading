@@ -38,7 +38,7 @@ counting locks got two. Layers 1 and 2 say *this process may trade real money*;
 by different people at different times.
 
 It is the one lock that lives in the database rather than the environment
-(`worker_config.allow_live_orders`, edited on the dashboard's Worker tab), and
+(`worker_config.allow_live_orders`, edited on the dashboard's Config tab), and
 that widening comes with its own conditions: a read-only session cannot touch
 it, arming it demands the operator's password with the request, and every change
 is written to the audit log with its before and after. Turning it **off** asks

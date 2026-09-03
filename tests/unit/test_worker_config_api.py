@@ -42,6 +42,7 @@ from atp_api.main import create_app
 from atp_core.audit.ports import Action
 from atp_core.config import Settings, get_settings
 from atp_core.domain import RunMode
+from atp_core.risk.limits import RiskLimits
 from atp_core.worker import RunningWorkerConfig, StoredWorkerConfig, WorkerConfig
 from tests.fakes import (
     FakeWorkerConfigRepository,
@@ -79,6 +80,22 @@ def live_settings() -> Settings:
     )
 
 
+#: The eight ceilings as `.env` used to ship them, which is what
+#: `DEFAULT_RISK_LIMITS` holds — so a payload carrying these saves a
+#: configuration indistinguishable from the one this platform had before they
+#: were editable, and the assertions here stay about what the endpoint does.
+DEFAULT_RISK: dict[str, Any] = {
+    "max_position_pct": "0.10",
+    "max_gross_exposure_pct": "1.00",
+    "max_daily_loss_pct": "0.03",
+    "max_orders_per_minute": 30,
+    "max_open_positions": 20,
+    "max_quote_age_seconds": 30,
+    "default_stop_loss_pct": "0.02",
+    "default_take_profit_pct": "0.06",
+}
+
+
 def a_payload(**overrides: Any) -> dict[str, Any]:
     """A complete, valid body. Every field, always — the endpoint takes no
     partial update, because a stop multiplier silently retaining an old value
@@ -95,6 +112,10 @@ def a_payload(**overrides: Any) -> dict[str, Any]:
         "stop_multiplier": "2",
         "stop_period": 14,
         "allow_live_orders": False,
+        # The ceilings ride along in the same body, and every field of them is
+        # required for the same reason the rest are: a partial risk section
+        # would let a browser's idea of "dirty" decide which limit stayed put.
+        "risk": DEFAULT_RISK,
     }
     body.update(overrides)
     return body
@@ -400,3 +421,189 @@ class TestTheThirdLock:
 
         assert response.status_code == 403
         assert repo.saves == []
+
+
+class TestTheRiskCeilings:
+    """The eight ceilings, on the same screen and in the same save.
+
+    Their being here at all is the change: they were `RISK_*` environment
+    variables, unreachable from a browser and unattributable to anybody. What
+    these cases hold is that moving them did not cost the two things `.env`
+    never had — a refusal that names the field, and a record of who moved which
+    number and from what — and did not buy something it should not have, namely
+    a second password prompt in front of *tightening* a limit.
+    """
+
+    async def test_they_are_served_with_the_saved_configuration(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        body = (await client.get(CONFIG)).json()
+
+        assert body["saved"]["config"]["risk"]["max_position_pct"] == "0.10"
+        assert body["saved"]["config"]["risk"]["max_open_positions"] == 20
+
+    async def test_the_fractions_are_strings(self, client: httpx.AsyncClient) -> None:
+        """Each is multiplied by equity to produce the number an order is
+        refused against, so none of them passes through a JSON float."""
+        risk = (await client.get(CONFIG)).json()["saved"]["config"]["risk"]
+
+        for name in ("max_position_pct", "max_gross_exposure_pct", "max_daily_loss_pct"):
+            assert isinstance(risk[name], str), name
+
+    async def test_the_form_catalogue_is_served_with_them(self, client: httpx.AsyncClient) -> None:
+        """The dashboard renders its boxes from this rather than from a list of
+        its own, so the prose beside a number that stops real money cannot drift
+        from the argument for it."""
+        fields = (await client.get(CONFIG)).json()["options"]["risk_fields"]
+
+        assert {f["name"] for f in fields} == {
+            "max_position_pct",
+            "max_gross_exposure_pct",
+            "max_daily_loss_pct",
+            "max_orders_per_minute",
+            "max_open_positions",
+            "max_quote_age_seconds",
+            "default_stop_loss_pct",
+            "default_take_profit_pct",
+        }
+        assert all(f["help"] for f in fields)
+
+    async def test_a_save_stores_them(
+        self, client: httpx.AsyncClient, repo: FakeWorkerConfigRepository
+    ) -> None:
+        tighter = {**DEFAULT_RISK, "max_position_pct": "0.04", "max_open_positions": 5}
+
+        response = await client.put(CONFIG, json=a_payload(risk=tighter))
+
+        assert response.status_code == 200
+        assert repo.saves[-1].risk.max_position_pct == Decimal("0.04")
+        assert repo.saves[-1].risk.max_open_positions == 5
+
+    async def test_a_fraction_arrives_as_a_decimal_not_a_float(
+        self, client: httpx.AsyncClient, repo: FakeWorkerConfigRepository
+    ) -> None:
+        """The value stored is the value typed. `Decimal(0.07)` is
+        0.070000000000000006...; a ceiling is not allowed to become that."""
+        await client.put(
+            CONFIG, json=a_payload(risk={**DEFAULT_RISK, "max_daily_loss_pct": "0.07"})
+        )
+
+        assert repo.saves[-1].risk.max_daily_loss_pct == Decimal("0.07")
+
+    async def test_a_bad_ceiling_is_refused_in_the_value_objects_words(
+        self, client: httpx.AsyncClient, repo: FakeWorkerConfigRepository
+    ) -> None:
+        """400 with the sentence `RiskLimits` wrote — the same one the worker
+        would print refusing to start on the row, because it is the same rule."""
+        response = await client.put(
+            CONFIG, json=a_payload(risk={**DEFAULT_RISK, "max_open_positions": 0})
+        )
+
+        assert response.status_code == 400
+        assert "max_open_positions" in response.json()["detail"]
+        assert repo.saves == []
+
+    async def test_a_position_limit_above_the_gross_limit_is_refused(
+        self, client: httpx.AsyncClient, repo: FakeWorkerConfigRepository
+    ) -> None:
+        response = await client.put(
+            CONFIG,
+            json=a_payload(
+                risk={**DEFAULT_RISK, "max_position_pct": "0.9", "max_gross_exposure_pct": "0.5"}
+            ),
+        )
+
+        assert response.status_code == 400
+        assert repo.saves == []
+
+    async def test_a_missing_risk_section_is_refused(
+        self, client: httpx.AsyncClient, repo: FakeWorkerConfigRepository
+    ) -> None:
+        """No partial update, for the reason the rest of the body has none: a
+        ceiling silently retaining its old value because a browser did not think
+        the box was dirty is the surprise this row must not have."""
+        body = a_payload()
+        del body["risk"]
+
+        response = await client.put(CONFIG, json=body)
+
+        assert response.status_code == 422
+        assert repo.saves == []
+
+    async def test_what_changed_names_the_ceiling_and_both_numbers(
+        self, client: httpx.AsyncClient, audit: RecordingAuditSink
+    ) -> None:
+        """The whole reason these left `.env`. "The configuration was saved"
+        answers nothing a post-mortem asks; "max_position_pct went from 0.10 to
+        0.25, saved by josh at 14:32" answers most of it."""
+        await client.put(CONFIG, json=a_payload(risk={**DEFAULT_RISK, "max_position_pct": "0.25"}))
+
+        changes = audit.entries[-1].detail["changes"]
+        assert changes["risk.max_position_pct"] == {"from": "0.10", "to": "0.25"}
+
+    async def test_an_unchanged_ceiling_is_not_in_the_diff(
+        self, client: httpx.AsyncClient, audit: RecordingAuditSink
+    ) -> None:
+        """Eight rows saying "unchanged" is how the one that moved gets missed."""
+        await client.put(CONFIG, json=a_payload(risk={**DEFAULT_RISK, "max_position_pct": "0.25"}))
+
+        changes = audit.entries[-1].detail["changes"]
+        assert [k for k in changes if k.startswith("risk.")] == ["risk.max_position_pct"]
+
+    async def test_tightening_one_asks_for_no_password(
+        self, client: httpx.AsyncClient, repo: FakeWorkerConfigRepository
+    ) -> None:
+        """The asymmetry that keeps the step-up meaningful. `allow_live_orders`
+        grants a capability; these bound orders that are already permitted, and
+        making a limit *harder* to tighten is the wrong direction — the same
+        reason `/halt` asks for nothing."""
+        response = await client.put(
+            CONFIG, json=a_payload(risk={**DEFAULT_RISK, "max_position_pct": "0.02"})
+        )
+
+        assert response.status_code == 200
+        assert repo.saves[-1].risk.max_position_pct == Decimal("0.02")
+
+    async def test_loosening_one_asks_for_no_password_either_but_is_recorded(
+        self, client: httpx.AsyncClient, audit: RecordingAuditSink
+    ) -> None:
+        """Stated rather than assumed, because it is the direction that can lose
+        money. The answer is not a prompt — it is that the audit row carries
+        both numbers and the operator's name, which is what makes a loosening
+        answerable afterwards."""
+        response = await client.put(
+            CONFIG, json=a_payload(risk={**DEFAULT_RISK, "max_position_pct": "0.95"})
+        )
+
+        assert response.status_code == 200
+        entry = audit.entries[-1]
+        assert entry.actor == "test-operator"
+        assert entry.detail["changes"]["risk.max_position_pct"]["to"] == "0.95"
+
+    async def test_the_running_worker_reports_its_own_ceilings(
+        self, client: httpx.AsyncClient, repo: FakeWorkerConfigRepository, status: Any
+    ) -> None:
+        """The gap this screen exists to show, applied to the ceilings. A worker
+        enforces what it booted with; a save since then is not in force for it
+        until it restarts, and the screen must be able to show both numbers."""
+        booted = WorkerConfig(
+            symbols=("SPY",),
+            strategy="sma_crossover",
+            risk=RiskLimits(max_position_pct=Decimal("0.02")),
+        )
+        # LIVE because that is the run mode these settings pin: the status
+        # store is keyed by it, and a report filed under another mode is a
+        # report this screen correctly cannot see.
+        await status.put(
+            RunMode.LIVE,
+            RunningWorkerConfig(
+                config=booted, revision=6, started_at=NOW, trading=True, reason="trading"
+            ),
+        )
+        repo.stored = a_stored(risk=RiskLimits(max_position_pct=Decimal("0.5")))
+
+        body = (await client.get(CONFIG)).json()
+
+        assert body["running"]["config"]["risk"]["max_position_pct"] == "0.02"
+        assert body["saved"]["config"]["risk"]["max_position_pct"] == "0.5"
+        assert body["pending_restart"] is True

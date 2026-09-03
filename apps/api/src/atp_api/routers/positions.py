@@ -48,6 +48,7 @@ from atp_api.deps import (
     get_broker,
     get_calendar,
     get_clock,
+    get_effective_risk_limits,
     get_kill_switch,
     get_portfolio_repository,
     get_quote_cache,
@@ -63,6 +64,7 @@ from atp_core.data.ports import QuoteCache
 from atp_core.errors import ATPError
 from atp_core.execution.ports import PortfolioRepository
 from atp_core.risk.killswitch import KillSwitch
+from atp_core.risk.limits import RiskLimits
 
 router = APIRouter(prefix="/positions", tags=["positions"])
 
@@ -166,6 +168,7 @@ async def close_position(
     clock: Annotated[Clock, Depends(get_clock)],
     calendar: Annotated[TradingCalendar, Depends(get_calendar)],
     settings: Annotated[Settings, Depends(get_settings)],
+    limits: Annotated[RiskLimits, Depends(get_effective_risk_limits)],
     portfolio_repo: Annotated[PortfolioRepository, Depends(get_portfolio_repository)],
     quote_cache: Annotated[QuoteCache, Depends(get_quote_cache)],
     audit: Annotated[AuditSink, Depends(get_audit_sink)],
@@ -215,7 +218,7 @@ async def close_position(
         kill_switch=kill_switch,
         clock=clock,
         calendar=calendar,
-        settings=settings,
+        limits=limits,
         quotes=quotes,
     )
     try:

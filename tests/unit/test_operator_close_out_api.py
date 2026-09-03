@@ -38,6 +38,7 @@ from atp_api.deps import (
     get_kill_switch,
     get_portfolio_repository,
     get_quote_cache,
+    get_worker_config_repository,
 )
 from atp_api.main import create_app
 from atp_core.audit.ports import Action
@@ -45,7 +46,13 @@ from atp_core.clock import SimulatedClock, TradingCalendar
 from atp_core.config import Settings, get_settings
 from atp_core.domain import Order, OrderType, Portfolio, Quote, Side
 from atp_core.risk.killswitch import HaltReason, HaltScope
-from tests.fakes import FakeBroker, FakeKillSwitch, FakePortfolioRepository, RecordingAuditSink
+from tests.fakes import (
+    FakeBroker,
+    FakeKillSwitch,
+    FakePortfolioRepository,
+    FakeWorkerConfigRepository,
+    RecordingAuditSink,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -174,6 +181,11 @@ def app(
     application.dependency_overrides[get_audit_sink] = lambda: audit
     application.dependency_overrides[get_portfolio_repository] = lambda: portfolio_repo
     application.dependency_overrides[get_quote_cache] = lambda: quotes
+    # The risk ceilings are a stored row since ADR 0025, so anything that
+    # validates an order or reads a limit reaches this repository. Empty
+    # means nothing has been saved, which is `DEFAULT_RISK_LIMITS` — the same
+    # numbers `.env` used to ship, so the expectations below are unchanged.
+    application.dependency_overrides[get_worker_config_repository] = FakeWorkerConfigRepository
     application.dependency_overrides[get_current_session] = lambda: Session(
         "test-operator", Scope.FULL
     )
@@ -298,6 +310,32 @@ class TestCancellingEverything:
         await client.post(CANCEL_ALL, json={})
 
         assert broker.close_calls == []
+
+    async def test_it_works_with_the_database_unreachable(
+        self, app: FastAPI, broker: FakeBroker
+    ) -> None:
+        """An emergency control must not depend on the configuration database.
+
+        This endpoint builds a router the risk chain is never consulted through
+        — it is already handed an empty quote map, which would deny every order
+        on `StaleDataRule` if it were. Moving the risk ceilings into Postgres
+        (ADR 0025) briefly gave it a `Depends` that loaded them anyway, so the
+        one control an operator reaches for when orders are going out that
+        should not be began failing whenever the database was down, in order to
+        fetch numbers it then did not use. It takes the defaults instead, and
+        touches only the venue and Redis.
+        """
+        working_order(broker)
+        broken = FakeWorkerConfigRepository()
+        broken.load_error = RuntimeError("postgres is unreachable")
+        app.dependency_overrides[get_worker_config_repository] = lambda: broken
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(CANCEL_ALL, json={})
+
+        assert response.status_code == 200
+        assert response.json() == {"cancelled": 1}
 
     async def test_a_partial_failure_is_a_502_that_says_so(
         self, client: httpx.AsyncClient, broker: FakeBroker, audit: RecordingAuditSink

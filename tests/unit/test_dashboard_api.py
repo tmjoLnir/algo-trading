@@ -28,6 +28,7 @@ from atp_api.deps import (
     get_kill_switch,
     get_portfolio_repository,
     get_snapshot_store,
+    get_worker_config_repository,
 )
 from atp_api.main import create_app
 from atp_core.clock import SimulatedClock
@@ -36,7 +37,12 @@ from atp_core.dashboard import build_snapshot
 from atp_core.domain import Order, OrderStatus, OrderType, Portfolio, Position, RunMode, Side
 from atp_core.execution.ports import EquityPoint
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
-from tests.fakes import FakeKillSwitch, FakePortfolioRepository, FakeSnapshotStore
+from tests.fakes import (
+    FakeKillSwitch,
+    FakePortfolioRepository,
+    FakeSnapshotStore,
+    FakeWorkerConfigRepository,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -130,6 +136,11 @@ def app(
     application.dependency_overrides[get_snapshot_store] = lambda: store
     application.dependency_overrides[get_portfolio_repository] = lambda: repo
     application.dependency_overrides[get_kill_switch] = lambda: kill_switch
+    # The risk ceilings are a stored row since ADR 0025, so anything that
+    # validates an order or reads a limit reaches this repository. Empty
+    # means nothing has been saved, which is `DEFAULT_RISK_LIMITS` — the same
+    # numbers `.env` used to ship, so the expectations below are unchanged.
+    application.dependency_overrides[get_worker_config_repository] = FakeWorkerConfigRepository
     # These tests are about the book the dashboard serves, not about who is asking. Overriding the
     # one dependency that answers that keeps them so — `tests/unit/
     # test_api_contract.py` is where the enforcement itself is held, from the
@@ -660,3 +671,66 @@ class TestContract:
         _, body = await get_live(client)
 
         assert [h["scope"] for h in body["active_halts"]] == ["global", "symbol"]
+
+
+class TestTheScreenAnOperatorOpensDuringAnOutage:
+    """No book and no database must still render the halts and the banners.
+
+    This is a property `get_live_dashboard` states in a comment beside its early
+    return — "the banners, the halts and the kill switch above still have to
+    render, which is why they were never in the book to begin with" — and it was
+    briefly untrue. Moving the risk ceilings into the database (ADR 0025) put the
+    quote-age budget behind a FastAPI `Depends`, and a dependency runs *before*
+    the handler body: the one path that had never needed Postgres started
+    failing on it, to load a budget that path does not use (`data_feed_healthy`
+    is `None` with no book).
+
+    It is not a corner case. `App.tsx` reads this endpoint for the pinned halt
+    state, so a Postgres outage took the halt banner off every screen at once.
+    """
+
+    async def test_no_book_and_no_database_still_answers(
+        self, app: FastAPI, store: FakeSnapshotStore
+    ) -> None:
+        broken = FakeWorkerConfigRepository()
+        broken.load_error = RuntimeError("postgres is unreachable")
+        app.dependency_overrides[get_worker_config_repository] = lambda: broken
+        # An empty store is the no-book state: a worker that is up and not
+        # trading publishes nothing, and so does one that has just started.
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(LIVE)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["account"] is None
+        # The two things the page exists to keep on screen.
+        assert "active_halts" in body
+        assert body["run_mode"]
+        # And the budget it never needed is not invented.
+        assert body["data_feed_healthy"] is None
+
+    async def test_a_book_plus_no_database_is_still_an_error(
+        self, app: FastAPI, store: FakeSnapshotStore
+    ) -> None:
+        """The other half, so the fix is not read as "swallow the outage".
+
+        With a book, this endpoint already had to reach Postgres for the day
+        anchor, and the quote-age budget joins that query rather than preceding
+        it. Reporting a feed as healthy against a budget nobody set would be the
+        same lie in a smaller font.
+        """
+        broken = FakeWorkerConfigRepository()
+        broken.load_error = RuntimeError("postgres is unreachable")
+        app.dependency_overrides[get_worker_config_repository] = lambda: broken
+        publish(store, a_book())
+
+        # Raised rather than answered, which is the same shape `day_pnl_since_open`
+        # already had on this path: a Postgres failure with a book on screen is a
+        # 500 from the error middleware, not a rendered dashboard. What the fix
+        # changed is only *which* requests can reach it.
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            with pytest.raises(RuntimeError, match="postgres is unreachable"):
+                await client.get(LIVE)

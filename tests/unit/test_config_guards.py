@@ -19,7 +19,7 @@ import pytest
 from pydantic import SecretStr
 
 from atp_core.brokers import AlpacaBroker
-from atp_core.config import RiskLimits, Settings
+from atp_core.config import Settings
 from atp_core.domain.enums import RunMode
 from atp_core.errors import MissingBrokerCredentialsError
 
@@ -65,8 +65,7 @@ def _settings_read_only_their_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     for name in _AMBIENT:
         monkeypatch.delenv(name, raising=False)
-    for model in (Settings, RiskLimits):
-        monkeypatch.setitem(model.model_config, "env_file", None)
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
 
 
 def test_live_mode_requires_second_flag() -> None:

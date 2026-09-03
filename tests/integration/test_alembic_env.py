@@ -224,13 +224,27 @@ class TestAnUnloadableEnvFileIsNamed:
         """Some of them are credentials, and this code cannot tell which."""
         assert "twelve" not in unloadable.stderr
 
-    def test_a_bad_risk_limit_does_not_stop_a_schema_migration(
+    def test_a_leftover_risk_line_does_not_stop_a_schema_migration(
         self, database_url: str, tmp_path: Path
     ) -> None:
-        """`Settings.risk` is a `default_factory`, so one bad `RISK_*` value
-        raises out of it during `Settings()`. A risk limit has nothing to do
-        with a schema, and refusing to migrate over one would be new
-        unhelpfulness rather than a fix."""
+        """A `RISK_*` line an upgrade left behind must not block `make migrate`.
+
+        This case was originally the reverse of the one above: a bad `RISK_*`
+        value did not stop a migration, because `Settings.risk` was a nested
+        `default_factory` and `env.py` supplied it unvalidated to get past it.
+        The ceilings are a database row now (ADR 0025), so that machinery is
+        gone — and with it the general property. Every value `Settings` *reads*
+        stops a migration when it will not load, which is what the four cases
+        above assert and what `env.py` is designed to do: it refuses to guess a
+        url rather than fall back to one that is silently right on a laptop.
+
+        What survives, and is worth more here than the general form, is the
+        upgrade path this change creates. `Settings` is `extra="ignore"`, so the
+        eight keys it stopped reading are now *unknown* keys — and an operator
+        who upgrades has all eight sitting in their `.env`, malformed or not,
+        until they delete them. `make migrate` is the first command in the
+        runbook; it must not be the thing that breaks on them.
+        """
         _write_env(tmp_path, DATABASE_URL=database_url, RISK_MAX_POSITION_PCT="not-a-number")
 
         result = _run_alembic(tmp_path, "current")

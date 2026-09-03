@@ -19,7 +19,7 @@
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiGet, apiPut } from '@/api/client'
-import type { WorkerConfigScreen } from '@/api/types'
+import type { RiskLimitsInput, WorkerConfigScreen } from '@/api/types'
 
 const KEY = ['worker', 'config']
 
@@ -42,6 +42,15 @@ export interface WorkerConfigSave {
   stop_multiplier: string
   stop_period: number
   allow_live_orders: boolean
+  /**
+   * The account-wide ceilings, saved in the same request.
+   *
+   * One save rather than two, because an operator who widens a stop and lifts a
+   * position limit in one sitting made one decision — and one request means one
+   * revision, one audit entry, and one "your worker is older than this" notice
+   * covering all of it.
+   */
+  risk: RiskLimitsInput
   password?: string
 }
 
@@ -56,6 +65,13 @@ export function useSaveWorkerConfig() {
       // invalidated and re-fetched. One round trip, and no window in which the
       // form renders the old revision beside a success message.
       qc.setQueryData(KEY, screen)
+      // The risk queries are a different matter: `/risk/status` and
+      // `/risk/limits` feed the panel on Strategies, and this save is the only
+      // thing in the application that changes what they return. Without this
+      // they keep serving the pre-save ceilings until something else refetches
+      // them, so an operator who tightens a limit here and checks it there is
+      // shown the number they just replaced.
+      void qc.invalidateQueries({ queryKey: ['risk'] })
     },
   })
 }

@@ -355,9 +355,15 @@ jobs:
       # class exactly — a ValidationError raised while `atp_api.main` builds its
       # app at import — and cannot be misread as switching this job towards
       # live trading (CLAUDE.md 1.8).
+      #
+      # `ENGINE_TICK_INTERVAL_SECONDS` rather than `RISK_MAX_POSITION_PCT`,
+      # which this used until the risk ceilings became a database row. That key
+      # is now read by nothing, so `sed`-ing junk into it would leave the API
+      # starting perfectly and this step asserting a property of an unrelated
+      # line. It has to be a value `Settings` still parses.
       - name: A configuration the API cannot start with is an exit, not a silence
         run: |
-          sed -i 's/^RISK_MAX_POSITION_PCT=.*/RISK_MAX_POSITION_PCT=not-a-number/' .env
+          sed -i 's/^ENGINE_TICK_INTERVAL_SECONDS=.*/ENGINE_TICK_INTERVAL_SECONDS=not-a-number/' .env
           docker compose up -d --force-recreate api || true
           cid=$(docker compose ps -aq api | head -n1)
 
@@ -418,7 +424,7 @@ jobs:
 
       - name: And it recovers by itself once the configuration is fixed
         run: |
-          sed -i 's/^RISK_MAX_POSITION_PCT=.*/RISK_MAX_POSITION_PCT=0.10/' .env
+          sed -i 's/^ENGINE_TICK_INTERVAL_SECONDS=.*/ENGINE_TICK_INTERVAL_SECONDS=60/' .env
           docker compose up -d --force-recreate api
           for i in $(seq 1 60); do
             if curl -fsS http://localhost:8000/healthz | grep -q '"ok"'; then

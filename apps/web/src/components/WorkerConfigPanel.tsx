@@ -1,7 +1,8 @@
 /**
- * What the worker trades, edited here rather than in a file on the host.
+ * What the worker trades and what it may risk, edited here rather than in a
+ * file on the host.
  *
- * These ten values were environment variables. Moving them onto a screen is
+ * These eighteen values were environment variables. Moving them onto a screen is
  * mostly about reach — changing a stop multiplier no longer needs SSH — but the
  * part that shapes this component is the part that does not go away: **a worker
  * reads its configuration once, at start.** So there are always two answers to
@@ -30,6 +31,19 @@
  * number as a multiple and a fixed-percentage stop reads it as a fraction; one
  * field carries both, and an input labelled "multiplier" next to a `fixed_pct`
  * stop is how somebody types 2 and gets a stop 200% below entry.
+ *
+ * **The risk section is rendered from the server's field list, not from a list
+ * here.** `options.risk_fields` carries each ceiling's label, unit, ceiling and
+ * the sentence saying what it means, so adding a limit to `RiskLimits` puts a
+ * box on this screen with no change to this file — and, more to the point, the
+ * prose beside a number that stops real money cannot drift from the prose in
+ * `docs/RISK.md` that argues for it. The same reason the stop dropdown's help
+ * comes down the wire.
+ *
+ * One form and one save for both halves, because they are one decision. The
+ * ceilings do **not** ask for the password: `allow_live_orders` grants a new
+ * capability, while these bound orders that are already permitted, and
+ * *tightening* one must never be the harder direction.
  */
 
 import { useEffect, useMemo, useState } from 'react'
@@ -37,6 +51,8 @@ import { ApiError } from '@/api/client'
 import { useSaveWorkerConfig, useWorkerConfig } from '@/hooks/useWorkerConfig'
 import { formatDateTime } from '@/lib/money'
 import type {
+  RiskLimitFieldView,
+  RiskLimitsInput,
   RunningConfigView,
   StrategyOptionView,
   WorkerConfigScreen,
@@ -56,6 +72,14 @@ interface Draft {
   stopMultiplier: string
   stopPeriod: string
   allowLiveOrders: boolean
+  /**
+   * The eight ceilings, keyed by the server's field name and every one a
+   * string — because every input is one, and because the five fractions must
+   * reach the server as typed. A `Record` rather than eight named keys so this
+   * type does not have to be edited alongside `RiskLimits`; the server's
+   * `risk_fields` is what says which keys exist.
+   */
+  risk: Record<string, string>
 }
 
 function toDraft(config: WorkerConfigView): Draft {
@@ -75,7 +99,99 @@ function toDraft(config: WorkerConfigView): Draft {
     stopMultiplier: config.stop_multiplier,
     stopPeriod: String(config.stop_period),
     allowLiveOrders: config.allow_live_orders,
+    // `String(...)` over the whole record: the three counts arrive as JSON
+    // numbers and the five fractions as strings, and the form edits both as
+    // text. The fractions are never round-tripped through `Number` — that is
+    // the one conversion that could move a ceiling (src/lib/money.ts).
+    risk: Object.fromEntries(
+      Object.entries(config.risk).map(([name, value]) => [name, String(value)]),
+    ),
   }
+}
+
+/**
+ * The risk section's draft, as the endpoint takes it.
+ *
+ * Driven off the server's field list rather than a list here, so a ceiling
+ * added to `RiskLimits` is sent without an edit to this file — and, more
+ * importantly, so a ceiling *removed* from it stops being sent rather than
+ * being posted to an endpoint that no longer has a field for it.
+ *
+ * `unit` decides the conversion, which is the only thing here that could
+ * corrupt a value: the counts go through `Number` because the server types them
+ * as integers, and everything else is sent **as typed**. A fraction through
+ * `Number` is a JSON float, and a `0.1` that has been a float is not the ceiling
+ * that was typed (CLAUDE.md §1.1).
+ *
+ * The split is `isFraction`, which recognises *counts* and treats anything else
+ * as money-shaped — so the failure mode of an unrecognised unit is a string the
+ * server refuses, not a silently-rounded ceiling it accepts.
+ */
+function riskPayload(
+  fields: readonly RiskLimitFieldView[],
+  values: Record<string, string>,
+): RiskLimitsInput {
+  const out: Record<string, string | number> = {}
+  for (const field of fields) {
+    const raw = (values[field.name] ?? '').trim()
+    out[field.name] = isFraction(field) ? raw : Number(raw)
+  }
+  return out as unknown as RiskLimitsInput
+}
+
+/**
+ * Whether this ceiling is a fraction of equity rather than a count.
+ *
+ * Written as "not a count" rather than "is a fraction", which matters because
+ * the two branches are not symmetric: the fraction branch sends the value as
+ * typed and the count branch puts it through `Number`. A unit this file has
+ * never heard of must land on the *string* side, so an added ceiling cannot
+ * silently start round-tripping a ratio through a JS float (CLAUDE.md §1.1).
+ * Counts are the closed set; everything else is money-shaped.
+ */
+const COUNT_UNITS = new Set(['positions', 'orders/min', 'seconds'])
+
+function isFraction(field: RiskLimitFieldView): boolean {
+  return !COUNT_UNITS.has(field.unit)
+}
+
+/**
+ * The first thing wrong with the risk section, named, or null.
+ *
+ * This is what a number input's own validation used to do, moved here because
+ * that input could not be used (see `RiskLimitFields`) and because a browser
+ * tooltip is a worse answer than the sentence the server would give: it names
+ * no field, cannot be styled, and disappears on the next click.
+ *
+ * Only refusals the operator can act on without a round trip. Everything else
+ * — the cross-field rule, the precision bound, the exclusive stop ceiling — is
+ * left to the server, whose message is better than anything restated here could
+ * be, and which has to check them anyway.
+ */
+function riskProblem(
+  fields: readonly RiskLimitFieldView[],
+  values: Record<string, string>,
+): string | null {
+  for (const field of fields) {
+    const raw = (values[field.name] ?? '').trim()
+    if (raw === '') {
+      // Was a bare 422 naming no field: `''` is not a Decimal, and pydantic
+      // reports the location rather than the label the operator can see.
+      return `${field.label} is empty. Every ceiling needs a value — there is no "no limit".`
+    }
+    if (!/^\d*\.?\d+$/.test(raw)) {
+      return `${field.label} is not a number: "${raw}".`
+    }
+    // Compared as numbers and sent as text. A bound check may round; the value
+    // that travels must not (CLAUDE.md §1.1).
+    if (field.maximum !== null && Number(raw) > Number(field.maximum)) {
+      return `${field.label} cannot be more than ${field.maximum}; you typed ${raw}.`
+    }
+    if (Number(raw) <= 0) {
+      return `${field.label} must be greater than zero — zero is not "no limit", it is a limit nothing can satisfy.`
+    }
+  }
+  return null
 }
 
 const FIELD =
@@ -197,6 +313,80 @@ function Select({
   )
 }
 
+/**
+ * The account-wide ceilings, one box per server-declared field.
+ *
+ * Its own bordered block rather than more rows in the grid above, because the
+ * two halves of this form are different kinds of thing and reading them as one
+ * list is how a limit gets treated as a preference. Above is what this platform
+ * *tries* to do; here is what it refuses to do regardless — including on an
+ * order an operator places by hand from this dashboard, which is why the note
+ * says "every order" rather than "the worker".
+ *
+ * **Text inputs with `inputMode`, not `type="number"`** — the same shape
+ * `sizing_value` and `stop_multiplier` above already use, and for the reasons
+ * that made them that way. A number input is the obvious choice and is wrong
+ * three times over for a Decimal a person edits:
+ *
+ * - **The wheel changes it.** A focused number input treats a scroll as a
+ *   spinner, so scrolling the page past a ceiling silently rewrites it, and the
+ *   only evidence is a Save the operator then presses.
+ * - **It mangles what is typed.** The HTML value sanitisation algorithm blanks
+ *   any value that is not a valid floating-point number, so the instant a
+ *   controlled input holds `0.` — every decimal, mid-keystroke — `event.target
+ *   .value` is `''` and the draft loses the digits before it.
+ * - **`max` is inclusive and one of these bounds is not.** `default_stop_loss_pct`
+ *   is refused *at* 1, which no `max` attribute can express.
+ *
+ * The bounds are checked in `riskProblem` on submit instead, which names the
+ * field the way a server refusal does rather than raising a browser tooltip the
+ * form cannot style or explain. The server re-checks everything regardless:
+ * `RiskLimits.__post_init__` is the authority.
+ */
+function RiskLimitFields({
+  fields,
+  values,
+  onChange,
+}: {
+  fields: readonly RiskLimitFieldView[]
+  values: Record<string, string>
+  onChange: (name: string, value: string) => void
+}) {
+  return (
+    <fieldset className="md:col-span-2 rounded border border-slate-700 bg-slate-900/40 p-3">
+      <legend className="px-1 text-xs font-semibold text-slate-200">Risk limits</legend>
+      <p className="mb-3 text-[11px] text-slate-500">
+        Account-wide ceilings, applied to every order this platform places — the worker's and any
+        you place by hand. A strategy may configure something tighter; it can never configure
+        something looser. Fractions are written as <code>0.10</code> for 10%.
+      </p>
+      <div className="grid gap-3 sm:grid-cols-2">
+        {fields.map((field) => {
+          const id = `risk-${field.name}`
+          const fraction = isFraction(field)
+          return (
+            <Field key={field.name} id={id} label={field.label} hint={field.help}>
+              <div className="mt-1 flex items-center gap-2">
+                <input
+                  id={id}
+                  value={values[field.name] ?? ''}
+                  onChange={(event) => onChange(field.name, event.target.value)}
+                  inputMode={fraction ? 'decimal' : 'numeric'}
+                  aria-describedby={`${id}-hint`}
+                  className={`${FIELD} tabular-nums`}
+                />
+                <span className="shrink-0 text-[11px] text-slate-500">
+                  {fraction ? 'of equity' : field.unit}
+                </span>
+              </div>
+            </Field>
+          )
+        })}
+      </div>
+    </fieldset>
+  )
+}
+
 /** The prose for whatever is currently selected. */
 function Help({ options, value }: { options: readonly WorkerOption[]; value: string }) {
   const chosen = options.find((option) => option.value === value)
@@ -284,6 +474,12 @@ export default function WorkerConfigPanel() {
       setLocalError(`Strategy parameters are not valid JSON: ${String(error)}`)
       return
     }
+    const badLimit = riskProblem(screen.options.risk_fields, draft.risk)
+    if (badLimit !== null) {
+      save.reset()
+      setLocalError(badLimit)
+      return
+    }
     setLocalError(null)
     save.mutate({
       symbols: draft.symbols
@@ -301,6 +497,7 @@ export default function WorkerConfigPanel() {
       stop_multiplier: draft.stopMultiplier.trim(),
       stop_period: Number(draft.stopPeriod),
       allow_live_orders: draft.allowLiveOrders,
+      risk: riskPayload(screen.options.risk_fields, draft.risk),
       ...(armingLive ? { password } : {}),
     })
   }
@@ -309,7 +506,10 @@ export default function WorkerConfigPanel() {
     <section className="space-y-4">
       <header className="space-y-2">
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-          <h2 className="text-sm font-semibold text-slate-100">Worker</h2>
+          {/* Names the saved row rather than the worker, because the risk
+              ceilings below are not the worker's — and the revision, author
+              and restart banner beside this cover both halves of it. */}
+          <h2 className="text-sm font-semibold text-slate-100">Saved configuration</h2>
           <span className="text-xs text-slate-500">
             revision {screen.saved.revision === 0 ? '— never saved' : screen.saved.revision}
             {screen.saved.updated_by
@@ -329,6 +529,15 @@ export default function WorkerConfigPanel() {
       </header>
 
       <form onSubmit={submit} className="grid gap-4 md:grid-cols-2">
+        {/* The worker half gets a heading now that it is not the only half.
+            Without one, the "Risk limits" legend below would read as a label
+            for a subsection of settings that all looked alike — and the
+            distinction between what this platform *tries* to do and what it
+            *refuses* to do is the one a reader must not miss. */}
+        <h3 className="md:col-span-2 -mb-1 text-xs font-semibold text-slate-200">
+          What the worker trades
+        </h3>
+
         <div className="md:col-span-2">
           <Field
             id="worker-symbols"
@@ -495,6 +704,16 @@ export default function WorkerConfigPanel() {
           </Field>
         </div>
 
+        <RiskLimitFields
+          fields={screen.options.risk_fields}
+          values={draft.risk}
+          onChange={(name, value) =>
+            setDraft((current) =>
+              current === null ? current : { ...current, risk: { ...current.risk, [name]: value } },
+            )
+          }
+        />
+
         <div className="md:col-span-2 rounded border border-rose-900/70 bg-rose-950/30 p-3">
           <label className="flex items-start gap-2">
             <input
@@ -566,7 +785,9 @@ export default function WorkerConfigPanel() {
             Discard changes
           </button>
           <span className="text-xs text-slate-500">
-            Takes effect at the worker's next start, not immediately.
+            The worker picks this up at its next start. The risk ceilings also apply immediately to
+            orders you place from this dashboard, which the worker's own chain does not see until it
+            restarts.
           </span>
 
           {failure ? (

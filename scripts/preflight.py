@@ -72,7 +72,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--symbols",
         default="",
-        help="override the watchlist (default: the one saved on the Worker tab)",
+        help="override the watchlist (default: the one saved on the Config tab)",
     )
     p.add_argument("--timeframe", default="1d", help="which bar series the strategy runs on")
     p.add_argument("--json", action="store_true", help="machine-readable, for a CI job or a log")
@@ -232,7 +232,13 @@ async def _local_checks(
             age = None if quote is None else (now - quote.ts).total_seconds()
             checks.append(
                 preflight.check_quote_freshness(
-                    symbol, age_seconds=age, budget=settings.risk.max_quote_age_seconds
+                    # The budget comes off the config this worker would boot
+                    # with, not off `Settings` — the ceilings are columns on
+                    # that row since ADR 0025, and preflight's whole job is to
+                    # predict what the *next* start will do.
+                    symbol,
+                    age_seconds=age,
+                    budget=config.risk.max_quote_age_seconds,
                 )
             )
         await close_redis(redis)
@@ -373,7 +379,7 @@ async def _sizing_check(
     price = series[-1].close
     stop_price = _derived_stop(config, series, price)
     return preflight.check_sizing_is_reachable(
-        config, settings.risk, equity=equity, price=price, stop_price=stop_price
+        config, config.risk, equity=equity, price=price, stop_price=stop_price
     )
 
 

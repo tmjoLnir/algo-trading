@@ -108,7 +108,7 @@ silence, and neither is visible from a log line until it is too late:
   anything. Thirty stored bars is not an error, it is five days of nothing.
 - **A size the position cap refuses.** `risk_pct` at 1% against a 2×ATR stop
   asks for roughly 30% of a $100k account on a ~$97 name, and
-  `RISK_MAX_POSITION_PCT` caps a position at 10% — so `max_position_size`
+  the `max_position_pct` ceiling caps a position at 10% — so `max_position_size`
   refuses every entry. Both numbers are right; they measure different things.
   The preflight prices the first entry through `position_size` — the same call
   the router makes — and says which value would fit.
@@ -148,9 +148,9 @@ Then confirm data is actually moving — the feed being *connected* and the feed
 uv run python scripts/status.py --no-broker
 ```
 
-It prints halts, quote freshness against `RISK_MAX_QUOTE_AGE_SECONDS` — the
-same budget `StaleDataRule` refuses orders on — and the latest stored bar per
-symbol. `--no-broker` keeps it to local state, so it needs no credentials.
+It prints halts, quote freshness against the saved `max_quote_age_seconds` — the
+same budget `StaleDataRule` refuses orders on, read from the `worker_config` row
+the Config tab writes — and the latest stored bar per symbol. `--no-broker` keeps it to local state, so it needs no credentials.
 
 **Do not proceed** until quotes are landing in Redis and bars are landing in the
 hypertable. A strategy started on a stale cache will be refused by

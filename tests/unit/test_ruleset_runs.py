@@ -22,9 +22,9 @@ import pytest
 from atp_core.backtest.engine import BacktestEngine
 from atp_core.backtest.ports import BacktestRunSpec, spec_to_json
 from atp_core.backtest.runner import _resolve_strategy, build_engine
-from atp_core.config import get_settings
 from atp_core.errors import ConfigError
 from atp_core.persistence.backtests import _spec_from_json
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS
 from atp_core.strategy.examples import rsi_mean_reversion
 from atp_core.strategy.examples.sma_crossover import SmaCrossover
 
@@ -125,7 +125,7 @@ class TestThroughTheColumn:
                 stop_period=14,
             )
         )
-        engine = build_engine(spec, limits=get_settings().risk)
+        engine = build_engine(spec, limits=DEFAULT_RISK_LIMITS)
         assert isinstance(engine, BacktestEngine)
         assert engine.strategy.name == "rsi_mean_reversion"
 
@@ -136,6 +136,6 @@ class TestThroughTheColumn:
         spec = through_the_column(
             a_spec(ruleset=shipped_rules(), stop_type="atr", stop_value="2.0", stop_period=14)
         )
-        engine = build_engine(spec, limits=get_settings().risk)
+        engine = build_engine(spec, limits=DEFAULT_RISK_LIMITS)
         assert engine.stop_config is not None
         assert engine.stop_config.period == 14

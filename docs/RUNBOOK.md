@@ -330,8 +330,8 @@ container is there and the port is not.
 $ make check-env
 environment: 1 problem
 
-  RISK_MAX_POSITION_PCT    .env line 51
-    Input should be a valid decimal
+  ENGINE_TICK_INTERVAL_SECONDS    .env line 143
+    Input should be a valid integer
     you wrote: not-a-number
 ```
 
@@ -356,16 +356,21 @@ nothing reads:
 ```
 .env: 1 key that nothing reads
 
-  RISK_MAX_POSITION_PC    .env line 51
-    did you mean RISK_MAX_POSITION_PCT?
+  DASHBOARD_STALE_AFTER_SECOND    .env line 144
+    did you mean DASHBOARD_STALE_AFTER_SECONDS?
 ```
 
 Nothing is broken here. Nothing exits, nothing appears in any log, and the API
 starts perfectly — the value simply had no effect. `Settings` is configured to
 ignore what it does not recognise, which is correct because this file is shared
 with compose and Vite, and the cost is that a **misspelling is silent**. The
-operator who wrote that line believes the position cap is 2%. It is 10%, five
-times looser, and every other symptom on this page is absent.
+operator who wrote that line believes a reading goes stale after a minute. It
+still takes five, and every other symptom on this page is absent.
+
+It also reports the eighteen keys that **moved** — the ten `WORKER_*` of ADR
+0023 and the eight `RISK_*` of ADR 0025 — as unread rather than as typos, naming
+the Config tab and, for the ceilings, the risk section on it. They are read by
+nothing now; the line in your file is doing exactly what a misspelling does.
 
 That is the reason to run `make check-env` when nothing is wrong: a stack that
 will not boot tells you so, and a limit you believe you tightened does not. Run
@@ -700,7 +705,7 @@ things to look at.
 ## A saved configuration has not taken effect
 
 Expected, not a fault. The worker reads its configuration **once, at start**, so
-a save on the dashboard's Worker tab applies at the next restart:
+a save on the dashboard's Config tab applies at the next restart:
 
 ```bash
 docker compose restart worker

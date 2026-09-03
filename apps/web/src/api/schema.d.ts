@@ -576,9 +576,10 @@ export interface paths {
          *
          *     Fast by construction: it is read by every open browser tab, so the book is
          *     one Redis `GET` of a document the worker already assembled rather than a
-         *     recomputation from fills. The two other reads — the halt keys and, only when
-         *     a book exists, one bounded equity query for the day anchor — are both small
-         *     and both bounded.
+         *     recomputation from fills. The three other reads — the halt keys, the single
+         *     `worker_config` row the quote-age budget now lives in, and, only when a book
+         *     exists, one bounded equity query for the day anchor — are all small and all
+         *     bounded.
          *
          *     Signals come back newest first, because a feed is read from the top.
          */
@@ -1012,15 +1013,27 @@ export interface paths {
          * Get Risk Limits
          * @description The configured ceilings. What the rules are, not where we stand.
          *
-         *     Config only: no Redis, no Postgres, no broker. That is the point of it
-         *     being separate from `/status` rather than a field on it — the moment an
-         *     operator most wants to know what the limits are is an incident, which is
-         *     also when the stores are least likely to answer. This route survives all of
-         *     them being down.
+         *     **One store, and it is the cheap one.** This used to read configuration and
+         *     nothing else, which made it the one route that survived every store being
+         *     down — and that was the argument for it existing separately from `/status`
+         *     rather than as a field on it. Moving the ceilings out of `.env` and into the
+         *     `worker_config` row cost exactly that: this now needs Postgres.
+         *
+         *     It is still worth being its own route, and the degradation it buys is still
+         *     real, because the two routes need different things. `/status` reads the
+         *     worker's published book out of Redis *and* the session's opening equity out
+         *     of Postgres to say where you stand. This reads one row. So a Redis that has
+         *     gone away — the failure that takes the book with it — still leaves an
+         *     operator able to ask what the ceilings are, which is the question an
+         *     incident actually raises.
+         *
+         *     What is no longer true is that it survives Postgres being down. Nothing can
+         *     honestly answer this question then: the ceilings are a row, and returning
+         *     the defaults instead would state numbers nobody set as though somebody had.
          *
          *     Read by a full or a read-only session alike; there is nothing here a reader
-         *     should not see, and `.env` is not somewhere a person can look during an
-         *     incident.
+         *     should not see, and the point of the move is that this no longer requires
+         *     shell access to a host to find out.
          */
         get: operations["get_risk_limits_api_v1_risk_limits_get"];
         put?: never;
@@ -1145,6 +1158,12 @@ export interface paths {
          *     opened, while `MaxExposureRule` refuses at `>` because the ceiling is a
          *     value exposure may reach — and a status screen that rounded those together
          *     would tell someone they are fine while the engine refuses their next order.
+         *
+         *     **The ceilings are the saved ones**, which is what a manual order placed
+         *     from this dashboard will be measured against. A worker that booted before
+         *     the last save is still enforcing older ones until it restarts; the settings
+         *     screen is where that difference is stated, because it is the screen with
+         *     both numbers on it.
          */
         get: operations["get_risk_status_api_v1_risk_status_get"];
         put?: never;
@@ -2060,6 +2079,31 @@ export interface components {
             target: string | null;
         };
         /**
+         * LimitFieldView
+         * @description One risk entry box, with the sentence that says what the number means.
+         *
+         *     Sent rather than hard-coded in the browser for the same reason the stop
+         *     dropdown's prose is: docs/RISK.md's argument for a number belongs on the
+         *     screen where it is typed, and a copy of it in TypeScript is a copy that goes
+         *     stale the first time the argument changes.
+         *
+         *     `maximum` is the server's own ceiling, sent so the form can refuse before
+         *     the round trip. It is a convenience and never the authority — `RiskLimits`
+         *     is, and it re-checks everything.
+         */
+        LimitFieldView: {
+            /** Help */
+            help: string;
+            /** Label */
+            label: string;
+            /** Maximum */
+            maximum: string | null;
+            /** Name */
+            name: string;
+            /** Unit */
+            unit: string;
+        };
+        /**
          * LimitUsageView
          * @description One limit, and where the book stands against it.
          *
@@ -2534,6 +2578,70 @@ export interface components {
             target: string | null;
             /** Was Halted */
             was_halted: boolean;
+        };
+        /**
+         * RiskLimitsPayload
+         * @description The eight account-wide ceilings, as the wire carries them.
+         *
+         *     The five fractions are strings for the reason every decimal on this API is
+         *     (docs/DASHBOARD.md): each is multiplied by equity to produce the number an
+         *     order is measured against, and a `0.1` that had been through a JSON float
+         *     would move that ceiling.
+         *
+         *     One model for both directions — read and write — unlike the pair above,
+         *     because unlike the worker configuration there is nothing here the server
+         *     knows and the client does not. Two identical models would be two places to
+         *     forget a field.
+         */
+        "RiskLimitsPayload-Input": {
+            /** Default Stop Loss Pct */
+            default_stop_loss_pct: number | string;
+            /** Default Take Profit Pct */
+            default_take_profit_pct: number | string;
+            /** Max Daily Loss Pct */
+            max_daily_loss_pct: number | string;
+            /** Max Gross Exposure Pct */
+            max_gross_exposure_pct: number | string;
+            /** Max Open Positions */
+            max_open_positions: number;
+            /** Max Orders Per Minute */
+            max_orders_per_minute: number;
+            /** Max Position Pct */
+            max_position_pct: number | string;
+            /** Max Quote Age Seconds */
+            max_quote_age_seconds: number;
+        };
+        /**
+         * RiskLimitsPayload
+         * @description The eight account-wide ceilings, as the wire carries them.
+         *
+         *     The five fractions are strings for the reason every decimal on this API is
+         *     (docs/DASHBOARD.md): each is multiplied by equity to produce the number an
+         *     order is measured against, and a `0.1` that had been through a JSON float
+         *     would move that ceiling.
+         *
+         *     One model for both directions — read and write — unlike the pair above,
+         *     because unlike the worker configuration there is nothing here the server
+         *     knows and the client does not. Two identical models would be two places to
+         *     forget a field.
+         */
+        "RiskLimitsPayload-Output": {
+            /** Default Stop Loss Pct */
+            default_stop_loss_pct: string;
+            /** Default Take Profit Pct */
+            default_take_profit_pct: string;
+            /** Max Daily Loss Pct */
+            max_daily_loss_pct: string;
+            /** Max Gross Exposure Pct */
+            max_gross_exposure_pct: string;
+            /** Max Open Positions */
+            max_open_positions: number;
+            /** Max Orders Per Minute */
+            max_orders_per_minute: number;
+            /** Max Position Pct */
+            max_position_pct: string;
+            /** Max Quote Age Seconds */
+            max_quote_age_seconds: number;
         };
         /**
          * RiskLimitsView
@@ -3018,6 +3126,7 @@ export interface components {
              * @default
              */
             password: string;
+            risk: components["schemas"]["RiskLimitsPayload-Input"];
             /** Sizing Method */
             sizing_method: string;
             /** Sizing Value */
@@ -3051,6 +3160,7 @@ export interface components {
             allow_live_orders: boolean;
             /** Max Silence Seconds */
             max_silence_seconds: number;
+            risk: components["schemas"]["RiskLimitsPayload-Output"];
             /** Sizing Method */
             sizing_method: string;
             /** Sizing Value */
@@ -3079,6 +3189,8 @@ export interface components {
             multiplier_stops: string[];
             /** Period Stops */
             period_stops: string[];
+            /** Risk Fields */
+            risk_fields: components["schemas"]["LimitFieldView"][];
             /** Sizing Methods */
             sizing_methods: components["schemas"]["OptionView"][];
             /** Stop Types */

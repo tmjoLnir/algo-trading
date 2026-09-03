@@ -22,9 +22,9 @@ if TYPE_CHECKING:
     from decimal import Decimal
 
     from atp_core.clock import Clock, TradingCalendar
-    from atp_core.config import RiskLimits
     from atp_core.domain import Order, Portfolio
     from atp_core.risk.killswitch import KillSwitch
+    from atp_core.risk.limits import RiskLimits
 
 
 @dataclass(frozen=True, slots=True)

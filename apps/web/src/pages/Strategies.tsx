@@ -267,7 +267,7 @@ export default function Strategies() {
           <span className="mt-1 block text-xs text-amber-200/70">
             A strategy gets a row here the first time a worker loads it, an author creates it, or a
             backtest is queued for it. No strategy is chosen by default — the{' '}
-            <strong>Worker</strong> tab is where one is — so on a fresh install this is expected
+            <strong>Config</strong> tab is where one is — so on a fresh install this is expected
             rather than a fault. These are still backtestable: the Backtests tab offers them and
             stores the row itself.
           </span>

@@ -44,8 +44,9 @@ from atp_worker.trading import resolve_stop_config
 if TYPE_CHECKING:
     from datetime import datetime
 
-    from atp_core.config import RiskLimits, Settings
+    from atp_core.config import Settings
     from atp_core.risk.killswitch import HaltRecord
+    from atp_core.risk.limits import RiskLimits
     from atp_core.worker.config import WorkerConfig
     from atp_worker.trading import TradingDecision
 
@@ -194,7 +195,7 @@ def check_locks(decision: TradingDecision) -> Check:
         "trading locks",
         Status.FAIL,
         decision.reason,
-        fix="choose a strategy and a watchlist on the Worker tab" if not decision.blocked else "",
+        fix="choose a strategy and a watchlist on the Config tab" if not decision.blocked else "",
     )
 
 
@@ -212,7 +213,7 @@ def check_strategy(config: WorkerConfig) -> Check:
             "strategy",
             Status.FAIL,
             "no strategy is configured",
-            fix="choose one on the dashboard's Worker tab",
+            fix="choose one on the dashboard's Config tab",
         )
     try:
         strategy_cls = registry.get(name)
@@ -227,7 +228,7 @@ def check_strategy(config: WorkerConfig) -> Check:
             "strategy",
             Status.FAIL,
             f"{name} rejected its parameters: {exc}",
-            fix="fix the strategy parameters on the Worker tab",
+            fix="fix the strategy parameters on the Config tab",
         )
     return Check("strategy", Status.PASS, f"{name} constructs, warmup_bars={strategy.warmup_bars}")
 
@@ -335,7 +336,7 @@ def check_warmup(symbol: str, *, required: int, stored: int, newest: datetime | 
 def check_quote_freshness(symbol: str, *, age_seconds: float | None, budget: int) -> Check:
     """The prices orders would be priced against.
 
-    Against `RISK_MAX_QUOTE_AGE_SECONDS` — the same budget `StaleDataRule`
+    Against the saved `max_quote_age_seconds` — the same budget `StaleDataRule`
     refuses orders on — so this answers the question the rule will ask rather
     than a similar-looking one.
 
@@ -407,7 +408,7 @@ def check_sizing_is_reachable(
     hypothetical one. `risk_pct` sizes by the distance to the stop, so a wide
     stop buys a large position *by construction*: 1% of $100,000 against a 2×ATR
     stop on a ~$97 name asks for 305 shares — 29.5% of the account against a 10%
-    `RISK_MAX_POSITION_PCT` — and `max_position_size` then refuses the entry
+    `max_position_pct` ceiling — and `max_position_size` then refuses the entry
     whole rather than trimming it. Both numbers are right. They measure
     different things, and the pair is docs/RISK.md's own recommendation.
 
@@ -430,7 +431,7 @@ def check_sizing_is_reachable(
             "sizing",
             Status.FAIL,
             f"{method} cannot size an entry here: {exc}",
-            fix="on the Worker tab, set sizing to fixed_qty with a value of 1 for a first run",
+            fix="on the Config tab, set sizing to fixed_qty with a value of 1 for a first run",
             source="docs/FIRST_PAPER_RUN.md, 'Stage 2'",
         )
     if qty <= 0:
@@ -438,7 +439,7 @@ def check_sizing_is_reachable(
             "sizing",
             Status.FAIL,
             f"{method} sizes the first entry at {qty} shares — nothing would be submitted",
-            fix="raise the sizing value on the Worker tab, or use fixed_qty for a first run",
+            fix="raise the sizing value on the Config tab, or use fixed_qty for a first run",
         )
 
     notional = qty * price
@@ -449,12 +450,12 @@ def check_sizing_is_reachable(
             "sizing",
             Status.FAIL,
             f"{method} asks for {qty} shares at {price} = {share:.1%} of equity, and "
-            f"RISK_MAX_POSITION_PCT caps a position at {limits.max_position_pct:.0%} — "
+            f"the max position ceiling caps a position at {limits.max_position_pct:.0%} — "
             f"max_position_size would refuse every entry, and the week would look silent",
             fix=(
-                f"lower the sizing value on the Worker tab (about "
+                f"lower the sizing value on the Config tab (about "
                 f"{value * limits.max_position_pct * equity / notional:.4f} fits), "
-                f"or use fixed_qty for a first run"
+                f"or raise the max position ceiling in the risk limits below it"
             ),
             source="docs/RISK.md, 'Why risk_pct is the default'",
         )

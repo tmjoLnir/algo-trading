@@ -45,6 +45,7 @@ from atp_core.persistence.quotes import RedisQuoteCache
 from atp_core.persistence.redis_client import close_redis, create_redis, create_sync_redis
 from atp_core.persistence.worker_config import PostgresWorkerConfigRepository
 from atp_core.risk.killswitch import RedisKillSwitch
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS, RiskLimits
 
 if TYPE_CHECKING:
     from atp_core.config import Settings
@@ -61,7 +62,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--symbols",
         default=None,
-        help="comma-separated; defaults to the watchlist saved on the Worker tab",
+        help="comma-separated; defaults to the watchlist saved on the Config tab",
     )
     p.add_argument("--timeframe", default="1d", help="which bar series to report on")
     p.add_argument(
@@ -87,6 +88,37 @@ async def _saved_symbols(settings: Settings) -> list[str]:
     finally:
         await engine.dispose()
     return [] if stored is None else list(stored.config.symbols)
+
+
+async def _saved_limits(settings: Settings) -> tuple[RiskLimits, str]:
+    """The risk ceilings in force, and where they came from.
+
+    **Three states, not two**, and the label is how they are told apart. The
+    ceilings and the provenance travel together because the number alone is
+    ambiguous in a way that matters here: 30 seconds means something different
+    if an operator chose it, if nobody has chosen anything, and if the database
+    could not be asked. This is the script somebody runs when the stack is half
+    up, so all three happen.
+
+    Defaults are a *state* in the middle case and a **fallback** in the third,
+    and the header says which. Printing "budget 30s (Config tab)" over an
+    unreachable database would state a number nobody had set as though somebody
+    had; printing it over an empty table would be wrong in the other direction,
+    since the defaults genuinely are what an unconfigured platform enforces.
+
+    Read failures are swallowed for the reason `_saved_symbols` returns an empty
+    list rather than raising: there is plenty else on this page to report.
+    """
+    engine = create_engine(settings.database_url)
+    try:
+        stored = await PostgresWorkerConfigRepository(create_session_factory(engine)).load()
+    except Exception:
+        return DEFAULT_RISK_LIMITS, "defaults; the database is not answering"
+    finally:
+        await engine.dispose()
+    if stored is None:
+        return DEFAULT_RISK_LIMITS, "defaults; nothing saved on the Config tab yet"
+    return stored.config.risk, "Config tab → risk limits"
 
 
 async def main(argv: list[str] | None = None) -> int:
@@ -124,7 +156,7 @@ async def main(argv: list[str] | None = None) -> int:
 
     _print_halts(settings)
     if not symbols:
-        print("\nno symbols — set a watchlist on the dashboard's Worker tab, or pass --symbols\n")
+        print("\nno symbols — set a watchlist on the dashboard's Config tab, or pass --symbols\n")
     else:
         await _print_local(settings, symbols, timeframe)
 
@@ -158,7 +190,12 @@ async def _print_local(settings: Settings, symbols: list[str], timeframe: Timefr
     """Quotes and bars — what an order would be priced against, and what a
     strategy would decide on."""
     now = datetime.now(UTC)
-    budget = settings.risk.max_quote_age_seconds
+    # The verdicts below need a number even when the row cannot be read, so the
+    # defaults stand in — and the header carries `source`, so a stale-quote
+    # verdict is never read as measured against a ceiling the operator set when
+    # it was measured against a fallback.
+    limits, source = await _saved_limits(settings)
+    budget = limits.max_quote_age_seconds
 
     redis = create_redis(settings.redis_url)
     engine = create_engine(settings.database_url)
@@ -166,7 +203,7 @@ async def _print_local(settings: Settings, symbols: list[str], timeframe: Timefr
         quotes = await RedisQuoteCache(redis).get_quotes(symbols)
         repo = PostgresBarRepository(create_session_factory(engine))
 
-        print(f"\nquotes     freshness budget {budget}s (RISK_MAX_QUOTE_AGE_SECONDS)")
+        print(f"\nquotes     freshness budget {budget}s ({source})")
         for symbol in symbols:
             quote = quotes.get(symbol)
             if quote is None:

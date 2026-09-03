@@ -54,6 +54,7 @@ from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.db import create_engine, create_session_factory
 from atp_core.persistence.jobs import QUEUE_NAME, ArqBacktestQueue
 from atp_core.persistence.redis_client import close_redis, create_redis
+from atp_core.persistence.worker_config import PostgresWorkerConfigRepository
 
 #: `@register` runs at import time, so a process that has never imported a
 #: strategy module has an EMPTY registry — and this worker would then fail every
@@ -140,6 +141,14 @@ async def on_startup(ctx: dict[str, Any]) -> None:
     ctx["redis"] = redis
     ctx["runs"] = PostgresBacktestRunRepository(session_factory)
     ctx["bars"] = PostgresBarRepository(session_factory)
+    # Where the risk ceilings live now that they are not in `.env`. The
+    # repository, not the values: this process is long-lived, so resolving them
+    # here would judge every run for days against whatever was saved the moment
+    # it booted. `tasks._limits` reads the row when the job *runs*, which is the
+    # nearest thing to "now" a queue can offer — a run that waited behind others
+    # is measured against the ceilings in force when it started, not when it was
+    # queued, and the two differ whenever somebody edits them in between.
+    ctx["worker_config"] = PostgresWorkerConfigRepository(session_factory)
     ctx["queue"] = ArqBacktestQueue(redis, settings.redis_url, clock)
 
     log.info("queue.ready", run_mode=settings.run_mode, queue=QUEUE_NAME, max_jobs=MAX_JOBS)

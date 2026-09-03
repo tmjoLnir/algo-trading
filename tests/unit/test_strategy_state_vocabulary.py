@@ -95,7 +95,7 @@ class TestWhatAFirstBootWrites:
         """`draft`, not something higher.
 
         A booting worker has been granted no promotion by anybody — it is
-        running because somebody chose it on the Worker tab, which is a fact about
+        running because somebody chose it on the Config tab, which is a fact about
         the deployment. Writing itself onto a higher rung would be the ratchet
         with its pawl removed, and "is it running" is `updated_at`.
         """

@@ -99,7 +99,7 @@ def decide(settings: Settings, config: WorkerConfig) -> TradingDecision:
             enabled=False,
             reason=(
                 "no strategy is configured — this worker places no orders. "
-                "Choose one on the dashboard's Worker tab."
+                "Choose one on the dashboard's Config tab."
             ),
         )
 
@@ -139,7 +139,7 @@ def decide(settings: Settings, config: WorkerConfig) -> TradingDecision:
             enabled=False,
             reason=(
                 "live mode is enabled but live order placement is not permitted — this worker "
-                "will not place real orders. Arm it on the dashboard's Worker tab, which asks "
+                "will not place real orders. Arm it on the dashboard's Config tab, which asks "
                 "for your password, and only when you intend an unattended loop to trade real "
                 "money."
             ),
@@ -181,9 +181,11 @@ def build_runner(
     strategy = strategy_cls(dict(config.strategy_params) or None)
 
     stop_manager = StopManager()
-    risk_engine = RiskEngine(
-        settings.risk, default_rules(kill_switch, clock, calendar, last_tick_at)
-    )
+    # The ceilings come off the same row as everything else here, so what this
+    # process enforces is what this process read at start — and the revision it
+    # publishes says which. Reading them live would mean a risk chain whose
+    # limits changed underneath a half-finished evaluation.
+    risk_engine = RiskEngine(config.risk, default_rules(kill_switch, clock, calendar, last_tick_at))
     router = OrderRouter(broker, risk_engine, stop_manager, clock, kill_switch=kill_switch)
     reconciler = Reconciler(broker, kill_switch, clock)
 

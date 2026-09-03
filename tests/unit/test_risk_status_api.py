@@ -31,6 +31,7 @@ from atp_api.deps import (
     get_current_session,
     get_portfolio_repository,
     get_snapshot_store,
+    get_worker_config_repository,
 )
 from atp_api.main import create_app
 from atp_core.clock import SimulatedClock
@@ -38,7 +39,9 @@ from atp_core.config import Settings, get_settings
 from atp_core.dashboard.snapshot import build_snapshot
 from atp_core.domain import Portfolio, Position, RunMode
 from atp_core.execution.ports import EquityPoint
-from tests.fakes import FakePortfolioRepository, FakeSnapshotStore
+from atp_core.risk.limits import RiskLimits
+from atp_core.worker import StoredWorkerConfig, WorkerConfig
+from tests.fakes import FakePortfolioRepository, FakeSnapshotStore, FakeWorkerConfigRepository
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -102,6 +105,11 @@ def app(store: FakeSnapshotStore, repo: FakePortfolioRepository) -> FastAPI:
     application.dependency_overrides[get_clock] = lambda: SimulatedClock(NOW)
     application.dependency_overrides[get_snapshot_store] = lambda: store
     application.dependency_overrides[get_portfolio_repository] = lambda: repo
+    # The risk ceilings are a stored row since ADR 0025, so anything that
+    # validates an order or reads a limit reaches this repository. Empty
+    # means nothing has been saved, which is `DEFAULT_RISK_LIMITS` — the same
+    # numbers `.env` used to ship, so the expectations below are unchanged.
+    application.dependency_overrides[get_worker_config_repository] = FakeWorkerConfigRepository
     # Scope is not what these are about — `test_api_contract.py` holds that from
     # the outside against every route at once. Both routes here are GETs, so a
     # read-only session may call them either way.
@@ -161,14 +169,21 @@ class TestLimits:
         assert isinstance(body["max_position_pct"], str)
         assert isinstance(body["max_daily_loss_pct"], str)
 
-    async def test_it_answers_with_every_store_gone(
+    async def test_it_answers_with_the_book_gone(
         self, app: FastAPI, client: httpx.AsyncClient
     ) -> None:
-        """The reason this is not a field on `/status`.
+        """Still the reason this is not a field on `/status`, but a narrower one.
 
         The moment an operator most wants to know what the limits are is an
-        incident, which is also when the stores are least likely to answer.
-        This route reads config and nothing else, so it survives all of them.
+        incident, which is also when the stores are least likely to answer. This
+        route used to read configuration and nothing else, so it survived *all*
+        of them; since the ceilings became a row (ADR 0025) it needs Postgres.
+
+        The degradation it buys is still real, because the two routes need
+        different things: `/status` reads the worker's published book out of
+        Redis **and** the day anchor out of Postgres, while this reads one row.
+        So the failure that takes the book away — the common one — still leaves
+        an operator able to ask what the ceilings are.
         """
         del app.dependency_overrides[get_snapshot_store]
         del app.dependency_overrides[get_portfolio_repository]
@@ -177,6 +192,44 @@ class TestLimits:
 
         assert response.status_code == 200
         assert response.json()["max_open_positions"] == 20
+
+    async def test_it_does_not_answer_with_the_database_gone(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        """The half of the old guarantee that is genuinely gone, pinned so it
+        cannot be quietly reintroduced as a lie.
+
+        Nothing can honestly answer this question during a Postgres outage: the
+        ceilings are a row, and serving `DEFAULT_RISK_LIMITS` instead would
+        state numbers nobody set as though somebody had — on the one screen an
+        operator consults to find out what will stop their next order.
+        """
+        broken = FakeWorkerConfigRepository()
+        broken.load_error = RuntimeError("postgres is unreachable")
+        app.dependency_overrides[get_worker_config_repository] = lambda: broken
+
+        with pytest.raises(RuntimeError, match="postgres is unreachable"):
+            await client.get(LIMITS)
+
+    async def test_it_serves_the_saved_ceilings_not_the_defaults(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        """`get_effective_risk_limits` is the whole of this change on the API
+        side, and a repository that only ever holds the defaults cannot tell a
+        working dependency from one that returns `DEFAULT_RISK_LIMITS`."""
+        saved = FakeWorkerConfigRepository(
+            StoredWorkerConfig(
+                config=WorkerConfig(risk=RiskLimits(max_open_positions=3)),
+                revision=4,
+                updated_at=NOW,
+                updated_by="josh",
+            )
+        )
+        app.dependency_overrides[get_worker_config_repository] = lambda: saved
+
+        body = (await client.get(LIMITS)).json()
+
+        assert body["max_open_positions"] == 3
 
 
 class TestStatusWithNoPublishedBook:

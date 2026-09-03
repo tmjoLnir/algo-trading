@@ -21,7 +21,6 @@ import pytest
 from atp_core.brokers.ports import TradeUpdate
 from atp_core.channels import CHANNEL_ORDERS, CHANNEL_SIGNALS
 from atp_core.clock import SimulatedClock
-from atp_core.config import get_settings
 from atp_core.dashboard.snapshot import DEFAULT_SIGNAL_LIMIT
 from atp_core.domain import (
     Bar,
@@ -43,6 +42,7 @@ from atp_core.execution.idempotency import FLATTEN, STOP_LOSS, TAKE_PROFIT, TIME
 from atp_core.execution.reconciliation import ReconciliationReport
 from atp_core.execution.router import ProtectionResult, SubmitResult
 from atp_core.risk.engine import RiskDecision, RiskEngine, backtest_rules
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS
 from atp_core.risk.stops import StopConfig, StopManager
 from atp_core.strategy.base import Strategy
 from atp_core.strategy.rules import PositionSizeSpec
@@ -175,7 +175,7 @@ class FakeRouter:
     """
 
     def __init__(self) -> None:
-        self.risk_engine = RiskEngine(get_settings().risk, rules=backtest_rules())
+        self.risk_engine = RiskEngine(DEFAULT_RISK_LIMITS, rules=backtest_rules())
         self.calls: list[str] = []
         self.signals: list[Signal] = []
         #: What the runner passed as in-flight on each `submit_signal`.

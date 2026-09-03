@@ -1,7 +1,8 @@
-"""The worker's trading configuration — read it, and change it.
+"""The worker's trading configuration and the account-wide risk ceilings —
+read them, and change them.
 
-These ten values used to be environment variables, which had three consequences
-worth naming because this endpoint exists to undo all three:
+These eighteen values used to be environment variables, which had three
+consequences worth naming because this endpoint exists to undo all three:
 
 - **Changing one needed shell access to the host.** Widening a stop or adding a
   symbol meant SSH, an editor, and a restart. The dashboard could show a book it
@@ -33,6 +34,22 @@ harder direction.
 
 The other two locks stay in `Settings` and stay out of this endpoint. A run mode
 editable from a browser would be the whole ratchet behind one form.
+
+**The eight risk ceilings arrive as one nested object and save in the same
+act.** They are limits rather than intent — the platform refuses an order that
+crosses one, where the fields above describe what it tries to do — so they are
+nested rather than flattened into the payload, and the form renders them under
+their own heading. What they are *not* is a second save: an operator who lifts a
+position limit while widening a stop made one decision, and one revision, one
+audit entry and one restart notice is how this endpoint records it.
+
+They do **not** ask for a password, and the asymmetry with `allow_live_orders` is
+deliberate. That field authorises an unattended loop to place real orders, which
+is a new capability. These bound orders that are already authorised, and the
+direction that matters is that *tightening* one must never be harder than
+loosening it — the same reason `/halt` asks for nothing. Every change to them is
+audited with both numbers, which is what makes a loosening answerable after the
+fact.
 """
 
 from __future__ import annotations
@@ -59,6 +76,7 @@ from atp_core.clock import Clock
 from atp_core.config import Settings, get_settings
 from atp_core.errors import ConfigError
 from atp_core.logging import get_logger
+from atp_core.risk.limits import RISK_LIMIT_FIELDS, RiskLimits
 from atp_core.strategy import examples as _examples  # noqa: F401 — populates the registry
 from atp_core.strategy import registry
 from atp_core.worker import (
@@ -88,6 +106,30 @@ router = APIRouter(prefix="/worker", tags=["worker"])
 UNSAVED = 0
 
 
+class RiskLimitsPayload(BaseModel):
+    """The eight account-wide ceilings, as the wire carries them.
+
+    The five fractions are strings for the reason every decimal on this API is
+    (docs/DASHBOARD.md): each is multiplied by equity to produce the number an
+    order is measured against, and a `0.1` that had been through a JSON float
+    would move that ceiling.
+
+    One model for both directions — read and write — unlike the pair above,
+    because unlike the worker configuration there is nothing here the server
+    knows and the client does not. Two identical models would be two places to
+    forget a field.
+    """
+
+    max_position_pct: Decimal
+    max_gross_exposure_pct: Decimal
+    max_daily_loss_pct: Decimal
+    max_orders_per_minute: int
+    max_open_positions: int
+    max_quote_age_seconds: int
+    default_stop_loss_pct: Decimal
+    default_take_profit_pct: Decimal
+
+
 class WorkerConfigView(BaseModel):
     """The ten parameters, as the wire carries them.
 
@@ -109,6 +151,10 @@ class WorkerConfigView(BaseModel):
     stop_multiplier: str
     stop_period: int
     allow_live_orders: bool
+    #: The ceilings this configuration carries. Present on the running view too,
+    #: which is the whole reason the worker publishes them: a ceiling edited
+    #: since a worker booted is not the ceiling refusing that worker's orders.
+    risk: RiskLimitsPayload
 
 
 class SavedConfigView(BaseModel):
@@ -158,12 +204,36 @@ class StrategyOptionView(OptionView):
     default_params: dict[str, Any]
 
 
+class LimitFieldView(BaseModel):
+    """One risk entry box, with the sentence that says what the number means.
+
+    Sent rather than hard-coded in the browser for the same reason the stop
+    dropdown's prose is: docs/RISK.md's argument for a number belongs on the
+    screen where it is typed, and a copy of it in TypeScript is a copy that goes
+    stale the first time the argument changes.
+
+    `maximum` is the server's own ceiling, sent so the form can refuse before
+    the round trip. It is a convenience and never the authority — `RiskLimits`
+    is, and it re-checks everything.
+    """
+
+    name: str
+    label: str
+    unit: str
+    help: str
+    maximum: Decimal | None
+
+
 class WorkerOptionsView(BaseModel):
     """Everything the form needs to render its selects."""
 
     strategies: list[StrategyOptionView]
     sizing_methods: list[OptionView]
     stop_types: list[OptionView]
+    #: The risk section's boxes, in the order the risk chain checks them —
+    #: which is the order the risk panel already lists them in, so an operator
+    #: who moves between the two screens reads the same sequence twice.
+    risk_fields: list[LimitFieldView]
     #: Stop families whose number is a multiple rather than a distance, and
     #: those that read the period. The form relabels its inputs from these
     #: rather than hard-coding a list the platform would then own twice.
@@ -220,10 +290,24 @@ class WorkerConfigUpdate(BaseModel):
     stop_multiplier: Decimal
     stop_period: int
     allow_live_orders: bool
+    risk: RiskLimitsPayload
     #: Required only when this request arms `allow_live_orders`. Never logged,
     #: never stored, and in the body rather than a query string because nginx
     #: writes query strings to its access log verbatim.
     password: str = Field(default="", max_length=1024)
+
+
+def _risk_payload(limits: RiskLimits) -> RiskLimitsPayload:
+    return RiskLimitsPayload(
+        max_position_pct=limits.max_position_pct,
+        max_gross_exposure_pct=limits.max_gross_exposure_pct,
+        max_daily_loss_pct=limits.max_daily_loss_pct,
+        max_orders_per_minute=limits.max_orders_per_minute,
+        max_open_positions=limits.max_open_positions,
+        max_quote_age_seconds=limits.max_quote_age_seconds,
+        default_stop_loss_pct=limits.default_stop_loss_pct,
+        default_take_profit_pct=limits.default_take_profit_pct,
+    )
 
 
 def _config_view(config: WorkerConfig) -> WorkerConfigView:
@@ -238,6 +322,7 @@ def _config_view(config: WorkerConfig) -> WorkerConfigView:
         stop_multiplier=str(config.stop_multiplier),
         stop_period=config.stop_period,
         allow_live_orders=config.allow_live_orders,
+        risk=_risk_payload(config.risk),
     )
 
 
@@ -275,6 +360,7 @@ def _options() -> WorkerOptionsView:
         strategies=[StrategyOptionView(**o) for o in strategy_options(registry.all_strategies())],
         sizing_methods=[OptionView(**asdict(o)) for o in SIZING_METHODS],
         stop_types=[OptionView(**asdict(o)) for o in STOP_TYPES],
+        risk_fields=[LimitFieldView(**asdict(f)) for f in RISK_LIMIT_FIELDS],
         multiplier_stops=sorted(MULTIPLIER_STOPS),
         period_stops=sorted(PERIOD_STOPS),
     )
@@ -322,6 +408,20 @@ def _to_config(payload: WorkerConfigUpdate) -> WorkerConfig:
             stop_multiplier=payload.stop_multiplier,
             stop_period=payload.stop_period,
             allow_live_orders=payload.allow_live_orders,
+            # Constructed here rather than trusted, so `RiskLimits.__post_init__`
+            # is what refuses a ceiling — the same rules the worker applies to
+            # the row it reads at start, so the two cannot disagree about what
+            # is storable.
+            risk=RiskLimits(
+                max_position_pct=payload.risk.max_position_pct,
+                max_gross_exposure_pct=payload.risk.max_gross_exposure_pct,
+                max_daily_loss_pct=payload.risk.max_daily_loss_pct,
+                max_orders_per_minute=payload.risk.max_orders_per_minute,
+                max_open_positions=payload.risk.max_open_positions,
+                max_quote_age_seconds=payload.risk.max_quote_age_seconds,
+                default_stop_loss_pct=payload.risk.default_stop_loss_pct,
+                default_take_profit_pct=payload.risk.default_take_profit_pct,
+            ),
         )
     except ConfigError as exc:
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -335,6 +435,12 @@ def _to_config(payload: WorkerConfigUpdate) -> WorkerConfig:
             ),
         )
     return config
+
+
+#: The ceiling names, taken from the form catalogue rather than restated, so a
+#: limit added to `RiskLimits` cannot be saved without appearing in the audit
+#: diff — the failure mode being a widened ceiling that no post-mortem can find.
+RISK_FIELDS: tuple[str, ...] = tuple(f.name for f in RISK_LIMIT_FIELDS)
 
 
 def _changes(before: WorkerConfig, after: WorkerConfig) -> dict[str, Any]:
@@ -362,6 +468,15 @@ def _changes(before: WorkerConfig, after: WorkerConfig) -> dict[str, Any]:
         old, new = getattr(before, name), getattr(after, name)
         if old != new:
             out[name] = {"from": _jsonable(old), "to": _jsonable(new)}
+    # The ceilings, flattened as `risk.max_position_pct` rather than nested one
+    # level deeper. The audit detail is read as a list of what moved, and a
+    # nested object would make the one entry that matters most in a post-mortem
+    # — "the position limit was lifted, by whom, when" — the only one a reader
+    # has to unwrap.
+    for field_name in RISK_FIELDS:
+        old, new = getattr(before.risk, field_name), getattr(after.risk, field_name)
+        if old != new:
+            out[f"risk.{field_name}"] = {"from": _jsonable(old), "to": _jsonable(new)}
     return out
 
 

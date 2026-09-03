@@ -12,11 +12,11 @@
  * ceilings, and we cannot currently see the book", which is a materially
  * different sentence from an empty screen.
  *
- * Not polled. Limits change when someone edits `.env` and restarts, and the
+ * Not polled. Limits change when somebody saves them on the Config tab, and the
  * book behind the readings moves on the worker's evaluation interval rather
  * than on a cadence worth chasing from here — the Dashboard is the screen for
  * watching something move. The client's refetch-on-focus covers returning to
- * the tab.
+ * the tab, which is the moment after an edit on that screen.
  */
 
 import { useQuery } from '@tanstack/react-query'
@@ -39,8 +39,12 @@ export function useRiskLimits(enabled: boolean) {
     queryKey: ['risk', 'limits'],
     queryFn: () => apiGet<RiskLimitsView>('/api/v1/risk/limits'),
     enabled,
-    // Config, fixed for the life of the process. Refetching it would be asking
-    // a question whose answer cannot have changed.
-    staleTime: Infinity,
+    // Editable now rather than fixed for the life of the process, so `Infinity`
+    // would be a promise this can no longer keep — a ceiling changed on the
+    // Config tab would leave this panel showing the old one until a reload.
+    // Five minutes because this is the *fallback* path, reached only when
+    // `/status` is failing: refetching harder while a store is down is the
+    // wrong instinct, and refetch-on-focus already covers coming back to look.
+    staleTime: 5 * 60 * 1000,
   })
 }

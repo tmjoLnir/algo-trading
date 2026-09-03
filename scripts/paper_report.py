@@ -70,7 +70,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--strategy",
         default=None,
-        help="which strategy's record to read (default: the one on the Worker tab)",
+        help="which strategy's record to read (default: the one on the Config tab)",
     )
     p.add_argument(
         "--logs",

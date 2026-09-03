@@ -15,6 +15,13 @@ them can be observed against a fake:
 3. **`NUMERIC(20, 8)` pads, and the read path trims it back.** `0.01` is stored
    as `0.01000000`; the API sends Decimals as strings, so without the trim the
    settings form redraws a saved value as a different-looking one.
+4. **The eight risk ceilings share all three of those behaviours** (ADR 0025),
+   and the fourth is theirs alone: the column *rounds* rather than refusing, and
+   the row is re-validated on the way out — so a value the value object accepted
+   but the column could not hold exactly would come back outside its own bound
+   and raise on every read, on the row every screen and the worker's boot need.
+   The guard against that is in `RiskLimits`, and this is where it is confirmed
+   against the database it is a guard about.
 """
 
 from __future__ import annotations
@@ -26,8 +33,10 @@ from typing import TYPE_CHECKING
 import asyncpg
 import pytest
 
+from atp_core.errors import ConfigError
 from atp_core.persistence.db import create_engine, create_session_factory
 from atp_core.persistence.worker_config import PostgresWorkerConfigRepository
+from atp_core.risk.limits import MAX_COUNT, MAX_GROSS_CEILING, MAX_TAKE_PROFIT, RiskLimits
 from atp_core.worker import WorkerConfig
 
 if TYPE_CHECKING:
@@ -125,6 +134,101 @@ class TestTheRoundTrip:
         assert stored.config.strategy_params == {"fast_period": 20}
 
 
+class TestTheRiskCeilings:
+    """The eight columns ADR 0025 added, against the real numeric types.
+
+    Not covered by `test_every_field_survives` above: that saves the defaults for
+    all eight, so a repository that dropped every risk column and rebuilt
+    `DEFAULT_RISK_LIMITS` on load would pass it. These save values that are not
+    the defaults, which is the only way to tell a round trip from a fallback.
+    """
+
+    async def test_every_ceiling_survives_the_round_trip(
+        self, repo: PostgresWorkerConfigRepository
+    ) -> None:
+        tightened = RiskLimits(
+            max_position_pct=Decimal("0.04"),
+            max_gross_exposure_pct=Decimal("2.5"),
+            max_daily_loss_pct=Decimal("0.015"),
+            max_orders_per_minute=5,
+            max_open_positions=6,
+            max_quote_age_seconds=10,
+            default_stop_loss_pct=Decimal("0.011"),
+            default_take_profit_pct=Decimal("9.5"),
+        )
+        await repo.save(a_config(risk=tightened), actor="operator", at=NOW)
+
+        stored = await repo.load()
+        assert stored is not None
+        assert stored.config.risk == tightened
+
+    async def test_the_extreme_of_every_bound_is_storable(
+        self, repo: PostgresWorkerConfigRepository
+    ) -> None:
+        """A bound the value object allows but the column cannot hold would be a
+        value that saves and then will not load — and the widest value of each is
+        exactly where `NUMERIC(20, 8)` and `Integer` run out."""
+        edge = RiskLimits(
+            max_position_pct=Decimal("1"),
+            max_gross_exposure_pct=MAX_GROSS_CEILING,
+            max_daily_loss_pct=Decimal("1"),
+            max_orders_per_minute=MAX_COUNT,
+            max_open_positions=MAX_COUNT,
+            max_quote_age_seconds=MAX_COUNT,
+            default_stop_loss_pct=Decimal("0.99999999"),
+            default_take_profit_pct=MAX_TAKE_PROFIT,
+        )
+        await repo.save(a_config(risk=edge), actor="operator", at=NOW)
+
+        stored = await repo.load()
+        assert stored is not None
+        assert stored.config.risk == edge
+
+    async def test_the_finest_storable_precision_survives_exactly(
+        self, repo: PostgresWorkerConfigRepository
+    ) -> None:
+        """Eight decimal places is what the value object permits, so eight
+        decimal places has to come back unrounded — otherwise the guard is one
+        place out and the bound it protects is still reachable."""
+        fine = RiskLimits(max_position_pct=Decimal("0.12345678"))
+        await repo.save(a_config(risk=fine), actor="operator", at=NOW)
+
+        stored = await repo.load()
+        assert stored is not None
+        assert stored.config.risk.max_position_pct == Decimal("0.12345678")
+
+    async def test_padding_is_trimmed_on_the_ceilings_too(
+        self, repo: PostgresWorkerConfigRepository
+    ) -> None:
+        """`0.10` comes back as `0.10000000` untrimmed, and the form renders the
+        string the API sends — so a saved ceiling would redraw itself as a
+        different-looking number the operator did not type."""
+        await repo.save(a_config(), actor="operator", at=NOW)
+
+        stored = await repo.load()
+        assert stored is not None
+        assert str(stored.config.risk.max_position_pct) == "0.1"
+        assert str(stored.config.risk.max_daily_loss_pct) == "0.03"
+
+    async def test_a_row_written_past_the_precision_guard_refuses_to_load(
+        self, repo: PostgresWorkerConfigRepository, raw: asyncpg.Connection
+    ) -> None:
+        """The guard is in Python, so the database can still be handed such a
+        value by hand — and when it is, the read path must fail loudly rather
+        than serve a ceiling that is not the one stored.
+
+        This is the failure the guard exists to keep unreachable *through the
+        API*; asserting it here is what says the guard is the only thing keeping
+        it unreachable, rather than something else quietly clamping.
+        """
+        await repo.save(a_config(), actor="operator", at=NOW)
+        # Rounds to 1.00000000, which the exclusive bound refuses.
+        await raw.execute("UPDATE worker_config SET risk_default_stop_loss_pct = 0.999999999")
+
+        with pytest.raises(ConfigError, match="default_stop_loss_pct"):
+            await repo.load()
+
+
 class TestTheRevision:
     async def test_the_first_save_is_revision_one(
         self, repo: PostgresWorkerConfigRepository
@@ -175,14 +279,23 @@ class TestOnlyOneRow:
         dashboard can silently disagree about which is in force."""
         await repo.save(a_config(), actor="operator", at=NOW)
 
+        # Every column, including the eight ceilings — which have no server
+        # default, deliberately (the migration drops the one it needs to
+        # backfill). An INSERT that omitted them would trip the NOT NULL
+        # constraint *before* reaching the CHECK this is about, and pass or
+        # fail for a reason that has nothing to do with single-row-ness.
         with pytest.raises(asyncpg.CheckViolationError):
             await raw.execute(
                 "INSERT INTO worker_config "
                 "(id, symbols, max_silence_seconds, strategy, strategy_params, "
                 " sizing_method, sizing_value, stop_type, stop_multiplier, stop_period, "
-                " allow_live_orders, revision, updated_at, updated_by) "
+                " allow_live_orders, revision, updated_at, updated_by, "
+                " risk_max_position_pct, risk_max_gross_exposure_pct, risk_max_daily_loss_pct, "
+                " risk_max_orders_per_minute, risk_max_open_positions, risk_max_quote_age_seconds, "
+                " risk_default_stop_loss_pct, risk_default_take_profit_pct) "
                 "VALUES ('second', '[]', 60, '', '{}', 'risk_pct', 0.01, 'atr', 2, 14, "
-                "        false, 1, now(), 'somebody')"
+                "        false, 1, now(), 'somebody', "
+                "        0.10, 1.00, 0.03, 30, 20, 30, 0.02, 0.06)"
             )
 
     async def test_saving_twice_leaves_one_row(

@@ -24,7 +24,6 @@ from decimal import Decimal
 import pytest
 
 from atp_core.clock import SimulatedClock, TradingCalendar
-from atp_core.config import RiskLimits
 from atp_core.domain import (
     Fill,
     Order,
@@ -41,6 +40,7 @@ from atp_core.domain.enums import StopType
 from atp_core.errors import BrokerConnectionError, ExecutionError
 from atp_core.execution.router import NO_ACTION, ROUTING, SIZING, OrderRouter
 from atp_core.risk.engine import RiskDecision, RiskEngine, default_rules
+from atp_core.risk.limits import RiskLimits
 from atp_core.risk.rules import DailyLossLimitRule
 from atp_core.risk.stops import StopConfig, StopManager
 from atp_core.strategy.rules import PositionSizeSpec

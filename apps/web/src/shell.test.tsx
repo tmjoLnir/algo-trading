@@ -145,7 +145,9 @@ describe('the pinned header', () => {
       'Backtests',
       'Positions',
       'Orders',
-      'Worker',
+      // Named for what the screen holds rather than for the process: the risk
+      // ceilings on it bind a manual order placed here with no worker running.
+      'Config',
       'Analytics',
       'Audit',
     ]) {

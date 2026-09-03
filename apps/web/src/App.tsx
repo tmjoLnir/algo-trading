@@ -22,7 +22,10 @@ const NAV = [
   { to: '/backtests', label: 'Backtests' },
   { to: '/positions', label: 'Positions' },
   { to: '/orders', label: 'Orders' },
-  { to: '/worker', label: 'Worker' },
+  // "Config", not "Worker". The screen behind it stopped being only about the
+  // worker when the account-wide risk ceilings moved onto it: those bind a
+  // manual order typed on this dashboard while no worker is running at all.
+  { to: '/worker', label: 'Config' },
   { to: '/analytics', label: 'Analytics' },
   { to: '/audit', label: 'Audit' },
 ]

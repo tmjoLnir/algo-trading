@@ -7,7 +7,6 @@ use `settings.redacted()`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
 from functools import lru_cache
 from typing import Any, Literal
 
@@ -15,30 +14,6 @@ from pydantic import Field, SecretStr, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from atp_core.domain.enums import RunMode
-
-
-class RiskLimits(BaseSettings):
-    """Account-wide hard ceilings.
-
-    A strategy may configure something tighter; it can never configure something
-    looser. These are the last line of defence before a bug becomes a loss.
-    """
-
-    model_config = SettingsConfigDict(env_prefix="RISK_", env_file=".env", extra="ignore")
-
-    max_position_pct: Decimal = Decimal("0.10")
-    max_gross_exposure_pct: Decimal = Decimal("1.00")
-    max_daily_loss_pct: Decimal = Decimal("0.03")
-    max_orders_per_minute: int = 30
-    max_open_positions: int = 20
-    #: A quote older than this is not a quiet market, it is a dead feed.
-    #: Lives here rather than on the rule so an operator can tune it.
-    max_quote_age_seconds: int = 30
-    #: A fallback, not a recommendation: docs/RISK.md is explicit that a fixed
-    #: percentage stop is too tight on a volatile name and too loose on a dull
-    #: one, and that ATR-based stops are the default.
-    default_stop_loss_pct: Decimal = Decimal("0.02")
-    default_take_profit_pct: Decimal = Decimal("0.06")
 
 
 class Settings(BaseSettings):
@@ -194,7 +169,24 @@ class Settings(BaseSettings):
     #: edit can quietly get wrong.
     worker_metrics_addr: str = Field(default="0.0.0.0", alias="WORKER_METRICS_ADDR")
 
-    risk: RiskLimits = Field(default_factory=RiskLimits)
+    # ── risk ────────────────────────────────────────────────────────────────
+    # **The eight account-wide ceilings are not here any more.** The position,
+    # exposure and daily-loss fractions, the order-rate and open-position
+    # counts, the quote-age budget and the two stop/target fallbacks moved to
+    # the `worker_config` row that the dashboard writes
+    # (`atp_core.risk.limits`), for the three reasons the ten trading
+    # parameters above moved: changing one needed shell access to the host,
+    # nothing recorded who changed it, and the API could not read it to explain
+    # a refusal it had just returned.
+    #
+    # They were also the only values in this class whose *correct* setting an
+    # operator learns from running the platform — a position limit is tuned
+    # against a book, and `.env` is the one place a book cannot be seen from.
+    #
+    # `extra="ignore"` means an old `.env` still loads with the `RISK_*` keys in
+    # it. `make check-env` reports them as keys nothing reads, which is the
+    # right thing to say: the value is being ignored, and the dashboard is
+    # where it lives now.
 
     @model_validator(mode="after")
     def _guard_live_trading(self) -> Settings:
@@ -261,10 +253,7 @@ class Settings(BaseSettings):
 
     def redacted(self) -> dict[str, Any]:
         """Safe to log: secrets replaced with '***'."""
-        return {
-            k: "***" if isinstance(v, SecretStr) else v
-            for k, v in self.model_dump(exclude={"risk"}).items()
-        }
+        return {k: "***" if isinstance(v, SecretStr) else v for k, v in self.model_dump().items()}
 
 
 @lru_cache(maxsize=1)
@@ -295,9 +284,8 @@ def get_settings() -> Settings:
 class ConfigProblem:
     """One value in the environment that will not load, named as it was written.
 
-    `env_var` is the name in `.env`, not the field name — those differ for every
-    aliased field and for all of `RiskLimits`, and the field name is the half a
-    traceback gives you.
+    `env_var` is the name in `.env`, not the field name — the two differ for
+    every aliased field, and the field name is the half a traceback gives you.
 
     `value` is `None` for a secret, and that is not the same as an empty value:
     the renderer must not print what it cannot show. A malformed credential is
@@ -320,8 +308,11 @@ class ConfigProblem:
         return not self.env_var
 
 
-#: Every model that reads the environment, in the order an operator meets them.
-_ENV_MODELS: tuple[type[BaseSettings], ...] = (RiskLimits, Settings)
+#: Every model that reads the environment. One, since the risk ceilings moved
+#: to the database — kept as a tuple rather than collapsed into a bare
+#: `Settings` so that the day a second one appears, `known_env_vars` and
+#: `config_problems` need no reshaping to find it.
+_ENV_MODELS: tuple[type[BaseSettings], ...] = (Settings,)
 
 
 def _resolve(model: type[BaseSettings], reported: str) -> tuple[str, bool]:
@@ -329,8 +320,8 @@ def _resolve(model: type[BaseSettings], reported: str) -> tuple[str, bool]:
 
     Pydantic names the *alias* in `loc` for an aliased field and the *field
     name* for an unaliased one, so both arrive here and neither can be assumed:
-    `Settings` reports `WORKER_METRICS_PORT` while `RiskLimits` reports
-    `max_position_pct` for the value written as `RISK_MAX_POSITION_PCT`.
+    `Settings` reports `WORKER_METRICS_PORT` for an aliased field and
+    `database_url` for the value written as `DATABASE_URL`.
 
     An unrecognised name is treated as a secret. That direction is deliberate —
     the cost of redacting a value that was safe to show is a slightly less
@@ -386,29 +377,21 @@ def config_problems() -> list[ConfigProblem]:
     eventually disagree with the thing it is checking, and the disagreement
     would surface as "the check passes and the API still will not start".
 
-    **`RiskLimits` is checked first and separately, and `Settings` is then built
-    with it supplied.** Not tidiness: `Settings.risk` is a `default_factory`, so
-    a bad `RISK_*` value raises out of that factory *during* `Settings()` and
-    takes the rest of the validation with it. A plain `Settings()` therefore
-    reports one bad risk limit and stays silent about every other broken value
-    in the file — which is one edit-run-edit cycle per mistake, in a file where
-    mistakes arrive in batches after a hand-merge. Supplying `risk` unvalidated
-    lets `Settings` reach its own fields.
+    One `Settings()` call is now the whole of it. It used to be two, because
+    `Settings.risk` was a nested `default_factory` and a single bad `RISK_*`
+    value raised out of that factory *during* `Settings()` — taking every other
+    field's validation with it, and reporting one problem in a file where
+    mistakes arrive in batches after a hand-merge. The ceilings live in the
+    database now, so the nesting that caused it is gone; the batch-reporting it
+    bought is kept by `tests/unit/test_env_doctor.py`.
     """
     problems: list[ConfigProblem] = []
 
-    try:
-        RiskLimits()
-    except ValidationError as exc:
-        problems += _problems_from(RiskLimits, exc)
-
-    try:
-        # `model_construct` skips validation deliberately: the RISK_ values were
-        # just checked on their own, and this stands in only so the nested
-        # factory cannot raise here and mask the rest.
-        Settings(risk=RiskLimits.model_construct())
-    except ValidationError as exc:
-        problems += _problems_from(Settings, exc)
+    for model in _ENV_MODELS:
+        try:
+            model()
+        except ValidationError as exc:
+            problems += _problems_from(model, exc)
 
     # Deduplicated in first-seen order rather than through a set, so a report is
     # stable between runs.
@@ -416,7 +399,7 @@ def config_problems() -> list[ConfigProblem]:
 
 
 def known_env_vars() -> frozenset[str]:
-    """Every variable name `Settings` and `RiskLimits` will actually read.
+    """Every variable name `Settings` will actually read.
 
     For the other half of "what is wrong with my `.env`", and it is the half
     that fails silently. `Settings` is configured `extra="ignore"`, which is the
@@ -425,12 +408,17 @@ def known_env_vars() -> frozenset[str]:
     them would be wrong. The cost is that a **misspelled** key is dropped
     without a word:
 
-        RISK_MAX_POSITION_PC=0.02      # the T is missing
+        DASHBOARD_STALE_AFTER_SECOND=60    # the S is missing
 
-    loads cleanly, reports nothing, and leaves `max_position_pct` at its 0.10
-    default — five times looser than the operator believes they just set. That
-    direction is the reason this exists. `config_problems()` cannot see it,
-    because from pydantic's side nothing went wrong.
+    loads cleanly, reports nothing, and leaves the threshold at its 300-second
+    default — five times more tolerant of a stale reading than the operator
+    believes they just set. That direction is the reason this exists.
+    `config_problems()` cannot see it, because from pydantic's side nothing went
+    wrong.
+
+    It is also the check that now catches a leftover `RISK_*` line: those keys
+    were read here until the ceilings moved into the database, so an `.env` that
+    still carries them is setting nothing, and this is what says so.
 
     Derived from the models rather than listed, so it cannot drift: a field
     added tomorrow is known here the moment it exists.

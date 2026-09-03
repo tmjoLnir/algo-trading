@@ -44,7 +44,7 @@ trades — which happens to good strategies — is an account-threatening event.
 **`risk_pct` and the position cap can contradict each other, and the cap wins.**
 A wide stop buys a large position by construction: 1% of $100,000 against a
 2×ATR stop of $3.27 is 305 shares of a $97 stock, which is 29.5% of the account
-against a 10% `RISK_MAX_POSITION_PCT` — so `max_position_size` refuses the whole
+against a 10% `max_position_pct` — so `max_position_size` refuses the whole
 entry rather than trimming it. Nothing is wrong with either number; they are
 measuring different things, and a strategy whose stop is wide relative to its
 price needs a risk fraction small enough that the resulting notional fits. This
@@ -168,7 +168,7 @@ only defences are position size and `flatten_at_close` — not tighter stops.
 
 ## Portfolio limits
 
-Hard ceilings in `.env`, enforced by `RiskEngine` on every order:
+Hard ceilings, enforced by `RiskEngine` on every order:
 
 | Limit | Default | Prevents |
 |---|---|---|
@@ -177,6 +177,29 @@ Hard ceilings in `.env`, enforced by `RiskEngine` on every order:
 | `max_daily_loss_pct` | 3% | a bad day compounding into a disaster |
 | `max_orders_per_minute` | 30 | a runaway loop |
 | `max_open_positions` | 20 | unmonitorable sprawl |
+
+**Where they live.** These were `RISK_*` environment variables until ADR 0025.
+They are now columns on the `worker_config` row, edited in the risk section of
+the dashboard's **Config** tab, and every save is one audit entry naming the
+operator and both numbers. The values above are the defaults an unconfigured
+deployment runs on — the same ones `.env.example` used to ship.
+
+**Two processes read them at different moments, and the screen says which.** The
+worker builds its `RiskEngine` once at start, so a tightened ceiling binds it at
+its next restart; the API builds a router per request, so an order you place
+from the dashboard is measured against the row as saved, immediately. The
+settings screen shows the saved and the running numbers side by side and says
+when a restart is owed.
+
+**Bounds are enforced at the point of typing.** A fraction must be above zero
+and no wider than its ceiling — 100% of equity for a single position, Reg-T's
+400% for gross exposure, and strictly *below* a whole entry price for the
+default stop, which at exactly 1 would be a stop at zero. Zero is refused
+everywhere rather than read as "off": a zero position limit refuses every order
+and a zero daily-loss limit halts on the first cent, and an operator who wants
+trading stopped has a kill switch that says so. `max_position_pct` may not
+exceed `max_gross_exposure_pct` — the gross rule would refuse first, so the
+position limit you typed would not be the one in force.
 
 Gross, not net: a long/short book that nets to zero still borrows and still
 loses on both legs in a correlated shock.

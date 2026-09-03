@@ -29,6 +29,7 @@ from atp_core.backtest.runner import (
 from atp_core.domain import Timeframe
 from atp_core.errors import ATPError
 from atp_core.logging import correlation_id, get_logger
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS, RiskLimits
 
 if TYPE_CHECKING:
     from atp_core.backtest.engine import BacktestResult, ProgressCallback
@@ -149,9 +150,33 @@ async def _execute(ctx: dict[str, Any], spec: BacktestRunSpec, run_id: str) -> B
         run_spec,
         spec,
         bars,
-        limits=ctx["settings"].risk,
+        limits=await _limits(ctx),
         on_progress=progress_reporter(ctx, run_id),
     )
+
+
+async def _limits(ctx: dict[str, Any]) -> RiskLimits:
+    """The ceilings this backtest is measured against.
+
+    The saved ones, read when the job runs rather than at process start: this
+    worker outlives any number of edits, and judging every run against whatever
+    was saved when the container booted would be judging it against a number
+    days old.
+
+    "When it runs" is not "when it was queued", and for a run that waited behind
+    others those differ. Reading at queue time would mean carrying the ceilings
+    on the job payload, which is a bigger change than it looks: the queue is the
+    wrong place to store a decision, and a re-run of a stored spec would then
+    replay ceilings nobody could see on the run.
+
+    They belong in a backtest at all because a strategy that only looks
+    profitable through a ceiling it would breach in production is the result
+    this platform most needs not to believe. Nothing saved means the defaults,
+    which is what `.env.example` shipped and therefore what an unconfigured
+    deployment has always tested against.
+    """
+    stored = await ctx["worker_config"].load()
+    return DEFAULT_RISK_LIMITS if stored is None else stored.config.risk
 
 
 def progress_reporter(ctx: dict[str, Any], run_id: str) -> ProgressCallback:
