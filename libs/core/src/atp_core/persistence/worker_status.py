@@ -24,7 +24,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any, cast
 
 from atp_core.logging import get_logger
-from atp_core.risk.limits import DEFAULT_RISK_LIMITS, RiskLimits
+from atp_core.risk.limits import RiskLimits
 from atp_core.worker.config import SizingMethod, StopTypeName, WorkerConfig, normalise_symbols
 from atp_core.worker.ports import RunningWorkerConfig
 
@@ -108,22 +108,35 @@ def decode_running(payload: dict[str, Any]) -> RunningWorkerConfig:
 
 
 def _decode_risk(raw: dict[str, Any]) -> RiskLimits:
-    """The ceilings a worker published, or the defaults for one that predates them.
+    """The ceilings a worker published. Raises if it published none.
 
-    A blob written by the previous release has no `risk` key, and this is the
-    one decoder in the pair that must not raise over it: `WorkerStatusStore.get`
-    is documented to return None rather than fail, because this decorates a
-    settings screen and a dashboard that refused to render the form over a stale
-    status blob would take away the one screen that could fix it. A worker
-    restart replaces the key within one deploy anyway.
+    A blob written by the previous release has no `risk` key, and the tempting
+    thing is to fall back to `DEFAULT_RISK_LIMITS` — the values `.env.example`
+    shipped — so the settings screen keeps rendering through a deploy. That is
+    wrong, and it is wrong in the direction this whole screen exists to avoid.
 
-    Falling back to the defaults is honest here for the same reason revision `0`
-    is: what it renders is what that worker was in fact running, since the
-    defaults are the values `.env` shipped.
+    The defaults are what that worker was running only if nobody ever tuned a
+    `RISK_*` variable. For a deployment that had `RISK_MAX_POSITION_PCT=0.25`,
+    the migration backfills the row with 0.10 (it cannot read their `.env`) and
+    leaves `revision` untouched — so substituting here would render "the running
+    worker's position ceiling is 10%, and it matches what is saved", with
+    `pending_restart` false, about a live process still refusing at 25%. A
+    screen claiming ceilings a process is not enforcing is the same class of lie
+    as a dashboard rendering an empty book because Redis blinked.
+
+    So this raises, and `RedisWorkerStatusStore.get` does what it already does
+    with any payload it cannot read: logs `worker.status.unreadable` and returns
+    None, which the screen renders as "no worker has reported" — the honest
+    reading, in that adapter's own words, of not being able to say what is
+    running. It costs the running summary for one worker restart, which is the
+    length of the deploy window that produces it.
     """
     published = raw.get("risk")
     if not isinstance(published, dict):
-        return DEFAULT_RISK_LIMITS
+        raise KeyError(
+            "the published worker status carries no risk ceilings, so what that worker is "
+            "enforcing is unknown — it booted before the ceilings moved to the config row"
+        )
     return RiskLimits(
         max_position_pct=Decimal(str(published["max_position_pct"])),
         max_gross_exposure_pct=Decimal(str(published["max_gross_exposure_pct"])),

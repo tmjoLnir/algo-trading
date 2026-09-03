@@ -209,7 +209,7 @@ services:
     #
     # Whether it trades is not decided here. The watchlist, the strategy and
     # the rest of what it trades live in the database and are edited on the
-    # dashboard's Worker tab; with nothing saved this ingests no market data,
+    # dashboard's Config tab; with nothing saved this ingests no market data,
     # places no orders, and runs the schedule. Changes there take effect at the
     # worker's next start — `docker compose restart worker`.
     build:

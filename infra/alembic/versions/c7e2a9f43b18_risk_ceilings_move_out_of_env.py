@@ -42,7 +42,7 @@ Create Date: 2026-09-03 02:10:00.000000
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
 from alembic import op
@@ -57,7 +57,11 @@ depends_on: str | Sequence[str] | None = None
 
 #: Column name → (type, the value `.env.example` shipped). Ordered as
 #: `RiskLimits` declares them, which is the order the dashboard renders.
-_COLUMNS: tuple[tuple[str, sa.types.TypeEngine[object], str], ...] = (
+#:
+#: `Any` for the type slot rather than `TypeEngine[object]`: SQLAlchemy's type
+#: objects are generic in the Python type they carry, so `Numeric[Decimal]` and
+#: `Integer` share no annotatable supertype that is also assignable from both.
+_COLUMNS: tuple[tuple[str, Any, str], ...] = (
     ("risk_max_position_pct", sa.Numeric(20, 8), "0.10"),
     ("risk_max_gross_exposure_pct", sa.Numeric(20, 8), "1.00"),
     ("risk_max_daily_loss_pct", sa.Numeric(20, 8), "0.03"),

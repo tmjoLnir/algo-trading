@@ -24,8 +24,12 @@ values out of `.env` changed one half of it:
   machinery to say so — the saved row carries a revision, the worker publishes
   the revision it booted with, and the screen renders the difference.
 - The **API** builds a router per request (`atp_api.execution.build_router`),
-  so a manual order placed from the dashboard is measured against the row as
-  saved, immediately.
+  so an order the dashboard itself places is measured against the row as saved,
+  immediately. Today that is `POST /positions/{symbol}/close` — a market order
+  down the full chain, where a refusal comes back as a named rule. It is worth
+  being exact about the scope: `POST /orders` is still a `NotImplementedError`
+  stub, so "a manual order" does not yet mean opening a position, and
+  `POST /orders/cancel-all` deliberately never reaches the chain at all.
 
 Before this module both halves were frozen until both processes restarted, so
 the API half is strictly more responsive than it was. The screen says which is
@@ -41,7 +45,7 @@ risk package is what owns the rules, and `RiskRule.check` takes one of these.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
 from atp_core.errors import ConfigError
 
@@ -66,6 +70,34 @@ MAX_STOP_LOSS = Decimal("1")
 #: typo guard rather than a rule: ten times entry is a misplaced decimal point,
 #: not a plan.
 MAX_TAKE_PROFIT = Decimal("10")
+
+#: Decimal places a stored ceiling may carry, matching the scale of the
+#: `NUMERIC(20, 8)` column each one lives in.
+#:
+#: **This is a correctness bound, not tidiness.** Postgres *rounds* to the
+#: column's scale rather than refusing, and `_to_stored` rebuilds a `RiskLimits`
+#: from what came back — so a value accepted here but rounded on the way in can
+#: land outside its own bound and make the row permanently unloadable. Observed:
+#: `default_stop_loss_pct = 0.999999999` is accepted (it is under the exclusive
+#: ceiling of 1), stores as `1.00000000`, and then fails `_check_fraction` on
+#: every read. That read is `repo.load()`, which is on the path of
+#: `GET /worker/config`, `/risk/limits`, `/risk/status`, `/dashboard/live`, every
+#: manual order and the worker's own boot — including the `PUT /worker/config`
+#: that would repair it, because it loads the previous row to build its audit
+#: diff. The only recovery is hand-editing the row in SQL.
+#:
+#: Declared here rather than imported from `persistence.models.MONEY`, because a
+#: value object does not depend on a storage layer (CLAUDE.md §2). The two are
+#: held in step by `tests/unit/test_risk_limits.py`, which reads the column's
+#: real scale and asserts it equals this.
+STORED_DECIMAL_PLACES = 8
+
+#: The largest count these fields can hold, because all three are stored in a
+#: plain `Integer` (int4) column. Without this the driver raises a `DataError`
+#: from inside `repo.save`, which nothing converts to a 400 — so a fat-fingered
+#: run of digits produces a bare 500 naming no field, instead of the sentence
+#: every other bad ceiling gets.
+MAX_COUNT = 2_147_483_647
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,10 +126,18 @@ class RiskLimits:
     #: More open positions than one person can watch is its own risk.
     max_open_positions: int = 20
     #: A quote older than this is not a quiet market, it is a dead feed.
-    #: Necessarily tighter than `WorkerConfig.max_silence_seconds`, which is how
+    #: Should be tighter than `WorkerConfig.max_silence_seconds`, which is how
     #: long the *feed* may go quiet: a single symbol can legitimately go a
     #: minute without printing, but an order must not be priced off a quote that
     #: old.
+    #:
+    #: **A convention, not an invariant, and deliberately unenforced.** The two
+    #: guard different things — the watchdog times the whole feed, this times one
+    #: symbol — so inverting them is not incoherent the way a position limit
+    #: above the gross limit is; it just leaves one frozen symbol unguarded while
+    #: the rest of the watchlist keeps printing and the watchdog stays quiet. A
+    #: cross-object rule would also refuse the harmless direction (a tighter
+    #: watchdog than quote budget), so the form advises it instead.
     max_quote_age_seconds: int = 30
     #: A fallback, not a recommendation: docs/RISK.md is explicit that a fixed
     #: percentage stop is too tight on a volatile name and too loose on a dull
@@ -181,14 +221,34 @@ class RiskLimits:
                 f"anything {'at or above' if exclusive else 'above'} {ceiling:%}. "
                 "Fractions are written as 0.10 for 10%."
             )
+        exponent = value.as_tuple().exponent
+        # `is_finite()` above guarantees an int rather than the 'n'/'F' a NaN or
+        # an infinity carries here.
+        if isinstance(exponent, int) and -exponent > STORED_DECIMAL_PLACES:
+            raise ConfigError(
+                f"{name} of {value} has more than {STORED_DECIMAL_PLACES} decimal places, "
+                "which is the precision it is stored at — the value that came back would not "
+                "be the value you typed, and could fall outside the bound this just checked"
+            )
 
     @staticmethod
     def _check_count(name: str, value: int) -> None:
-        """A count or a duration: at least one of whatever it counts."""
+        """A count or a duration: at least one, and no more than the column holds.
+
+        The upper bound is not a judgement about how many orders a minute is
+        sensible — it is the point past which the *database* refuses, and being
+        refused here means a 400 naming the field rather than a 500 raised out
+        of the driver with nothing on it a reader can act on.
+        """
         if value < 1:
             raise ConfigError(
                 f"{name} must be at least 1, got {value} — zero would refuse every order "
                 "rather than lifting the limit"
+            )
+        if value > MAX_COUNT:
+            raise ConfigError(
+                f"{name} of {value} is larger than the {MAX_COUNT} this can store; "
+                "a number that size is a slipped keystroke rather than a limit"
             )
 
 
@@ -208,9 +268,16 @@ class LimitField:
     typed rather than one document away.
 
     `unit` is what the form renders beside the box — `fraction` gets a percent
-    hint, the rest get their noun — and `maximum` is the same ceiling
-    `__post_init__` enforces, sent so the browser refuses before the server has
-    to. It is a convenience and never the authority: the value object is.
+    hint, the rest get their noun — and `maximum` is the ceiling from
+    `__post_init__`, sent so the browser refuses before the server has to.
+
+    **It is a convenience and never the authority.** The form checks it on
+    submit and names the field, rather than handing it to an HTML `max`
+    attribute — which could not carry it anyway, since `default_stop_loss_pct`
+    is bounded *exclusively* (a stop of a whole entry price is the level zero)
+    and `max` is inclusive. So a value at an exclusive bound passes the client
+    check and is refused by the server with a sentence, which is the one round
+    trip this field does not save.
     """
 
     name: str
@@ -292,16 +359,3 @@ RISK_LIMIT_FIELDS: tuple[LimitField, ...] = (
         MAX_TAKE_PROFIT,
     ),
 )
-
-
-def parse_limit_decimal(raw: str | Decimal | int | float, *, field_name: str) -> Decimal:
-    """A `Decimal` from whatever the wire carried, refusing junk by name.
-
-    Via `str` for a float on the off chance one reaches here: these fractions
-    are multiplied by equity to produce the ceiling an order is measured
-    against, and `Decimal(0.1)` is not `Decimal("0.1")` (rule §1.1).
-    """
-    try:
-        return Decimal(str(raw))
-    except (InvalidOperation, ValueError) as exc:
-        raise ConfigError(f"{field_name} is not a number: {raw!r}") from exc

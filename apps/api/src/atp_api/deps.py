@@ -245,8 +245,11 @@ async def get_effective_risk_limits(
     responsive half of a deliberate asymmetry, and it is worth being explicit
     about which half:
 
-    - **Here**, a ceiling binds the next manual order — `build_router`
-      constructs its chain per request, so a save takes effect immediately.
+    - **Here**, a ceiling binds the next order this process places —
+      `build_router` constructs its chain per request, so a save takes effect
+      immediately. Today that is `POST /positions/{symbol}/close`;
+      `POST /orders` is still a stub, and `cancel-all` passes the defaults
+      because its chain is never consulted.
     - **In the worker**, it binds at the next restart, because the live loop
       builds one `RiskEngine` at start. The dashboard says so: the row carries a
       revision, the worker publishes the one it booted with, and the settings

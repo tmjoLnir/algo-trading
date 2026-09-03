@@ -158,10 +158,16 @@ async def _execute(ctx: dict[str, Any], spec: BacktestRunSpec, run_id: str) -> B
 async def _limits(ctx: dict[str, Any]) -> RiskLimits:
     """The ceilings this backtest is measured against.
 
-    The saved ones, read now rather than at process start: this worker outlives
-    any number of edits, and a run queued this morning should be judged by the
-    limits the platform was carrying this morning — not by whatever it started
-    with days ago.
+    The saved ones, read when the job runs rather than at process start: this
+    worker outlives any number of edits, and judging every run against whatever
+    was saved when the container booted would be judging it against a number
+    days old.
+
+    "When it runs" is not "when it was queued", and for a run that waited behind
+    others those differ. Reading at queue time would mean carrying the ceilings
+    on the job payload, which is a bigger change than it looks: the queue is the
+    wrong place to store a decision, and a re-run of a stored spec would then
+    replay ceilings nobody could see on the run.
 
     They belong in a backtest at all because a strategy that only looks
     profitable through a ceiling it would breach in production is the result

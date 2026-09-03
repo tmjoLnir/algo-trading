@@ -24,19 +24,22 @@ Two properties are load-bearing here and neither is obvious:
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import FrozenInstanceError
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
 from atp_core.errors import ConfigError
 from atp_core.risk.limits import (
     DEFAULT_RISK_LIMITS,
+    MAX_COUNT,
     MAX_GROSS_CEILING,
     MAX_STOP_LOSS,
     RISK_LIMIT_FIELDS,
+    STORED_DECIMAL_PLACES,
     RiskLimits,
-    parse_limit_decimal,
 )
 
 #: The value each field carried in `.env.example` before the move. Restated
@@ -89,15 +92,18 @@ class TestTheDefaultsAreWhatTheFileShipped:
     def test_each_default_is_the_value_env_carried(self, field: str, expected: object) -> None:
         assert getattr(DEFAULT_RISK_LIMITS, field) == expected
 
-    def test_the_defaults_are_loadable(self) -> None:
-        """`DEFAULT_RISK_LIMITS` passes its own validation.
+    def test_every_default_satisfies_every_bound(self) -> None:
+        """A tightened bound must not exclude the default it was tightened past.
 
-        Not circular: the defaults are class attributes, and `__post_init__`
-        could perfectly well refuse one — a tightened bound that nobody checked
-        against the default it was tightening past would make every unsaved
-        deployment fail to start.
+        `assert RiskLimits() == DEFAULT_RISK_LIMITS` was what stood here, and it
+        cannot fail: `DEFAULT_RISK_LIMITS` *is* `RiskLimits()`. The property
+        worth holding is that each declared default is inside its own bound,
+        which is checked by constructing an object that carries **only** that
+        default while every other field is set to something known-valid — so a
+        failure names the field rather than the object.
         """
-        assert RiskLimits() == DEFAULT_RISK_LIMITS
+        for field, default in SHIPPED.items():
+            limits_with(field, default)  # raises ConfigError if the default is out of bounds
 
 
 class TestZeroIsNotOff:
@@ -204,7 +210,21 @@ class TestTheFormCatalogue:
     """
 
     def test_every_field_has_an_entry(self) -> None:
-        assert {f.name for f in RISK_LIMIT_FIELDS} == set(SHIPPED)
+        """Derived from the dataclass, not from `SHIPPED`.
+
+        `SHIPPED` is hand-written, so checking the catalogue against it would
+        only prove two hand-written lists agree. `dataclasses.fields` is the
+        real thing: a ceiling added to `RiskLimits` and to nothing else fails
+        here, which is what makes the API's `RISK_FIELDS` comment true — that
+        one cannot be saved without appearing in the audit diff, since that
+        tuple is derived from this catalogue.
+        """
+        declared = {f.name for f in dataclasses.fields(RiskLimits)}
+
+        assert {f.name for f in RISK_LIMIT_FIELDS} == declared
+        # And the hand-written table this module compares defaults against is
+        # complete too, or half these cases would be silently skipping a field.
+        assert set(SHIPPED) == declared
 
     def test_no_entry_names_a_field_that_does_not_exist(self) -> None:
         for field in RISK_LIMIT_FIELDS:
@@ -236,18 +256,65 @@ class TestTheFormCatalogue:
                 limits_with(field.name, field.maximum + Decimal("0.01"))
 
 
-class TestParsingWhatTheWireCarried:
-    def test_a_string_becomes_a_decimal(self) -> None:
-        assert parse_limit_decimal("0.10", field_name="x") == Decimal("0.10")
+class TestAValueTheRowCannotHold:
+    """The bug this class exists for bricked the entire configuration row.
 
-    def test_a_float_goes_via_str(self) -> None:
-        """`Decimal(0.1)` is not `Decimal('0.1')` (rule §1.1), and this is
-        multiplied by equity to produce a ceiling."""
-        assert parse_limit_decimal(0.1, field_name="x") == Decimal("0.1")
+    `NUMERIC(20, 8)` *rounds* rather than refusing, and `_to_stored` rebuilds a
+    `RiskLimits` from what came back — so a value accepted here and rounded on
+    the way in can land outside its own bound. Reproduced against a real
+    Postgres before this guard existed: `default_stop_loss_pct = 0.999999999`
+    was accepted (under the exclusive ceiling of 1), stored as `1.00000000`, and
+    then raised `ConfigError` on every subsequent read. That read is
+    `repo.load()`, which sits on `GET /worker/config`, `/risk/limits`,
+    `/risk/status`, `/dashboard/live`, every manual order and the worker's boot
+    — *including* the `PUT /worker/config` that would repair it, since it loads
+    the previous row to build its audit diff. Recovery was hand-written SQL.
+    """
 
-    def test_junk_is_refused_by_name(self) -> None:
-        with pytest.raises(ConfigError, match="max_position_pct is not a number"):
-            parse_limit_decimal("ten percent", field_name="max_position_pct")
+    @pytest.mark.parametrize("field", FRACTIONS)
+    def test_more_places_than_the_column_holds_is_refused(self, field: str) -> None:
+        with pytest.raises(ConfigError, match="decimal places"):
+            limits_with(field, Decimal("0.123456789"))
+
+    @pytest.mark.parametrize("field", FRACTIONS)
+    def test_exactly_the_column_precision_is_accepted(self, field: str) -> None:
+        """The bound is what the column holds, not something tighter."""
+        assert limits_with(field, Decimal("0.12345678")) is not None
+
+    def test_the_value_that_rounded_up_across_its_bound_is_refused(self) -> None:
+        """The exact reproduction: accepted before the guard, unloadable after."""
+        with pytest.raises(ConfigError, match="decimal places"):
+            RiskLimits(default_stop_loss_pct=Decimal("0.999999999"))
+
+    def test_the_value_that_rounded_down_to_zero_is_refused(self) -> None:
+        """The other direction — stored as 0, then refused as "must be greater
+        than zero" on every read."""
+        with pytest.raises(ConfigError, match="decimal places"):
+            RiskLimits(max_position_pct=Decimal("1E-9"))
+
+    def test_the_declared_precision_is_the_columns_real_precision(self) -> None:
+        """Binds the constant to the schema without the value object importing it.
+
+        `STORED_DECIMAL_PLACES` is declared in `atp_core.risk.limits` because a
+        value object does not depend on a storage layer. That leaves the two
+        free to drift, and drifting *looser* re-opens exactly the bug above — so
+        the coupling is held here, by reading the column the values land in.
+        """
+        from atp_core.persistence.models import MONEY
+
+        assert MONEY.scale == STORED_DECIMAL_PLACES
+
+    @pytest.mark.parametrize("field", COUNTS)
+    def test_a_count_past_the_integer_column_is_refused(self, field: str) -> None:
+        """Otherwise asyncpg raises a `DataError` from inside `repo.save` that
+        nothing converts to a 400: the operator gets a bare 500 naming no field,
+        where every other bad ceiling gets a sentence."""
+        with pytest.raises(ConfigError, match="larger than"):
+            limits_with(field, MAX_COUNT + 1)
+
+    @pytest.mark.parametrize("field", COUNTS)
+    def test_the_largest_storable_count_is_accepted(self, field: str) -> None:
+        assert limits_with(field, MAX_COUNT) is not None
 
 
 class TestItIsFrozen:
@@ -255,3 +322,52 @@ class TestItIsFrozen:
         limits = RiskLimits()
         with pytest.raises(FrozenInstanceError, match="cannot assign"):
             limits.max_position_pct = Decimal("0.5")  # type: ignore[misc]
+
+
+class TestTheMigrationBackfillsWhatTheDefaultsSay:
+    """The values `c7e2a9f43b18` writes into an existing row must be these ones.
+
+    They are a **third** copy of the eight defaults — after the dataclass and
+    `.env.example` — and the only one a test never touches, because a migration
+    is not imported by anything. Drift there is invisible and consequential in
+    exactly one direction: an operator upgrades, the row is backfilled with
+    numbers that are not the ones this platform documents as its defaults, and
+    nothing anywhere says so.
+
+    A migration is never edited once applied, so this does not exist to let it
+    change — it exists so that changing `DEFAULT_RISK_LIMITS` makes somebody
+    look at what the already-shipped backfill wrote.
+    """
+
+    @staticmethod
+    def _migration() -> object:
+        import importlib.util
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "infra/alembic/versions/c7e2a9f43b18_risk_ceilings_move_out_of_env.py"
+        )
+        spec = importlib.util.spec_from_file_location("risk_ceilings_migration", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_it_adds_exactly_the_eight_columns(self) -> None:
+        columns = {name for name, _type, _default in self._migration()._COLUMNS}  # type: ignore[attr-defined]
+
+        assert columns == {f"risk_{name}" for name in SHIPPED}
+
+    def test_each_backfilled_value_is_the_declared_default(self) -> None:
+        for name, _type, default in self._migration()._COLUMNS:  # type: ignore[attr-defined]
+            field = name.removeprefix("risk_")
+            declared = getattr(DEFAULT_RISK_LIMITS, field)
+            assert Decimal(default) == Decimal(str(declared)), field
+
+    def test_every_backfilled_value_is_one_the_value_object_accepts(self) -> None:
+        """A backfill outside the bounds would make every existing deployment's
+        row unloadable at the first read after the upgrade."""
+        for name, _type, default in self._migration()._COLUMNS:  # type: ignore[attr-defined]
+            field = name.removeprefix("risk_")
+            value = Decimal(default) if field in FRACTIONS else int(default)
+            limits_with(field, value)

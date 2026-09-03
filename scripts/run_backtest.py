@@ -472,8 +472,14 @@ async def main(argv: list[str] | None = None) -> int:
     # are still unreachable for the reason given above — the argument handling
     # has already refused each of those conditions by flag name. Were one ever
     # to become reachable, a named failure beats the traceback it raised before.
+    # Outside the `try` below, deliberately. `DatabaseUnavailableError` is an
+    # `ATPError`, so a database that will not answer would otherwise be reported
+    # as "backtest failed" — sending the operator to look at their spec for a
+    # fault that is in their stack.
+    limits = await _load_limits(settings.database_url)
+
     try:
-        result = run_spec(spec, bars, limits=await _load_limits(settings.database_url))
+        result = run_spec(spec, bars, limits=limits)
     except ATPError as exc:
         raise SystemExit(f"backtest failed: {exc}") from None
 

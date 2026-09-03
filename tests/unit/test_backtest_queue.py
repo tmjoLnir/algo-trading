@@ -37,8 +37,9 @@ from atp_core.config import get_settings
 from atp_core.domain import Bar, Timeframe
 from atp_core.persistence.backtests import new_run
 from atp_core.persistence.jobs import QUEUE_NAME, RUN_BACKTEST_TASK
-from atp_core.risk.limits import DEFAULT_RISK_LIMITS
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS, RiskLimits
 from atp_core.strategy import registry
+from atp_core.worker import StoredWorkerConfig, WorkerConfig
 from atp_worker.queue import (
     INTERRUPTED_ERROR,
     JOB_TIMEOUT_SECONDS,
@@ -46,7 +47,7 @@ from atp_worker.queue import (
     WorkerSettings,
     sweep_interrupted,
 )
-from atp_worker.tasks import run_backtest_task
+from atp_worker.tasks import _limits, run_backtest_task
 from tests.fakes import (
     FakeBacktestQueue,
     FakeBacktestRunRepository,
@@ -781,3 +782,48 @@ class TestTheRunKeepsItsWarnings:
         assert stored.status == "failed"
         assert stored.error is not None
         assert stored.warnings is None
+
+
+class TestTheCeilingsABacktestIsJudgedAgainst:
+    """A backtest runs the same nine-rule chain a live order does, so the
+    ceilings decide which of its entries are refused — and since ADR 0025 they
+    are a mutable row rather than a value baked into the process.
+
+    Both branches matter and only one of them is the ordinary case. An empty
+    repository means the defaults, which is what an unconfigured checkout has
+    always tested against; a *saved* row is what every real deployment has, and
+    a `_limits` that ignored it would silently judge every backtest against
+    limits nobody set — flattering exactly the strategies whose profit depends
+    on positions the platform would refuse.
+    """
+
+    async def test_nothing_saved_means_the_defaults(self, ctx: dict[str, Any]) -> None:
+        assert await _limits(ctx) == DEFAULT_RISK_LIMITS
+
+    async def test_a_saved_row_is_what_the_run_is_measured_against(
+        self, ctx: dict[str, Any]
+    ) -> None:
+        tightened = RiskLimits(max_open_positions=3, max_position_pct=Decimal("0.02"))
+        ctx["worker_config"] = FakeWorkerConfigRepository(
+            StoredWorkerConfig(
+                config=WorkerConfig(risk=tightened),
+                revision=9,
+                updated_at=datetime(2026, 9, 3, tzinfo=UTC),
+                updated_by="josh",
+            )
+        )
+
+        assert await _limits(ctx) == tightened
+
+    async def test_an_unreachable_database_is_not_silently_the_defaults(
+        self, ctx: dict[str, Any]
+    ) -> None:
+        """The direction that matters. Falling back here would run the backtest
+        against looser ceilings than the operator set and report the result as
+        though it had been measured properly."""
+        broken = FakeWorkerConfigRepository()
+        broken.load_error = RuntimeError("postgres is unreachable")
+        ctx["worker_config"] = broken
+
+        with pytest.raises(RuntimeError, match="postgres is unreachable"):
+            await _limits(ctx)

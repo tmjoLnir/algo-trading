@@ -141,10 +141,13 @@ async def on_startup(ctx: dict[str, Any]) -> None:
     ctx["redis"] = redis
     ctx["runs"] = PostgresBacktestRunRepository(session_factory)
     ctx["bars"] = PostgresBarRepository(session_factory)
-    # Where the risk ceilings live now that they are not in `.env`. Read per
-    # run rather than resolved here, because this process is long-lived and a
-    # backtest queued after a ceiling changed should be measured against the
-    # ceiling in force when it was queued.
+    # Where the risk ceilings live now that they are not in `.env`. The
+    # repository, not the values: this process is long-lived, so resolving them
+    # here would judge every run for days against whatever was saved the moment
+    # it booted. `tasks._limits` reads the row when the job *runs*, which is the
+    # nearest thing to "now" a queue can offer — a run that waited behind others
+    # is measured against the ceilings in force when it started, not when it was
+    # queued, and the two differ whenever somebody edits them in between.
     ctx["worker_config"] = PostgresWorkerConfigRepository(session_factory)
     ctx["queue"] = ArqBacktestQueue(redis, settings.redis_url, clock)
 

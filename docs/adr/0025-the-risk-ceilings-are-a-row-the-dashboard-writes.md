@@ -68,11 +68,15 @@ the operator would otherwise believe they had a limit they do not have.
 The worker builds its `RiskEngine` once at start, so a saved ceiling binds it
 only at its next restart — the same restart semantics ADR 0023 established, with
 the same revision comparison rendering it. The API builds a router per request,
-so a manual order placed from the dashboard is measured against the row as
-saved, immediately. Before this change neither half moved until both processes
-restarted; the API half is therefore strictly more responsive than it was, which
-is an improvement provided nobody assumes the two agree. The settings screen
-carries both numbers, and the note under the save button states the difference.
+so an order the dashboard itself places is measured against the row as saved,
+immediately. Today that means `POST /positions/{symbol}/close`, which sends a
+market order down the full chain; `POST /orders` is still an unimplemented stub,
+so "a manual order" does not yet mean *opening* a position, and
+`POST /orders/cancel-all` deliberately never reaches the chain. Before this
+change neither half moved until both processes restarted; the API half is
+therefore strictly more responsive than it was, which is an improvement provided
+nobody assumes the two agree. The settings screen carries both numbers, and the
+note under the save button states the difference.
 
 **They do not ask for the password.** `allow_live_orders` does, because it grants
 a new capability to an unattended loop (ADR 0009). These bound orders that are
@@ -94,10 +98,13 @@ serving the defaults instead would state numbers nobody set as though somebody
 had.
 
 **A backtest reads them at run time.** `scripts/run_backtest.py` and the queue
-worker load the saved row rather than a settings field, so a run queued this
-morning is judged by the limits the platform was carrying this morning. The
-alternative — resolving them once at process start — would judge a run against
-whatever the long-lived queue worker booted with days ago.
+worker load the saved row rather than a settings field, so a run is judged by
+the limits in force when the job **runs** — not when it was queued, which for a
+run that waited behind others is a different moment, and not when the container
+booted, which for a long-lived queue worker could be days earlier. Reading at
+queue time would mean carrying the ceilings on the job payload; the queue is the
+wrong place to store a decision, and a re-run of a stored spec would then replay
+ceilings nobody could see on the run.
 
 **An existing `.env` keeps working and is told it is being ignored.** `Settings`
 is `extra="ignore"`, so a leftover `RISK_*` line loads and does nothing.
@@ -112,8 +119,8 @@ dashboard once; the removed block in `.env.example` lists the defaults so the
 comparison can be made without digging through git history.
 
 **The tab is renamed from Worker to Config.** The screen stopped being about the
-worker when the ceilings landed on it: they bind a manual order typed into this
-dashboard while no worker is running at all. Every operator-facing pointer at
+worker when the ceilings landed on it: they bind an order this dashboard places
+— closing a position — while no worker is running at all. Every operator-facing pointer at
 "the Worker tab" — in the runbook, the preflight fixes, the worker's own startup
 hints — moved with it. ADR 0023's text is left as written, being the record of a
 decision taken when that was the name.

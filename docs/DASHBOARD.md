@@ -455,18 +455,38 @@ is written to the audit trail against the session's user (`strategy_created`),
 because this is where a strategy's name — the key every later signal and order
 carries — comes into existence.
 
-## The worker page
+## The Config page
 
-`/worker`, over `GET` and `PUT /api/v1/worker/config` — the newest of the eight
-tabs, and the first screen in this app that **writes something a running process
-will act on**.
+`/worker`, labelled **Config**, over `GET` and `PUT /api/v1/worker/config` — the
+newest of the eight tabs, and the first screen in this app that **writes
+something a running process will act on**.
 Everything else either reads, halts trading, or queues a backtest.
 
-The ten settings it edits — the watchlist, the strategy and its parameters, the
-sizing pair, the stop triple, the feed watchdog, and whether the worker may place
-live orders — were environment variables until ADR 0023. What that ADR argues is
-why they are here at all; what this section is about is the two things the screen
-has to get right.
+The ten worker settings it edits — the watchlist, the strategy and its
+parameters, the sizing pair, the stop triple, the feed watchdog, and whether the
+worker may place live orders — were environment variables until ADR 0023. The
+eight account-wide risk ceilings under them were environment variables until ADR
+0025, and joined the same row, the same save and the same audit entry. What
+those ADRs argue is why any of it is here at all; what this section is about is
+the things the screen has to get right.
+
+**The tab is called Config, not Worker**, because the ceilings are not the
+worker's: they bind every order this platform places, including one the dashboard
+places itself while no worker is running.
+
+**The risk section does not ask for a password, and `allow_live_orders` does.**
+That lock grants a capability to an unattended loop; a ceiling bounds orders that
+are already permitted, and a step-up in front of one would make *tightening* it
+harder than leaving it alone — the direction `/risk/halt` deliberately never
+takes. What makes a loosening answerable instead is the audit row, which carries
+the field, both numbers and the operator's name.
+
+**The two processes pick a ceiling up at different moments.** The worker builds
+its `RiskEngine` once at start, so a save binds it at the next restart — the
+same restart notice the settings above get. The API builds its router per
+request, so an order the dashboard itself places (today, closing a position) is
+measured against the row as saved, immediately. The screen carries both numbers;
+the note under Save states the difference.
 
 **Saved and running are two different facts, and the screen shows both.** A
 worker reads its configuration once, at start, so what is stored and what is in

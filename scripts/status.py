@@ -90,24 +90,35 @@ async def _saved_symbols(settings: Settings) -> list[str]:
     return [] if stored is None else list(stored.config.symbols)
 
 
-async def _saved_limits(settings: Settings) -> RiskLimits | None:
-    """The saved risk ceilings, or None when the database will not answer.
+async def _saved_limits(settings: Settings) -> tuple[RiskLimits, str]:
+    """The risk ceilings in force, and where they came from.
 
-    None rather than the defaults on a read failure, for the reason
-    `_saved_symbols` returns an empty list: this is the script somebody runs
-    when the stack is half up. But the two failures print differently — an empty
-    watchlist is a *state*, while defaulted ceilings would be a **claim**, and
-    printing "budget 30s" over an unreachable database would state a number
-    nobody had set as though somebody had. The caller labels it instead.
+    **Three states, not two**, and the label is how they are told apart. The
+    ceilings and the provenance travel together because the number alone is
+    ambiguous in a way that matters here: 30 seconds means something different
+    if an operator chose it, if nobody has chosen anything, and if the database
+    could not be asked. This is the script somebody runs when the stack is half
+    up, so all three happen.
+
+    Defaults are a *state* in the middle case and a **fallback** in the third,
+    and the header says which. Printing "budget 30s (Config tab)" over an
+    unreachable database would state a number nobody had set as though somebody
+    had; printing it over an empty table would be wrong in the other direction,
+    since the defaults genuinely are what an unconfigured platform enforces.
+
+    Read failures are swallowed for the reason `_saved_symbols` returns an empty
+    list rather than raising: there is plenty else on this page to report.
     """
     engine = create_engine(settings.database_url)
     try:
         stored = await PostgresWorkerConfigRepository(create_session_factory(engine)).load()
     except Exception:
-        return None
+        return DEFAULT_RISK_LIMITS, "defaults; the database is not answering"
     finally:
         await engine.dispose()
-    return DEFAULT_RISK_LIMITS if stored is None else stored.config.risk
+    if stored is None:
+        return DEFAULT_RISK_LIMITS, "defaults; nothing saved on the Config tab yet"
+    return stored.config.risk, "Config tab → risk limits"
 
 
 async def main(argv: list[str] | None = None) -> int:
@@ -179,13 +190,12 @@ async def _print_local(settings: Settings, symbols: list[str], timeframe: Timefr
     """Quotes and bars — what an order would be priced against, and what a
     strategy would decide on."""
     now = datetime.now(UTC)
-    limits = await _saved_limits(settings)
-    # The verdicts below still need a number when the row cannot be read, so
-    # they use the default — and the header says which of the two it is, so a
-    # stale-quote verdict is never read as measured against a ceiling the
-    # operator set when it was measured against a fallback.
-    budget = (limits or DEFAULT_RISK_LIMITS).max_quote_age_seconds
-    source = "Config tab → risk limits" if limits else "default; the database is not answering"
+    # The verdicts below need a number even when the row cannot be read, so the
+    # defaults stand in — and the header carries `source`, so a stale-quote
+    # verdict is never read as measured against a ceiling the operator set when
+    # it was measured against a fallback.
+    limits, source = await _saved_limits(settings)
+    budget = limits.max_quote_age_seconds
 
     redis = create_redis(settings.redis_url)
     engine = create_engine(settings.database_url)

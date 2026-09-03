@@ -1974,15 +1974,26 @@ wording if it is not the demonstration you want.
   system a book cannot be seen from. The API also returns the refusals these
   ceilings cause and could not read the number that caused one.
 
-  **The bounds are new, and they close AUDIT.md finding #42.** `RiskLimits` was
-  eight bare annotations: `RISK_MAX_POSITION_PCT=10` loaded cleanly and set the
-  single-position cap to 1000% of equity, and `RISK_MAX_ORDERS_PER_MINUTE=0`
-  denied every order forever. Neither raised, logged, nor appeared in
-  `config_problems()`. `RiskLimits.__post_init__` now refuses both, in the one
-  place the API and the worker both get their rules from — plus the cross-field
-  rule that a single symbol may not be allowed to exceed the whole book's
-  ceiling, which is not unsafe but means the operator has a limit they do not
-  have.
+  **The bounds are new, and they remove the defect AUDIT.md finding #42 reports.**
+  `RiskLimits` was eight bare annotations: `RISK_MAX_POSITION_PCT=10` loaded
+  cleanly and set the single-position cap to 1000% of equity, and
+  `RISK_MAX_ORDERS_PER_MINUTE=0` denied every order forever. Neither raised,
+  logged, nor appeared in `config_problems()`. `RiskLimits.__post_init__` now
+  refuses both, in the one place the API and the worker both get their rules
+  from — plus the cross-field rule that a single symbol may not be allowed to
+  exceed the whole book's ceiling, which is not unsafe but means the operator has
+  a limit they do not have; and a precision bound, because `NUMERIC(20, 8)`
+  rounds rather than refusing, so a ceiling accepted at nine decimal places could
+  round across its own bound and leave the row unloadable by everything that
+  reads it — the endpoint that would repair it included.
+
+  **Finding #42 stays marked Open in AUDIT.md, deliberately.** That file's
+  convention is that a state is annotated with the PR that earned it, in the same
+  diff. It is marked closed — and its citation re-pointed away from
+  `config.py:29`, which now addresses unrelated code — when this work has a PR
+  number to annotate it with. Claiming closure here while the audit still reads
+  Open would put the two records in disagreement, which is the failure the
+  audit's own state axis exists to prevent.
 
   **They do not ask for the password, and that is deliberate.**
   `allow_live_orders` grants a capability to an unattended loop; these bound

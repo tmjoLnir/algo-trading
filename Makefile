@@ -40,7 +40,7 @@ up: .env  ## Start the full stack
 	@echo "api  → http://localhost:8000/docs"
 	@echo "web  → http://localhost:5173"
 	@echo "worker → market-data ingestion + scheduled jobs"
-	@echo "         what it trades is set on the dashboard's Worker tab, not in .env;"
+	@echo "         what it trades is set on the dashboard's Config tab, not in .env;"
 	@echo "         with nothing saved it ingests nothing and places no orders"
 	@echo "queue  → runs the backtests the dashboard queues"
 

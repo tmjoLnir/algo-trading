@@ -118,10 +118,14 @@ function toDraft(config: WorkerConfigView): Draft {
  * being posted to an endpoint that no longer has a field for it.
  *
  * `unit` decides the conversion, which is the only thing here that could
- * corrupt a value: the three counts go through `Number` because the server
- * types them as integers, and the five fractions are sent **as typed**. A
- * fraction through `Number` is a JSON float, and a `0.1` that has been a float
- * is not the ceiling that was typed (CLAUDE.md §1.1).
+ * corrupt a value: the counts go through `Number` because the server types them
+ * as integers, and everything else is sent **as typed**. A fraction through
+ * `Number` is a JSON float, and a `0.1` that has been a float is not the ceiling
+ * that was typed (CLAUDE.md §1.1).
+ *
+ * The split is `isFraction`, which recognises *counts* and treats anything else
+ * as money-shaped — so the failure mode of an unrecognised unit is a string the
+ * server refuses, not a silently-rounded ceiling it accepts.
  */
 function riskPayload(
   fields: readonly RiskLimitFieldView[],
@@ -130,9 +134,64 @@ function riskPayload(
   const out: Record<string, string | number> = {}
   for (const field of fields) {
     const raw = (values[field.name] ?? '').trim()
-    out[field.name] = field.unit === 'fraction' ? raw : Number(raw)
+    out[field.name] = isFraction(field) ? raw : Number(raw)
   }
   return out as unknown as RiskLimitsInput
+}
+
+/**
+ * Whether this ceiling is a fraction of equity rather than a count.
+ *
+ * Written as "not a count" rather than "is a fraction", which matters because
+ * the two branches are not symmetric: the fraction branch sends the value as
+ * typed and the count branch puts it through `Number`. A unit this file has
+ * never heard of must land on the *string* side, so an added ceiling cannot
+ * silently start round-tripping a ratio through a JS float (CLAUDE.md §1.1).
+ * Counts are the closed set; everything else is money-shaped.
+ */
+const COUNT_UNITS = new Set(['positions', 'orders/min', 'seconds'])
+
+function isFraction(field: RiskLimitFieldView): boolean {
+  return !COUNT_UNITS.has(field.unit)
+}
+
+/**
+ * The first thing wrong with the risk section, named, or null.
+ *
+ * This is what a number input's own validation used to do, moved here because
+ * that input could not be used (see `RiskLimitFields`) and because a browser
+ * tooltip is a worse answer than the sentence the server would give: it names
+ * no field, cannot be styled, and disappears on the next click.
+ *
+ * Only refusals the operator can act on without a round trip. Everything else
+ * — the cross-field rule, the precision bound, the exclusive stop ceiling — is
+ * left to the server, whose message is better than anything restated here could
+ * be, and which has to check them anyway.
+ */
+function riskProblem(
+  fields: readonly RiskLimitFieldView[],
+  values: Record<string, string>,
+): string | null {
+  for (const field of fields) {
+    const raw = (values[field.name] ?? '').trim()
+    if (raw === '') {
+      // Was a bare 422 naming no field: `''` is not a Decimal, and pydantic
+      // reports the location rather than the label the operator can see.
+      return `${field.label} is empty. Every ceiling needs a value — there is no "no limit".`
+    }
+    if (!/^\d*\.?\d+$/.test(raw)) {
+      return `${field.label} is not a number: "${raw}".`
+    }
+    // Compared as numbers and sent as text. A bound check may round; the value
+    // that travels must not (CLAUDE.md §1.1).
+    if (field.maximum !== null && Number(raw) > Number(field.maximum)) {
+      return `${field.label} cannot be more than ${field.maximum}; you typed ${raw}.`
+    }
+    if (Number(raw) <= 0) {
+      return `${field.label} must be greater than zero — zero is not "no limit", it is a limit nothing can satisfy.`
+    }
+  }
+  return null
 }
 
 const FIELD =
@@ -264,11 +323,25 @@ function Select({
  * order an operator places by hand from this dashboard, which is why the note
  * says "every order" rather than "the worker".
  *
- * `type="number"` with `min`/`max`/`step` for the browser's own refusal before
- * the round trip, and `inputMode` so a phone offers the right keypad. The server
- * re-checks all of it: `RiskLimits.__post_init__` is the authority and these
- * attributes are a convenience, which is why a `maximum` of `null` (a count,
- * bounded below only) simply omits the attribute rather than inventing one.
+ * **Text inputs with `inputMode`, not `type="number"`** — the same shape
+ * `sizing_value` and `stop_multiplier` above already use, and for the reasons
+ * that made them that way. A number input is the obvious choice and is wrong
+ * three times over for a Decimal a person edits:
+ *
+ * - **The wheel changes it.** A focused number input treats a scroll as a
+ *   spinner, so scrolling the page past a ceiling silently rewrites it, and the
+ *   only evidence is a Save the operator then presses.
+ * - **It mangles what is typed.** The HTML value sanitisation algorithm blanks
+ *   any value that is not a valid floating-point number, so the instant a
+ *   controlled input holds `0.` — every decimal, mid-keystroke — `event.target
+ *   .value` is `''` and the draft loses the digits before it.
+ * - **`max` is inclusive and one of these bounds is not.** `default_stop_loss_pct`
+ *   is refused *at* 1, which no `max` attribute can express.
+ *
+ * The bounds are checked in `riskProblem` on submit instead, which names the
+ * field the way a server refusal does rather than raising a browser tooltip the
+ * form cannot style or explain. The server re-checks everything regardless:
+ * `RiskLimits.__post_init__` is the authority.
  */
 function RiskLimitFields({
   fields,
@@ -290,19 +363,15 @@ function RiskLimitFields({
       <div className="grid gap-3 sm:grid-cols-2">
         {fields.map((field) => {
           const id = `risk-${field.name}`
-          const fraction = field.unit === 'fraction'
+          const fraction = isFraction(field)
           return (
             <Field key={field.name} id={id} label={field.label} hint={field.help}>
               <div className="mt-1 flex items-center gap-2">
                 <input
                   id={id}
-                  type="number"
                   value={values[field.name] ?? ''}
                   onChange={(event) => onChange(field.name, event.target.value)}
                   inputMode={fraction ? 'decimal' : 'numeric'}
-                  min={fraction ? '0' : '1'}
-                  {...(field.maximum === null ? {} : { max: field.maximum })}
-                  step={fraction ? 'any' : '1'}
                   aria-describedby={`${id}-hint`}
                   className={`${FIELD} tabular-nums`}
                 />
@@ -403,6 +472,12 @@ export default function WorkerConfigPanel() {
     } catch (error) {
       save.reset()
       setLocalError(`Strategy parameters are not valid JSON: ${String(error)}`)
+      return
+    }
+    const badLimit = riskProblem(screen.options.risk_fields, draft.risk)
+    if (badLimit !== null) {
+      save.reset()
+      setLocalError(badLimit)
       return
     }
     setLocalError(null)

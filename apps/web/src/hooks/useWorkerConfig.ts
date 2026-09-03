@@ -65,6 +65,13 @@ export function useSaveWorkerConfig() {
       // invalidated and re-fetched. One round trip, and no window in which the
       // form renders the old revision beside a success message.
       qc.setQueryData(KEY, screen)
+      // The risk queries are a different matter: `/risk/status` and
+      // `/risk/limits` feed the panel on Strategies, and this save is the only
+      // thing in the application that changes what they return. Without this
+      // they keep serving the pre-save ceilings until something else refetches
+      // them, so an operator who tightens a limit here and checks it there is
+      // shown the number they just replaced.
+      void qc.invalidateQueries({ queryKey: ['risk'] })
     },
   })
 }

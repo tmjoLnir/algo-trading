@@ -41,7 +41,7 @@ from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from atp_core.errors import ConfigError
-from atp_core.risk.limits import DEFAULT_RISK_LIMITS, RiskLimits
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS, STORED_DECIMAL_PLACES, RiskLimits
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -199,6 +199,31 @@ def _fail(message: str) -> ConfigError:
     return ConfigError(message)
 
 
+def _check_storable(name: str, value: Decimal) -> None:
+    """Refuse a number the row cannot hold at the precision it was typed.
+
+    The same guard `RiskLimits._check_fraction` applies, for the same reason and
+    on the same row: `NUMERIC(20, 8)` *rounds* rather than refusing, and
+    `_to_stored` rebuilds this object from what came back — so a value accepted
+    here and rounded on the way in can land outside its own bound and make the
+    row unloadable by everything that reads it, including the endpoint that
+    would repair it. `sizing_value = 0.000000001` is accepted as positive,
+    stores as zero, and then fails "must be positive" on every read forever.
+
+    Applied to these two as well as to the ceilings because a half-guarded row
+    is still a brickable row, and both fields are reached from the same form.
+    """
+    if not value.is_finite():
+        raise _fail(f"{name} must be a finite number, got {value}")
+    exponent = value.as_tuple().exponent
+    if isinstance(exponent, int) and -exponent > STORED_DECIMAL_PLACES:
+        raise _fail(
+            f"{name} of {value} has more than {STORED_DECIMAL_PLACES} decimal places, which is "
+            "the precision it is stored at — the value that came back would not be the value "
+            "you typed"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerConfig:
     """What one worker trades, and how.
@@ -220,9 +245,10 @@ class WorkerConfig:
     #: The market-data watchlist. Uppercase tickers, deduplicated, order kept.
     symbols: tuple[str, ...] = ()
     #: How long the feed may go quiet *during a session* before the watchdog
-    #: halts trading. Necessarily looser than `RiskLimits.max_quote_age_seconds`,
+    #: halts trading. Should be looser than `RiskLimits.max_quote_age_seconds`,
     #: which is how stale a quote may be when an order is priced against it: a
-    #: symbol can legitimately go a minute without printing.
+    #: symbol can legitimately go a minute without printing. A convention rather
+    #: than an invariant, and unenforced — see that field for why.
     max_silence_seconds: int = 60
     #: Registry name of the strategy to trade. Empty means this worker places no
     #: orders — it still ingests and still runs its schedule.
@@ -324,6 +350,7 @@ class WorkerConfig:
             )
         if self.sizing_value <= 0:
             raise _fail(f"sizing value must be positive, got {self.sizing_value}")
+        _check_storable("sizing value", self.sizing_value)
         if self.sizing_method in FRACTIONAL_SIZING and self.sizing_value > MAX_FRACTIONAL_SIZING:
             # The same backstop `PositionSizeSpec` applies, refused here so it is
             # refused at the moment of typing rather than at the next boot.
@@ -352,6 +379,7 @@ class WorkerConfig:
                 f"{self.stop_multiplier} means {self.stop_multiplier:%} below entry — "
                 "a level price cannot reach. Use 0.02 for 2%."
             )
+        _check_storable("stop multiplier", self.stop_multiplier)
         if self.stop_period < 1:
             raise _fail(f"stop period must be at least 1 bar, got {self.stop_period}")
 

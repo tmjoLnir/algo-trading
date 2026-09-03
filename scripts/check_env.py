@@ -10,14 +10,14 @@ you can see and one you cannot.
 Seeing it still left the operator a translation to do. The traceback in
 `docker compose logs api` names a *field*:
 
-    ValidationError: 1 validation error for RiskLimits
-    max_position_pct
-      Input should be a valid decimal [input_value='not-a-number']
+    ValidationError: 1 validation error for Settings
+    dashboard_stale_after_seconds
+      Input should be a valid integer [input_value='not-a-number']
 
-and `dashboard_stale_after_seconds` is not in `.env`. `DASHBOARD_STALE_AFTER_SECONDS`
-is. This prints
-the second name, the line it is on, and what is wrong with it — for every broken
-value at once rather than one per edit-and-retry.
+and `dashboard_stale_after_seconds` is not what is in `.env`;
+`DASHBOARD_STALE_AFTER_SECONDS` is. This prints the second name, the line it is
+on, and what is wrong with it — for every broken value at once rather than one
+per edit-and-retry.
 
 **Every check here runs without the platform.** No container, no database, no
 network: it reads the same `.env` through the same `Settings` and reports what

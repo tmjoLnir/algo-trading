@@ -259,3 +259,38 @@ class TestTheRiskCeilingsTravelWithIt:
     def test_two_configs_differing_only_in_a_ceiling_are_not_equal(self) -> None:
         """What the audit diff and the restart notice both rest on."""
         assert WorkerConfig() != WorkerConfig(risk=RiskLimits(max_open_positions=19))
+
+
+class TestAValueTheRowCannotHold:
+    """`sizing_value` and `stop_multiplier` share the ceilings' storage hazard.
+
+    `NUMERIC(20, 8)` rounds rather than refusing, and `_to_stored` rebuilds this
+    object from what came back — so a value accepted here and rounded on the way
+    in can land outside its own bound and make the row unloadable by everything
+    that reads it, the `PUT /worker/config` that would repair it included.
+
+    Guarded here as well as in `RiskLimits` because a half-guarded row is still a
+    brickable row: both of these are reached from the same form, on the same
+    save, into the same columns.
+    """
+
+    def test_a_sizing_value_that_rounds_to_zero_is_refused(self) -> None:
+        """Accepted as positive, stored as `0.00000000`, then refused as "must be
+        positive" on every subsequent read."""
+        with pytest.raises(ConfigError, match="decimal places"):
+            WorkerConfig(sizing_value=Decimal("1E-9"))
+
+    def test_a_stop_multiplier_finer_than_the_column_is_refused(self) -> None:
+        with pytest.raises(ConfigError, match="decimal places"):
+            WorkerConfig(stop_multiplier=Decimal("2.123456789"))
+
+    def test_exactly_the_column_precision_is_accepted(self) -> None:
+        assert WorkerConfig(sizing_value=Decimal("0.01234567")).sizing_value == Decimal(
+            "0.01234567"
+        )
+
+    def test_an_infinite_multiplier_is_refused(self) -> None:
+        """`Decimal('Infinity') > 0` is True, so the positivity check alone lets
+        it through and `as_tuple().exponent` is then a string rather than an int."""
+        with pytest.raises(ConfigError, match="finite"):
+            WorkerConfig(stop_multiplier=Decimal("Infinity"))

@@ -41,7 +41,6 @@ from atp_api.deps import (
     get_broker,
     get_calendar,
     get_clock,
-    get_effective_risk_limits,
     get_kill_switch,
     get_order_repository,
 )
@@ -54,7 +53,7 @@ from atp_core.domain import Order, OrderStatus
 from atp_core.errors import ATPError
 from atp_core.execution.ports import OrderRepository
 from atp_core.risk.killswitch import KillSwitch
-from atp_core.risk.limits import RiskLimits
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -342,7 +341,6 @@ async def cancel_all_orders(
     kill_switch: Annotated[KillSwitch, Depends(get_kill_switch)],
     clock: Annotated[Clock, Depends(get_clock)],
     calendar: Annotated[TradingCalendar, Depends(get_calendar)],
-    limits: Annotated[RiskLimits, Depends(get_effective_risk_limits)],
     audit: Annotated[AuditSink, Depends(get_audit_sink)],
     symbol: str | None = None,
 ) -> dict[str, int]:
@@ -354,11 +352,19 @@ async def cancel_all_orders(
     order before reporting a failure, so one stubborn cancel does not abandon
     the other nine.
 
-    The router is built with **no quotes**, which would deny every order on
-    `StaleDataRule` if the chain were consulted. It is not: cancelling places
-    nothing, so `RiskEngine.validate` is never reached. Passing an empty map
-    rather than reading the cache says that at the call site instead of leaving
-    a reader to work out which rules a cancel runs.
+    The router is built with **no quotes and the default ceilings**, either of
+    which would be wrong if the chain were consulted — an empty quote map denies
+    every order on `StaleDataRule`, and the defaults are not necessarily this
+    platform's limits. It is not consulted: cancelling places nothing, so
+    `RiskEngine.validate` is never reached. Saying so at the call site beats
+    leaving a reader to work out which rules a cancel runs.
+
+    It also keeps this endpoint off Postgres, which matters more here than
+    anywhere else on this router. Loading the saved ceilings would make an
+    **emergency control** — the one an operator reaches for when orders are
+    going out that should not be — fail whenever the database is unreachable,
+    in order to fetch numbers it then does not use. The venue and Redis are what
+    a cancel needs, and they are all it now touches.
 
     **This does not close positions.** Cancelling a protective stop leaves the
     position it was protecting naked, which is why the runbook's emergency path
@@ -369,7 +375,7 @@ async def cancel_all_orders(
         kill_switch=kill_switch,
         clock=clock,
         calendar=calendar,
-        limits=limits,
+        limits=DEFAULT_RISK_LIMITS,
         quotes={},
     )
     try:

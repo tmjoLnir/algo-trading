@@ -46,7 +46,7 @@ from sqlalchemy import pool
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from atp_core.config import RiskLimits, Settings, config_problems
+from atp_core.config import Settings, config_problems
 from atp_core.persistence.db import is_auth_failure
 from atp_core.persistence.models import Base
 
@@ -60,19 +60,22 @@ target_metadata = Base.metadata
 def database_url() -> str:
     """The url this migration will use, resolved exactly as the platform does.
 
-    `risk` is supplied unvalidated for the reason `config_problems` gives: it is
-    a `default_factory`, so one bad `RISK_*` value raises out of it *during*
-    `Settings()`. A risk limit has nothing to do with a schema, and refusing to
-    migrate over one would be this module inventing a new way to be unhelpful.
+    A plain `Settings()`. It used to be `Settings(risk=RiskLimits.model_construct())`,
+    because `risk` was a nested `default_factory` and one bad `RISK_*` value
+    raised out of it *during* `Settings()` — taking a schema migration down over
+    a number that has nothing to do with a schema. The ceilings are a database
+    row since ADR 0025, so the nesting that caused it is gone and the workaround
+    with it. The property it protected is still tested
+    (`tests/integration/test_alembic_env.py`), now with an unrelated bad value.
 
-    Anything else that will not load is refused rather than worked around. The
+    Anything that will not load is refused rather than worked around. The
     fallback that used to live here is precisely the bug in this file's
     docstring: a default that is silently correct on a laptop and silently wrong
     everywhere else. A url that cannot be resolved is a question for the
     operator, not a value for this module to guess.
     """
     try:
-        return Settings(risk=RiskLimits.model_construct()).database_url
+        return Settings().database_url
     except ValidationError:
         raise SystemExit("\n".join(_unloadable_configuration())) from None
 

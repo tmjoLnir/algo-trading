@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WorkerConfigPanel from './WorkerConfigPanel'
-import type { WorkerConfigScreen, WorkerConfigView } from '@/api/types'
+import type { RiskLimitFieldView, WorkerConfigScreen, WorkerConfigView } from '@/api/types'
 
 /**
  * The worker settings panel, from the side a person sees.
@@ -70,7 +70,7 @@ function config(overrides: Partial<WorkerConfigView> = {}): WorkerConfigView {
  * `Number` and has no upper bound. Eight would exercise the same two paths four
  * times each and hide which one a failure came from.
  */
-const RISK_FIELDS = [
+const RISK_FIELDS: RiskLimitFieldView[] = [
   {
     name: 'max_position_pct',
     label: 'Max position',
@@ -364,19 +364,79 @@ describe('the risk limits', () => {
     })
   })
 
-  it('bounds a fraction by the server ceiling and leaves a count unbounded', async () => {
-    // The browser refusing before the round trip, from the server's own number
-    // rather than one copied here. A count has no `maximum`, and inventing one
-    // would refuse a value the server accepts.
+  it('is a text box, not a spinner', async () => {
+    // `type="number"` is the obvious choice and is wrong for a Decimal a person
+    // edits: a scroll over a focused one silently rewrites the value, and the
+    // HTML value-sanitisation algorithm blanks anything that is not yet a valid
+    // float — so a controlled input loses the digits before the dot the instant
+    // it holds "0.". The rest of the form's Decimal fields are already text.
     stub()
     renderPanel()
 
     const position = (await screen.findByLabelText(/Max position/)) as HTMLInputElement
     const open = screen.getByLabelText(/Max open positions/) as HTMLInputElement
 
-    expect(position.getAttribute('max')).toBe('1')
-    expect(open.hasAttribute('max')).toBe(false)
-    expect(open.getAttribute('min')).toBe('1')
+    expect(position.getAttribute('type')).not.toBe('number')
+    expect(position.getAttribute('inputmode')).toBe('decimal')
+    expect(open.getAttribute('inputmode')).toBe('numeric')
+  })
+
+  it('refuses a ceiling above the server bound, naming the field, without a round trip', async () => {
+    // What the browser's own `max` used to do, moved into the form so the
+    // message names the label the operator can see rather than raising a
+    // tooltip. `max` could not survive the move anyway: it is inclusive, and
+    // one of these bounds is not.
+    const fetchMock = stub()
+    renderPanel()
+
+    fireEvent.change(await screen.findByLabelText(/Max position/), { target: { value: '2' } })
+    fireEvent.click(screen.getByRole('button', { name: /Save configuration/ }))
+
+    expect(await screen.findByText(/Max position cannot be more than 1/)).toBeTruthy()
+    expect(fetchMock.mock.calls.filter((call) => call[1]?.method === 'PUT')).toHaveLength(0)
+  })
+
+  it('refuses an emptied box by name rather than posting an empty string', async () => {
+    // Previously posted `""`, which pydantic rejects as a Decimal — so the
+    // operator got a bare "Unprocessable Entity" naming no field.
+    const fetchMock = stub()
+    renderPanel()
+
+    fireEvent.change(await screen.findByLabelText(/Max open positions/), { target: { value: '' } })
+    fireEvent.click(screen.getByRole('button', { name: /Save configuration/ }))
+
+    expect(await screen.findByText(/Max open positions is empty/)).toBeTruthy()
+    expect(fetchMock.mock.calls.filter((call) => call[1]?.method === 'PUT')).toHaveLength(0)
+  })
+
+  it('treats a unit it does not recognise as money, not as a count', async () => {
+    // The failure mode of an added ceiling must be a string the server refuses,
+    // never a ratio silently round-tripped through a JS float.
+    const fetchMock = stub(
+      screenPayload({
+        options: {
+          ...screenPayload().options,
+          risk_fields: [
+            {
+              name: 'max_position_pct',
+              label: 'Max position',
+              unit: 'ratio-of-something-new',
+              help: 'A unit this build of the form has never seen.',
+              maximum: '1',
+            },
+          ],
+        },
+      }),
+    )
+    renderPanel()
+
+    fireEvent.change(await screen.findByLabelText(/Max position/), { target: { value: '0.30' } })
+    fireEvent.click(screen.getByRole('button', { name: /Save configuration/ }))
+
+    await waitFor(() => {
+      const risk = lastPut(fetchMock).risk as Record<string, unknown>
+      expect(risk.max_position_pct).toBe('0.30')
+    })
   })
 
   it('renders only the fields the server declares', async () => {

@@ -408,7 +408,7 @@ def check_sizing_is_reachable(
     hypothetical one. `risk_pct` sizes by the distance to the stop, so a wide
     stop buys a large position *by construction*: 1% of $100,000 against a 2×ATR
     stop on a ~$97 name asks for 305 shares — 29.5% of the account against a 10%
-    the `max_position_pct` ceiling — and `max_position_size` then refuses the entry
+    `max_position_pct` ceiling — and `max_position_size` then refuses the entry
     whole rather than trimming it. Both numbers are right. They measure
     different things, and the pair is docs/RISK.md's own recommendation.
 

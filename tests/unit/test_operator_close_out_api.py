@@ -311,6 +311,32 @@ class TestCancellingEverything:
 
         assert broker.close_calls == []
 
+    async def test_it_works_with_the_database_unreachable(
+        self, app: FastAPI, broker: FakeBroker
+    ) -> None:
+        """An emergency control must not depend on the configuration database.
+
+        This endpoint builds a router the risk chain is never consulted through
+        — it is already handed an empty quote map, which would deny every order
+        on `StaleDataRule` if it were. Moving the risk ceilings into Postgres
+        (ADR 0025) briefly gave it a `Depends` that loaded them anyway, so the
+        one control an operator reaches for when orders are going out that
+        should not be began failing whenever the database was down, in order to
+        fetch numbers it then did not use. It takes the defaults instead, and
+        touches only the venue and Redis.
+        """
+        working_order(broker)
+        broken = FakeWorkerConfigRepository()
+        broken.load_error = RuntimeError("postgres is unreachable")
+        app.dependency_overrides[get_worker_config_repository] = lambda: broken
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(CANCEL_ALL, json={})
+
+        assert response.status_code == 200
+        assert response.json() == {"cancelled": 1}
+
     async def test_a_partial_failure_is_a_502_that_says_so(
         self, client: httpx.AsyncClient, broker: FakeBroker, audit: RecordingAuditSink
     ) -> None:

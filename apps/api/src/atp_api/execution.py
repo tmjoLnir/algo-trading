@@ -88,9 +88,14 @@ def build_router(
     through the venue, not through this object.
 
     `limits` arrives as a value rather than being read off `Settings`, because
-    the ceilings are a stored row now and reading them is I/O — `get_risk_limits`
-    does it once per request as a dependency, which keeps this function what it
-    has always been: assembly over collaborators that are already built.
+    the ceilings are a stored row now and reading them is I/O — callers get them
+    from the `get_effective_risk_limits` dependency, which keeps this function
+    what it has always been: assembly over collaborators that are already built.
+
+    A caller whose chain is never consulted passes `DEFAULT_RISK_LIMITS` instead
+    of loading anything, and `POST /orders/cancel-all` is the one that does:
+    taking a database dependency to fetch numbers an emergency control does not
+    read is how that control stops working during an outage.
     """
 
     def last_tick_at(symbol: str) -> datetime | None:

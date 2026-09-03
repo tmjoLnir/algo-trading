@@ -52,10 +52,10 @@ from pydantic import BaseModel, Field
 from atp_api.deps import (
     get_calendar,
     get_clock,
-    get_effective_risk_limits,
     get_kill_switch,
     get_portfolio_repository,
     get_snapshot_store,
+    get_worker_config_repository,
 )
 from atp_core.clock import Clock, TradingCalendar
 from atp_core.config import Settings, get_settings
@@ -71,7 +71,8 @@ from atp_core.domain import RunMode
 from atp_core.execution.ports import PortfolioRepository
 from atp_core.logging import get_logger
 from atp_core.risk.killswitch import HaltRecord, KillSwitch
-from atp_core.risk.limits import RiskLimits
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS
+from atp_core.worker.ports import WorkerConfigRepository
 
 log = get_logger(__name__)
 
@@ -314,8 +315,9 @@ async def _read_snapshot(store: SnapshotStore, run_mode: RunMode) -> LiveSnapsho
 def _feed_healthy(last_data_at: datetime | None, *, now: datetime, budget: int) -> bool:
     """Is market data still arriving?
 
-    Judged against `RISK_MAX_QUOTE_AGE_SECONDS` — the same budget `StaleDataRule`
-    refuses to price an order against, and the one `scripts/status.py` prints.
+    Judged against the saved `max_quote_age_seconds` — the same budget
+    `StaleDataRule` refuses to price an order against, and the one
+    `scripts/status.py` prints.
     Using a second number here would let the dashboard call a feed healthy while
     every order against it is being refused for staleness, which is the pair of
     observations an operator would spend an afternoon reconciling.
@@ -423,7 +425,7 @@ def account_view(
 @router.get("/live", response_model=LiveDashboard)
 async def get_live_dashboard(
     settings: Annotated[Settings, Depends(get_settings)],
-    limits: Annotated[RiskLimits, Depends(get_effective_risk_limits)],
+    config_repo: Annotated[WorkerConfigRepository, Depends(get_worker_config_repository)],
     clock: Annotated[Clock, Depends(get_clock)],
     calendar: Annotated[TradingCalendar, Depends(get_calendar)],
     kill_switch: Annotated[KillSwitch, Depends(get_kill_switch)],
@@ -438,10 +440,18 @@ async def get_live_dashboard(
 
     Fast by construction: it is read by every open browser tab, so the book is
     one Redis `GET` of a document the worker already assembled rather than a
-    recomputation from fills. The three other reads — the halt keys, the single
-    `worker_config` row the quote-age budget now lives in, and, only when a book
-    exists, one bounded equity query for the day anchor — are all small and all
+    recomputation from fills. The other reads — the halt keys, and, **only when a
+    book exists**, one bounded equity query for the day anchor plus the single
+    `worker_config` row the quote-age budget now lives in — are all small and all
     bounded.
+
+    **Both Postgres reads sit below the no-book early return**, and the quote-age
+    budget is why that is worth stating. It arrived here as a `Depends`, which
+    runs before this body — so a database outage began failing the one path that
+    had never needed a database: no book, no day anchor, just the halts and the
+    banners. That path is not a corner case, it is the screen an operator opens
+    during an incident, and `data_feed_healthy` is `None` on it anyway, so the
+    budget it was loading is not even read.
 
     Signals come back newest first, because a feed is read from the top.
     """
@@ -471,6 +481,13 @@ async def get_live_dashboard(
             last_data_at=None,
             data_feed_healthy=None,
         )
+
+    # Below the early return, beside the other query that needs a database.
+    # Nothing saved means the defaults, exactly as `get_effective_risk_limits`
+    # reads it; an unreachable database still raises, because a feed reported
+    # healthy against a budget nobody set is a worse answer than no answer.
+    stored = await config_repo.load()
+    limits = DEFAULT_RISK_LIMITS if stored is None else stored.config.risk
 
     day_pnl, day_pnl_pct = await day_pnl_since_open(
         portfolio_repo,

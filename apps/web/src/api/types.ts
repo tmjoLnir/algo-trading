@@ -239,10 +239,16 @@ export type WorkerOption = Schemas['OptionView']
  * Two names for one model because FastAPI emits two: on the way **out** a
  * `Decimal` is always a string, and on the way **in** it accepts either — so
  * the generated schema splits them, and the split is worth keeping rather than
- * papering over. The form reads `…Payload` and sends `…Input`, and the compiler
- * is what stops a fraction being sent as a float.
+ * papering over. The form reads `…Payload` and sends `…Input`.
  *
- * The three counts are numbers in both directions. They are counts, not money.
+ * **The compiler does not stop a fraction going out as a float.** `…Input`
+ * types every fraction as `number | string`, because the server genuinely
+ * accepts both — so both halves of that union typecheck and only one of them
+ * preserves the value. What holds the rule is `riskPayload` in
+ * `WorkerConfigPanel`, and the test that asserts the *string* rather than the
+ * number reaches the wire.
+ *
+ * The counts are numbers in both directions. They are counts, not money.
  */
 export type RiskLimitsPayload = Schemas['RiskLimitsPayload-Output']
 export type RiskLimitsInput = Schemas['RiskLimitsPayload-Input']

@@ -191,9 +191,12 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
                 msg="nothing has been saved on the Config tab — running the defaults",
                 hint="open the dashboard's Config tab to set a watchlist and a strategy",
             )
-        # What it loaded, in full. `.env` used to be readable on the host, so an
-        # operator could always see what a worker was configured with; now that
-        # it is a row, this line is that.
+        # What it loaded, in full — the ceilings included, since they joined the
+        # row (ADR 0025) and are the half a post-mortem asks about first. `.env`
+        # used to be readable on the host, so an operator could always see what a
+        # worker was configured with; now that it is a row, this line is that.
+        # Flattened into one field rather than eight, because this is a log line
+        # somebody greps, not a payload anything parses.
         log.info(
             "worker.config_loaded",
             revision=revision,
@@ -203,6 +206,14 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
             sizing=f"{config.sizing_method} {config.sizing_value}",
             stop=f"{config.stop_type} x{config.stop_multiplier} period={config.stop_period}",
             max_silence_seconds=config.max_silence_seconds,
+            risk=(
+                f"position={config.risk.max_position_pct} "
+                f"gross={config.risk.max_gross_exposure_pct} "
+                f"daily_loss={config.risk.max_daily_loss_pct} "
+                f"orders_per_min={config.risk.max_orders_per_minute} "
+                f"open_positions={config.risk.max_open_positions} "
+                f"quote_age={config.risk.max_quote_age_seconds}s"
+            ),
             allow_live_orders=config.allow_live_orders,
         )
         bar_repo = PostgresBarRepository(session_factory)
