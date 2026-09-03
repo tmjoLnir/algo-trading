@@ -12,6 +12,8 @@ import Login from './pages/Login'
 import RunModeBanner from './components/RunModeBanner'
 import HaltBanner from './components/HaltBanner'
 import LiveStream from './components/LiveStream'
+import KillSwitchButton from './components/KillSwitchButton'
+import { useLiveDashboard } from './hooks/useLiveDashboard'
 import { useLogout, useSession } from './api/session'
 
 const NAV = [
@@ -31,6 +33,31 @@ function Centred({ children }: { children: React.ReactNode }) {
       {children}
     </div>
   )
+}
+
+/**
+ * The emergency stop, reading the book for itself.
+ *
+ * It lived on the dashboard until now, which made `KillSwitchButton`'s own
+ * first line — "always visible, never behind a menu" — untrue twice over: it
+ * was on one route of eight, and on that route it scrolled away with everything
+ * else. Pinning the chrome around it would have left the one control that acts
+ * on the book as the only thing on the bar that could still leave the screen.
+ *
+ * It reads `halted` here rather than taking it from a page because there is no
+ * page above the nav to take it from, and it is a component rather than a hook
+ * call in `App` because `App` renders the sign-in form above this: called up
+ * there the query would run for a browser that has no session, and ask for the
+ * book on the login screen to be told no.
+ *
+ * The condition is the dashboard's, unchanged — any active halt, not only a
+ * global one. That is worth knowing rather than fixing in passing: a
+ * symbol-scoped halt still swaps this for the inert badge, so it is not a
+ * statement that *all* trading is stopped.
+ */
+function PinnedKillSwitch() {
+  const { data } = useLiveDashboard()
+  return <KillSwitchButton halted={(data?.active_halts?.length ?? 0) > 0} />
 }
 
 export default function App() {
@@ -135,11 +162,20 @@ export default function App() {
             </NavLink>
           ))}
 
+          {/* The emergency stop rides the bar, before the account block rather
+              than after it. Sign out is the neighbour it must not be confused
+              with: halting asks for no confirmation by design — hesitation is
+              the expensive part — so the two are separated by the account name
+              and a rule, not by four pixels of gap. */}
+          <div className="ml-auto flex shrink-0 items-center pl-3">
+            <PinnedKillSwitch />
+          </div>
+
           {/* Who you are signed in as, at the far end. Not decoration: every
               halt and every manual order is now recorded against this name, so
               it should be visible before you press the red button rather than
               discovered in the audit log afterwards. */}
-          <div className="ml-auto flex shrink-0 items-center gap-3 pl-3 text-xs text-slate-500">
+          <div className="ml-3 flex shrink-0 items-center gap-3 border-l border-slate-800 pl-3 text-xs text-slate-500">
             <span>{user}</span>
             {/* Stated rather than implied. A read-only session behaves almost
                 identically today — the only acting control on this screen is the

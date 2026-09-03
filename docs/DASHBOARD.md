@@ -92,23 +92,29 @@ Top to bottom, in the order a person needs it:
 1. **Run mode banner** — backtest, paper or live. Loud, permanent, not
    dismissible. An unrecognised mode falls through to the loudest branch.
 2. **Halt banner** — if trading is stopped, nothing else matters first.
-3. **Account summary** — equity, day P&L, exposure, leverage.
-4. **Equity curve.**
-5. **Open positions** — with distance-to-stop.
-6. **Signal feed** — what the rules decided and *why*.
-7. **Working orders.**
-8. **Kill switch** — always visible, never behind a menu.
+3. **Kill switch** — always visible, never behind a menu. On the tab bar, not
+   on this page: it is a session control, like the two banners above it that
+   say why you would reach for it. It sat on the dashboard until the chrome was
+   pinned, which made "always visible" untrue twice — absent from seven routes,
+   and scrolling away on the eighth. It is placed at the far side of the bar
+   *before* the account block, so the account name and a rule separate it from
+   `Sign out`: engaging it asks for no confirmation, by design.
+4. **Account summary** — equity, day P&L, exposure, leverage.
+5. **Equity curve.**
+6. **Open positions** — with distance-to-stop.
+7. **Signal feed** — what the rules decided and *why*.
+8. **Working orders.**
 
 Positions before signals: what you are exposed to matters more than what the
 system is thinking about.
 
-Items 1 and 2, and the tab bar beneath them, are *pinned* to the top of the
-viewport rather than merely placed there first. "Above everything else" was a
+Items 1 to 3, and the tab bar that carries the third, are *pinned* to the top
+of the viewport rather than merely placed there first. "Above everything else" was a
 claim about the top of the document, and every screen here is a long table: an
 operator reading row 200 of the order history had scrolled the run mode, the
-halt list and the navigation off the top together. A banner only visible from a
-scroll position nobody acting is at states nothing to the person it exists to
-interrupt.
+halt list, the emergency stop and the navigation off the top together. A banner
+only visible from a scroll position nobody acting is at states nothing to the
+person it exists to interrupt.
 
 Two consequences of pinning, both load-bearing:
 

@@ -100,13 +100,13 @@ const EMPTY_BOOK = {
   working_orders: [],
 }
 
-function renderApp() {
+function renderApp(path = '/') {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={['/']}>
+      <MemoryRouter initialEntries={[path]}>
         <App />
       </MemoryRouter>
     </QueryClientProvider>,
@@ -166,6 +166,58 @@ describe('the pinned header', () => {
     expect(bar.className).toContain('sticky')
     expect(bar.className).toContain('top-0')
     expect(bar.className).toContain('bg-slate-950')
+  })
+})
+
+describe('the kill switch, in the pinned bar', () => {
+  /**
+   * It used to be mounted by `Dashboard`, which made its own first line —
+   * "always visible, never behind a menu" — false on seven routes and false on
+   * the eighth as soon as you scrolled. These are the two halves of that: it is
+   * on every route, and it is inside the block that does not scroll away.
+   */
+  it.each([
+    '/',
+    '/orders',
+    '/positions',
+    '/analytics',
+    '/audit',
+    '/worker',
+    '/strategies',
+    '/backtests',
+  ])('is inside the pinned header on %s', async (path) => {
+    signedIn(EMPTY_BOOK)
+    renderApp(path)
+
+    const bar = await header()
+    await within(bar).findByRole('button', { name: 'HALT TRADING' })
+  })
+
+  it('is not left behind on the dashboard as a second copy', async () => {
+    signedIn(EMPTY_BOOK)
+    renderApp('/')
+
+    const bar = await header()
+    // Wait for the dashboard's own body first. Counting before it renders passes
+    // against a page that simply had not yet had the chance to add its copy —
+    // which is the regression, so the assertion has to outlive it.
+    await screen.findByRole('button', { name: /refresh now/i })
+
+    // The move has to be a move. Two emergency stops on one screen is a screen
+    // where somebody presses whichever is nearer and reads the wrong outcome.
+    within(bar).getByRole('button', { name: 'HALT TRADING' })
+    expect(screen.getAllByRole('button', { name: 'HALT TRADING' })).toHaveLength(1)
+  })
+
+  it('states why it is inert while a halt is in force, rather than disappearing', async () => {
+    signedIn({ ...EMPTY_BOOK, active_halts: [GLOBAL_HALT] })
+    renderApp('/orders')
+
+    const bar = await header()
+    // A control that vanishes when it cannot be used reads as one that is
+    // missing — under exactly the conditions an operator looks for it hardest.
+    await within(bar).findByText('TRADING HALTED')
+    expect(within(bar).queryByRole('button', { name: 'HALT TRADING' })).toBeNull()
   })
 })
 
