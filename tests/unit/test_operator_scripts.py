@@ -29,6 +29,9 @@ from atp_api.auth import looks_like_bcrypt_hash, verify_password
 from atp_core.alerts import Severity
 from atp_core.config import Settings
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS, RiskLimits
+from atp_core.worker import StoredWorkerConfig, WorkerConfig
+from tests.fakes import FakeWorkerConfigRepository
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 
@@ -53,6 +56,38 @@ status = _load("status")
 check_alerts = _load("check_alerts")
 preflight_cli = _load("preflight")
 paper_report = _load("paper_report")
+
+
+def _settings() -> Settings:
+    """Enough of `Settings` for the reads under test. The url is never dialled:
+    `_stub_config_repo` replaces the repository before anything opens a socket."""
+    return Settings(database_url="postgresql+asyncpg://nobody@127.0.0.1:1/none")
+
+
+def _stored(risk: RiskLimits) -> StoredWorkerConfig:
+    return StoredWorkerConfig(
+        config=WorkerConfig(risk=risk),
+        revision=4,
+        updated_at=datetime(2026, 9, 3, tzinfo=UTC),
+        updated_by="josh",
+    )
+
+
+def _stub_config_repo(monkeypatch: pytest.MonkeyPatch, repo: FakeWorkerConfigRepository) -> None:
+    """Swap the repository and neutralise the engine the script builds around it.
+
+    `status._saved_limits` opens an engine, constructs a repository over it and
+    disposes it. Only the middle step is under test, so the other two are made
+    inert rather than pointed at a database this suite must not need (§1.7).
+    """
+    monkeypatch.setattr(status, "PostgresWorkerConfigRepository", lambda _factory: repo)
+    monkeypatch.setattr(status, "create_engine", lambda _url: _InertEngine())
+    monkeypatch.setattr(status, "create_session_factory", lambda _engine: None)
+
+
+class _InertEngine:
+    async def dispose(self) -> None:
+        return None
 
 
 class TestHaltArguments:
@@ -485,3 +520,55 @@ class TestPaperReportArguments:
         assert block.count("- [") == 4
         assert "[?]" in block
         assert "were not shown" in block
+
+
+class TestTheRiskBudgetStatusPrints:
+    """`status.py` reports quote freshness against a ceiling that is now a row.
+
+    Three states, and the *label* is the whole point of the test: 30 seconds
+    means something different if an operator chose it, if nobody has chosen
+    anything, and if the database could not be asked. This is the script somebody
+    runs when the stack is half up, so the third happens — and printing a
+    fallback under "Config tab → risk limits" would tell a reader a number was
+    chosen when it was invented.
+    """
+
+    async def test_a_saved_row_is_labelled_as_the_operators(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        saved = RiskLimits(max_quote_age_seconds=12)
+        _stub_config_repo(monkeypatch, FakeWorkerConfigRepository(_stored(saved)))
+
+        limits, source = await status._saved_limits(_settings())
+
+        assert limits.max_quote_age_seconds == 12
+        assert source == "Config tab → risk limits"
+
+    async def test_nothing_saved_says_so_rather_than_claiming_a_choice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The defaults genuinely *are* what an unconfigured platform enforces,
+        so this is not a fallback — but nobody typed them, and the header must
+        not imply somebody did."""
+        _stub_config_repo(monkeypatch, FakeWorkerConfigRepository())
+
+        limits, source = await status._saved_limits(_settings())
+
+        assert limits == DEFAULT_RISK_LIMITS
+        assert "nothing saved" in source
+
+    async def test_an_unreachable_database_is_labelled_a_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Swallowed rather than raised, for the reason `_saved_symbols` returns
+        an empty list — there is plenty else on this page to report — but never
+        silently: a stale-quote verdict must not read as measured against a
+        ceiling the operator set."""
+        broken = FakeWorkerConfigRepository()
+        broken.load_error = RuntimeError("postgres is unreachable")
+        _stub_config_repo(monkeypatch, broken)
+
+        limits, source = await status._saved_limits(_settings())
+
+        assert limits == DEFAULT_RISK_LIMITS
+        assert "not answering" in source
