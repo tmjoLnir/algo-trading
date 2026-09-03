@@ -1,4 +1,4 @@
-"""The ten parameters that decide what a worker trades, as one value object.
+"""What a worker trades and what the platform will let it risk, as one object.
 
 Every one of these was an environment variable until this module existed, and
 the move is not cosmetic. An `.env` file is read once at process start, is not
@@ -14,6 +14,15 @@ stop period the API accepts and the worker rejects is a configuration that
 saves cleanly and then kills the process on the next restart, which is the
 worst of the three possible behaviours. So the rules are written once, in
 `__post_init__`, and both callers get them by constructing the object.
+
+**The risk ceilings travel with it.** `RiskLimits` was the other half of the
+`.env` trading configuration and it moved here for the same three reasons, into
+the same row, saved by the same request. One save, one revision, one audit
+entry: an operator who widens a stop and lifts the position limit in one sitting
+made one decision, and a post-mortem should read it as one. The ceilings
+themselves live in `atp_core.risk.limits`, because the risk package owns the
+rules that enforce them and they bind orders this worker never placed — see that
+module for which process picks up an edit when.
 
 **What is deliberately NOT here.** `ATP_RUN_MODE`, `ATP_ALLOW_LIVE_TRADING`,
 the broker credentials and the datastore URLs stay in `Settings`. Those say
@@ -32,6 +41,7 @@ from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from atp_core.errors import ConfigError
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS, RiskLimits
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -233,6 +243,13 @@ class WorkerConfig:
     #: keeps it a decision rather than a click (ADR 0009's argument, applied to
     #: the one field here that can lose real money).
     allow_live_orders: bool = False
+    #: The account-wide ceilings every order is measured against — this
+    #: worker's, and equally an order an operator types into the dashboard
+    #: while no worker is running. Nested rather than flattened into this class
+    #: so that the one thing a reader must not get wrong stays obvious: these
+    #: eight are *limits*, refused at the boundary, while the fields above are
+    #: *intent*. `atp_core.risk.limits` is where they are defined and validated.
+    risk: RiskLimits = DEFAULT_RISK_LIMITS
 
     def __post_init__(self) -> None:
         """Refuse anything a worker could not run, at construction.
@@ -243,12 +260,28 @@ class WorkerConfig:
         """
         self._check_symbols()
         self._check_strategy()
+        self._check_risk()
         self._check_sizing()
         self._check_stop()
         if self.max_silence_seconds < 1:
             raise _fail(
                 f"max silence must be at least 1 second, got {self.max_silence_seconds} — "
                 "zero would halt trading on the first quiet moment"
+            )
+
+    def _check_risk(self) -> None:
+        """That the nested ceilings are ceilings at all.
+
+        `RiskLimits.__post_init__` has already refused anything out of range by
+        the time one exists, so this is only the type check a `dict` decoded
+        from a row or a JSON body would otherwise slip past — arriving as a
+        mapping whose `max_position_pct` reads as an attribute error nine
+        layers down, inside a rule, on the first order of the day.
+        """
+        if not isinstance(self.risk, RiskLimits):
+            raise _fail(
+                "risk limits must be a RiskLimits, got "
+                f"{type(self.risk).__name__} — build one so its own bounds are checked"
             )
 
     def _check_symbols(self) -> None:
@@ -338,9 +371,10 @@ class WorkerConfig:
 
 
 #: What a worker runs on when nothing has been saved: no watchlist, no strategy,
-#: and docs/RISK.md's defaults for everything that has one. Identical to the
-#: values `.env.example` shipped, so an existing deployment that upgrades and
-#: saves nothing behaves exactly as it did.
+#: and docs/RISK.md's defaults for everything that has one — the ceilings
+#: included, via `DEFAULT_RISK_LIMITS`. Identical to the values `.env.example`
+#: shipped, so an existing deployment that upgrades and saves nothing behaves
+#: exactly as it did.
 DEFAULT_WORKER_CONFIG = WorkerConfig()
 
 

@@ -1,4 +1,4 @@
-"""`WorkerConfig` — the ten trading parameters, and every refusal they carry.
+"""`WorkerConfig` — what a worker trades, and every refusal it carries.
 
 The value object is the *only* place these rules live, and that is the property
 worth testing hardest. The dashboard refuses a bad edit and the worker refuses
@@ -20,6 +20,7 @@ from decimal import Decimal
 import pytest
 
 from atp_core.errors import ConfigError
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS, RiskLimits
 from atp_core.strategy import examples as _examples  # noqa: F401 — populates the registry
 from atp_core.strategy import registry
 from atp_core.worker import DEFAULT_WORKER_CONFIG, SIZING_METHODS, STOP_TYPES, WorkerConfig
@@ -221,3 +222,40 @@ class TestStrategyOptions:
         """ "No strategy" is not a strategy. The screen renders it as its own
         choice with its own sentence."""
         assert all(o["value"] for o in strategy_options(registry.all_strategies()))
+
+
+class TestTheRiskCeilingsTravelWithIt:
+    """The eight ceilings are nested here, saved here, and published from here.
+
+    They are a different *kind* of thing from the fields above — a limit the
+    platform refuses to cross, rather than something it tries to do — and
+    `atp_core.risk.limits` owns their rules. What this class holds is the
+    consequence of putting them in the same object: one save, one revision, one
+    restart comparison, and a worker that enforces the ceilings it booted with
+    rather than whatever has been saved since.
+    """
+
+    def test_the_default_config_carries_the_default_ceilings(self) -> None:
+        assert DEFAULT_WORKER_CONFIG.risk == DEFAULT_RISK_LIMITS
+
+    def test_a_ceiling_can_be_set_without_touching_anything_else(self) -> None:
+        config = WorkerConfig(risk=RiskLimits(max_position_pct=Decimal("0.05")))
+        assert config.risk.max_position_pct == Decimal("0.05")
+        assert config.sizing_value == DEFAULT_WORKER_CONFIG.sizing_value
+
+    def test_a_bad_ceiling_is_refused_by_the_object_that_owns_it(self) -> None:
+        """`RiskLimits` refuses at its own construction, so this never reaches
+        `WorkerConfig` — which is the point: one set of rules, not two."""
+        with pytest.raises(ConfigError, match="max_open_positions"):
+            WorkerConfig(risk=RiskLimits(max_open_positions=0))
+
+    def test_a_mapping_is_not_a_ceiling(self) -> None:
+        """A `dict` decoded from a row or a JSON body would otherwise surface as
+        an attribute error nine layers down, inside a rule, on the first order
+        of the day."""
+        with pytest.raises(ConfigError, match="must be a RiskLimits"):
+            WorkerConfig(risk={"max_position_pct": "0.1"})  # type: ignore[arg-type]
+
+    def test_two_configs_differing_only_in_a_ceiling_are_not_equal(self) -> None:
+        """What the audit diff and the restart notice both rest on."""
+        assert WorkerConfig() != WorkerConfig(risk=RiskLimits(max_open_positions=19))

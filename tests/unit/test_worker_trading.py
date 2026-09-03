@@ -25,7 +25,7 @@ from decimal import Decimal
 import pytest
 from pydantic import SecretStr
 
-from atp_core.config import RiskLimits, Settings
+from atp_core.config import Settings
 from atp_core.domain import RunMode, StopType
 from atp_core.errors import ConfigError
 from atp_core.worker import DEFAULT_WORKER_CONFIG, WorkerConfig
@@ -53,8 +53,7 @@ def _no_ambient_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     for name in _AMBIENT:
         monkeypatch.delenv(name, raising=False)
-    for model in (Settings, RiskLimits):
-        monkeypatch.setitem(model.model_config, "env_file", None)
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
 
 
 def settings(**kwargs: object) -> Settings:

@@ -14,7 +14,8 @@ Seeing it still left the operator a translation to do. The traceback in
     max_position_pct
       Input should be a valid decimal [input_value='not-a-number']
 
-and `max_position_pct` is not in `.env`. `RISK_MAX_POSITION_PCT` is. This prints
+and `dashboard_stale_after_seconds` is not in `.env`. `DASHBOARD_STALE_AFTER_SECONDS`
+is. This prints
 the second name, the line it is on, and what is wrong with it — for every broken
 value at once rather than one per edit-and-retry.
 
@@ -164,8 +165,21 @@ MOVED = dict.fromkeys(
         "WORKER_STOP_PERIOD",
         "WORKER_ALLOW_LIVE_ORDERS",
     ),
-    "moved to the dashboard's Worker tab (ADR 0023) — this line does nothing; "
+    "moved to the dashboard's Config tab (ADR 0023) — this line does nothing; "
     "copy the value across and delete it",
+) | dict.fromkeys(
+    (
+        "RISK_MAX_POSITION_PCT",
+        "RISK_MAX_GROSS_EXPOSURE_PCT",
+        "RISK_MAX_DAILY_LOSS_PCT",
+        "RISK_MAX_ORDERS_PER_MINUTE",
+        "RISK_MAX_OPEN_POSITIONS",
+        "RISK_MAX_QUOTE_AGE_SECONDS",
+        "RISK_DEFAULT_STOP_LOSS_PCT",
+        "RISK_DEFAULT_TAKE_PROFIT_PCT",
+    ),
+    "moved to the risk section of the dashboard's Config tab (ADR 0025) — this "
+    "line does nothing; copy the value across and delete it",
 )
 
 
@@ -175,8 +189,8 @@ def unread_keys(lines: dict[str, int]) -> list[tuple[str, int, str]]:
     The silent half of a broken `.env`. `Settings` ignores what it does not
     recognise — correctly, since the file is shared with compose and Vite — so a
     misspelled key is dropped without a word and the field keeps its default.
-    An operator who wrote `RISK_MAX_POSITION_PC=0.02` believes the cap is 2%;
-    it is 10%.
+    An operator who wrote `DASHBOARD_STALE_AFTER_SECOND=60` believes a reading
+    goes stale after a minute; it still takes five.
 
     A close match is offered where one exists, because "read by nothing" and
     "you are one character out" are the same finding and only the second is

@@ -38,6 +38,7 @@ from atp_api.deps import (
     get_kill_switch,
     get_portfolio_repository,
     get_quote_cache,
+    get_worker_config_repository,
 )
 from atp_api.main import create_app
 from atp_core.audit.ports import Action
@@ -45,7 +46,13 @@ from atp_core.clock import SimulatedClock, TradingCalendar
 from atp_core.config import Settings, get_settings
 from atp_core.domain import Order, OrderType, Portfolio, Quote, Side
 from atp_core.risk.killswitch import HaltReason, HaltScope
-from tests.fakes import FakeBroker, FakeKillSwitch, FakePortfolioRepository, RecordingAuditSink
+from tests.fakes import (
+    FakeBroker,
+    FakeKillSwitch,
+    FakePortfolioRepository,
+    FakeWorkerConfigRepository,
+    RecordingAuditSink,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -174,6 +181,11 @@ def app(
     application.dependency_overrides[get_audit_sink] = lambda: audit
     application.dependency_overrides[get_portfolio_repository] = lambda: portfolio_repo
     application.dependency_overrides[get_quote_cache] = lambda: quotes
+    # The risk ceilings are a stored row since ADR 0025, so anything that
+    # validates an order or reads a limit reaches this repository. Empty
+    # means nothing has been saved, which is `DEFAULT_RISK_LIMITS` — the same
+    # numbers `.env` used to ship, so the expectations below are unchanged.
+    application.dependency_overrides[get_worker_config_repository] = FakeWorkerConfigRepository
     application.dependency_overrides[get_current_session] = lambda: Session(
         "test-operator", Scope.FULL
     )

@@ -22,9 +22,9 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from atp_core.clock import Clock, TradingCalendar
-    from atp_core.config import RiskLimits
     from atp_core.domain import Order, Portfolio
     from atp_core.risk.killswitch import KillSwitch
+    from atp_core.risk.limits import RiskLimits
 
 
 def reduces_position(order: Order, portfolio: Portfolio) -> bool:

@@ -37,9 +37,9 @@ from atp_core.backtest.runner import (
     risk_chain_summary,
     run_spec,
 )
-from atp_core.config import get_settings
 from atp_core.domain import Bar, Portfolio, Timeframe
 from atp_core.persistence.backtests import _spec_from_json
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -333,7 +333,7 @@ def _runnable(**overrides: Any) -> BacktestRunSpec:
 
 def _exported(spec: BacktestRunSpec) -> dict[str, Any]:
     """Run it and assemble the `--out` file, which is the pair under test."""
-    result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+    result = run_spec(spec, {"SPY": _wave()}, limits=DEFAULT_RISK_LIMITS)
     return cast("dict[str, Any]", cli.build_report(result, spec))
 
 
@@ -547,7 +547,7 @@ class TestTheCaveatsTheRunAttaches:
         closed round trips only.
         """
         spec = _runnable()
-        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        result = run_spec(spec, {"SPY": _wave()}, limits=DEFAULT_RISK_LIMITS)
         exported = cli.build_report(result, spec)["warnings"]
 
         assert result.portfolio.open_positions, "the baseline run should end holding one"
@@ -570,7 +570,7 @@ class TestTheCaveatsTheRunAttaches:
         rather than through `float` (CLAUDE.md §1.1) — this string is the only
         place several readers will meet the number."""
         spec = _runnable()
-        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        result = run_spec(spec, {"SPY": _wave()}, limits=DEFAULT_RISK_LIMITS)
         note = open_positions_note(result)
 
         assert note is not None
@@ -596,7 +596,7 @@ class TestTheCaveatsTheRunAttaches:
         in the file — `stated_separately` decides what the table skips, never
         what the run records."""
         spec = _runnable(cost_model="zero", sizing_method="fixed_qty", sizing_value="10")
-        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        result = run_spec(spec, {"SPY": _wave()}, limits=DEFAULT_RISK_LIMITS)
         exported = cli.build_report(result, spec)["warnings"]
 
         assert cli.stated_separately(spec, result) <= set(exported)
@@ -613,7 +613,7 @@ class TestWhatTheTableRepeats:
 
     def test_it_skips_what_the_preamble_said(self) -> None:
         spec = _runnable(cost_model="zero")
-        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        result = run_spec(spec, {"SPY": _wave()}, limits=DEFAULT_RISK_LIMITS)
         assert ZERO_COST_WARNING in cli.stated_separately(spec, result)
 
     def test_it_skips_the_refusal_summary(self) -> None:
@@ -621,7 +621,7 @@ class TestWhatTheTableRepeats:
         block applies cannot swallow the line saying how much of the run
         actually happened."""
         spec = _runnable(sizing_method="fixed_notional", sizing_value="100000000")
-        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        result = run_spec(spec, {"SPY": _wave()}, limits=DEFAULT_RISK_LIMITS)
         refusals = refusal_summary(result)
 
         assert refusals is not None, "the oversized order should have been refused"
@@ -637,7 +637,7 @@ class TestWhatTheTableRepeats:
         from the table.
         """
         spec = _runnable()
-        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        result = run_spec(spec, {"SPY": _wave()}, limits=DEFAULT_RISK_LIMITS)
 
         assert cli.stated_separately(spec, result) == {
             risk_chain_summary(),
@@ -656,7 +656,7 @@ class TestWhatTheTableRepeats:
         as long as that stays true.
         """
         spec = _runnable(sizing_method="", sizing_value="")
-        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        result = run_spec(spec, {"SPY": _wave()}, limits=DEFAULT_RISK_LIMITS)
 
         attached = FIXED_QTY_WARNING.format(qty=Decimal("10"))
         assert attached in result.warnings, "run_spec should have attached it"
@@ -666,7 +666,7 @@ class TestWhatTheTableRepeats:
         """The filter is for what the CLI says elsewhere, not a mute button. A
         coverage shortfall has no other place to appear."""
         spec = _runnable()
-        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        result = run_spec(spec, {"SPY": _wave()}, limits=DEFAULT_RISK_LIMITS)
         result.warnings.append("coverage: SPY starts late")
         cli._print_report("s", ["SPY"], result, result.metrics, Decimal("0"), set())
 
@@ -682,7 +682,7 @@ class TestWhatTheTableRepeats:
         caveat twice; getting it wrong the other way is how one disappears.
         """
         spec = _runnable()
-        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        result = run_spec(spec, {"SPY": _wave()}, limits=DEFAULT_RISK_LIMITS)
         cli._print_report(
             "s", ["SPY"], result, result.metrics, Decimal("0"), cli.stated_separately(spec, result)
         )
@@ -697,7 +697,7 @@ class TestWhatTheTableRepeats:
         """The zero-cost line is on the result — and so in `--out` — while the
         preamble above the run is the only place the terminal says it."""
         spec = _runnable(cost_model="zero")
-        result = run_spec(spec, {"SPY": _wave()}, limits=get_settings().risk)
+        result = run_spec(spec, {"SPY": _wave()}, limits=DEFAULT_RISK_LIMITS)
         cli._print_report(
             "s", ["SPY"], result, result.metrics, Decimal("0"), cli.stated_separately(spec, result)
         )

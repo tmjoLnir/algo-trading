@@ -52,6 +52,7 @@ from pydantic import BaseModel, Field
 from atp_api.deps import (
     get_calendar,
     get_clock,
+    get_effective_risk_limits,
     get_kill_switch,
     get_portfolio_repository,
     get_snapshot_store,
@@ -70,6 +71,7 @@ from atp_core.domain import RunMode
 from atp_core.execution.ports import PortfolioRepository
 from atp_core.logging import get_logger
 from atp_core.risk.killswitch import HaltRecord, KillSwitch
+from atp_core.risk.limits import RiskLimits
 
 log = get_logger(__name__)
 
@@ -421,6 +423,7 @@ def account_view(
 @router.get("/live", response_model=LiveDashboard)
 async def get_live_dashboard(
     settings: Annotated[Settings, Depends(get_settings)],
+    limits: Annotated[RiskLimits, Depends(get_effective_risk_limits)],
     clock: Annotated[Clock, Depends(get_clock)],
     calendar: Annotated[TradingCalendar, Depends(get_calendar)],
     kill_switch: Annotated[KillSwitch, Depends(get_kill_switch)],
@@ -435,9 +438,10 @@ async def get_live_dashboard(
 
     Fast by construction: it is read by every open browser tab, so the book is
     one Redis `GET` of a document the worker already assembled rather than a
-    recomputation from fills. The two other reads — the halt keys and, only when
-    a book exists, one bounded equity query for the day anchor — are both small
-    and both bounded.
+    recomputation from fills. The three other reads — the halt keys, the single
+    `worker_config` row the quote-age budget now lives in, and, only when a book
+    exists, one bounded equity query for the day anchor — are all small and all
+    bounded.
 
     Signals come back newest first, because a feed is read from the top.
     """
@@ -499,9 +503,7 @@ async def get_live_dashboard(
         symbols=list(snapshot.symbols),
         last_data_at=snapshot.last_data_at,
         data_feed_healthy=(
-            _feed_healthy(
-                snapshot.last_data_at, now=now, budget=settings.risk.max_quote_age_seconds
-            )
+            _feed_healthy(snapshot.last_data_at, now=now, budget=limits.max_quote_age_seconds)
             if market_open
             # Out of hours a silent feed is correct, not broken. Reporting it as
             # unhealthy every evening is how a health indicator stops being read.

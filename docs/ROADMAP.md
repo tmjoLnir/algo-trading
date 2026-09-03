@@ -27,9 +27,9 @@ fix it here in the PR that discovered it.
 
 ## Where this stands
 
-**21 of 50 items ticked — and the other 29 are not a measure of what is
+**21 of 51 items ticked — and the other 30 are not a measure of what is
 unbuilt.** Reading them as one is the specific mistake this section exists to
-prevent. Twenty-two of the twenty-nine sit in Phases 4 and 5, whose *Verifiable:*
+prevent. Twenty-three of the thirty sit in Phases 4 and 5, whose *Verifiable:*
 lines both come down to the same event: a strategy trading the paper account for
 a week. The code is written and tested. The week has not happened.
 
@@ -40,17 +40,17 @@ a week. The code is written and tested. The week has not happened.
 | 2 — Backtesting | 7 / 7 | 0 | — |
 | 3 — Risk | 2 / 4 | 2 | A strategy that tries to breach every limit, refused by name |
 | 4 — Execution & paper trading | 0 / 11 | 11 | **The paper week.** A strategy trades the paper account for a week and reconciles clean |
-| 5 — Dashboard & analytics | 0 / 11 | 11 | **The same paper week**, read back through the screens and the analytics |
+| 5 — Dashboard & analytics | 0 / 12 | 12 | **The same paper week**, read back through the screens and the analytics |
 | 6 — Production readiness | 5 / 8 | 3 | A scrape from a real deployment, a restore actually performed, the chosen host with the stack actually on it |
-| **Total** | **21 / 50** | **29** | |
+| **Total** | **21 / 51** | **30** | |
 
-The twenty-nine open items are in three different states, and the difference
+The thirty open items are in three different states, and the difference
 matters more than the count:
 
 | State | Count | Means |
 |---|---:|---|
 | Claimed, in progress (`wip`) | 0 | Nobody has an open PR against an item here right now |
-| Built, awaiting the phase line | 27 | Phases 1, 3, 4, 5 and 6. Code merged and tested, nothing left but the demonstration |
+| Built, awaiting the phase line | 28 | Phases 1, 3, 4, 5 and 6. Code merged and tested, nothing left but the demonstration |
 | Unclaimed | 2 | **Daily report** (Phase 5) and **strategy lifecycle verbs** (Phase 4) — nobody has started either |
 
 Two things a reader should take from this rather than from the counts:
@@ -1952,6 +1952,54 @@ wording if it is not the demonstration you want.
   branch of the step-up, and 11 on the panel — but every one of them is a
   fixture, and the property this screen exists for is an operator changing a
   setting and a *real* worker booting on it.
+
+- [ ] The risk ceilings join that row, and the tab becomes Config — @claude.
+  **An item this phase was missing**, added in the PR that built it. ADR 0025
+  has the decision; it is the companion to ADR 0023 above, finishing the job that
+  one started.
+
+  **Eight more environment variables became columns.** `RISK_MAX_POSITION_PCT`,
+  `RISK_MAX_GROSS_EXPOSURE_PCT`, `RISK_MAX_DAILY_LOSS_PCT`,
+  `RISK_MAX_ORDERS_PER_MINUTE`, `RISK_MAX_OPEN_POSITIONS`,
+  `RISK_MAX_QUOTE_AGE_SECONDS` and the two `RISK_DEFAULT_*` fallbacks are gone
+  from `.env.example` and from `Settings`, which no longer has a `risk` field at
+  all. They are nested on `WorkerConfig` as `RiskLimits`, saved by the same
+  `PUT /worker/config`, and edited in a risk section under the worker settings
+  on the same screen. One row, so one revision, one audit entry and one restart
+  notice cover a decision an operator made once.
+
+  **Why they were the worse half to leave behind.** Every argument ADR 0023 made
+  applies, and one applies harder: a position limit is *learned* — tuned against
+  a book, in response to what trading did — and `.env` is the one place in this
+  system a book cannot be seen from. The API also returns the refusals these
+  ceilings cause and could not read the number that caused one.
+
+  **The bounds are new, and they close AUDIT.md finding #42.** `RiskLimits` was
+  eight bare annotations: `RISK_MAX_POSITION_PCT=10` loaded cleanly and set the
+  single-position cap to 1000% of equity, and `RISK_MAX_ORDERS_PER_MINUTE=0`
+  denied every order forever. Neither raised, logged, nor appeared in
+  `config_problems()`. `RiskLimits.__post_init__` now refuses both, in the one
+  place the API and the worker both get their rules from — plus the cross-field
+  rule that a single symbol may not be allowed to exceed the whole book's
+  ceiling, which is not unsafe but means the operator has a limit they do not
+  have.
+
+  **They do not ask for the password, and that is deliberate.**
+  `allow_live_orders` grants a capability to an unattended loop; these bound
+  orders that are already permitted. A step-up in front of them would make
+  *tightening* a ceiling harder than leaving it alone — the direction `/halt`
+  never takes. The audit row carrying both numbers and the operator's name is
+  what makes a loosening answerable instead.
+
+  **The tab is renamed Worker → Config**, because the screen stopped being about
+  the worker: these ceilings bind a manual order typed into the dashboard while
+  no worker is running. Every operator-facing pointer at "the Worker tab" moved
+  with it — the runbook, the preflight fixes, the worker's own startup hints.
+
+  Unticked, for the same reason as the item above: 47 unit tests on the value
+  object, 10 on the published-status round trip, 13 on the API and 7 on the
+  panel, and every one of them is a fixture. The property this exists for is an
+  operator tightening a ceiling and a *real* order being refused by it.
 
 - [ ] Backtest queue, endpoints and screen — @claude.
   **An item this phase was missing**, added in the PR that built it. `POST

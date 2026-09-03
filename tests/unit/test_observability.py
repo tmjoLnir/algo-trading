@@ -194,8 +194,8 @@ class TestTheKillSwitchIsCounted:
 
 class TestTheRiskEngineIsCounted:
     def test_a_denial_records_the_rule_that_refused(self) -> None:
-        from atp_core.config import RiskLimits
         from atp_core.risk.engine import RiskDecision, RiskEngine
+        from atp_core.risk.limits import RiskLimits
 
         class AlwaysDenies:
             @property
@@ -212,8 +212,8 @@ class TestTheRiskEngineIsCounted:
         assert value("atp_risk_denials_total", rule="always_denies") == 1
 
     def test_an_approval_is_counted_as_approved(self) -> None:
-        from atp_core.config import RiskLimits
         from atp_core.risk.engine import RiskEngine
+        from atp_core.risk.limits import RiskLimits
 
         RiskEngine(RiskLimits(), rules=[]).validate(object(), object())  # type: ignore[arg-type]
 
@@ -222,9 +222,9 @@ class TestTheRiskEngineIsCounted:
     def test_a_shrink_is_counted_apart_from_an_approval(self) -> None:
         """A rule that cut the order in half approved it and also changed it,
         and an operator watching sizes shrink wants to see that separately."""
-        from atp_core.config import RiskLimits
         from atp_core.domain import Order, OrderType, Side
         from atp_core.risk.engine import RiskDecision, RiskEngine
+        from atp_core.risk.limits import RiskLimits
 
         class Shrinks:
             @property

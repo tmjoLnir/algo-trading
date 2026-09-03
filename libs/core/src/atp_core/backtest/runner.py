@@ -44,8 +44,8 @@ if TYPE_CHECKING:
     from atp_core.backtest.costs import CostModel
     from atp_core.backtest.engine import BacktestResult, ProgressCallback
     from atp_core.backtest.ports import BacktestRunSpec
-    from atp_core.config import RiskLimits
     from atp_core.domain import Bar
+    from atp_core.risk.limits import RiskLimits
     from atp_core.strategy.base import Strategy
 
 #: Cost models a request may name, and what each builds.

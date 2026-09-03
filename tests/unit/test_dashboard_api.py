@@ -28,6 +28,7 @@ from atp_api.deps import (
     get_kill_switch,
     get_portfolio_repository,
     get_snapshot_store,
+    get_worker_config_repository,
 )
 from atp_api.main import create_app
 from atp_core.clock import SimulatedClock
@@ -36,7 +37,12 @@ from atp_core.dashboard import build_snapshot
 from atp_core.domain import Order, OrderStatus, OrderType, Portfolio, Position, RunMode, Side
 from atp_core.execution.ports import EquityPoint
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
-from tests.fakes import FakeKillSwitch, FakePortfolioRepository, FakeSnapshotStore
+from tests.fakes import (
+    FakeKillSwitch,
+    FakePortfolioRepository,
+    FakeSnapshotStore,
+    FakeWorkerConfigRepository,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -130,6 +136,11 @@ def app(
     application.dependency_overrides[get_snapshot_store] = lambda: store
     application.dependency_overrides[get_portfolio_repository] = lambda: repo
     application.dependency_overrides[get_kill_switch] = lambda: kill_switch
+    # The risk ceilings are a stored row since ADR 0025, so anything that
+    # validates an order or reads a limit reaches this repository. Empty
+    # means nothing has been saved, which is `DEFAULT_RISK_LIMITS` — the same
+    # numbers `.env` used to ship, so the expectations below are unchanged.
+    application.dependency_overrides[get_worker_config_repository] = FakeWorkerConfigRepository
     # These tests are about the book the dashboard serves, not about who is asking. Overriding the
     # one dependency that answers that keeps them so — `tests/unit/
     # test_api_contract.py` is where the enforcement itself is held, from the

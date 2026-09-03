@@ -47,6 +47,7 @@ from atp_core.persistence.strategies import PostgresStrategyRepository
 from atp_core.persistence.worker_config import PostgresWorkerConfigRepository
 from atp_core.persistence.worker_status import RedisWorkerStatusStore
 from atp_core.risk.killswitch import KillSwitch
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS, RiskLimits
 from atp_core.strategy.ports import SignalRepository, StrategyRepository
 from atp_core.worker.ports import WorkerConfigRepository, WorkerStatusStore
 
@@ -232,6 +233,37 @@ async def get_worker_config_repository(
     computes the other's number.
     """
     return PostgresWorkerConfigRepository(session_factory)
+
+
+async def get_effective_risk_limits(
+    repo: Annotated[WorkerConfigRepository, Depends(get_worker_config_repository)],
+) -> RiskLimits:
+    """The account-wide ceilings in force for a request this process serves.
+
+    Read per request from the saved row rather than once from `Settings`, which
+    is where they lived until they became editable. That makes this process the
+    responsive half of a deliberate asymmetry, and it is worth being explicit
+    about which half:
+
+    - **Here**, a ceiling binds the next manual order — `build_router`
+      constructs its chain per request, so a save takes effect immediately.
+    - **In the worker**, it binds at the next restart, because the live loop
+      builds one `RiskEngine` at start. The dashboard says so: the row carries a
+      revision, the worker publishes the one it booted with, and the settings
+      screen renders the difference.
+
+    Before the ceilings moved out of `.env` neither half moved until both
+    processes restarted, so nothing here became less strict — but a reader must
+    not assume the two agree, and the screen is what stops them having to.
+
+    No row is not an error. It means nothing has ever been saved, which is the
+    ordinary state of a fresh database and means `DEFAULT_RISK_LIMITS` — the
+    same numbers `.env.example` shipped. An unreachable database still raises,
+    because a request that quietly fell back to the defaults would validate an
+    order against ceilings looser than the ones an operator had set.
+    """
+    stored = await repo.load()
+    return DEFAULT_RISK_LIMITS if stored is None else stored.config.risk
 
 
 async def get_worker_status_store(

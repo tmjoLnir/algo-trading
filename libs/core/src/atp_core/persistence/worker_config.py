@@ -23,6 +23,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from atp_core.logging import get_logger
 from atp_core.persistence.db import read_scope, session_scope
 from atp_core.persistence.models import WORKER_CONFIG_ID, WorkerConfigRow
+from atp_core.risk.limits import RiskLimits
 from atp_core.worker.config import (
     SizingMethod,
     StopTypeName,
@@ -95,6 +96,11 @@ class PostgresWorkerConfigRepository:
             strategy=config.strategy or None,
             symbols=list(config.symbols),
             allow_live_orders=config.allow_live_orders,
+            # The two ceilings whose movement is worth finding in a log without
+            # the audit screen: one caps a single symbol, the other stops the
+            # day. The rest are in the audit row's diff.
+            max_position_pct=str(config.risk.max_position_pct),
+            max_daily_loss_pct=str(config.risk.max_daily_loss_pct),
         )
         return stored
 
@@ -112,6 +118,19 @@ def _values(config: WorkerConfig, *, actor: str, at: datetime) -> dict[str, Any]
         "stop_multiplier": config.stop_multiplier,
         "stop_period": config.stop_period,
         "allow_live_orders": config.allow_live_orders,
+        # Flattened onto the row with a `risk_` prefix rather than nested, for
+        # the reason `WorkerConfigRow` gives — and prefixed rather than bare so
+        # that `max_open_positions` beside `max_silence_seconds` cannot be read
+        # as two settings of the same kind. They are not: one is a ceiling this
+        # refuses to cross, the other is a watchdog budget.
+        "risk_max_position_pct": config.risk.max_position_pct,
+        "risk_max_gross_exposure_pct": config.risk.max_gross_exposure_pct,
+        "risk_max_daily_loss_pct": config.risk.max_daily_loss_pct,
+        "risk_max_orders_per_minute": config.risk.max_orders_per_minute,
+        "risk_max_open_positions": config.risk.max_open_positions,
+        "risk_max_quote_age_seconds": config.risk.max_quote_age_seconds,
+        "risk_default_stop_loss_pct": config.risk.default_stop_loss_pct,
+        "risk_default_take_profit_pct": config.risk.default_take_profit_pct,
         "updated_at": at,
         "updated_by": actor,
     }
@@ -128,6 +147,10 @@ def _trimmed(value: Decimal) -> Decimal:
 
     `normalize()` alone is not enough: it renders `100` as `1E+2`, which is a
     correct Decimal and an alarming thing to find in a sizing box.
+
+    Applied to the five risk fractions for the same reason: a position limit
+    that redraws itself as `0.10000000` after a save reads as the platform
+    having rewritten what the operator typed.
     """
     normalised = value.normalize()
     exponent = normalised.as_tuple().exponent
@@ -158,6 +181,21 @@ def _to_stored(row: WorkerConfigRow) -> StoredWorkerConfig:
             stop_multiplier=_trimmed(row.stop_multiplier),
             stop_period=row.stop_period,
             allow_live_orders=row.allow_live_orders,
+            # Constructed rather than assigned field by field, so the row's
+            # ceilings go through `RiskLimits.__post_init__` on the way out. A
+            # row written before a bound was tightened fails here, loudly, at
+            # the worker's next start — rather than trading on a limit the
+            # platform has since decided is unsafe.
+            risk=RiskLimits(
+                max_position_pct=_trimmed(row.risk_max_position_pct),
+                max_gross_exposure_pct=_trimmed(row.risk_max_gross_exposure_pct),
+                max_daily_loss_pct=_trimmed(row.risk_max_daily_loss_pct),
+                max_orders_per_minute=row.risk_max_orders_per_minute,
+                max_open_positions=row.risk_max_open_positions,
+                max_quote_age_seconds=row.risk_max_quote_age_seconds,
+                default_stop_loss_pct=_trimmed(row.risk_default_stop_loss_pct),
+                default_take_profit_pct=_trimmed(row.risk_default_take_profit_pct),
+            ),
         ),
         revision=row.revision,
         updated_at=row.updated_at,

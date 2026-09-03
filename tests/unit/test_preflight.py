@@ -25,8 +25,9 @@ from decimal import Decimal
 
 import pytest
 
-from atp_core.config import RiskLimits, Settings
+from atp_core.config import Settings
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
+from atp_core.risk.limits import RiskLimits
 from atp_core.worker import WorkerConfig
 from atp_worker import preflight, trading
 from atp_worker.preflight import Check, Preflight, Status

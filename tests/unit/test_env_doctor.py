@@ -5,11 +5,13 @@ points at the *right* line. Two of these exist because the first implementation
 got them wrong, and both mistakes were the kind that leave a green check over a
 misleading answer rather than a failure:
 
-- `test_every_broken_value_is_reported_in_one_run` — `Settings.risk` is a
-  `default_factory`, so a bad `RISK_*` value raises out of it *during*
-  `Settings()` and takes the rest of the validation with it. The first version
-  reported one bad risk limit and stayed silent about every other broken value
-  in the file.
+- `test_every_broken_value_is_reported_in_one_run` — the first version reported
+  one bad value and stayed silent about every other broken value in the file.
+  The mechanism was `Settings.risk`, a nested `default_factory` that raised
+  *during* `Settings()` and took the rest of the validation with it; that
+  nesting went away when the risk ceilings became a database row, and this case
+  stayed, because the property an operator depends on — a file's mistakes are
+  reported in one pass — is the thing worth pinning rather than the trap.
 - `test_an_exported_value_is_not_blamed_on_the_env_file` — the environment wins
   over `.env`, so a key that is both exported and written in the file is being
   read from the export. Pointing at the `.env` line sends an operator to edit a
@@ -26,10 +28,10 @@ from typing import Any
 import asyncpg.exceptions as pg
 import pytest
 from dotenv import dotenv_values
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from atp_core.config import (
     ConfigProblem,
-    RiskLimits,
     Settings,
     _resolve,
     config_problem_summary,
@@ -42,7 +44,12 @@ SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 #: Set in some environments (a CI runner, a remote container) and inherited by
 #: the test process, where they would make "a clean environment" mean different
 #: things on different machines.
-AMBIENT = ("ATP_RUN_MODE", "ATP_ALLOW_LIVE_TRADING", "RISK_MAX_POSITION_PCT", "WORKER_METRICS_PORT")
+AMBIENT = (
+    "ATP_RUN_MODE",
+    "ATP_ALLOW_LIVE_TRADING",
+    "DASHBOARD_STALE_AFTER_SECONDS",
+    "WORKER_METRICS_PORT",
+)
 
 
 def _load(name: str) -> Any:
@@ -74,17 +81,17 @@ class TestWhatIsReported:
         assert config_problems() == []
         assert config_problem_summary() is None
 
-    def test_a_risk_limit_is_named_as_it_was_written(
+    def test_a_value_is_named_as_it_was_written(
         self, clean_env: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """`RISK_MAX_POSITION_PCT`, not `max_position_pct`.
+        """`DASHBOARD_STALE_AFTER_SECONDS`, upper-cased, with its value shown.
 
         The traceback gives the field name, which is the half that is not in the
         file — the whole point of this is to print the other half.
         """
-        monkeypatch.setenv("RISK_MAX_POSITION_PCT", "not-a-number")
+        monkeypatch.setenv("DASHBOARD_STALE_AFTER_SECONDS", "not-a-number")
         problems = config_problems()
-        assert [p.env_var for p in problems] == ["RISK_MAX_POSITION_PCT"]
+        assert [p.env_var for p in problems] == ["DASHBOARD_STALE_AFTER_SECONDS"]
         assert problems[0].value == "not-a-number"
 
     def test_an_aliased_setting_is_named_by_its_alias(
@@ -96,23 +103,30 @@ class TestWhatIsReported:
     def test_every_broken_value_is_reported_in_one_run(
         self, clean_env: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A bad risk limit must not hide the rest of the file.
+        """One bad value must not hide the rest of the file.
 
         One problem per edit-and-retry cycle is the wrong shape for a file whose
         mistakes arrive in batches, after a hand-merge or a first setup.
         """
-        monkeypatch.setenv("RISK_MAX_POSITION_PCT", "not-a-number")
+        monkeypatch.setenv("DASHBOARD_STALE_AFTER_SECONDS", "not-a-number")
         monkeypatch.setenv("WORKER_METRICS_PORT", "not-a-port")
         assert sorted(p.env_var for p in config_problems()) == [
-            "RISK_MAX_POSITION_PCT",
+            "DASHBOARD_STALE_AFTER_SECONDS",
             "WORKER_METRICS_PORT",
         ]
 
     def test_a_problem_is_reported_once_not_per_model(
         self, clean_env: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """`RiskLimits` is validated on its own *and* reached through `Settings`."""
-        monkeypatch.setenv("RISK_MAX_POSITION_PCT", "not-a-number")
+        """One bad value is one line, however many models walk the environment.
+
+        `config_problems` deduplicates because it validates every entry in
+        `_ENV_MODELS` and a value can be reachable through more than one. That
+        was live when `RiskLimits` was validated on its own *and* through
+        `Settings.risk`; today the tuple holds one model, so this guards the
+        dedup against the next one being added rather than against a live bug.
+        """
+        monkeypatch.setenv("DASHBOARD_STALE_AFTER_SECONDS", "not-a-number")
         assert len(config_problems()) == 1
 
     def test_a_rule_between_values_names_no_single_variable(
@@ -130,9 +144,9 @@ class TestWhatIsReported:
     def test_the_summary_names_the_variables(
         self, clean_env: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("RISK_MAX_POSITION_PCT", "not-a-number")
+        monkeypatch.setenv("DASHBOARD_STALE_AFTER_SECONDS", "not-a-number")
         summary = config_problem_summary()
-        assert summary is not None and "RISK_MAX_POSITION_PCT" in summary
+        assert summary is not None and "DASHBOARD_STALE_AFTER_SECONDS" in summary
 
 
 class TestSecretsAreNotPrinted:
@@ -162,9 +176,23 @@ class TestSecretsAreNotPrinted:
         problem = ConfigProblem(env_var="API_SECRET_KEY", reason="bad", value=None)
         assert "withheld" in "\n".join(check_env.describe(problem, {}))
 
-    def test_the_risk_prefix_is_applied(self) -> None:
-        env_var, _ = _resolve(RiskLimits, "max_position_pct")
-        assert env_var == "RISK_MAX_POSITION_PCT"
+    def test_an_env_prefix_is_applied(self) -> None:
+        """`_resolve` still composes `env_prefix` with the field name.
+
+        No model in `atp_core.config` sets one today — `RiskLimits` was the
+        last, and its ceilings are a database row now — so this uses a local
+        model rather than deleting the case. The branch is what `known_env_vars`
+        and every problem line would need the day a prefixed model returns, and
+        an untested branch is how it would come back subtly wrong.
+        """
+
+        class Prefixed(BaseSettings):
+            model_config = SettingsConfigDict(env_prefix="THING_")
+
+            some_value: int = 1
+
+        env_var, secret = _resolve(Prefixed, "some_value")
+        assert (env_var, secret) == ("THING_SOME_VALUE", False)
 
 
 class TestWhereTheValueCameFrom:
@@ -222,23 +250,32 @@ class TestKeysNothingReads:
 
     `Settings` is `extra="ignore"`, which is right — the file is shared with
     compose and Vite — and the cost is that a misspelled key is dropped without
-    a word. `RISK_MAX_POSITION_PC=0.02` loads cleanly and leaves the cap at
-    0.10, five times looser than the operator believes they set.
+    a word. `DASHBOARD_STALE_AFTER_SECOND=60` loads cleanly and leaves the
+    threshold at 300, five times more tolerant than the operator believes.
     """
 
-    def test_known_names_cover_aliases_and_the_risk_prefix(self) -> None:
+    def test_known_names_cover_aliases_and_plain_fields(self) -> None:
         known = known_env_vars()
         assert "ATP_RUN_MODE" in known  # aliased
         assert "ALPACA_API_KEY" in known  # unaliased, field name upper
-        assert "RISK_MAX_POSITION_PCT" in known  # nested, env_prefix applied
-        assert "max_position_pct" not in known  # never the field name
+        assert "alpaca_api_key" not in known  # never the field name
+
+    def test_a_moved_key_is_no_longer_known(self) -> None:
+        """The `RISK_*` keys are read by nothing since ADR 0025.
+
+        Asserted rather than assumed, because "known" is what decides whether
+        `unread_keys` mentions a line at all: a ceiling still listed here would
+        make a dead `.env` line look live, which is the exact direction of
+        mistake this whole check exists to catch.
+        """
+        assert not [name for name in known_env_vars() if name.startswith("RISK_")]
 
     def test_a_misspelled_key_is_reported_with_the_name_meant(self) -> None:
-        found = check_env.unread_keys({"RISK_MAX_POSITION_PC": 51})
+        found = check_env.unread_keys({"DASHBOARD_STALE_AFTER_SECOND": 51})
         assert len(found) == 1
         key, line, note = found[0]
-        assert (key, line) == ("RISK_MAX_POSITION_PC", 51)
-        assert "RISK_MAX_POSITION_PCT" in note
+        assert (key, line) == ("DASHBOARD_STALE_AFTER_SECOND", 51)
+        assert "DASHBOARD_STALE_AFTER_SECONDS" in note
 
     def test_a_key_nothing_resembles_is_still_reported(self) -> None:
         found = check_env.unread_keys({"MY_OWN_TOOL_VAR": 9})
@@ -258,16 +295,21 @@ class TestKeysNothingReads:
         assert check_env.unread_keys(lines) == []
 
     def test_a_key_that_moved_says_where_it_went(self) -> None:
-        """Ten keys left `.env` for the database in ADR 0023. Reported as
-        unread — because they are, and the consequence is the dangerous one —
-        but not as a *typo*: an operator upgrading would otherwise get ten
-        lines saying "nothing reads it" and go looking for a misspelling that
-        is not there."""
-        found = check_env.unread_keys({"WORKER_STRATEGY": 12})
+        """Eighteen keys left `.env` for the database — ten in ADR 0023, the
+        eight risk ceilings in ADR 0025. Reported as unread — because they are,
+        and the consequence is the dangerous one — but not as a *typo*: an
+        operator upgrading would otherwise get eighteen lines saying "nothing
+        reads it" and go looking for a misspelling that is not there."""
+        found = check_env.unread_keys({"WORKER_STRATEGY": 12, "RISK_MAX_POSITION_PCT": 51})
 
-        assert [k for k, _, _ in found] == ["WORKER_STRATEGY"]
-        assert "Worker tab" in found[0][2]
+        assert [k for k, _, _ in found] == ["WORKER_STRATEGY", "RISK_MAX_POSITION_PCT"]
+        assert "Config tab" in found[0][2]
         assert "did you mean" not in found[0][2]
+
+        # The ceiling names its own section, because the tab has two and an
+        # operator copying a value across needs to find the right one.
+        assert "risk section" in found[1][2]
+        assert "did you mean" not in found[1][2]
 
     def test_every_moved_key_is_one_settings_really_stopped_reading(self) -> None:
         """The list fails *open* if it goes stale: a key added back to
@@ -468,7 +510,7 @@ class TestTheDatabaseThatRefusesACorrectFile:
         )
 
     def test_a_configuration_that_will_not_load_is_not(self) -> None:
-        problem = ConfigProblem(env_var="RISK_MAX_POSITION_PCT", reason="nope", value="x")
+        problem = ConfigProblem(env_var="DASHBOARD_STALE_AFTER_SECONDS", reason="nope", value="x")
         assert not check_env.should_ask_the_database(
             offline=False, problems=[problem], credentials=[], dsn=_DSN
         )

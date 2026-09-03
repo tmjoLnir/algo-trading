@@ -119,9 +119,9 @@ def test_engaging_it_actually_refuses_orders(redis_url: str, client: redis_sync.
     from decimal import Decimal
 
     from atp_core.clock import SimulatedClock, TradingCalendar
-    from atp_core.config import RiskLimits
     from atp_core.domain import Order, Portfolio, Side
     from atp_core.risk.engine import RiskEngine, default_rules
+    from atp_core.risk.limits import RiskLimits
     from atp_core.risk.rules import DailyLossLimitRule
 
     now = datetime(2024, 1, 2, 15, 0, tzinfo=UTC)  # 10:00 New York, a Tuesday

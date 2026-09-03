@@ -37,6 +37,7 @@ from atp_core.config import get_settings
 from atp_core.domain import Bar, Timeframe
 from atp_core.persistence.backtests import new_run
 from atp_core.persistence.jobs import QUEUE_NAME, RUN_BACKTEST_TASK
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS
 from atp_core.strategy import registry
 from atp_worker.queue import (
     INTERRUPTED_ERROR,
@@ -46,7 +47,12 @@ from atp_worker.queue import (
     sweep_interrupted,
 )
 from atp_worker.tasks import run_backtest_task
-from tests.fakes import FakeBacktestQueue, FakeBacktestRunRepository, a_totals
+from tests.fakes import (
+    FakeBacktestQueue,
+    FakeBacktestRunRepository,
+    FakeWorkerConfigRepository,
+    a_totals,
+)
 
 T0 = datetime(2024, 1, 2, tzinfo=UTC)
 RUN_ID = "run-1"
@@ -148,6 +154,11 @@ def ctx(
         "runs": runs,
         "queue": queue,
         "bars": bar_repo,
+        # Where the risk ceilings live since ADR 0025. Empty means nothing has
+        # been saved, so a run is measured against `DEFAULT_RISK_LIMITS` — the
+        # values `.env` shipped, which is what these expectations were written
+        # against when they read `settings.risk`.
+        "worker_config": FakeWorkerConfigRepository(),
         "clock": SystemClock(),
         "settings": get_settings(),
     }
@@ -508,7 +519,7 @@ class TestWarningsTravelWithTheResult:
         from atp_core.backtest.runner import run_spec
 
         spec = a_spec(cost_model="zero")
-        result = run_spec(spec, {"SPY": bars()}, limits=get_settings().risk)
+        result = run_spec(spec, {"SPY": bars()}, limits=DEFAULT_RISK_LIMITS)
 
         assert "NOT evidence" in result.warnings[0]
 
@@ -518,7 +529,7 @@ class TestWarningsTravelWithTheResult:
         of the share count as much as of the strategy."""
         from atp_core.backtest.runner import run_spec
 
-        result = run_spec(a_spec(), {"SPY": bars()}, limits=get_settings().risk)
+        result = run_spec(a_spec(), {"SPY": bars()}, limits=DEFAULT_RISK_LIMITS)
 
         assert "sized at 10 shares" in " ".join(result.warnings)
 
@@ -529,7 +540,7 @@ class TestWarningsTravelWithTheResult:
         from atp_core.backtest.runner import run_spec
 
         spec = a_spec(sizing_method="equity_pct", sizing_value="0.05")
-        result = run_spec(spec, {"SPY": bars()}, limits=get_settings().risk)
+        result = run_spec(spec, {"SPY": bars()}, limits=DEFAULT_RISK_LIMITS)
 
         assert "sized at" not in " ".join(result.warnings)
 
@@ -539,7 +550,7 @@ class TestWarningsTravelWithTheResult:
         the chain had been dropped again."""
         from atp_core.backtest.runner import run_spec
 
-        result = run_spec(a_spec(), {"SPY": bars()}, limits=get_settings().risk)
+        result = run_spec(a_spec(), {"SPY": bars()}, limits=DEFAULT_RISK_LIMITS)
 
         assert "no pre-trade risk rules" not in " ".join(result.warnings)
 
@@ -630,7 +641,7 @@ class TestTheRunKeepsItsMoney:
         """
         from atp_core.backtest.runner import run_spec
 
-        totals = run_spec(a_spec(), {"SPY": bars()}, limits=get_settings().risk).totals()
+        totals = run_spec(a_spec(), {"SPY": bars()}, limits=DEFAULT_RISK_LIMITS).totals()
 
         for key in (
             "starting_equity",
@@ -652,7 +663,7 @@ class TestTheRunKeepsItsMoney:
         """
         from atp_core.backtest.runner import run_spec
 
-        result = run_spec(a_spec(), {"SPY": bars()}, limits=get_settings().risk)
+        result = run_spec(a_spec(), {"SPY": bars()}, limits=DEFAULT_RISK_LIMITS)
 
         report = result.to_report()
 

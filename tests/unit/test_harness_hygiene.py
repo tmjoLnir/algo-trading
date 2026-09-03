@@ -23,7 +23,6 @@ per file is one the next file forgets.
 
 from __future__ import annotations
 
-from decimal import Decimal
 from typing import TYPE_CHECKING
 
 import pytest
@@ -31,19 +30,19 @@ from pydantic_settings import BaseSettings
 
 from atp_core import config
 from atp_core.alerts import LoggingAlertSink, build_alert_sink
-from atp_core.config import _ENV_MODELS, RiskLimits, Settings
+from atp_core.config import _ENV_MODELS, Settings
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-#: A `.env` shaped like an operator's: alerting wired up, and one ordinary
-#: value per settings model so the assertions below are not all about alerting.
+#: A `.env` shaped like an operator's: alerting wired up, and two ordinary
+#: values so the assertions below are not all about alerting.
 _A_HOSTS_DOTENV = """\
 ALERT_NTFY_TOPIC=atp-a-real-topic
 ALERT_TELEGRAM_TOKEN=123456:AAF-a-real-token
 ALERT_TELEGRAM_CHAT_ID=9876
 ENGINE_TICK_INTERVAL_SECONDS=17
-RISK_MAX_POSITION_PCT=0.99
+DASHBOARD_STALE_AFTER_SECONDS=999
 """
 
 
@@ -77,12 +76,16 @@ def test_a_dotenv_does_not_configure_alerting() -> None:
 def test_a_dotenv_reaches_no_setting_at_all() -> None:
     """Alerting is where it was noticed, not the extent of it.
 
-    Both models read a `.env`, and any test asserting a default is wrong by the
+    `Settings` reads a `.env`, and any test asserting a default is wrong by the
     same mechanism — which is how two `test_config_guards.py` cases came to read
     `ATP_RUN_MODE` out of the file written by `make up`.
+
+    Two fields rather than one, and neither of them aliased, because the failure
+    is per-model rather than per-field: one assertion would pass for a model
+    that had been detached for an unrelated reason.
     """
     assert Settings().engine_tick_interval_seconds == 60
-    assert RiskLimits().max_position_pct == Decimal("0.10")
+    assert Settings().dashboard_stale_after_seconds == 300
 
 
 @pytest.mark.parametrize("model", _ENV_MODELS, ids=lambda m: m.__name__)

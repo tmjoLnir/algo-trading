@@ -41,6 +41,7 @@ from atp_api.deps import (
     get_broker,
     get_calendar,
     get_clock,
+    get_effective_risk_limits,
     get_kill_switch,
     get_order_repository,
 )
@@ -53,6 +54,7 @@ from atp_core.domain import Order, OrderStatus
 from atp_core.errors import ATPError
 from atp_core.execution.ports import OrderRepository
 from atp_core.risk.killswitch import KillSwitch
+from atp_core.risk.limits import RiskLimits
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -340,7 +342,7 @@ async def cancel_all_orders(
     kill_switch: Annotated[KillSwitch, Depends(get_kill_switch)],
     clock: Annotated[Clock, Depends(get_clock)],
     calendar: Annotated[TradingCalendar, Depends(get_calendar)],
-    settings: Annotated[Settings, Depends(get_settings)],
+    limits: Annotated[RiskLimits, Depends(get_effective_risk_limits)],
     audit: Annotated[AuditSink, Depends(get_audit_sink)],
     symbol: str | None = None,
 ) -> dict[str, int]:
@@ -367,7 +369,7 @@ async def cancel_all_orders(
         kill_switch=kill_switch,
         clock=clock,
         calendar=calendar,
-        settings=settings,
+        limits=limits,
         quotes={},
     )
     try:

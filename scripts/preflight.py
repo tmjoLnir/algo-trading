@@ -72,7 +72,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--symbols",
         default="",
-        help="override the watchlist (default: the one saved on the Worker tab)",
+        help="override the watchlist (default: the one saved on the Config tab)",
     )
     p.add_argument("--timeframe", default="1d", help="which bar series the strategy runs on")
     p.add_argument("--json", action="store_true", help="machine-readable, for a CI job or a log")
@@ -373,7 +373,7 @@ async def _sizing_check(
     price = series[-1].close
     stop_price = _derived_stop(config, series, price)
     return preflight.check_sizing_is_reachable(
-        config, settings.risk, equity=equity, price=price, stop_price=stop_price
+        config, config.risk, equity=equity, price=price, stop_price=stop_price
     )
 
 

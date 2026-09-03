@@ -232,3 +232,26 @@ export type RunningConfigView = Schemas['RunningConfigView']
 export type WorkerOptionsView = Schemas['WorkerOptionsView']
 export type StrategyOptionView = Schemas['StrategyOptionView']
 export type WorkerOption = Schemas['OptionView']
+
+/**
+ * The risk ceilings, which ride in the same screen and the same save.
+ *
+ * Two names for one model because FastAPI emits two: on the way **out** a
+ * `Decimal` is always a string, and on the way **in** it accepts either — so
+ * the generated schema splits them, and the split is worth keeping rather than
+ * papering over. The form reads `…Payload` and sends `…Input`, and the compiler
+ * is what stops a fraction being sent as a float.
+ *
+ * The three counts are numbers in both directions. They are counts, not money.
+ */
+export type RiskLimitsPayload = Schemas['RiskLimitsPayload-Output']
+export type RiskLimitsInput = Schemas['RiskLimitsPayload-Input']
+
+/**
+ * One risk entry box and the sentence explaining it, from the server.
+ *
+ * The prose is not duplicated here for the reason the stop dropdown's is not:
+ * docs/RISK.md's argument for a number belongs beside the box it is typed into,
+ * and a copy in TypeScript goes stale the first time the argument changes.
+ */
+export type RiskLimitFieldView = Schemas['LimitFieldView']

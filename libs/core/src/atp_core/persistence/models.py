@@ -361,9 +361,18 @@ class WorkerConfigRow(Base):
     timestamp because two saves in the same second must still be distinct, and
     because a clock that steps backwards would make the comparison lie.
 
-    Numerics, not floats, for the two fields that scale money (rule §1.1):
-    `sizing_value` decides order size and `stop_multiplier` decides where the
-    protective stop sits.
+    Numerics, not floats, for every field that scales money (rule §1.1):
+    `sizing_value` decides order size, `stop_multiplier` decides where the
+    protective stop sits, and the five `*_pct` ceilings are multiplied by equity
+    to produce the number an order is measured against — a `0.1` that had been
+    through a binary float would move that ceiling.
+
+    The eight risk columns are flat rather than a JSON blob, unlike
+    `strategy_params` beside them. The difference is who owns the shape:
+    strategy parameters differ per strategy and the platform cannot know them,
+    while these eight are fixed, queried by the risk screen, and each one is a
+    number a `NUMERIC` column can refuse to hold nonsense in. A blob would also
+    put the ceilings that stop real money behind a JSON parse.
     """
 
     __tablename__ = "worker_config"
@@ -386,6 +395,21 @@ class WorkerConfigRow(Base):
     #: The third live lock. Stored, and changed only through an endpoint that
     #: re-asks for the operator's password.
     allow_live_orders: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # ── the account-wide ceilings (`atp_core.risk.limits.RiskLimits`) ────────
+    # Nullable=False with server-side defaults matching `DEFAULT_RISK_LIMITS`,
+    # so the migration that adds them can backfill the one existing row with
+    # the values its `.env` was carrying rather than leaving a configuration
+    # this platform would refuse to load.
+    risk_max_position_pct: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0.10"))
+    risk_max_gross_exposure_pct: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("1.00"))
+    risk_max_daily_loss_pct: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0.03"))
+    risk_max_orders_per_minute: Mapped[int] = mapped_column(default=30)
+    risk_max_open_positions: Mapped[int] = mapped_column(default=20)
+    risk_max_quote_age_seconds: Mapped[int] = mapped_column(default=30)
+    risk_default_stop_loss_pct: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0.02"))
+    risk_default_take_profit_pct: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0.06"))
+
     revision: Mapped[int] = mapped_column(BigInteger, default=1)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     #: The signed-in operator who saved it. Every write comes from an

@@ -31,6 +31,7 @@ from atp_api.deps import (
     get_current_session,
     get_portfolio_repository,
     get_snapshot_store,
+    get_worker_config_repository,
 )
 from atp_api.main import create_app
 from atp_core.clock import SimulatedClock
@@ -38,7 +39,7 @@ from atp_core.config import Settings, get_settings
 from atp_core.dashboard.snapshot import build_snapshot
 from atp_core.domain import Portfolio, Position, RunMode
 from atp_core.execution.ports import EquityPoint
-from tests.fakes import FakePortfolioRepository, FakeSnapshotStore
+from tests.fakes import FakePortfolioRepository, FakeSnapshotStore, FakeWorkerConfigRepository
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -102,6 +103,11 @@ def app(store: FakeSnapshotStore, repo: FakePortfolioRepository) -> FastAPI:
     application.dependency_overrides[get_clock] = lambda: SimulatedClock(NOW)
     application.dependency_overrides[get_snapshot_store] = lambda: store
     application.dependency_overrides[get_portfolio_repository] = lambda: repo
+    # The risk ceilings are a stored row since ADR 0025, so anything that
+    # validates an order or reads a limit reaches this repository. Empty
+    # means nothing has been saved, which is `DEFAULT_RISK_LIMITS` — the same
+    # numbers `.env` used to ship, so the expectations below are unchanged.
+    application.dependency_overrides[get_worker_config_repository] = FakeWorkerConfigRepository
     # Scope is not what these are about — `test_api_contract.py` holds that from
     # the outside against every route at once. Both routes here are GETs, so a
     # read-only session may call them either way.

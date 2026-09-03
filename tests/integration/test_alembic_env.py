@@ -224,14 +224,20 @@ class TestAnUnloadableEnvFileIsNamed:
         """Some of them are credentials, and this code cannot tell which."""
         assert "twelve" not in unloadable.stderr
 
-    def test_a_bad_risk_limit_does_not_stop_a_schema_migration(
+    def test_an_unrelated_bad_value_does_not_stop_a_schema_migration(
         self, database_url: str, tmp_path: Path
     ) -> None:
-        """`Settings.risk` is a `default_factory`, so one bad `RISK_*` value
-        raises out of it during `Settings()`. A risk limit has nothing to do
-        with a schema, and refusing to migrate over one would be new
-        unhelpfulness rather than a fix."""
-        _write_env(tmp_path, DATABASE_URL=database_url, RISK_MAX_POSITION_PCT="not-a-number")
+        """A value that has nothing to do with a schema must not block one.
+
+        This was written when the risk ceilings were `RISK_*` variables and
+        `Settings.risk` was a nested `default_factory`, which made one bad
+        ceiling raise during `Settings()` and take the migration with it. The
+        ceilings are a database row now, so the specific trap is gone — but the
+        property is about `env.py` reading only `DATABASE_URL` out of the file,
+        which is what the runbook's first command depends on, and any other
+        unparseable value still exercises it.
+        """
+        _write_env(tmp_path, DATABASE_URL=database_url, ENGINE_TICK_INTERVAL_SECONDS="not-a-number")
 
         result = _run_alembic(tmp_path, "current")
 

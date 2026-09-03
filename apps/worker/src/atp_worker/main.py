@@ -188,8 +188,8 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
         if stored is None:
             log.warning(
                 "worker.no_stored_config",
-                msg="nothing has been saved on the Worker tab — running the defaults",
-                hint="open the dashboard's Worker tab to set a watchlist and a strategy",
+                msg="nothing has been saved on the Config tab — running the defaults",
+                hint="open the dashboard's Config tab to set a watchlist and a strategy",
             )
         # What it loaded, in full. `.env` used to be readable on the host, so an
         # operator could always see what a worker was configured with; now that
@@ -237,7 +237,7 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
             log.error(
                 "worker.no_watchlist",
                 msg="the watchlist is empty — ingesting no market data",
-                hint="add symbols on the dashboard's Worker tab, then restart this worker",
+                hint="add symbols on the dashboard's Config tab, then restart this worker",
             )
 
         decision = trading.decide(settings, config)
@@ -322,7 +322,7 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
             log.warning(
                 "worker.status_not_published",
                 error=str(exc),
-                msg="the Worker tab will report no worker running; trading is unaffected",
+                msg="the Config tab will report no worker running; trading is unaffected",
             )
 
         log.info(

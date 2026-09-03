@@ -53,6 +53,8 @@ from atp_core.logging import configure as configure_logging
 from atp_core.logging import get_logger
 from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.db import create_engine, create_session_factory
+from atp_core.persistence.worker_config import PostgresWorkerConfigRepository
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS, RiskLimits
 from atp_core.strategy import examples as _examples  # noqa: F401 — populates the registry
 from atp_core.strategy import registry
 
@@ -312,6 +314,25 @@ async def _load_bars(
         await engine.dispose()
 
 
+async def _load_limits(database_url: str) -> RiskLimits:
+    """The saved ceilings this backtest is measured against.
+
+    A database read where this used to be `settings.risk`, because the ceilings
+    are the `worker_config` row now (ADR 0025). It is the same round trip
+    `_load_bars` already makes, against the same database, so a CLI that could
+    run without one is not what changed here.
+
+    Nothing saved means the defaults — what `.env.example` shipped — so an
+    unconfigured checkout backtests against exactly the limits it always did.
+    """
+    engine = create_engine(database_url)
+    try:
+        stored = await PostgresWorkerConfigRepository(create_session_factory(engine)).load()
+    finally:
+        await engine.dispose()
+    return DEFAULT_RISK_LIMITS if stored is None else stored.config.risk
+
+
 async def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
@@ -452,7 +473,7 @@ async def main(argv: list[str] | None = None) -> int:
     # has already refused each of those conditions by flag name. Were one ever
     # to become reachable, a named failure beats the traceback it raised before.
     try:
-        result = run_spec(spec, bars, limits=settings.risk)
+        result = run_spec(spec, bars, limits=await _load_limits(settings.database_url))
     except ATPError as exc:
         raise SystemExit(f"backtest failed: {exc}") from None
 

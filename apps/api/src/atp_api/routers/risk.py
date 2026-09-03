@@ -21,6 +21,7 @@ from atp_api.deps import (
     get_broker,
     get_calendar,
     get_clock,
+    get_effective_risk_limits,
     get_kill_switch,
     get_portfolio_repository,
     get_signal_repository,
@@ -31,7 +32,7 @@ from atp_api.stepup import require_step_up
 from atp_core.audit.ports import Action, AuditEntry, AuditSink
 from atp_core.brokers import BrokerPort
 from atp_core.clock import Clock, TradingCalendar
-from atp_core.config import RiskLimits, Settings, get_settings
+from atp_core.config import Settings, get_settings
 from atp_core.dashboard import LiveSnapshot, SnapshotStore
 from atp_core.dashboard.snapshot import RATIO_PLACES
 from atp_core.domain import RunMode
@@ -39,6 +40,7 @@ from atp_core.errors import ATPError
 from atp_core.execution.ports import PortfolioRepository
 from atp_core.logging import get_logger
 from atp_core.risk.killswitch import HaltReason, HaltScope, KillSwitch
+from atp_core.risk.limits import RiskLimits
 from atp_core.strategy.ports import SignalRepository
 
 log = get_logger(__name__)
@@ -530,26 +532,39 @@ def _status_view(
 
 @router.get("/limits", response_model=RiskLimitsView)
 async def get_risk_limits(
-    settings: Annotated[Settings, Depends(get_settings)],
+    limits: Annotated[RiskLimits, Depends(get_effective_risk_limits)],
 ) -> RiskLimitsView:
     """The configured ceilings. What the rules are, not where we stand.
 
-    Config only: no Redis, no Postgres, no broker. That is the point of it
-    being separate from `/status` rather than a field on it — the moment an
-    operator most wants to know what the limits are is an incident, which is
-    also when the stores are least likely to answer. This route survives all of
-    them being down.
+    **One store, and it is the cheap one.** This used to read configuration and
+    nothing else, which made it the one route that survived every store being
+    down — and that was the argument for it existing separately from `/status`
+    rather than as a field on it. Moving the ceilings out of `.env` and into the
+    `worker_config` row cost exactly that: this now needs Postgres.
+
+    It is still worth being its own route, and the degradation it buys is still
+    real, because the two routes need different things. `/status` reads the
+    worker's published book out of Redis *and* the session's opening equity out
+    of Postgres to say where you stand. This reads one row. So a Redis that has
+    gone away — the failure that takes the book with it — still leaves an
+    operator able to ask what the ceilings are, which is the question an
+    incident actually raises.
+
+    What is no longer true is that it survives Postgres being down. Nothing can
+    honestly answer this question then: the ceilings are a row, and returning
+    the defaults instead would state numbers nobody set as though somebody had.
 
     Read by a full or a read-only session alike; there is nothing here a reader
-    should not see, and `.env` is not somewhere a person can look during an
-    incident.
+    should not see, and the point of the move is that this no longer requires
+    shell access to a host to find out.
     """
-    return _limits_view(settings.risk)
+    return _limits_view(limits)
 
 
 @router.get("/status", response_model=RiskStatusView)
 async def get_risk_status(
     settings: Annotated[Settings, Depends(get_settings)],
+    limits: Annotated[RiskLimits, Depends(get_effective_risk_limits)],
     clock: Annotated[Clock, Depends(get_clock)],
     calendar: Annotated[TradingCalendar, Depends(get_calendar)],
     store: Annotated[SnapshotStore, Depends(get_snapshot_store)],
@@ -575,9 +590,14 @@ async def get_risk_status(
     opened, while `MaxExposureRule` refuses at `>` because the ceiling is a
     value exposure may reach — and a status screen that rounded those together
     would tell someone they are fine while the engine refuses their next order.
+
+    **The ceilings are the saved ones**, which is what a manual order placed
+    from this dashboard will be measured against. A worker that booted before
+    the last save is still enforcing older ones until it restarts; the settings
+    screen is where that difference is stated, because it is the screen with
+    both numbers on it.
     """
     now = clock.now()
-    limits = settings.risk
     snapshot = await _read_book(store, settings.run_mode)
 
     if snapshot is None:

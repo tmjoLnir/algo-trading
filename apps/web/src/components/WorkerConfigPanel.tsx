@@ -1,7 +1,8 @@
 /**
- * What the worker trades, edited here rather than in a file on the host.
+ * What the worker trades and what it may risk, edited here rather than in a
+ * file on the host.
  *
- * These ten values were environment variables. Moving them onto a screen is
+ * These eighteen values were environment variables. Moving them onto a screen is
  * mostly about reach — changing a stop multiplier no longer needs SSH — but the
  * part that shapes this component is the part that does not go away: **a worker
  * reads its configuration once, at start.** So there are always two answers to
@@ -30,6 +31,19 @@
  * number as a multiple and a fixed-percentage stop reads it as a fraction; one
  * field carries both, and an input labelled "multiplier" next to a `fixed_pct`
  * stop is how somebody types 2 and gets a stop 200% below entry.
+ *
+ * **The risk section is rendered from the server's field list, not from a list
+ * here.** `options.risk_fields` carries each ceiling's label, unit, ceiling and
+ * the sentence saying what it means, so adding a limit to `RiskLimits` puts a
+ * box on this screen with no change to this file — and, more to the point, the
+ * prose beside a number that stops real money cannot drift from the prose in
+ * `docs/RISK.md` that argues for it. The same reason the stop dropdown's help
+ * comes down the wire.
+ *
+ * One form and one save for both halves, because they are one decision. The
+ * ceilings do **not** ask for the password: `allow_live_orders` grants a new
+ * capability, while these bound orders that are already permitted, and
+ * *tightening* one must never be the harder direction.
  */
 
 import { useEffect, useMemo, useState } from 'react'
@@ -37,6 +51,8 @@ import { ApiError } from '@/api/client'
 import { useSaveWorkerConfig, useWorkerConfig } from '@/hooks/useWorkerConfig'
 import { formatDateTime } from '@/lib/money'
 import type {
+  RiskLimitFieldView,
+  RiskLimitsInput,
   RunningConfigView,
   StrategyOptionView,
   WorkerConfigScreen,
@@ -56,6 +72,14 @@ interface Draft {
   stopMultiplier: string
   stopPeriod: string
   allowLiveOrders: boolean
+  /**
+   * The eight ceilings, keyed by the server's field name and every one a
+   * string — because every input is one, and because the five fractions must
+   * reach the server as typed. A `Record` rather than eight named keys so this
+   * type does not have to be edited alongside `RiskLimits`; the server's
+   * `risk_fields` is what says which keys exist.
+   */
+  risk: Record<string, string>
 }
 
 function toDraft(config: WorkerConfigView): Draft {
@@ -75,7 +99,40 @@ function toDraft(config: WorkerConfigView): Draft {
     stopMultiplier: config.stop_multiplier,
     stopPeriod: String(config.stop_period),
     allowLiveOrders: config.allow_live_orders,
+    // `String(...)` over the whole record: the three counts arrive as JSON
+    // numbers and the five fractions as strings, and the form edits both as
+    // text. The fractions are never round-tripped through `Number` — that is
+    // the one conversion that could move a ceiling (src/lib/money.ts).
+    risk: Object.fromEntries(
+      Object.entries(config.risk).map(([name, value]) => [name, String(value)]),
+    ),
   }
+}
+
+/**
+ * The risk section's draft, as the endpoint takes it.
+ *
+ * Driven off the server's field list rather than a list here, so a ceiling
+ * added to `RiskLimits` is sent without an edit to this file — and, more
+ * importantly, so a ceiling *removed* from it stops being sent rather than
+ * being posted to an endpoint that no longer has a field for it.
+ *
+ * `unit` decides the conversion, which is the only thing here that could
+ * corrupt a value: the three counts go through `Number` because the server
+ * types them as integers, and the five fractions are sent **as typed**. A
+ * fraction through `Number` is a JSON float, and a `0.1` that has been a float
+ * is not the ceiling that was typed (CLAUDE.md §1.1).
+ */
+function riskPayload(
+  fields: readonly RiskLimitFieldView[],
+  values: Record<string, string>,
+): RiskLimitsInput {
+  const out: Record<string, string | number> = {}
+  for (const field of fields) {
+    const raw = (values[field.name] ?? '').trim()
+    out[field.name] = field.unit === 'fraction' ? raw : Number(raw)
+  }
+  return out as unknown as RiskLimitsInput
 }
 
 const FIELD =
@@ -197,6 +254,70 @@ function Select({
   )
 }
 
+/**
+ * The account-wide ceilings, one box per server-declared field.
+ *
+ * Its own bordered block rather than more rows in the grid above, because the
+ * two halves of this form are different kinds of thing and reading them as one
+ * list is how a limit gets treated as a preference. Above is what this platform
+ * *tries* to do; here is what it refuses to do regardless — including on an
+ * order an operator places by hand from this dashboard, which is why the note
+ * says "every order" rather than "the worker".
+ *
+ * `type="number"` with `min`/`max`/`step` for the browser's own refusal before
+ * the round trip, and `inputMode` so a phone offers the right keypad. The server
+ * re-checks all of it: `RiskLimits.__post_init__` is the authority and these
+ * attributes are a convenience, which is why a `maximum` of `null` (a count,
+ * bounded below only) simply omits the attribute rather than inventing one.
+ */
+function RiskLimitFields({
+  fields,
+  values,
+  onChange,
+}: {
+  fields: readonly RiskLimitFieldView[]
+  values: Record<string, string>
+  onChange: (name: string, value: string) => void
+}) {
+  return (
+    <fieldset className="md:col-span-2 rounded border border-slate-700 bg-slate-900/40 p-3">
+      <legend className="px-1 text-xs font-semibold text-slate-200">Risk limits</legend>
+      <p className="mb-3 text-[11px] text-slate-500">
+        Account-wide ceilings, applied to every order this platform places — the worker's and any
+        you place by hand. A strategy may configure something tighter; it can never configure
+        something looser. Fractions are written as <code>0.10</code> for 10%.
+      </p>
+      <div className="grid gap-3 sm:grid-cols-2">
+        {fields.map((field) => {
+          const id = `risk-${field.name}`
+          const fraction = field.unit === 'fraction'
+          return (
+            <Field key={field.name} id={id} label={field.label} hint={field.help}>
+              <div className="mt-1 flex items-center gap-2">
+                <input
+                  id={id}
+                  type="number"
+                  value={values[field.name] ?? ''}
+                  onChange={(event) => onChange(field.name, event.target.value)}
+                  inputMode={fraction ? 'decimal' : 'numeric'}
+                  min={fraction ? '0' : '1'}
+                  {...(field.maximum === null ? {} : { max: field.maximum })}
+                  step={fraction ? 'any' : '1'}
+                  aria-describedby={`${id}-hint`}
+                  className={`${FIELD} tabular-nums`}
+                />
+                <span className="shrink-0 text-[11px] text-slate-500">
+                  {fraction ? 'of equity' : field.unit}
+                </span>
+              </div>
+            </Field>
+          )
+        })}
+      </div>
+    </fieldset>
+  )
+}
+
 /** The prose for whatever is currently selected. */
 function Help({ options, value }: { options: readonly WorkerOption[]; value: string }) {
   const chosen = options.find((option) => option.value === value)
@@ -301,6 +422,7 @@ export default function WorkerConfigPanel() {
       stop_multiplier: draft.stopMultiplier.trim(),
       stop_period: Number(draft.stopPeriod),
       allow_live_orders: draft.allowLiveOrders,
+      risk: riskPayload(screen.options.risk_fields, draft.risk),
       ...(armingLive ? { password } : {}),
     })
   }
@@ -309,7 +431,10 @@ export default function WorkerConfigPanel() {
     <section className="space-y-4">
       <header className="space-y-2">
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-          <h2 className="text-sm font-semibold text-slate-100">Worker</h2>
+          {/* Names the saved row rather than the worker, because the risk
+              ceilings below are not the worker's — and the revision, author
+              and restart banner beside this cover both halves of it. */}
+          <h2 className="text-sm font-semibold text-slate-100">Saved configuration</h2>
           <span className="text-xs text-slate-500">
             revision {screen.saved.revision === 0 ? '— never saved' : screen.saved.revision}
             {screen.saved.updated_by
@@ -329,6 +454,15 @@ export default function WorkerConfigPanel() {
       </header>
 
       <form onSubmit={submit} className="grid gap-4 md:grid-cols-2">
+        {/* The worker half gets a heading now that it is not the only half.
+            Without one, the "Risk limits" legend below would read as a label
+            for a subsection of settings that all looked alike — and the
+            distinction between what this platform *tries* to do and what it
+            *refuses* to do is the one a reader must not miss. */}
+        <h3 className="md:col-span-2 -mb-1 text-xs font-semibold text-slate-200">
+          What the worker trades
+        </h3>
+
         <div className="md:col-span-2">
           <Field
             id="worker-symbols"
@@ -495,6 +629,16 @@ export default function WorkerConfigPanel() {
           </Field>
         </div>
 
+        <RiskLimitFields
+          fields={screen.options.risk_fields}
+          values={draft.risk}
+          onChange={(name, value) =>
+            setDraft((current) =>
+              current === null ? current : { ...current, risk: { ...current.risk, [name]: value } },
+            )
+          }
+        />
+
         <div className="md:col-span-2 rounded border border-rose-900/70 bg-rose-950/30 p-3">
           <label className="flex items-start gap-2">
             <input
@@ -566,7 +710,9 @@ export default function WorkerConfigPanel() {
             Discard changes
           </button>
           <span className="text-xs text-slate-500">
-            Takes effect at the worker's next start, not immediately.
+            The worker picks this up at its next start. The risk ceilings also apply immediately to
+            orders you place from this dashboard, which the worker's own chain does not see until it
+            restarts.
           </span>
 
           {failure ? (

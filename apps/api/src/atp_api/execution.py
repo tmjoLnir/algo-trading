@@ -48,11 +48,11 @@ if TYPE_CHECKING:
 
     from atp_core.brokers.ports import BrokerPort
     from atp_core.clock import Clock, TradingCalendar
-    from atp_core.config import Settings
     from atp_core.data.ports import QuoteCache
     from atp_core.domain import Portfolio, Quote, RunMode
     from atp_core.execution.ports import PortfolioRepository
     from atp_core.risk.killswitch import KillSwitch
+    from atp_core.risk.limits import RiskLimits
 
 
 def build_router(
@@ -61,7 +61,7 @@ def build_router(
     kill_switch: KillSwitch,
     clock: Clock,
     calendar: TradingCalendar,
-    settings: Settings,
+    limits: RiskLimits,
     quotes: Mapping[str, Quote],
 ) -> OrderRouter:
     """One router for one request, over the full nine-rule chain.
@@ -86,15 +86,18 @@ def build_router(
     holds engine-side levels for positions this router did not open, and the
     ones that matter are broker-side anyway. `flatten` cancels protection
     through the venue, not through this object.
+
+    `limits` arrives as a value rather than being read off `Settings`, because
+    the ceilings are a stored row now and reading them is I/O — `get_risk_limits`
+    does it once per request as a dependency, which keeps this function what it
+    has always been: assembly over collaborators that are already built.
     """
 
     def last_tick_at(symbol: str) -> datetime | None:
         quote = quotes.get(symbol)
         return quote.ts if quote is not None else None
 
-    risk_engine = RiskEngine(
-        settings.risk, default_rules(kill_switch, clock, calendar, last_tick_at)
-    )
+    risk_engine = RiskEngine(limits, default_rules(kill_switch, clock, calendar, last_tick_at))
     return OrderRouter(broker, risk_engine, StopManager(), clock, kill_switch=kill_switch)
 
 

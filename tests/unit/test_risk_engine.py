@@ -21,10 +21,10 @@ import pytest
 from pydantic import ValidationError
 
 from atp_core.clock import SimulatedClock, TradingCalendar
-from atp_core.config import RiskLimits
 from atp_core.domain import Order, Portfolio, Side
 from atp_core.errors import ConfigError, RiskLimitBreachedError
 from atp_core.risk.engine import RiskDecision, RiskEngine, RiskRule, default_rules
+from atp_core.risk.limits import MAX_GROSS_CEILING, RiskLimits
 from atp_core.risk.rules import (
     BuyingPowerRule,
     DailyLossLimitRule,
@@ -717,8 +717,12 @@ class TestInFlightOrdersCountAgainstTheLimits:
         The exposure cap is lifted here so that buying power is the rule left
         to bind — each order is 9% of equity against a 10% position cap, and
         eleven of them exhaust the cash without any one being remarkable.
+
+        Lifted to `MAX_GROSS_CEILING` rather than to an arbitrary 10, which
+        `RiskLimits` refuses: 400% is the widest a US equities account can run
+        at, and this needs only to clear the 99% the batch reaches.
         """
-        chain = RiskEngine(limits(max_gross_exposure_pct=Decimal(10)), rules=self._rules())
+        chain = RiskEngine(limits(max_gross_exposure_pct=MAX_GROSS_CEILING), rules=self._rules())
         book = portfolio(cash=100_000)
         spent = self._batch(11, qty=90)  # 99,000 of 100,000
 

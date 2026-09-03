@@ -291,7 +291,7 @@ in every daily backtest.
 **Stop** field) exists on a run, the engine watches only the levels a `Signal`
 itself carries — and none of the shipped strategies emits one, so every run this
 platform had produced was an unprotected one. If that strategy is configured
-live behind an ATR stop on the Worker tab, the backtest and the live worker are running
+live behind an ATR stop on the Config tab, the backtest and the live worker are running
 two different strategies, and the number on the screen belongs to the one you
 are not going to trade. That is CLAUDE.md §5's divergence in its purest form: no
 error, no warning, just a result about something else.
@@ -352,7 +352,7 @@ run does not provide.
 **Expect the position cap to bite when you turn stops on.** docs/RISK.md's
 recommended pair is `risk_pct` at 1% with a 2×ATR stop, and on a ~$97 stock with
 an ATR near $1.64 that asks for 305 shares — 29.5% of a $100,000 account against
-a 10% `RISK_MAX_POSITION_PCT`, so `max_position_size` refuses every entry. The
+a 10% `max_position_pct`, so `max_position_size` refuses every entry. The
 refusal line says so. It is not a bug in either the sizer or the cap; it is the
 two limits meeting, and the run above uses 0.3% because that is what fits.
 
@@ -361,7 +361,7 @@ what was refused and by which rule. That line matters more than the return above
 it: a backtest whose entries were mostly refused reports what the survivors did,
 which is a statement about the limits rather than about the strategy. The
 default `--qty 100` on a ~$100 stock is $10,000 against a $100,000 account —
-right at `RISK_MAX_POSITION_PCT` — so runs that used to fill will now be
+right at `max_position_pct` — so runs that used to fill will now be
 partly refused. That is the correction, not a regression: those positions were
 always over the limit, and nothing said so.
 

@@ -236,6 +236,15 @@ template sees no sprawl limit and cannot tune it without reading the source.
 the template now, and `RISK_DEFAULT_STOP_LOSS_PCT` carries a comment saying it is a fallback
 rather than a recommendation (item 5's smaller half).
 
+**SUPERSEDED (ADR 0025)** — the template no longer carries any of them, because none of them
+is an environment variable any more. All eight are columns on the `worker_config` row, edited
+in the risk section of the dashboard's Config tab. The concern this item raised is answered
+more completely than the fix it asked for: every ceiling is now on a screen with the sentence
+explaining it beside the box, so there is nothing to tune "without reading the source" and
+nothing an operator can fail to notice because a template omitted it. `.env.example` keeps a
+block naming the eight and their old defaults, so an operator upgrading can see what to copy
+across.
+
 ### 8. `flatten_at_close` is a field nobody reads
 
 `RiskSpec.flatten_at_close` (`strategy/rules.py:132`) exists and is never referenced

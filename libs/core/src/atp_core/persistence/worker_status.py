@@ -24,6 +24,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any, cast
 
 from atp_core.logging import get_logger
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS, RiskLimits
 from atp_core.worker.config import SizingMethod, StopTypeName, WorkerConfig, normalise_symbols
 from atp_core.worker.ports import RunningWorkerConfig
 
@@ -64,6 +65,20 @@ def encode_running(running: RunningWorkerConfig) -> dict[str, Any]:
             "stop_multiplier": str(config.stop_multiplier),
             "stop_period": config.stop_period,
             "allow_live_orders": config.allow_live_orders,
+            # Published as well as stored, and that is the point of publishing
+            # anything here: the worker builds its `RiskEngine` from these once
+            # at start, so a ceiling edited since is not the ceiling refusing
+            # its orders. The screen can only say so by comparing the two.
+            "risk": {
+                "max_position_pct": str(config.risk.max_position_pct),
+                "max_gross_exposure_pct": str(config.risk.max_gross_exposure_pct),
+                "max_daily_loss_pct": str(config.risk.max_daily_loss_pct),
+                "max_orders_per_minute": config.risk.max_orders_per_minute,
+                "max_open_positions": config.risk.max_open_positions,
+                "max_quote_age_seconds": config.risk.max_quote_age_seconds,
+                "default_stop_loss_pct": str(config.risk.default_stop_loss_pct),
+                "default_take_profit_pct": str(config.risk.default_take_profit_pct),
+            },
         },
     }
 
@@ -83,11 +98,41 @@ def decode_running(payload: dict[str, Any]) -> RunningWorkerConfig:
             stop_multiplier=Decimal(str(raw["stop_multiplier"])),
             stop_period=int(raw["stop_period"]),
             allow_live_orders=bool(raw["allow_live_orders"]),
+            risk=_decode_risk(raw),
         ),
         revision=int(payload["revision"]),
         started_at=datetime.fromisoformat(payload["started_at"]),
         trading=bool(payload["trading"]),
         reason=str(payload["reason"]),
+    )
+
+
+def _decode_risk(raw: dict[str, Any]) -> RiskLimits:
+    """The ceilings a worker published, or the defaults for one that predates them.
+
+    A blob written by the previous release has no `risk` key, and this is the
+    one decoder in the pair that must not raise over it: `WorkerStatusStore.get`
+    is documented to return None rather than fail, because this decorates a
+    settings screen and a dashboard that refused to render the form over a stale
+    status blob would take away the one screen that could fix it. A worker
+    restart replaces the key within one deploy anyway.
+
+    Falling back to the defaults is honest here for the same reason revision `0`
+    is: what it renders is what that worker was in fact running, since the
+    defaults are the values `.env` shipped.
+    """
+    published = raw.get("risk")
+    if not isinstance(published, dict):
+        return DEFAULT_RISK_LIMITS
+    return RiskLimits(
+        max_position_pct=Decimal(str(published["max_position_pct"])),
+        max_gross_exposure_pct=Decimal(str(published["max_gross_exposure_pct"])),
+        max_daily_loss_pct=Decimal(str(published["max_daily_loss_pct"])),
+        max_orders_per_minute=int(published["max_orders_per_minute"]),
+        max_open_positions=int(published["max_open_positions"]),
+        max_quote_age_seconds=int(published["max_quote_age_seconds"]),
+        default_stop_loss_pct=Decimal(str(published["default_stop_loss_pct"])),
+        default_take_profit_pct=Decimal(str(published["default_take_profit_pct"])),
     )
 
 

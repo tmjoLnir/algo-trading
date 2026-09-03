@@ -41,7 +41,6 @@ from atp_core.backtest.runner import (
     run_spec,
 )
 from atp_core.clock import SimulatedClock, TradingCalendar
-from atp_core.config import RiskLimits, get_settings
 from atp_core.domain import (
     SIZING,
     Bar,
@@ -61,6 +60,7 @@ from atp_core.risk.engine import (
     backtest_rules,
     default_rules,
 )
+from atp_core.risk.limits import DEFAULT_RISK_LIMITS, RiskLimits
 from atp_core.risk.rules import DailyLossLimitRule, TradingHoursRule, position_size
 from atp_core.strategy import examples as _examples  # noqa: F401 — populates the registry
 from atp_core.strategy import registry
@@ -243,7 +243,7 @@ class TestSessionAnchoring:
     def test_a_run_anchors_rather_than_refusing_everything(self) -> None:
         """End to end: without the engine's own session boundary, every entry in
         every backtest would be denied by the loss limit."""
-        result = run_spec(a_spec(), {"SPY": bars()}, limits=get_settings().risk)
+        result = run_spec(a_spec(), {"SPY": bars()}, limits=DEFAULT_RISK_LIMITS)
 
         denied = [o for o in result.orders if o.rejected_by == "daily_loss_limit"]
         assert denied == []
@@ -303,7 +303,7 @@ class TestSizingReachesTheBacktest:
         rather than returning an empty result that looks like a strategy which
         never signalled."""
         spec = a_spec(sizing_method="risk_pct", sizing_value="0.01")
-        result = run_spec(spec, {"SPY": bars()}, limits=get_settings().risk)
+        result = run_spec(spec, {"SPY": bars()}, limits=DEFAULT_RISK_LIMITS)
 
         refused = [o for o in result.orders if o.rejected_by == SIZING]
         assert refused
@@ -321,7 +321,7 @@ class TestSizingReachesTheBacktest:
         similar prices twice.
         """
         spec = a_spec(sizing_method="equity_pct", sizing_value="0.05")
-        result = run_spec(spec, {"SPY": bars()}, limits=get_settings().risk)
+        result = run_spec(spec, {"SPY": bars()}, limits=DEFAULT_RISK_LIMITS)
 
         filled = [o for o in result.orders if o.status is OrderStatus.FILLED]
         assert filled
@@ -337,7 +337,7 @@ class TestTheChainRefusesForReal:
         """Half the book in one symbol, against a 10% ceiling. Before this
         wiring the engine would have taken it."""
         spec = a_spec(sizing_method="equity_pct", sizing_value="0.50")
-        result = run_spec(spec, {"SPY": bars()}, limits=get_settings().risk)
+        result = run_spec(spec, {"SPY": bars()}, limits=DEFAULT_RISK_LIMITS)
 
         assert result.orders
         assert all(o.rejected_by == "max_position_size" for o in result.orders)
@@ -347,7 +347,7 @@ class TestTheChainRefusesForReal:
         """One line saying how much of the run happened. Three hundred
         individual warnings is a list nobody reads."""
         spec = a_spec(sizing_method="equity_pct", sizing_value="0.50")
-        result = run_spec(spec, {"SPY": bars()}, limits=get_settings().risk)
+        result = run_spec(spec, {"SPY": bars()}, limits=DEFAULT_RISK_LIMITS)
 
         summary = " ".join(result.warnings)
         assert "were refused before reaching the market" in summary
@@ -358,7 +358,7 @@ class TestTheChainRefusesForReal:
             run_spec(
                 a_spec(sizing_method="equity_pct", sizing_value="0.05"),
                 {"SPY": bars()},
-                limits=get_settings().risk,
+                limits=DEFAULT_RISK_LIMITS,
             )
         ) in (None, refusal_summary(_clean_result()))
 
@@ -389,7 +389,7 @@ class TestTheResultSaysWhichChainRan:
         result = run_spec(
             a_spec(sizing_method="equity_pct", sizing_value="0.05"),
             {"SPY": bars()},
-            limits=get_settings().risk,
+            limits=DEFAULT_RISK_LIMITS,
         )
 
         summary = " ".join(result.warnings)
@@ -409,7 +409,7 @@ class TestTheResultSaysWhichChainRan:
         result = run_spec(
             a_spec(sizing_method="equity_pct", sizing_value="0.05"),
             {"SPY": bars()},
-            limits=get_settings().risk,
+            limits=DEFAULT_RISK_LIMITS,
             with_rules=False,
         )
 
@@ -424,8 +424,8 @@ class TestTheResultSaysWhichChainRan:
         nothing, which reads as a guarantee being kept.
         """
         spec = a_spec(sizing_method="equity_pct", sizing_value="0.50")
-        refused = run_spec(spec, {"SPY": bars()}, limits=get_settings().risk)
-        unrefused = run_spec(spec, {"SPY": bars()}, limits=get_settings().risk, with_rules=False)
+        refused = run_spec(spec, {"SPY": bars()}, limits=DEFAULT_RISK_LIMITS)
+        unrefused = run_spec(spec, {"SPY": bars()}, limits=DEFAULT_RISK_LIMITS, with_rules=False)
 
         assert any(o.rejected_by == "max_position_size" for o in refused.orders)
         assert not any(o.rejected_by for o in unrefused.orders)
@@ -438,7 +438,7 @@ class TestTheResultSaysWhichChainRan:
         result = run_spec(
             a_spec(sizing_method="equity_pct", sizing_value="0.50"),
             {"SPY": bars()},
-            limits=get_settings().risk,
+            limits=DEFAULT_RISK_LIMITS,
         )
 
         assert refusal_summary(result) == result.warnings[-1]

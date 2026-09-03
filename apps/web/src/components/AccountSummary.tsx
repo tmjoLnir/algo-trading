@@ -52,7 +52,7 @@ export default function AccountSummary({ account, marketOpen, bookAgeSeconds }: 
         <h2 className="text-sm font-semibold text-amber-300">No book published</h2>
         <p className="mt-1 text-sm text-amber-200/80">
           The worker has not reported an account. It may not be trading (no strategy chosen on the{' '}
-          <strong>Worker</strong> tab), or it may have only just started. This is{' '}
+          <strong>Config</strong> tab), or it may have only just started. This is{' '}
           <strong>not</strong> a statement that you hold nothing.
         </p>
       </section>

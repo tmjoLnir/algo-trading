@@ -19,7 +19,7 @@
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiGet, apiPut } from '@/api/client'
-import type { WorkerConfigScreen } from '@/api/types'
+import type { RiskLimitsInput, WorkerConfigScreen } from '@/api/types'
 
 const KEY = ['worker', 'config']
 
@@ -42,6 +42,15 @@ export interface WorkerConfigSave {
   stop_multiplier: string
   stop_period: number
   allow_live_orders: boolean
+  /**
+   * The account-wide ceilings, saved in the same request.
+   *
+   * One save rather than two, because an operator who widens a stop and lifts a
+   * position limit in one sitting made one decision — and one request means one
+   * revision, one audit entry, and one "your worker is older than this" notice
+   * covering all of it.
+   */
+  risk: RiskLimitsInput
   password?: string
 }
 
