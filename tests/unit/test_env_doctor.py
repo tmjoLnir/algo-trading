@@ -383,10 +383,17 @@ class TestTheDatabasePasswordSurvivesTheTrip:
         assert secret not in problem
 
     def test_a_host_side_url_disagreeing_with_the_deploy_password_is_reported(self) -> None:
-        """`make migrate`, `seed` and `halt.py` read `.env`'s DATABASE_URL, not
+        """`make migrate`, `seed` and `backfill` read `.env`'s DATABASE_URL, not
         the one compose builds. On a deployed host the two must carry the same
         password or the host-side tools fail against the database the
-        containers are using (.env.example, 'datastores')."""
+        containers are using (.env.example, 'datastores').
+
+        `halt.py` used to be named here and in the reason string itself, and it
+        never read this url — it reaches Redis and the venue, which is what lets
+        docs/RUNBOOK.md promise it keeps working while Postgres is refusing
+        everyone. `make migrate` is the tool that genuinely belongs in the list
+        and was, until `infra/alembic/env.py` started reading `Settings`, the one
+        member of it that did not read this line at all."""
         found = check_env.db_credential_problems(
             {
                 "ATP_DB_PASSWORD": "deadbeef",

@@ -2683,6 +2683,77 @@ has met a database holding a real strategy's history.
   uptime on a provisioned host; this is one more thing that host will not need a
   human to diagnose, not the host.
 
+  **And the fifth tool in that family turned out to be the one causing the
+  fault, not reporting it.** Every entry above treats a refused password as
+  something an operator did — a rotation against an existing volume, a `%` that
+  does not survive the trip — and improves how the platform says so.
+  `infra/alembic/env.py` was producing it on its own. It read
+  `os.environ.get("DATABASE_URL", "postgresql+asyncpg://atp:atp@localhost:5432/atp")`
+  under a docstring that said the url comes from `Settings`, and neither `make`
+  nor `uv run` puts `.env` into the environment — so host-side `make migrate`
+  sent the development password to whatever database was on 5432, whatever the
+  operator had written. `seed`, `backfill`, `status` and `preflight` all read the
+  file through `Settings` and did not.
+
+  What that costs is worse than a wrong url, because of *where* the command sits.
+  `make migrate` is the first line of the deploy procedure and of every upgrade
+  after it, and `.env.example`, `docs/DEPLOYMENT.md` and `check_env`'s own advice
+  all named it as a reader of `DATABASE_URL`. So an operator who followed the
+  deployment doc exactly — generate a password, set `ATP_DB_PASSWORD`, carry it
+  into `DATABASE_URL` — got `password authentication failed for user "atp"` for a
+  password they had never typed, from the only command that had to work before
+  anything else could, with three documents telling them the value they had set
+  was the one being used. `make check-env` would then open a connection with that
+  same url, be *accepted*, and report the file clean.
+
+  It survived because the fallback is correct on the two machines anyone tests
+  on: a laptop running the base compose file, whose password is `atp`, and CI,
+  whose service container is also `atp`. The url is only wrong where nobody was
+  looking, which is the deployed host. `tests/integration/test_alembic_env.py`
+  covers it the one way that works — a password in `.env` the database will
+  *refuse*, so the assertion fails whenever the file is not being read, rather
+  than passing on a fallback that happens to be right.
+
+  A refused password is now diagnosed rather than raised, the way `preflight` and
+  `status` were taught to in the entries above and off the same `is_auth_failure`
+  predicate: the url without its password, the SQLSTATE, `make check-env`, and
+  the sentence that a `28` does not end by waiting. The url no longer goes
+  through `config.set_main_option` either — that hands it to `ConfigParser`,
+  where a `%` in a password is an interpolation symbol and the resulting
+  `ValueError` quotes the whole DSN, which is §1.6 in a terminal.
+
+  **The same fault had a second half, in the deployed compose configuration.**
+  `docker-compose.prod.yml` overrides `DATABASE_URL` for `api`, `worker` and
+  `queue` and had no `migrate` service at all, so the overlay initialised
+  Postgres with `ATP_DB_PASSWORD` and left the schema step carrying the base
+  file's `atp:atp@db`. Nothing in the Makefile runs that combination — ADR 0024
+  keeps the migrate profile out of `make deploy` deliberately, and the runbook
+  sends an operator to the host-side command — so it was a trap rather than an
+  outage, and it is the same trap: one variable that has to reach both ends of a
+  connection, written out once per service, with one copy missed.
+
+  So the override is there now, and the thing worth keeping is the check rather
+  than the two lines. `scripts/check_port_bindings.py` already asserts the
+  deployed *shape* against the resolved configuration, on the argument that
+  reading a compose file tells you what was intended and not what compose did
+  with it; `check_database_credentials` asks the same question of the
+  credentials, for every service at once, and fails the build when a client
+  would authenticate with a password `db` was not built with. It compares raw
+  strings deliberately — a password that cannot survive the trip into a url is
+  `make check-env`'s finding (`db_password_problem`), and reporting it here too
+  would be one fault twice with the vaguer half last.
+
+  Both configurations now resolve the `migrate` profile, which nothing did
+  before: `docker compose config` omits a profiled service entirely, so the
+  service with the wrong password was in neither configuration under test. That
+  is the blind spot the restart-policy check had over `web`, in a second place,
+  and the reason it is worth naming twice is that a profile is how this
+  repository says "this exists and is not started by default" — which is a
+  statement about when it runs, never a reason to stop checking what it does.
+
+  Ticks nothing. It is a fix, like the four above it — and unlike them, one to
+  something this file's own Phase 0 tick already claimed worked.
+
   So **each process exports its own `/metrics` and the worker does not push**,
   which is the decision worth arguing with. The natural alternative was for the
   worker to write its numbers into Redis — already the cross-process bus for the
