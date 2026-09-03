@@ -279,14 +279,23 @@ class TestOnlyOneRow:
         dashboard can silently disagree about which is in force."""
         await repo.save(a_config(), actor="operator", at=NOW)
 
+        # Every column, including the eight ceilings — which have no server
+        # default, deliberately (the migration drops the one it needs to
+        # backfill). An INSERT that omitted them would trip the NOT NULL
+        # constraint *before* reaching the CHECK this is about, and pass or
+        # fail for a reason that has nothing to do with single-row-ness.
         with pytest.raises(asyncpg.CheckViolationError):
             await raw.execute(
                 "INSERT INTO worker_config "
                 "(id, symbols, max_silence_seconds, strategy, strategy_params, "
                 " sizing_method, sizing_value, stop_type, stop_multiplier, stop_period, "
-                " allow_live_orders, revision, updated_at, updated_by) "
+                " allow_live_orders, revision, updated_at, updated_by, "
+                " risk_max_position_pct, risk_max_gross_exposure_pct, risk_max_daily_loss_pct, "
+                " risk_max_orders_per_minute, risk_max_open_positions, risk_max_quote_age_seconds, "
+                " risk_default_stop_loss_pct, risk_default_take_profit_pct) "
                 "VALUES ('second', '[]', 60, '', '{}', 'risk_pct', 0.01, 'atr', 2, 14, "
-                "        false, 1, now(), 'somebody')"
+                "        false, 1, now(), 'somebody', "
+                "        0.10, 1.00, 0.03, 30, 20, 30, 0.02, 0.06)"
             )
 
     async def test_saving_twice_leaves_one_row(
