@@ -17,6 +17,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
+from structlog.testing import capture_logs
 
 from atp_core.brokers.ports import TradeUpdate
 from atp_core.channels import CHANNEL_ORDERS, CHANNEL_SIGNALS
@@ -29,6 +30,7 @@ from atp_core.domain import (
     OrderStatus,
     OrderType,
     Portfolio,
+    Position,
     Quote,
     RunMode,
     Side,
@@ -46,7 +48,7 @@ from atp_core.risk.limits import DEFAULT_RISK_LIMITS
 from atp_core.risk.stops import StopConfig, StopManager
 from atp_core.strategy.base import Strategy
 from atp_core.strategy.rules import PositionSizeSpec
-from atp_worker.runner import MAX_CONSECUTIVE_ERRORS, StrategyRunner
+from atp_worker.runner import MAX_CONSECUTIVE_ERRORS, LiveContext, StrategyRunner
 from tests.fakes import (
     FakeKillSwitch,
     FakeOrderRepository,
@@ -58,7 +60,7 @@ from tests.fakes import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, MutableMapping, Sequence
 
     from atp_core.strategy.context import StrategyContext
 
@@ -120,23 +122,45 @@ class ScriptedStrategy(Strategy):
 
 
 class FakeBarRepo:
-    def __init__(self, bars: dict[str, list[Bar]] | None = None) -> None:
+    """Bars for one timeframe, and it **filters on it** like the real one.
+
+    `PostgresBarRepository` narrows on the column
+    (`.where(BarRow.timeframe == timeframe.value)`), so a runner asking for a
+    series nothing writes gets an empty list rather than an error. This fake
+    ignored the argument and answered every timeframe with the same bars —
+    which is why nothing here noticed that `build_runner` hard-coded
+    `Timeframe.D1` against a `1m` ingestor, and why the strategy went a full
+    session without being handed a bar (docs/paper-week/day-1-review.md).
+
+    A fake that cannot express the disagreement cannot catch it.
+    """
+
+    def __init__(
+        self, bars: dict[str, list[Bar]] | None = None, *, timeframe: Timeframe = Timeframe.D1
+    ) -> None:
         self.bars = bars or {}
+        #: The one series this repository holds. Anything else reads as empty.
+        self.timeframe = timeframe
+
+    def _series(self, symbol: str, timeframe: Any) -> list[Bar]:
+        if timeframe is not None and timeframe != self.timeframe:
+            return []
+        return list(self.bars.get(symbol, []))
 
     async def upsert_bars(self, bars: list[Bar]) -> int:
         return 0
 
     async def get_bars(self, symbol: str, timeframe: Any, start: Any, end: Any) -> list[Bar]:
-        return list(self.bars.get(symbol, []))
+        return self._series(symbol, timeframe)
 
     async def get_last_n_bars(self, symbol: str, timeframe: Any, n: int) -> list[Bar]:
-        return list(self.bars.get(symbol, []))[-n:]
+        return self._series(symbol, timeframe)[-n:]
 
     async def find_gaps(self, symbol: str, timeframe: Any, start: Any, end: Any) -> list[Any]:
         return []
 
     async def stored_series(self) -> list[tuple[str, Any]]:
-        return [(symbol, Timeframe.D1) for symbol in self.bars]
+        return [(symbol, self.timeframe) for symbol in self.bars]
 
 
 class FakeQuoteCache:
@@ -185,6 +209,10 @@ class FakeRouter:
         self.protected: list[Order] = []
         self.refuse_signals = False
         self.refuse_protection = False
+        #: What the venue is holding, by symbol. The runner asks before acting
+        #: on an engine-side stop, so a fake that could not answer would let
+        #: `_stop_is_missing` pass on a fiction.
+        self.protected_qty: dict[str, Decimal] = {}
         self.refuse_flatten = False
         #: Refuse *before* an order is composed — sizing, routing. The refusal
         #: is then real and there is no order to store.
@@ -218,6 +246,14 @@ class FakeRouter:
             broker_order_id=f"brk-{self._next_id}",
             status=OrderStatus.SUBMITTED,
         )
+
+    def broker_side_protected_qty(self, symbol: str, position: Position) -> Decimal:
+        """How much of `position` this fake says is covered at the venue.
+
+        Side-aware in the real router; here the tests set the number directly,
+        because what is under test is what the *runner* does with the answer.
+        """
+        return self.protected_qty.get(symbol, Decimal(0))
 
     async def submit_signal(
         self,
@@ -1521,3 +1557,334 @@ class TestTheDecisionRecord:
         # `evaluate` catches and counts rather than propagating — the loop must
         # not die — but the pass is recorded as failed rather than as clean.
         assert runner.stats.errors == 1
+
+
+class TestTheSeriesItReads:
+    """The runner must read the series something is writing.
+
+    `PostgresBarRepository` narrows on the timeframe column, so a runner built
+    for one series and an ingestor writing another do not error — the runner
+    receives nothing, forever, and `_refresh_bars` returns an empty list on
+    every pass. Day 1 of the paper week spent ten hours in exactly that state
+    with the worker reporting itself ready and trading
+    (docs/paper-week/day-1-review.md).
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_runner_reading_a_series_nothing_writes_is_never_handed_a_bar(self) -> None:
+        """The bug, reproduced. The strategy is not called once, and nothing
+        raises — which is what made it survive a full session unnoticed."""
+        strategy = ScriptedStrategy()
+        runner, _, _, _, portfolio, _ = build(strategy=strategy, bars=[bar(0)])
+        # The store holds minutes; this runner was built asking for days.
+        runner.bar_repo.timeframe = Timeframe.M1  # type: ignore[attr-defined]
+        runner.timeframe = Timeframe.D1
+
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1, close=101.0))
+        await runner.evaluate(portfolio)
+
+        assert strategy.bars_seen == []
+
+    @pytest.mark.asyncio
+    async def test_the_same_series_at_both_ends_delivers_the_bar(self) -> None:
+        """The control. Identical setup but for the timeframe, so the assertion
+        above is about the disagreement and not about the harness."""
+        strategy = ScriptedStrategy()
+        runner, _, _, _, portfolio, _ = build(strategy=strategy, bars=[bar(0)])
+        runner.bar_repo.timeframe = Timeframe.M1  # type: ignore[attr-defined]
+        runner.timeframe = Timeframe.M1
+
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1, close=101.0))
+        await runner.evaluate(portfolio)
+
+        assert [b.close for b in strategy.bars_seen] == [Decimal("101.0")]
+
+
+class TestMarkingTheWatchlist:
+    """A market entry is priced off `position.last_price`, and an entry is only
+    ever emitted for a symbol that is *flat*.
+
+    Marking open positions alone therefore left every entry candidate unpriced,
+    and `OrderRouter._size` had nothing to size against — a second blocker
+    sitting behind the timeframe one, and one that would have produced a wall of
+    sizing refusals the moment the first was fixed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_flat_watchlist_symbol_is_priced_from_the_quote(self) -> None:
+        runner, _, _, _, portfolio, _ = build()
+        await runner.warmup(portfolio)
+        await runner.quote_cache.set_quote(
+            Quote(symbol=SYMBOL, ts=START, bid=Decimal("200"), ask=Decimal("202"))
+        )
+
+        await runner.evaluate(portfolio)
+
+        assert portfolio.position(SYMBOL).is_flat
+        assert portfolio.position(SYMBOL).last_price == Decimal("201")
+
+    @pytest.mark.asyncio
+    async def test_a_flat_symbol_falls_back_to_the_last_bar(self) -> None:
+        """No quote yet is not a reason to leave an entry unpriceable — the last
+        completed bar is what the strategy decided on anyway."""
+        runner, _, _, _, portfolio, _ = build(bars=[bar(0, close=123.0)])
+        await runner.warmup(portfolio)
+
+        await runner.evaluate(portfolio)
+
+        assert portfolio.position(SYMBOL).last_price == Decimal("123.0")
+
+    @pytest.mark.asyncio
+    async def test_a_quiet_flat_symbol_does_not_warn(self) -> None:
+        """One line per quiet symbol per pass would drown the warning that
+        matters: an unmarked *holding*, which makes every percentage limit
+        compute too small.
+
+        `capture_logs` rather than `caplog`: structlog does not route through
+        the stdlib logger in this configuration, so a `not in caplog.text`
+        assertion would pass however loud this got (tests/unit/test_alerts.py).
+        """
+        runner, _, _, _, portfolio, _ = build(bars=[])
+        runner.bar_repo.bars = {}  # type: ignore[attr-defined]
+        await runner.warmup(portfolio)
+
+        with capture_logs() as events:
+            await runner.evaluate(portfolio)
+
+        assert not [e for e in events if e["event"] == "runner.no_quote_for_mark"]
+
+    @pytest.mark.asyncio
+    async def test_an_unmarked_holding_still_warns(self) -> None:
+        runner, _, _, _, portfolio, _ = build(bars=[])
+        runner.bar_repo.bars = {}  # type: ignore[attr-defined]
+        await runner.warmup(portfolio)
+        portfolio.position(SYMBOL).qty = Decimal("10")
+
+        with capture_logs() as events:
+            await runner.evaluate(portfolio)
+
+        assert [e for e in events if e["event"] == "runner.no_quote_for_mark"]
+
+
+class TestTheEvaluationHeartbeat:
+    """Whether the loop ran at all has to be answerable from the log.
+
+    The only export of `stats.evaluations` was a Prometheus counter, the metrics
+    server had refused to start for want of a token, and the success path logged
+    nothing — so a session of roughly 390 evaluations produced no evidence that
+    the strategy was ever asked anything.
+    """
+
+    @staticmethod
+    def _heartbeat(events: Sequence[MutableMapping[str, Any]]) -> MutableMapping[str, Any]:
+        beats = [e for e in events if e["event"] == "runner.evaluated"]
+        assert len(beats) == 1, beats
+        return beats[0]
+
+    @pytest.mark.asyncio
+    async def test_every_pass_says_so(self) -> None:
+        runner, _, _, _, portfolio, _ = build()
+        await runner.warmup(portfolio)
+
+        with capture_logs() as events:
+            await runner.evaluate(portfolio)
+
+        assert self._heartbeat(events)["evaluations"] == 1
+
+    @pytest.mark.asyncio
+    async def test_it_reports_no_bars_when_none_closed(self) -> None:
+        """`bars_closed=0` for a whole session is the shape of the timeframe
+        bug, and this line is where an operator would see it."""
+        runner, _, _, _, portfolio, _ = build()
+        runner.bar_repo.timeframe = Timeframe.M1  # type: ignore[attr-defined]
+        runner.timeframe = Timeframe.D1
+        await runner.warmup(portfolio)
+
+        with capture_logs() as events:
+            await runner.evaluate(portfolio)
+
+        beat = self._heartbeat(events)
+        assert beat["bars_closed"] == 0
+        assert beat["timeframe"] == "1d"
+
+    @pytest.mark.asyncio
+    async def test_it_counts_a_closed_bar(self) -> None:
+        runner, _, _, _, portfolio, _ = build()
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1, close=101.0))
+
+        with capture_logs() as events:
+            await runner.evaluate(portfolio)
+
+        assert self._heartbeat(events)["bars_closed"] == 1
+
+
+class TestAStopThatIsNotWhereTheConfigSaysItIs:
+    """`broker_side` says where stops are *meant* to rest, not where this
+    position's stop actually is.
+
+    Read alone it made this loop decline to watch the level for a position whose
+    protective order the risk chain had refused — leaving a holding with no stop
+    at the venue and none in the engine, which is docs/SAFETY.md layers 5 and 4
+    failing together and silently.
+    """
+
+    BROKER_SIDE = StopConfig(stop_type=StopType.FIXED_PCT, value=Decimal("0.02"), broker_side=True)
+
+    @staticmethod
+    def _held(portfolio: Portfolio) -> None:
+        position = portfolio.position(SYMBOL)
+        position.qty = Decimal("10")
+        position.avg_entry_price = Decimal("100")
+        position.last_price = Decimal("100")
+        position.stop_loss_price = Decimal("99")
+
+    @pytest.mark.asyncio
+    async def test_a_refused_stop_is_watched_by_the_engine(self) -> None:
+        """The gap this closes. Nothing is resting at the venue, so the engine
+        is the only thing that can act on the level."""
+        runner, router, _, _, portfolio, _ = build(stop_config=self.BROKER_SIDE)
+        await runner.warmup(portfolio)
+        self._held(portfolio)
+        # What `_protect` records when `submit_protective_orders` comes back
+        # short, and what the router then reports holding: nothing.
+        runner._unprotected[SYMBOL] = Decimal("10")
+        router.protected_qty[SYMBOL] = Decimal("0")
+
+        close_bar(runner, bar(1, close=90.0))
+        await runner.evaluate(portfolio)
+
+        assert router.flattened == [SYMBOL]
+        assert router.flatten_purposes == [STOP_LOSS]
+
+    @pytest.mark.asyncio
+    async def test_a_stop_resting_at_the_venue_is_left_to_the_venue(self) -> None:
+        """The double-exit this must not cause: if both fire the position closes
+        twice, and the second close opens a reversed one with nothing on it."""
+        runner, router, _, _, portfolio, _ = build(stop_config=self.BROKER_SIDE)
+        await runner.warmup(portfolio)
+        self._held(portfolio)
+        runner._unprotected[SYMBOL] = Decimal("10")
+        # Protection was later established over the whole position.
+        router.protected_qty[SYMBOL] = Decimal("10")
+
+        close_bar(runner, bar(1, close=90.0))
+        await runner.evaluate(portfolio)
+
+        assert router.flattened == []
+
+    @pytest.mark.asyncio
+    async def test_a_position_this_process_never_armed_is_left_alone(self) -> None:
+        """The restart case, and the reason `_stop_is_missing` is a positive
+        claim rather than the absence of one.
+
+        `OrderRouter`'s protective map is in-process and is not rebuilt at
+        start, so after a restart it is empty for a position whose venue stop is
+        still resting. Treating that emptiness as "unprotected" would flatten a
+        position the venue also closes — trading one silent bug for a worse one.
+        """
+        runner, router, _, _, portfolio, _ = build(stop_config=self.BROKER_SIDE)
+        await runner.warmup(portfolio)
+        self._held(portfolio)
+        # No record either way: nothing in this process ever armed this symbol.
+        assert runner._unprotected == {}
+        router.protected_qty[SYMBOL] = Decimal("0")
+
+        close_bar(runner, bar(1, close=90.0))
+        await runner.evaluate(portfolio)
+
+        assert router.flattened == []
+
+    @pytest.mark.asyncio
+    async def test_a_partially_covered_position_is_watched(self) -> None:
+        """Half a stop is not a stop for the other half."""
+        runner, router, _, _, portfolio, _ = build(stop_config=self.BROKER_SIDE)
+        await runner.warmup(portfolio)
+        self._held(portfolio)
+        runner._unprotected[SYMBOL] = Decimal("4")
+        router.protected_qty[SYMBOL] = Decimal("6")
+
+        close_bar(runner, bar(1, close=90.0))
+        await runner.evaluate(portfolio)
+
+        assert router.flattened == [SYMBOL]
+
+    @pytest.mark.asyncio
+    async def test_the_target_is_still_watched_when_the_venue_holds_the_stop(self) -> None:
+        """Unchanged by this: the venue holds the stop, the engine holds the
+        target, and returning early on both would leave no upside exit."""
+        runner, router, _, _, portfolio, _ = build(stop_config=self.BROKER_SIDE)
+        await runner.warmup(portfolio)
+        self._held(portfolio)
+        portfolio.position(SYMBOL).take_profit_price = Decimal("110")
+        router.protected_qty[SYMBOL] = Decimal("10")
+
+        close_bar(runner, bar(1, close=112.0))
+        await runner.evaluate(portfolio)
+
+        assert router.flatten_purposes == [TAKE_PROFIT]
+
+
+class TestAStrategyAskingForAnotherSeries:
+    """`closes` and `history` take a timeframe and can only serve the one the
+    runner warmed up on.
+
+    Fixing the runner-to-ingestor wiring leaves this half: `SmaCrossover`'s own
+    default is `timeframe: 1d`, so a worker correctly configured for minutes
+    still hands it minute closes under a daily label. The bars are the right
+    ones — they are the only ones — but nothing said the parameter was being
+    discarded, and a silent substitution is what the layer above was just fixed
+    for (docs/paper-week/day-1-review.md).
+    """
+
+    @staticmethod
+    def _context(timeframe: Timeframe = Timeframe.M1) -> LiveContext:
+        return LiveContext(
+            {SYMBOL: [bar(0)]},
+            {},
+            Portfolio(cash=Decimal("1"), starting_equity=Decimal("1")),
+            SimulatedClock(START),
+            (SYMBOL,),
+            timeframe,
+        )
+
+    def test_asking_for_the_served_series_is_silent(self) -> None:
+        context = self._context(Timeframe.M1)
+
+        with capture_logs() as events:
+            context.closes(SYMBOL, Timeframe.M1, 1)
+
+        assert not [e for e in events if e["event"] == "runner.timeframe_mismatch"]
+
+    def test_asking_for_another_series_says_so(self) -> None:
+        context = self._context(Timeframe.M1)
+
+        with capture_logs() as events:
+            context.closes(SYMBOL, Timeframe.D1, 1)
+
+        mismatch = [e for e in events if e["event"] == "runner.timeframe_mismatch"]
+        assert len(mismatch) == 1
+        assert mismatch[0]["asked_for"] == "1d"
+        assert mismatch[0]["serving"] == "1m"
+
+    def test_it_still_serves_the_bars_it_has(self) -> None:
+        """A warning, not a raise: `on_bar` runs inside the evaluation loop and
+        three consecutive errors halt trading, so raising here would turn a
+        long-standing wrong parameter into an outage."""
+        context = self._context(Timeframe.M1)
+
+        assert len(context.closes(SYMBOL, Timeframe.D1, 1)) == 1
+
+    def test_it_warns_once_per_series_not_once_per_bar(self) -> None:
+        """One line per symbol per bar would be 6,887 of them in a session, which
+        is the volume that buried the signal in the first place."""
+        context = self._context(Timeframe.M1)
+
+        with capture_logs() as events:
+            for _ in range(5):
+                context.closes(SYMBOL, Timeframe.D1, 1)
+                context.history(SYMBOL, Timeframe.D1, 1)
+
+        assert len([e for e in events if e["event"] == "runner.timeframe_mismatch"]) == 1

@@ -95,6 +95,9 @@ class TestTheRoundTrip:
     async def test_every_field_survives(self, repo: PostgresWorkerConfigRepository) -> None:
         saved = a_config(
             max_silence_seconds=45,
+            # Not the default, so the column is proved to carry the value rather
+            # than the row happening to agree with `WorkerConfig`'s fallback.
+            timeframe="5m",
             sizing_method="fixed_qty",
             sizing_value=Decimal("3"),
             stop_type="chandelier",

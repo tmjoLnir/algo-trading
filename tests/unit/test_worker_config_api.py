@@ -106,6 +106,7 @@ def a_payload(**overrides: Any) -> dict[str, Any]:
         "max_silence_seconds": 60,
         "strategy": "sma_crossover",
         "strategy_params": {},
+        "timeframe": "1m",
         "sizing_method": "risk_pct",
         "sizing_value": "0.01",
         "stop_type": "atr",

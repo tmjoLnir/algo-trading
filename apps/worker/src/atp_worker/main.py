@@ -203,6 +203,10 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
             symbols=symbols,
             strategy=config.strategy or None,
             strategy_params=config.strategy_params or None,
+            # The series both the ingestor and the runner are about to be built
+            # with. Logged because when it is wrong nothing else in this log
+            # says so: the strategy is simply never handed a bar.
+            timeframe=config.timeframe,
             sizing=f"{config.sizing_method} {config.sizing_value}",
             stop=f"{config.stop_type} x{config.stop_multiplier} period={config.stop_period}",
             max_silence_seconds=config.max_silence_seconds,
@@ -236,6 +240,12 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
                 provider,
                 publisher=publisher,
                 kill_switch=kill_switch,
+                # Off the same row the runner is built from, so the series this
+                # writes is the series the strategy is handed. Left to its
+                # default while `build_runner` hard-coded `D1`, the two
+                # disagreed and the strategy was never called at all
+                # (docs/paper-week/day-1-review.md).
+                bar_timeframe=config.bar_timeframe,
             )
             monitor = StalenessMonitor(config.max_silence_seconds, kill_switch=kill_switch)
             responsibilities["ingestor"] = lambda: ingestor.run(symbols)

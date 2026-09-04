@@ -576,10 +576,18 @@ export interface paths {
          *
          *     Fast by construction: it is read by every open browser tab, so the book is
          *     one Redis `GET` of a document the worker already assembled rather than a
-         *     recomputation from fills. The three other reads — the halt keys, the single
-         *     `worker_config` row the quote-age budget now lives in, and, only when a book
-         *     exists, one bounded equity query for the day anchor — are all small and all
+         *     recomputation from fills. The other reads — the halt keys, and, **only when a
+         *     book exists**, one bounded equity query for the day anchor plus the single
+         *     `worker_config` row the quote-age budget now lives in — are all small and all
          *     bounded.
+         *
+         *     **Both Postgres reads sit below the no-book early return**, and the quote-age
+         *     budget is why that is worth stating. It arrived here as a `Depends`, which
+         *     runs before this body — so a database outage began failing the one path that
+         *     had never needed a database: no book, no day anchor, just the halts and the
+         *     banners. That path is not a corner case, it is the screen an operator opens
+         *     during an incident, and `data_feed_healthy` is `None` on it anyway, so the
+         *     budget it was loading is not even read.
          *
          *     Signals come back newest first, because a feed is read from the top.
          */
@@ -735,11 +743,19 @@ export interface paths {
          *     order before reporting a failure, so one stubborn cancel does not abandon
          *     the other nine.
          *
-         *     The router is built with **no quotes**, which would deny every order on
-         *     `StaleDataRule` if the chain were consulted. It is not: cancelling places
-         *     nothing, so `RiskEngine.validate` is never reached. Passing an empty map
-         *     rather than reading the cache says that at the call site instead of leaving
-         *     a reader to work out which rules a cancel runs.
+         *     The router is built with **no quotes and the default ceilings**, either of
+         *     which would be wrong if the chain were consulted — an empty quote map denies
+         *     every order on `StaleDataRule`, and the defaults are not necessarily this
+         *     platform's limits. It is not consulted: cancelling places nothing, so
+         *     `RiskEngine.validate` is never reached. Saying so at the call site beats
+         *     leaving a reader to work out which rules a cancel runs.
+         *
+         *     It also keeps this endpoint off Postgres, which matters more here than
+         *     anywhere else on this router. Loading the saved ceilings would make an
+         *     **emergency control** — the one an operator reaches for when orders are
+         *     going out that should not be — fail whenever the database is unreachable,
+         *     in order to fetch numbers it then does not use. The venue and Redis are what
+         *     a cancel needs, and they are all it now touches.
          *
          *     **This does not close positions.** Cancelling a protective stop leaves the
          *     position it was protecting naked, which is why the runbook's emergency path
@@ -3145,6 +3161,8 @@ export interface components {
             };
             /** Symbols */
             symbols: string[];
+            /** Timeframe */
+            timeframe: string;
         };
         /**
          * WorkerConfigView
@@ -3179,6 +3197,8 @@ export interface components {
             };
             /** Symbols */
             symbols: string[];
+            /** Timeframe */
+            timeframe: string;
         };
         /**
          * WorkerOptionsView
@@ -3197,6 +3217,8 @@ export interface components {
             stop_types: components["schemas"]["OptionView"][];
             /** Strategies */
             strategies: components["schemas"]["StrategyOptionView"][];
+            /** Timeframes */
+            timeframes: components["schemas"]["OptionView"][];
         };
     };
     responses: never;

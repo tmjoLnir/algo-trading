@@ -40,6 +40,7 @@ from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
+from atp_core.domain import Timeframe
 from atp_core.errors import ConfigError
 from atp_core.risk.limits import DEFAULT_RISK_LIMITS, STORED_DECIMAL_PLACES, RiskLimits
 
@@ -60,6 +61,12 @@ type SizingMethod = Literal[
 type StopTypeName = Literal[
     "fixed_pct", "fixed_amount", "trailing_pct", "atr", "time", "chandelier"
 ]
+
+#: The bar series a strategy can be run against, as `Timeframe` spells them.
+#: Restated as a `Literal` for the same reason as the two above: this is the
+#: *stored* vocabulary, and a value already written to the row must stay
+#: loadable even if `Timeframe` later grows or loses a member.
+type TimeframeName = Literal["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 
 #: A ticker as every column in this platform spells one: uppercase, and inside
 #: the `String(20)` the bar and order tables give it. Identical to the strategies
@@ -189,10 +196,64 @@ MAX_FRACTIONAL_SIZING = Decimal("0.10")
 FRACTIONAL_SIZING = frozenset({"equity_pct", "risk_pct", "volatility_target"})
 
 
+#: The bar series dropdown. One entry per `TimeframeName`, in the order a
+#: reader should consider them — fastest first, because that is the end of the
+#: range a live intraday strategy sits at and the end where the choice is
+#: easiest to get wrong.
+#:
+#: The prose earns its place here more than on any other field on this row. The
+#: platform reads one series and writes another unless these agree, and when
+#: they disagree nothing errors: the strategy is simply never handed a bar. That
+#: failure is invisible from the logs (docs/paper-week/day-1-review.md), so the
+#: warning belongs on the screen where the value is chosen.
+TIMEFRAMES: tuple[SelectOption, ...] = (
+    SelectOption(
+        "1m",
+        "1 minute",
+        "One bar a minute during the session. What an intraday strategy trades, and what "
+        "the realtime feed subscribes to.",
+    ),
+    SelectOption(
+        "5m",
+        "5 minutes",
+        "Slower than the feed writes, so bars are aggregated from stored minutes rather "
+        "than streamed. Needs the aggregation job that produces them.",
+    ),
+    SelectOption(
+        "15m",
+        "15 minutes",
+        "As 5 minutes: aggregated, not streamed.",
+    ),
+    SelectOption(
+        "30m",
+        "30 minutes",
+        "As 5 minutes: aggregated, not streamed.",
+    ),
+    SelectOption(
+        "1h",
+        "1 hour",
+        "As 5 minutes: aggregated, not streamed.",
+    ),
+    SelectOption(
+        "4h",
+        "4 hours",
+        "As 5 minutes: aggregated, not streamed.",
+    ),
+    SelectOption(
+        "1d",
+        "1 day",
+        "One bar per session, and it does not complete until the close — so a daily "
+        "strategy decides once a day, after the fact, and places nothing intraday. "
+        "Correct for a swing strategy; a silent no-op for anything meant to trade today.",
+    ),
+)
+
+
 #: The accepted values, unpacked from the aliases above so the two cannot drift.
 #: A `type` statement holds its right-hand side lazily, hence `__value__`.
 _SIZING_VALUES: frozenset[str] = frozenset(get_args(SizingMethod.__value__))
 _STOP_VALUES: frozenset[str] = frozenset(get_args(StopTypeName.__value__))
+_TIMEFRAME_VALUES: frozenset[str] = frozenset(get_args(TimeframeName.__value__))
 
 
 def _fail(message: str) -> ConfigError:
@@ -257,6 +318,22 @@ class WorkerConfig:
     #: A `dict` on a frozen object: treat it as read-only, and build a new
     #: config rather than mutating it.
     strategy_params: dict[str, Any] = field(default_factory=dict)
+    #: Which bar series this worker trades — **the series it writes and the
+    #: series the strategy reads, from this one value.**
+    #:
+    #: It is a stored field rather than a constant for a reason worth stating.
+    #: The ingestor writes bars at one timeframe and the strategy runner asks
+    #: the repository for the newest bar at another; the repository filters
+    #: strictly on the column, so if the two ever disagree the runner is handed
+    #: nothing, forever. Nothing raises — `_refresh_bars` simply returns an
+    #: empty list on every pass and `on_bar` is never called. That is not a
+    #: hypothetical: it is what day 1 of the paper week did for ten hours, with
+    #: the worker reporting itself healthy throughout
+    #: (docs/paper-week/day-1-review.md). Both call sites now read this field,
+    #: so the disagreement is not expressible.
+    #:
+    #: Defaults to `1m`, which is what the realtime feed subscribes to.
+    timeframe: TimeframeName = "1m"
     sizing_method: SizingMethod = "risk_pct"
     sizing_value: Decimal = Decimal("0.01")
     stop_type: StopTypeName = "atr"
@@ -286,6 +363,7 @@ class WorkerConfig:
         """
         self._check_symbols()
         self._check_strategy()
+        self._check_timeframe()
         self._check_risk()
         self._check_sizing()
         self._check_stop()
@@ -343,6 +421,17 @@ class WorkerConfig:
         except (TypeError, ValueError) as exc:
             raise _fail(f"strategy parameters are not storable as JSON: {exc}") from exc
 
+    def _check_timeframe(self) -> None:
+        """That the series named is one this platform stores.
+
+        Checked against the *stored* vocabulary rather than against `Timeframe`
+        itself, so that a row written today stays loadable if the enum is ever
+        reordered — the same argument `_check_sizing` makes for its own list.
+        `bar_timeframe` is where the two are held in step.
+        """
+        if self.timeframe not in _TIMEFRAME_VALUES:
+            raise _fail(f"unknown timeframe {self.timeframe!r}; one of {sorted(_TIMEFRAME_VALUES)}")
+
     def _check_sizing(self) -> None:
         if self.sizing_method not in _SIZING_VALUES:
             raise _fail(
@@ -382,6 +471,17 @@ class WorkerConfig:
         _check_storable("stop multiplier", self.stop_multiplier)
         if self.stop_period < 1:
             raise _fail(f"stop period must be at least 1 bar, got {self.stop_period}")
+
+    @property
+    def bar_timeframe(self) -> Timeframe:
+        """`timeframe` as the enum every bar-reading and bar-writing port takes.
+
+        The one conversion point, and the reason the field is a string on the
+        row at all: the column stores the stored vocabulary, this hands the
+        domain enum to the ingestor and the runner alike. Both call sites go
+        through here, so neither can be given a series the other is not using.
+        """
+        return Timeframe(self.timeframe)
 
     @property
     def trades(self) -> bool:
