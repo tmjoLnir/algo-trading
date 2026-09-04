@@ -42,6 +42,7 @@ function config(overrides: Partial<WorkerConfigView> = {}): WorkerConfigView {
     max_silence_seconds: 60,
     strategy: 'sma_crossover',
     strategy_params: {},
+    timeframe: '1m',
     sizing_method: 'risk_pct',
     sizing_value: '0.01',
     stop_type: 'atr',
@@ -114,6 +115,10 @@ function screenPayload(overrides: Partial<WorkerConfigScreen> = {}): WorkerConfi
       stop_types: [
         { value: 'atr', label: 'ATR multiple', help: 'Volatility-adaptive.' },
         { value: 'fixed_pct', label: 'Fixed %', help: 'A fraction below entry.' },
+      ],
+      timeframes: [
+        { value: '1m', label: '1 minute', help: 'What the realtime feed subscribes to.' },
+        { value: '1d', label: '1 day', help: 'One bar per session, complete only at the close.' },
       ],
       multiplier_stops: ['atr', 'chandelier'],
       period_stops: ['atr', 'chandelier', 'time'],

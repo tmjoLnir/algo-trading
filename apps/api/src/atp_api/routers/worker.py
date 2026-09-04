@@ -82,6 +82,7 @@ from atp_core.strategy import registry
 from atp_core.worker import (
     SIZING_METHODS,
     STOP_TYPES,
+    TIMEFRAMES,
     RunningWorkerConfig,
     StoredWorkerConfig,
     WorkerConfig,
@@ -145,6 +146,10 @@ class WorkerConfigView(BaseModel):
     #: a value, and "" is that value.
     strategy: str
     strategy_params: dict[str, Any]
+    #: The bar series this worker writes and reads. One value drives both the
+    #: ingestor and the strategy runner, so they cannot be pointed at different
+    #: series — see `WorkerConfig.timeframe`.
+    timeframe: str
     sizing_method: str
     sizing_value: str
     stop_type: str
@@ -230,6 +235,10 @@ class WorkerOptionsView(BaseModel):
     strategies: list[StrategyOptionView]
     sizing_methods: list[OptionView]
     stop_types: list[OptionView]
+    #: The bar series a worker can trade. Carries its own prose for the reason
+    #: `SelectOption` exists: which series a strategy reads is the field whose
+    #: wrong value fails silently rather than loudly.
+    timeframes: list[OptionView]
     #: The risk section's boxes, in the order the risk chain checks them —
     #: which is the order the risk panel already lists them in, so an operator
     #: who moves between the two screens reads the same sequence twice.
@@ -284,6 +293,7 @@ class WorkerConfigUpdate(BaseModel):
     max_silence_seconds: int
     strategy: str = Field(max_length=64)
     strategy_params: dict[str, Any]
+    timeframe: str = Field(max_length=8)
     sizing_method: str = Field(max_length=32)
     sizing_value: Decimal
     stop_type: str = Field(max_length=32)
@@ -316,6 +326,7 @@ def _config_view(config: WorkerConfig) -> WorkerConfigView:
         max_silence_seconds=config.max_silence_seconds,
         strategy=config.strategy,
         strategy_params=dict(config.strategy_params),
+        timeframe=config.timeframe,
         sizing_method=config.sizing_method,
         sizing_value=str(config.sizing_value),
         stop_type=config.stop_type,
@@ -360,6 +371,7 @@ def _options() -> WorkerOptionsView:
         strategies=[StrategyOptionView(**o) for o in strategy_options(registry.all_strategies())],
         sizing_methods=[OptionView(**asdict(o)) for o in SIZING_METHODS],
         stop_types=[OptionView(**asdict(o)) for o in STOP_TYPES],
+        timeframes=[OptionView(**asdict(o)) for o in TIMEFRAMES],
         risk_fields=[LimitFieldView(**asdict(f)) for f in RISK_LIMIT_FIELDS],
         multiplier_stops=sorted(MULTIPLIER_STOPS),
         period_stops=sorted(PERIOD_STOPS),
@@ -402,6 +414,7 @@ def _to_config(payload: WorkerConfigUpdate) -> WorkerConfig:
             max_silence_seconds=payload.max_silence_seconds,
             strategy=payload.strategy.strip(),
             strategy_params=payload.strategy_params,
+            timeframe=payload.timeframe,  # type: ignore[arg-type]
             sizing_method=payload.sizing_method,  # type: ignore[arg-type]
             sizing_value=payload.sizing_value,
             stop_type=payload.stop_type,  # type: ignore[arg-type]
@@ -456,6 +469,7 @@ def _changes(before: WorkerConfig, after: WorkerConfig) -> dict[str, Any]:
         "max_silence_seconds",
         "strategy",
         "strategy_params",
+        "timeframe",
         "sizing_method",
         "sizing_value",
         "stop_type",

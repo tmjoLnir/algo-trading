@@ -451,6 +451,12 @@ order in production. The configured ceilings are untested numbers.
 
 ## 7. Before day 2 runs
 
+> **Status.** The four P0 items are fixed in code. The sections above are left as
+> they were written — they describe what day 1 did, and that does not change.
+> `METRICS_TOKEN` in item 3 is the one part no commit can discharge: it is a
+> deployment secret, and it still has to be set on the host before day 2. The
+> P1 and P2 items below are open.
+
 **P0 — blocking**
 
 1. **B1** — add `timeframe` to `WorkerConfig`; thread it into both `StrategyRunner` and

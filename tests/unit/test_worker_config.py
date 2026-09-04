@@ -19,14 +19,22 @@ from decimal import Decimal
 
 import pytest
 
+from atp_core.domain import Timeframe
 from atp_core.errors import ConfigError
 from atp_core.risk.limits import DEFAULT_RISK_LIMITS, RiskLimits
 from atp_core.strategy import examples as _examples  # noqa: F401 — populates the registry
 from atp_core.strategy import registry
-from atp_core.worker import DEFAULT_WORKER_CONFIG, SIZING_METHODS, STOP_TYPES, WorkerConfig
+from atp_core.worker import (
+    DEFAULT_WORKER_CONFIG,
+    SIZING_METHODS,
+    STOP_TYPES,
+    TIMEFRAMES,
+    WorkerConfig,
+)
 from atp_core.worker.config import (
     _SIZING_VALUES,
     _STOP_VALUES,
+    _TIMEFRAME_VALUES,
     MAX_SYMBOLS,
     normalise_symbols,
     parse_strategy_params,
@@ -54,16 +62,24 @@ class TestTheVocabularyMatchesThePlatform:
 
         assert {member.value for member in StopType} == _STOP_VALUES
 
+    def test_every_timeframe_is_a_member_of_the_enum(self) -> None:
+        """A stored value the domain cannot parse would be a row that loads and
+        then raises at `bar_timeframe`, inside worker startup."""
+        from atp_core.domain import Timeframe
+
+        assert {member.value for member in Timeframe} == _TIMEFRAME_VALUES
+
     def test_every_accepted_value_has_a_dropdown_option(self) -> None:
         """An option missing from the catalogue is a value the form cannot set
         and the screen renders as a blank select."""
         assert {o.value for o in SIZING_METHODS} == _SIZING_VALUES
         assert {o.value for o in STOP_TYPES} == _STOP_VALUES
+        assert {o.value for o in TIMEFRAMES} == _TIMEFRAME_VALUES
 
     def test_every_option_explains_itself(self) -> None:
         """A `<select>` of six stop types tells a reader nothing about which to
         pick, which is the whole reason each option carries prose."""
-        for option in (*SIZING_METHODS, *STOP_TYPES):
+        for option in (*SIZING_METHODS, *STOP_TYPES, *TIMEFRAMES):
             assert option.help.strip(), option.value
 
 
@@ -294,3 +310,41 @@ class TestAValueTheRowCannotHold:
         it through and `as_tuple().exponent` is then a string rather than an int."""
         with pytest.raises(ConfigError, match="finite"):
             WorkerConfig(stop_multiplier=Decimal("Infinity"))
+
+
+class TestTheBarSeries:
+    """The field that decides whether the strategy is handed a bar at all.
+
+    Day 1 of the paper week ran ten hours with the ingestor writing `1m` and the
+    runner reading `1d`. Nothing raised, nothing warned, and `on_bar` was never
+    called — the repository filters strictly on the column, so the runner simply
+    kept receiving the bar it already held (docs/paper-week/day-1-review.md).
+    These are the tests that make that state unreachable from configuration.
+    """
+
+    def test_it_defaults_to_the_series_the_feed_subscribes_to(self) -> None:
+        """`1m` and not `1d`: the realtime feed writes minutes, so any other
+        default reintroduces the disagreement on a fresh install."""
+        assert DEFAULT_WORKER_CONFIG.timeframe == "1m"
+
+    def test_an_unknown_series_is_refused_by_name(self) -> None:
+        with pytest.raises(ConfigError, match="unknown timeframe"):
+            WorkerConfig(timeframe="1w")  # type: ignore[arg-type]
+
+    def test_the_refusal_lists_what_is_accepted(self) -> None:
+        """Both callers put this sentence in front of a person."""
+        with pytest.raises(ConfigError, match="1m"):
+            WorkerConfig(timeframe="")  # type: ignore[arg-type]
+
+    def test_bar_timeframe_is_the_enum_both_call_sites_take(self) -> None:
+        """The single conversion point. The ingestor and the runner are built
+        from this one property, which is what makes them unable to disagree."""
+        assert WorkerConfig(timeframe="1m").bar_timeframe is Timeframe.M1
+        assert WorkerConfig(timeframe="1d").bar_timeframe is Timeframe.D1
+
+    def test_every_stored_value_converts(self) -> None:
+        """A row that loads but cannot be converted would fail inside worker
+        startup rather than at the save that caused it."""
+        for name in sorted(_TIMEFRAME_VALUES):
+            config = WorkerConfig(timeframe=name)  # type: ignore[arg-type]
+            assert config.bar_timeframe.value == name

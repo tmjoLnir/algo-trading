@@ -135,15 +135,54 @@ class LiveContext:
         portfolio: Portfolio,
         clock: Clock,
         symbols: tuple[str, ...],
+        timeframe: Timeframe,
     ) -> None:
         self._bars = bars
         self._quotes = quotes
         self._portfolio = portfolio
         self._clock = clock
         self._symbols = symbols
+        #: The series `_bars` actually holds. Kept so that a strategy asking for
+        #: a different one is answered honestly — see `_check_timeframe`.
+        self._timeframe = timeframe
+        #: Timeframes already reported as unserveable, so the warning is once
+        #: per series rather than once per symbol per bar.
+        self._warned_timeframes: set[Timeframe] = set()
         self._indicator_cache: dict[
             tuple[str, str, int, tuple[tuple[str, object], ...]], float
         ] = {}
+
+    def _check_timeframe(self, timeframe: Timeframe) -> None:
+        """Say so when a strategy asks for a series this runner does not hold.
+
+        `history` and `closes` are handed a timeframe and can only ever answer
+        from the one series the runner warmed up on, so a mismatch is silently
+        served with the wrong bars: a strategy carrying `timeframe: 1d` — which
+        is `SmaCrossover`'s own default — gets minute closes and computes a
+        20/50 crossover nobody asked for. That is the same class of silent
+        divergence as the runner and the ingestor disagreeing, one layer up, and
+        it is the half that survived fixing the wiring
+        (docs/paper-week/day-1-review.md).
+
+        A warning rather than a raise, deliberately. `on_bar` runs inside the
+        evaluation loop and three consecutive errors halt trading, so raising
+        here would turn a parameter that has been wrong all along into an
+        outage. The operator's fix is to set `strategy_params.timeframe` to the
+        series the worker is configured for, or to change the worker's series;
+        this is what tells them which.
+        """
+        if timeframe == self._timeframe or timeframe in self._warned_timeframes:
+            return
+        self._warned_timeframes.add(timeframe)
+        log.warning(
+            "runner.timeframe_mismatch",
+            asked_for=timeframe.value,
+            serving=self._timeframe.value,
+            msg=(
+                "the strategy asked for a series this worker does not hold and was given "
+                "the one it does — align strategy_params.timeframe with the worker's"
+            ),
+        )
 
     def invalidate(self) -> None:
         """Drop cached indicator values. Called when the window moves."""
@@ -168,6 +207,7 @@ class LiveContext:
         stop rather than to trade on a number that does not mean what its name
         says.
         """
+        self._check_timeframe(timeframe)
         available = self._bars.get(symbol, [])
         if len(available) < lookback:
             raise DataGapError(
@@ -182,6 +222,7 @@ class LiveContext:
         the reference strategies check the length themselves so they can sit
         quietly through warmup.
         """
+        self._check_timeframe(timeframe)
         available = self._bars.get(symbol, [])
         window = available[-lookback:] if lookback > 0 else []
         return np.array([float(b.close) for b in window], dtype=float)
@@ -317,12 +358,25 @@ class StrategyRunner:
         #: without an optional, and replaced rather than mutated.
         self._portfolio = Portfolio(cash=Decimal(0), starting_equity=Decimal(0))
         self._context = LiveContext(
-            self._bars, self._quotes, self._portfolio, clock, tuple(symbols)
+            self._bars, self._quotes, self._portfolio, clock, tuple(symbols), timeframe
         )
         #: What we believe is working at the venue, keyed by `client_order_id`.
         #: This is what `Reconciler.reconcile` needs and had no source for: the
         #: runner is the thing that knows what it submitted.
         self._open_orders: dict[str, Order] = {}
+        #: Symbols this process has tried and failed to fully protect at the
+        #: venue, and by how much. Written by `_protect`, read by
+        #: `_stop_is_missing`, and cleared when the position closes.
+        #:
+        #: A *positive* record of a known gap rather than the absence of a
+        #: record, and the distinction is the whole reason this exists. The
+        #: router's protective map is in-process and is not rebuilt at start
+        #: (`OrderRouter.cancel_protection`), so after a restart it is empty for
+        #: a position whose venue stop is still resting. Reading that emptiness
+        #: as "unprotected" would have the engine flatten a position the venue
+        #: also closes, and the second close opens a reversed one with nothing
+        #: on it. Only a refusal this process actually saw goes in here.
+        self._unprotected: dict[str, Decimal] = {}
         #: Fills booked since the last pass, awaiting `strategy.on_fill`.
         self._pending_fills: list[_AppliedFill] = []
         #: What the strategy decided lately and what became of it, newest last.
@@ -364,7 +418,7 @@ class StrategyRunner:
         """
         self._portfolio = portfolio
         self._context = LiveContext(
-            self._bars, self._quotes, portfolio, self.clock, tuple(self.symbols)
+            self._bars, self._quotes, portfolio, self.clock, tuple(self.symbols), self.timeframe
         )
 
         # First, before anything can produce a signal or an order. Both store a
@@ -608,6 +662,53 @@ class StrategyRunner:
 
         self.stats.evaluations += 1
         self.stats.last_evaluation_at = self.clock.now()
+        self._log_evaluation(portfolio, closed, signals)
+
+    def _log_evaluation(
+        self, portfolio: Portfolio, closed: list[Bar], signals: list[Signal]
+    ) -> None:
+        """One line per pass, so that a loop doing nothing is distinguishable
+        from a loop not running.
+
+        This exists because day 1 of the paper week could not tell those apart.
+        The evaluation counter was exported through one Prometheus metric and
+        nothing else, the metrics server had refused to start for want of a
+        token, and the success path of this method logged nothing at all — so
+        roughly 390 evaluations produced no output, and the question "did the
+        strategy ever see a bar?" had no answer anywhere in ten hours of logs
+        (docs/paper-week/day-1-review.md).
+
+        The fields are chosen to answer that question rather than to describe
+        the pass. `bars_closed` at zero for a whole session with a live feed is
+        the shape of a runner reading a series nothing writes, and
+        `newest_bar_age_seconds` is what names it: minutes during a session
+        means the feed is behind, days means this runner and the ingestor are
+        looking at different timeframes. Metrics remain the right home for the
+        rate; a log line is what is left when metrics are down, which is
+        precisely when this is needed.
+        """
+        newest = max(
+            (bars[-1].ts for bars in self._bars.values() if bars),
+            default=None,
+        )
+        log.info(
+            "runner.evaluated",
+            evaluations=self.stats.evaluations,
+            timeframe=self.timeframe.value,
+            bars_closed=len(closed),
+            symbols_held=sum(1 for bars in self._bars.values() if bars),
+            newest_bar_at=newest.isoformat() if newest is not None else None,
+            newest_bar_age_seconds=(
+                round((self.clock.now() - newest).total_seconds(), 1)
+                if newest is not None
+                else None
+            ),
+            signals=len(signals),
+            open_positions=len(portfolio.open_positions),
+            working_orders=len(self._open_orders),
+            submitted=self.stats.orders_submitted,
+            refused=self.stats.orders_rejected_by_risk,
+        )
 
     async def _persist(self, portfolio: Portfolio) -> None:
         """Step 6. Write the book, then publish it.
@@ -648,11 +749,10 @@ class StrategyRunner:
             return
         try:
             # The whole watchlist, read fresh, rather than `self._quotes`. That
-            # cache is filled by `_mark`, which returns early when nothing is
-            # open and never prunes what it holds — so a flat book with a
-            # perfectly healthy feed would publish "no data has ever arrived",
-            # and a symbol exited an hour ago would keep answering for the
-            # feed's pulse long after we stopped watching it.
+            # cache is filled by `_mark` and never pruned, so a symbol exited an
+            # hour ago would keep answering for the feed's pulse long after we
+            # stopped watching it. Re-reading here also keeps this a fact about
+            # the moment the snapshot is published rather than about step 1.
             quotes = await self.quote_cache.get_quotes(list(self.symbols))
             await self.snapshot_store.put(
                 build_snapshot(
@@ -700,7 +800,7 @@ class StrategyRunner:
         return just_closed
 
     async def _mark(self, portfolio: Portfolio) -> None:
-        """Step 1. Value open positions off the freshest price we have.
+        """Step 1. Price the watchlist off the freshest quote we have.
 
         The quote, not the last bar close — the opposite of what the strategy
         decides on. A mark is about what the book is worth *now*, and every
@@ -708,25 +808,53 @@ class StrategyRunner:
         breached limit look compliant. `Portfolio.unmarked_symbols` already
         refuses to price a book it cannot value; this is what keeps that list
         empty.
+
+        **The whole watchlist, not only what is open**, and the difference is
+        the difference between a strategy that can enter and one that cannot.
+        `OrderRouter._size` prices a market entry through `reference_price`,
+        which falls back to `position.last_price` when the request carries no
+        limit price — and `sma_crossover` emits a market `ENTER_LONG` only when
+        the position is *flat*. Marking open positions alone therefore leaves
+        every entry candidate unpriced, and every entry is refused at sizing
+        for want of a number the quote cache was holding all along
+        (docs/paper-week/day-1-review.md).
+
+        Marking a flat symbol inserts a flat `Position` into the book, which is
+        why this only does so when there is a price to record. That insertion
+        is harmless by construction: `open_positions`, `unmarked_symbols` and
+        `PostgresPortfolioRepository.snapshot` all filter on `is_flat`, and a
+        flat position contributes zero to `gross_exposure` and to realised P&L.
         """
-        open_symbols = [p.symbol for p in portfolio.open_positions]
-        if not open_symbols:
+        open_symbols = {p.symbol for p in portfolio.open_positions}
+        # Watchlist order, then any holding that has left it — still marked,
+        # because an unmarked holding is what makes every percentage limit
+        # compute too small, and it is the one symbol this cannot skip. Built in
+        # a fixed order rather than from a set union so that the quote request
+        # and the warnings below come out the same way on every pass.
+        wanted = list(self.symbols) + sorted(open_symbols - set(self.symbols))
+        if not wanted:
             return
 
-        quotes = await self.quote_cache.get_quotes(open_symbols)
-        for symbol in open_symbols:
+        quotes = await self.quote_cache.get_quotes(wanted)
+        for symbol in wanted:
             quote = quotes.get(symbol)
             if quote is not None:
                 self._quotes[symbol] = quote
                 portfolio.position(symbol).last_price = quote.mid
                 continue
             # No quote: fall back to the last completed bar rather than leaving
-            # the position unmarked, and say so — an unmarked holding is what
-            # makes every percentage limit compute too small.
+            # it unpriced. Recorded even for a flat symbol, because that is the
+            # number an entry would be sized against.
             fallback = self._context.last_price(symbol)
             if fallback is not None:
                 portfolio.position(symbol).last_price = fallback
-            log.warning("runner.no_quote_for_mark", symbol=symbol)
+            if symbol in open_symbols:
+                # Warned on whether or not the bar fallback worked: the missing
+                # quote is the fact, the fallback is only the mitigation.
+                # Deliberately not warned for a flat symbol — a name the feed
+                # has not reached yet is not an alarm, and one line per quiet
+                # symbol per pass would drown the holdings that are.
+                log.warning("runner.no_quote_for_mark", symbol=symbol)
 
     async def _check_stops(self, portfolio: Portfolio, closed: list[Bar]) -> None:
         """Step 2. Engine-side protective levels, and trailing ratchets.
@@ -817,18 +945,55 @@ class StrategyRunner:
                 return TIME_EXIT
             return None
 
-        if self.stop_config.broker_side:
+        if self.stop_config.broker_side and not self._stop_is_missing(position):
             # The *stop* is resting at the venue; checking it here as well would
             # double-exit on the bar the venue also fills. The target is not —
             # `submit_protective_orders` arms it on the position rather than
             # sending a second order — so it is still ours to watch, and
             # returning early on both would leave a broker-side configuration
             # with no upside exit at all.
+            #
+            # `_stop_is_missing` is what makes the first clause a claim about
+            # this position rather than about the configuration. Read alone,
+            # `broker_side` says only that stops are *meant* to rest at the
+            # venue; a stop the risk chain refused leaves it saying so about a
+            # position that has none, and this method then declined to watch the
+            # level as well. The result was a holding with no stop anywhere,
+            # which is docs/SAFETY.md layer 5 and layer 4 failing together and
+            # silently (docs/paper-week/day-1-review.md).
             return TAKE_PROFIT if target_hit(position, bar) else None
 
         if self.stop_manager.should_trigger(position, bar):
             return STOP_LOSS
         return TAKE_PROFIT if target_hit(position, bar) else None
+
+    def _stop_is_missing(self, position: Position) -> bool:
+        """Whether this position is *known* to be short of a venue-side stop.
+
+        Answers a narrower question than "is it protected", and deliberately.
+        Three states exist and only two of them are safe to act on:
+
+        - **known short** — this process armed protection for the symbol and was
+          refused, wholly or in part. The venue is not holding the stop, so the
+          engine has to watch the level or nothing does. Returns True.
+        - **known covered** — protection was armed and the router still counts
+          enough working quantity against the position. The venue owns it and
+          checking here too would double-exit. Returns False.
+        - **unknown** — nothing in this process ever tried, which is every
+          position adopted across a restart. Returns False, because the venue is
+          the only stop that can exist for such a position and flattening it
+          here would close it twice.
+
+        The router supplies the live number rather than this method trusting its
+        own record: a stop that has since filled, been cancelled, or been
+        shrunk by the risk chain changes the answer, and
+        `broker_side_protected_qty` is side-aware in a way a stored quantity
+        could not stay after a flip.
+        """
+        if position.symbol not in self._unprotected:
+            return False
+        covered = self.router.broker_side_protected_qty(position.symbol, position)
+        return covered < abs(position.qty)
 
     def _bars_held(self, position: Position) -> int | None:
         """How many completed bars since the position opened."""
@@ -1136,6 +1301,11 @@ class StrategyRunner:
         position = portfolio.position(order.symbol)
         position.apply_fill(fill, fill.qty * order.side.sign)
         portfolio.cash -= fill.qty * fill.price * order.side.sign + fill.fee
+        if position.is_flat:
+            # The protection gap died with the position. Left behind, it would
+            # make the next entry in this symbol look known-unprotected before
+            # `_protect` has had a chance to say otherwise.
+            self._unprotected.pop(order.symbol, None)
 
     async def _protect(self, order: Order, portfolio: Portfolio) -> None:
         """Arm protection on a position that just opened or grew.
@@ -1154,7 +1324,16 @@ class StrategyRunner:
         )
         for protective in result.placed:
             self._track(protective)
-        if not result.is_fully_protected:
+        if result.is_fully_protected:
+            # Records the opposite fact just as explicitly: a symbol that was
+            # short a stop and now is not must stop being treated as one, or the
+            # engine keeps watching a level the venue is already holding.
+            self._unprotected.pop(order.symbol, None)
+        else:
+            # Remembered, not only logged. `_exit_reason` needs to know the
+            # venue is *not* holding this position's stop, and this is the only
+            # moment anything learns it.
+            self._unprotected[order.symbol] = result.unprotected_qty
             # Loud: this is docs/SAFETY.md layer 5 not holding, and the position
             # is real whether or not the stop is. `unprotected_qty` is measured
             # after the risk chain, so a stop the chain shrank reports the

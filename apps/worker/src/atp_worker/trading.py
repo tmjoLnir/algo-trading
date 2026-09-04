@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from atp_core.domain import Portfolio, RunMode, StopType, Timeframe
+from atp_core.domain import Portfolio, RunMode, StopType
 from atp_core.execution.reconciliation import Reconciler
 from atp_core.execution.router import OrderRouter
 from atp_core.logging import get_logger
@@ -202,7 +202,11 @@ def build_runner(
         reconciler=reconciler,
         sizing=PositionSizeSpec(type=config.sizing_method, value=config.sizing_value),
         stop_config=resolve_stop_config(config),
-        timeframe=Timeframe.D1,
+        # The same value the ingestor is constructed with, off the same row.
+        # Hard-coded here until day 1 of the paper week, which is how the runner
+        # came to spend a full session asking for daily bars nothing was writing
+        # (docs/paper-week/day-1-review.md).
+        timeframe=config.bar_timeframe,
         run_mode=settings.run_mode,
         order_repo=order_repo,
         portfolio_repo=portfolio_repo,

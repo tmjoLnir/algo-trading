@@ -20,17 +20,18 @@ dashboard writes rather than ten more environment variables. Every test hands
 
 from __future__ import annotations
 
+import inspect
 from decimal import Decimal
 
 import pytest
 from pydantic import SecretStr
 
 from atp_core.config import Settings
-from atp_core.domain import RunMode, StopType
+from atp_core.domain import RunMode, StopType, Timeframe
 from atp_core.errors import ConfigError
 from atp_core.worker import DEFAULT_WORKER_CONFIG, WorkerConfig
 from atp_core.worker.config import parse_strategy_params
-from atp_worker import trading
+from atp_worker import main, trading
 
 SYMBOLS = ("SPY",)
 
@@ -287,3 +288,32 @@ class TestAVenueThatIsNotConfigured:
 
         assert decision.enabled is False
         assert "ALPACA_API_KEY" not in decision.reason
+
+
+class TestTheSeriesBothEndsRead:
+    """`build_runner` takes the timeframe off the row, and so does the ingestor.
+
+    The two used to be set independently — the runner hard-coded `Timeframe.D1`
+    and the ingestor took its own `1m` default — and because the bar repository
+    filters strictly on the column, the disagreement produced no error at all.
+    The runner asked for a series nothing was writing and was handed nothing,
+    for ten hours (docs/paper-week/day-1-review.md).
+    """
+
+    def test_the_runner_is_built_for_the_configured_series(self) -> None:
+        assert config(timeframe="1m").bar_timeframe is Timeframe.M1
+        assert config(timeframe="1d").bar_timeframe is Timeframe.D1
+
+    def test_it_is_no_longer_hard_coded(self) -> None:
+        """The specific regression: a literal here is what made the row's value
+        irrelevant, so a reader changing it back should fail this."""
+        source = inspect.getsource(trading.build_runner)
+        assert "timeframe=config.bar_timeframe" in source
+        assert "Timeframe.D1" not in source
+
+    def test_the_worker_gives_the_ingestor_the_same_value(self) -> None:
+        """One property feeding both call sites is the whole mechanism. If
+        `main` ever stops passing it, the ingestor silently reverts to its own
+        default and the disagreement is expressible again."""
+        source = inspect.getsource(main.run)
+        assert "bar_timeframe=config.bar_timeframe" in source

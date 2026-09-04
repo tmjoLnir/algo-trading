@@ -387,6 +387,12 @@ class WorkerConfigRow(Base):
     #: that wide. Empty means this worker places no orders.
     strategy: Mapped[str] = mapped_column(String(36), default="")
     strategy_params: Mapped[JsonDict] = mapped_column(JSON, default=dict)
+    #: The bar series this worker both writes and reads. `String(8)` holds the
+    #: widest `Timeframe` value with room to spare. The ingestor and the
+    #: strategy runner are configured from this one column precisely so they
+    #: cannot disagree — see `WorkerConfig.timeframe` for what happens when
+    #: they do.
+    timeframe: Mapped[str] = mapped_column(String(8), default="1m")
     sizing_method: Mapped[str] = mapped_column(String(20), default="risk_pct")
     sizing_value: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0.01"))
     stop_type: Mapped[str] = mapped_column(String(20), default="atr")

@@ -66,6 +66,7 @@ interface Draft {
   maxSilenceSeconds: string
   strategy: string
   strategyParams: string
+  timeframe: string
   sizingMethod: string
   sizingValue: string
   stopType: string
@@ -93,6 +94,7 @@ function toDraft(config: WorkerConfigView): Draft {
     strategyParams: Object.keys(config.strategy_params).length
       ? JSON.stringify(config.strategy_params, null, 2)
       : '',
+    timeframe: config.timeframe,
     sizingMethod: config.sizing_method,
     sizingValue: config.sizing_value,
     stopType: config.stop_type,
@@ -489,6 +491,7 @@ export default function WorkerConfigPanel() {
       max_silence_seconds: Number(draft.maxSilenceSeconds),
       strategy: draft.strategy,
       strategy_params: params,
+      timeframe: draft.timeframe,
       sizing_method: draft.sizingMethod,
       // Sent as typed. Never through `Number` — these two scale money, and the
       // server holds them as Decimals (src/lib/money.ts).
@@ -599,6 +602,19 @@ export default function WorkerConfigPanel() {
               className={`${FIELD} mt-1 font-mono`}
             />
           </Field>
+        </div>
+
+        <div>
+          <label htmlFor="worker-timeframe" className="text-xs font-medium text-slate-300">
+            Bar series
+          </label>
+          <Select
+            id="worker-timeframe"
+            value={draft.timeframe}
+            onChange={(value) => set('timeframe', value)}
+            options={screen.options.timeframes}
+          />
+          <Help options={screen.options.timeframes} value={draft.timeframe} />
         </div>
 
         <div>

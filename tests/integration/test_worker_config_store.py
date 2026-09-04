@@ -95,6 +95,9 @@ class TestTheRoundTrip:
     async def test_every_field_survives(self, repo: PostgresWorkerConfigRepository) -> None:
         saved = a_config(
             max_silence_seconds=45,
+            # Not the default, so the column is proved to carry the value rather
+            # than the row happening to agree with `WorkerConfig`'s fallback.
+            timeframe="5m",
             sizing_method="fixed_qty",
             sizing_value=Decimal("3"),
             stop_type="chandelier",
@@ -279,21 +282,26 @@ class TestOnlyOneRow:
         dashboard can silently disagree about which is in force."""
         await repo.save(a_config(), actor="operator", at=NOW)
 
-        # Every column, including the eight ceilings — which have no server
-        # default, deliberately (the migration drops the one it needs to
-        # backfill). An INSERT that omitted them would trip the NOT NULL
-        # constraint *before* reaching the CHECK this is about, and pass or
+        # Every column, including `timeframe` and the eight ceilings — none of
+        # which has a server default, deliberately (each migration drops the one
+        # it needs to backfill). An INSERT that omitted one would trip the NOT
+        # NULL constraint *before* reaching the CHECK this is about, and pass or
         # fail for a reason that has nothing to do with single-row-ness.
+        #
+        # That is not hypothetical: `timeframe` was added without being listed
+        # here, and this test failed with `NotNullViolationError` — the comment
+        # above describing the trap it had just fallen into. Any later NOT NULL
+        # column has to be added to both halves of this statement.
         with pytest.raises(asyncpg.CheckViolationError):
             await raw.execute(
                 "INSERT INTO worker_config "
-                "(id, symbols, max_silence_seconds, strategy, strategy_params, "
+                "(id, symbols, max_silence_seconds, strategy, strategy_params, timeframe, "
                 " sizing_method, sizing_value, stop_type, stop_multiplier, stop_period, "
                 " allow_live_orders, revision, updated_at, updated_by, "
                 " risk_max_position_pct, risk_max_gross_exposure_pct, risk_max_daily_loss_pct, "
                 " risk_max_orders_per_minute, risk_max_open_positions, risk_max_quote_age_seconds, "
                 " risk_default_stop_loss_pct, risk_default_take_profit_pct) "
-                "VALUES ('second', '[]', 60, '', '{}', 'risk_pct', 0.01, 'atr', 2, 14, "
+                "VALUES ('second', '[]', 60, '', '{}', '1m', 'risk_pct', 0.01, 'atr', 2, 14, "
                 "        false, 1, now(), 'somebody', "
                 "        0.10, 1.00, 0.03, 30, 20, 30, 0.02, 0.06)"
             )

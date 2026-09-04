@@ -28,6 +28,7 @@ from atp_core.worker.config import (
     SizingMethod,
     StopTypeName,
     StoredWorkerConfig,
+    TimeframeName,
     WorkerConfig,
     normalise_symbols,
 )
@@ -112,6 +113,7 @@ def _values(config: WorkerConfig, *, actor: str, at: datetime) -> dict[str, Any]
         "max_silence_seconds": config.max_silence_seconds,
         "strategy": config.strategy,
         "strategy_params": dict(config.strategy_params),
+        "timeframe": config.timeframe,
         "sizing_method": config.sizing_method,
         "sizing_value": config.sizing_value,
         "stop_type": config.stop_type,
@@ -175,6 +177,7 @@ def _to_stored(row: WorkerConfigRow) -> StoredWorkerConfig:
             strategy_params=dict(row.strategy_params),
             # Cast, then validated: `__post_init__` refuses a value outside
             # the vocabulary, so the narrowing is checked rather than assumed.
+            timeframe=cast("TimeframeName", row.timeframe),
             sizing_method=cast("SizingMethod", row.sizing_method),
             sizing_value=_trimmed(row.sizing_value),
             stop_type=cast("StopTypeName", row.stop_type),

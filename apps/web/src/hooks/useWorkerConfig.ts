@@ -36,6 +36,7 @@ export interface WorkerConfigSave {
   max_silence_seconds: number
   strategy: string
   strategy_params: Record<string, unknown>
+  timeframe: string
   sizing_method: string
   sizing_value: string
   stop_type: string
