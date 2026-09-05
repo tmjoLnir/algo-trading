@@ -39,7 +39,7 @@ from atp_core.domain import (
     StopType,
     Timeframe,
 )
-from atp_core.errors import ExecutionError
+from atp_core.errors import BrokerConnectionError, ExecutionError
 from atp_core.execution.idempotency import FLATTEN, STOP_LOSS, TAKE_PROFIT, TIME_EXIT
 from atp_core.execution.reconciliation import ReconciliationReport
 from atp_core.execution.router import ProtectionResult, SubmitResult
@@ -223,6 +223,8 @@ class FakeRouter:
         #: produces and which must never count as a risk rejection (F14).
         self.no_action = False
         self.refuse_protection = False
+        #: An exception to raise from `submit_protective_orders`, or None.
+        self.protection_raises: Exception | None = None
         #: What the venue is holding, by symbol. The runner asks before acting
         #: on an engine-side stop, so a fake that could not answer would let
         #: `_stop_is_missing` pass on a fiction.
@@ -301,6 +303,12 @@ class FakeRouter:
     ) -> ProtectionResult:
         self.calls.append("submit_protective_orders")
         self.protected.append(entry_order)
+        if self.protection_raises is not None:
+            # The real router does this: `_route` delegates an unknown outcome
+            # to `_resolve_indeterminate`, which engages a global halt and
+            # raises. The fake could not express it, which is why nothing caught
+            # that the raise escaped the fill handler and killed the worker.
+            raise self.protection_raises
         if self.refuse_protection:
             return ProtectionResult(
                 placed=[],
@@ -2030,3 +2038,61 @@ class TestNoActionIsNotARejection:
         await runner.evaluate(portfolio)
 
         assert switch.engagements == []
+
+
+class TestAProtectiveSubmissionThatRaises:
+    """The position exists; something has to write down that nothing is holding
+    it before the error takes the process out.
+
+    `_route` raises `BrokerConnectionError` out of `_resolve_indeterminate` when
+    a protective child's outcome is unknown — by design, and it engages a global
+    halt on the way. Nothing between `_protect` and the asyncio task boundary
+    caught it, so the trade-updates responsibility ended and the worker exited
+    *before* `self._unprotected` was written. The restart then read an empty map
+    as "nothing in this process ever tried", which `_stop_is_missing` treats as
+    safe — so the engine declined to watch the level the router had already
+    armed and persisted (the day-1 fix audit, sweep finding B2).
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_position_is_recorded_unprotected_before_the_raise(self) -> None:
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+        router.protection_raises = BrokerConnectionError("the venue went away")
+        await runner.evaluate(portfolio)
+        router.calls.clear()
+
+        with pytest.raises(BrokerConnectionError):
+            await runner.on_fill_event(self.a_fill_update("atp-1"), portfolio)
+
+        assert runner._unprotected[SYMBOL] == Decimal("10"), (
+            "a position whose stop submission raised is in the KNOWN-unprotected "
+            "state, not the unknown one"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_engine_then_watches_the_level(self) -> None:
+        """The whole point of recording it: `_stop_is_missing` short-circuits on
+        membership, so without the write the engine never asks the router
+        anything and never watches the stop."""
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+        router.protection_raises = BrokerConnectionError("the venue went away")
+        await runner.evaluate(portfolio)
+        with pytest.raises(BrokerConnectionError):
+            await runner.on_fill_event(self.a_fill_update("atp-1"), portfolio)
+
+        assert runner._stop_is_missing(portfolio.position(SYMBOL))
+
+    @staticmethod
+    def a_fill_update(client_order_id: str) -> TradeUpdate:
+        return TradeUpdate(
+            event="fill",
+            client_order_id=client_order_id,
+            broker_order_id="brk-1",
+            symbol=SYMBOL,
+            at=START,
+            fill=Fill(
+                order_id="x", ts=START, qty=Decimal("10"), price=Decimal("100"), venue_fill_id="e1"
+            ),
+        )

@@ -645,7 +645,13 @@ class AlpacaRealtimeFeed:
                 frame = await self._receive(connection)
                 if frame is None:
                     break
-                if not delivered:
+                # **A protocol ack is not delivery.** `_parse_frame` returns an
+                # empty list for anything that is not market data, and Alpaca
+                # always sends a subscription confirmation right after the
+                # subscribe — so `frame is not None` was satisfied by the
+                # handshake alone, and every connection reset the budget before
+                # it had proved anything about the tape.
+                if frame and not delivered:
                     delivered = True
                     attempts = 0
                     #: Cleared only once the connection has *delivered*, not
@@ -658,6 +664,41 @@ class AlpacaRealtimeFeed:
                 gap_since = self._last_message_at or gap_since
 
             reconnecting = True
+            if not delivered:
+                # **A connection that closed before delivering is a failed
+                # attempt**, and until this branch existed it was not counted as
+                # one. `_open()` raises only when the *connection* fails; when
+                # the server accepts, authenticates, acks and then hangs up —
+                # a 407 slow-client, a 500, a load balancer draining a node,
+                # the connection-limit fight this class of venue produces —
+                # `_receive` returns None, the inner loop breaks, and control
+                # reached the top of the outer loop with no sleep, no
+                # `attempts`, and no budget check. Measured against this
+                # adapter: 2,962 reconnects per second, and an elapsed-time
+                # budget that can therefore never expire, so the give-up path
+                # that halts trading was unreachable. Each of those reconnects
+                # also drives a `FeedReconnected` and its backfill, so the
+                # amplification reaches the venue's REST endpoint too.
+                #
+                # The same three steps the `except` branch takes, because it is
+                # the same event wearing different clothes.
+                attempts += 1
+                now = self._clock.now()
+                if first_failure_at is None:
+                    first_failure_at = now
+                if ws.budget_exhausted(first_failure_at, now, self._reconnect_budget_seconds):
+                    raise DataError(
+                        f"Alpaca stream accepted and dropped without delivering for "
+                        f"{self._reconnect_budget_seconds:.0f}s ({attempts} attempts)"
+                    )
+                log.warning(
+                    "data.alpaca.stream_flapping",
+                    attempt=attempts,
+                    trying_for_seconds=round((now - first_failure_at).total_seconds(), 1),
+                    budget_seconds=self._reconnect_budget_seconds,
+                    msg="the connection was accepted and closed before any market data arrived",
+                )
+                await self._sleep(self._backoff_delay(attempts))
 
     async def _receive(self, connection: _WebSocketConnection) -> list[StreamEvent] | None:
         """One frame's worth of events, or None once the connection has gone.

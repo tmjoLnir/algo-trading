@@ -305,7 +305,26 @@ class OrderRouter:
             signal_id=signal.id,
             purpose=purpose,
         )
-        return await self.submit(request, portfolio, pending=pending)
+        result = await self.submit(request, portfolio, pending=pending)
+        if purpose is EXIT and result.submitted:
+            # **A strategy exit has to take the stop with it.** `flatten` has
+            # always done this (see the end of that method); a strategy's own
+            # EXIT signal comes through here instead, and did not — so a
+            # position closed by a cross-down left its protective stop working
+            # at the venue, GTC, with nothing behind it. If price later trades
+            # through that level the stop fills and *opens a short*: the fill is
+            # for an order this process still tracks, so no reconciler flags it;
+            # `_protect` reads it as a reducing fill and arms nothing; and
+            # `sma_crossover` can emit neither an entry (it wants `is_flat`) nor
+            # an exit (it wants `is_long`), so the position is stranded with no
+            # stop for the rest of the week.
+            #
+            # After the submit and not before, exactly as `flatten` orders it: a
+            # refused exit must leave the position protected. A cancel that
+            # fails is best-effort by `cancel_protection`'s own contract, and
+            # the order stays tracked either way.
+            await self.cancel_protection(request.symbol)
+        return result
 
     async def submit(
         self, request: OrderRequest, portfolio: Portfolio, *, pending: Iterable[Order] = ()

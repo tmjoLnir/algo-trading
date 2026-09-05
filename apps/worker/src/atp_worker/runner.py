@@ -1405,9 +1405,36 @@ class StrategyRunner:
         if (position.qty > 0) != (order.side is Side.BUY):
             return  # a reducing fill
 
-        result = await self.router.submit_protective_orders(
-            order, portfolio, stop_config=self.stop_config, atr_value=self._atr(order.symbol)
-        )
+        try:
+            result = await self.router.submit_protective_orders(
+                order, portfolio, stop_config=self.stop_config, atr_value=self._atr(order.symbol)
+            )
+        except Exception:
+            # **The position exists; record that nothing is holding it, then let
+            # the error go.** `_route` raises `BrokerConnectionError` out of
+            # `_resolve_indeterminate` when a protective child's outcome is
+            # unknown — by design, and it engages a global halt on its way. But
+            # nothing between here and the task boundary caught it, so the
+            # trade-updates responsibility ended, the supervisor halted and the
+            # worker exited *before* this method could write down what had
+            # happened. The restart then found `_unprotected` empty, which
+            # `_stop_is_missing` reads as "nothing in this process ever tried" —
+            # the one state it treats as safe — so the engine declined to watch
+            # the level the router had already armed and persisted. A position
+            # with no venue stop and no engine stop, and no line anywhere saying
+            # so.
+            #
+            # Written before the re-raise so the fact survives the crash into
+            # the log, and so a caller that chooses to swallow this inherits a
+            # position in the "known short" state rather than the unknown one.
+            self._unprotected[order.symbol] = abs(position.qty)
+            log.critical(
+                "runner.position_unprotected",
+                symbol=order.symbol,
+                unprotected_qty=str(abs(position.qty)),
+                reason="protective submission raised",
+            )
+            raise
         for protective in result.placed:
             self._track(protective)
         if result.is_fully_protected:

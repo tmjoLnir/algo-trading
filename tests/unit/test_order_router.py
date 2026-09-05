@@ -1228,3 +1228,70 @@ class TestAcknowledgement:
         assert result.order is not None
         assert result.order.status is OrderStatus.REJECTED
         assert result.order.reject_reason == "insufficient buying power"
+
+
+class TestAStrategyExitTakesTheStopWithIt:
+    """A position closed by the strategy's own EXIT signal must not leave its
+    protective stop working at the venue.
+
+    `flatten` has always cancelled protection; `submit_signal` did not, and a
+    strategy exit goes through `submit_signal`. The leaked stop is GTC, so it
+    sits at the venue with nothing behind it until price trades through the
+    level — at which point it fills and opens a *short*, for an order this
+    process still tracks, which no reconciler flags and no `sma_crossover`
+    signal can ever close (the day-1 fix audit, sweep finding B1).
+    """
+
+    async def _long(self, broker: FakeBroker, portfolio: Portfolio, routed: OrderRouter) -> Order:
+        entry = await routed.submit_signal(
+            signal(stop=95), portfolio, sizing_config=sizing(value="10")
+        )
+        assert entry.order is not None
+        fill(entry.order, portfolio, 10, 100)
+        protection = await routed.submit_protective_orders(entry.order, portfolio)
+        assert protection.is_fully_protected
+        assert protection.stop_order is not None
+        return protection.stop_order
+
+    async def test_the_exit_cancels_the_resting_stop(self) -> None:
+        broker, portfolio = FakeBroker(), book(SPY=(0, 100))
+        routed = router(broker)
+        stop = await self._long(broker, portfolio, routed)
+
+        result = await routed.submit_signal(
+            signal(SignalAction.EXIT), portfolio, sizing_config=sizing()
+        )
+
+        assert result.submitted
+        assert stop.broker_order_id in broker.cancelled, (
+            "the stop for a position the strategy has just closed is still working"
+        )
+
+    async def test_a_refused_exit_leaves_the_position_protected(self) -> None:
+        """The ordering `flatten` uses, and for this reason: cancelling first
+        would strip the stop off a position the risk chain then declines to
+        close, which is the one state worse than the leak."""
+        broker, portfolio = FakeBroker(), book(SPY=(0, 100))
+        refusing = Refusing()
+        routed = router(broker, RiskEngine(limits(), rules=[refusing]))
+        stop = await self._long(broker, portfolio, routed)
+        refusing.engaged = True
+
+        result = await routed.submit_signal(
+            signal(SignalAction.EXIT), portfolio, sizing_config=sizing()
+        )
+
+        assert not result.submitted
+        assert broker.cancelled == [], "a refused exit must not disarm the position"
+        assert not stop.is_complete
+
+    async def test_an_entry_does_not_cancel_anything(self) -> None:
+        """Only the exit branch. An entry that cancelled protection would strip
+        the stop off a position it is adding to."""
+        broker, portfolio = FakeBroker(), book(SPY=(0, 100))
+        routed = router(broker)
+        await self._long(broker, portfolio, routed)
+
+        await routed.submit_signal(signal(), portfolio, sizing_config=sizing(value="5"))
+
+        assert broker.cancelled == []

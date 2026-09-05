@@ -621,6 +621,55 @@ class TestReconnect:
         # Two clean reconnects, each on the first attempt: nothing to sleep for.
         assert slept == []
 
+    async def test_an_acked_connection_that_delivers_no_data_is_a_failed_attempt(self) -> None:
+        """The shape the old guard could not see, and the one a venue actually
+        produces: accepted, authenticated, subscription confirmed, then hung up
+        before a single bar or quote.
+
+        `_parse_frame` returns `[]` for every one of those control messages, so
+        `frame is not None` was satisfied by the handshake alone — `delivered`
+        went true on a connection that had proved nothing, the budget reset, and
+        the outer loop reopened with no sleep and no attempt counted. Measured
+        against the real adapter before this test existed: 2,962 reconnects a
+        second.
+        """
+        flapping = [
+            FakeConnection(self.script([REAL_SUBSCRIPTION_MSG], DroppedError("closed")))
+            for _ in range(3)
+        ]
+        good = FakeConnection(self.script([BAR_MSG]))
+        feed, slept, _ = build(
+            *flapping, good, reconnect_budget_seconds=900.0, clock=ladder_clock()
+        )
+        await feed.subscribe(["SPY"])
+
+        # Stopped at the bar, before the scripted queue runs dry. Letting it run
+        # on would fill `slept` with waits from the *exhausted queue* instead —
+        # which is precisely how the pre-existing flap test passed while the
+        # flap path itself never slept once.
+        await collect(feed, limit=4)
+
+        assert len(slept) >= 3, (
+            "a connection that acked and dropped without market data is a failed "
+            f"attempt and must be waited out; slept {slept}"
+        )
+
+    async def test_the_flap_budget_can_expire(self) -> None:
+        """The give-up path was unreachable: with the budget never consumed, the
+        `DataError` that stops the worker and halts trading could not be raised
+        however long the venue misbehaved."""
+        flapping = [
+            FakeConnection(self.script([REAL_SUBSCRIPTION_MSG], DroppedError("closed")))
+            for _ in range(40)
+        ]
+        feed, _, _ = build(*flapping, reconnect_budget_seconds=120.0, clock=ladder_clock())
+        await feed.subscribe(["SPY"])
+
+        _, error = await collect(feed)
+
+        assert error is not None
+        assert "without delivering" in str(error)
+
     async def test_a_connection_that_never_delivers_keeps_backing_off(self) -> None:
         """A server that accepts and immediately hangs up — a connection-limit
         fight, a flapping upstream — must not become a hot loop."""

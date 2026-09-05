@@ -610,3 +610,35 @@ class TestTheAllClearDoesNotOverclaim:
 
         assert alerts.sent[0].context["halted"] == "False"
         assert "nothing is halted" in alerts.sent[0].body
+
+
+class TestRecoveryRestsOnAFrameNotAReconnect:
+    """The all-clear reaches a phone now, so the witness behind it has to be one
+    a reconnect cannot forge.
+
+    `storage_watermark` is a legitimate witness about *staleness* — it survives a
+    restart, which is why the baseline reads it — but it is written by the
+    reconnect path, and a backfill that recovered nothing used to write it. That
+    made `data_is_current` true for a feed that had delivered nothing for
+    minutes, and the operator's phone got "market data is flowing again"
+    (the day-1 fix audit, §4.4b and its consequence for §3.4).
+    """
+
+    async def test_a_watermark_alone_is_not_recovery(self) -> None:
+        verdict = monitor(max_silence_seconds=60).evaluate(
+            ingestor(storage_watermark=MIDSESSION),
+            MIDSESSION,
+        )
+
+        assert verdict.stale is False, "the watermark still answers the staleness question"
+        assert verdict.data_is_current is False, (
+            "a reconnect is evidence about the socket, not about the tape"
+        )
+
+    async def test_a_frame_is(self) -> None:
+        verdict = monitor(max_silence_seconds=60).evaluate(
+            ingestor(last_message_at=MIDSESSION),
+            MIDSESSION,
+        )
+
+        assert verdict.data_is_current is True

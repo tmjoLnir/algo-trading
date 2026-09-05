@@ -74,6 +74,27 @@ STALENESS_ACTOR = "staleness_monitor"
 MAX_RECONNECT_BACKFILL = timedelta(hours=6)
 
 
+@dataclass(frozen=True, slots=True)
+class _GapRepair:
+    """What one reconnect's backfill actually achieved.
+
+    Two fields rather than the bar count this used to return, because zero meant
+    two incompatible things and the caller could not tell them apart: "the
+    outage did not span a completed bar, so nothing was missing" and "we asked
+    the venue for the window and it had nothing either". Only the first is
+    harmless. The second is what a venue-wide outage looks like from inside the
+    ingestor, and treating it as a repair advanced the staleness watermark and
+    blinded the only watchdog that halts on a silent feed
+    (the day-1 fix audit, §4.4b).
+    """
+
+    bars_written: int
+    #: True only when the window asked for came back whole — every symbol, every
+    #: window, at least one bar. This is what may move the storage watermark;
+    #: nothing else may.
+    recovered_the_window: bool
+
+
 @dataclass(slots=True)
 class IngestorStats:
     connected_since: datetime | None = None
@@ -319,14 +340,31 @@ class StreamIngestor:
             gap_since=event.gap_since.isoformat(),
             symbols=len(self._symbols),
         )
-        backfilled = await self._backfill_gap(event.gap_since)
-        if backfilled is None:
+        repair = await self._backfill_gap(event.gap_since)
+        if repair is None:
             # The gap could not be closed; `_backfill_gap` has already halted.
             # The watermark must not move — claiming data is good up to now is
             # exactly the false "recovered" this whole change is about.
             return
-        self.stats.gaps_backfilled += backfilled
-        metrics.stream_gap_bars(backfilled)
+        self.stats.gaps_backfilled += repair.bars_written
+        metrics.stream_gap_bars(repair.bars_written)
+        if not repair.recovered_the_window:
+            # **The watermark moves only on data we actually got back**, and
+            # this is the condition that was missing. `_backfill_gap` returned a
+            # bare count, and zero meant two different things: "the outage did
+            # not span a completed bar" and "we asked the venue for the window
+            # and it had nothing either". The second is what a venue-wide outage
+            # looks like from here, and stamping the watermark at
+            # `reconnected_at` for it told `StalenessMonitor` the data was fine
+            # up to now. Measured: seven minutes of a dead feed and 2,548
+            # reconnects produced zero halts, because every one of them reset
+            # the watchdog's baseline. The comment three lines above is right
+            # about why — it just was not being enforced.
+            #
+            # Not moving it costs nothing when the feed is genuinely back:
+            # `last_message_at` advances on the first frame that arrives, and
+            # that is the witness the watchdog prefers anyway.
+            return
         # Data is known good again, and the watermark has to say so or the
         # watchdog would read the pre-outage `last_message_at` and halt a feed
         # that has just come back. This is the case `connected_since` used to
@@ -334,7 +372,7 @@ class StreamIngestor:
         # a true statement about the data, where a process restart is not.
         self.stats.storage_watermark = event.reconnected_at
 
-    async def _backfill_gap(self, since: datetime) -> int | None:
+    async def _backfill_gap(self, since: datetime) -> _GapRepair | None:
         """Fetch and store bars missed while disconnected.
 
         Raw prices, not adjusted. That halves the requests — the provider makes
@@ -416,7 +454,11 @@ class StreamIngestor:
                 "data.stream.backfill_skipped",
                 reason="the outage did not span a completed bar",
             )
-            return 0
+            # Nothing was missing, so nothing was recovered. The distinction
+            # matters to the caller: a sub-bar flap is not evidence that the
+            # tape is flowing, and a hot loop of them must not be able to hold
+            # the staleness baseline open.
+            return _GapRepair(bars_written=0, recovered_the_window=False)
 
         earliest = end - self._max_reconnect_backfill
         if start < earliest:
@@ -472,7 +514,13 @@ class StreamIngestor:
             requests=result.requests,
             symbols_without_data=len(result.empty_windows),
         )
-        return result.bars_written
+        # `ok` is "every symbol returned data for every window asked for", which
+        # is exactly the question the watermark turns on. A window the venue had
+        # nothing for is the shape of a venue-wide outage, not of a repair.
+        return _GapRepair(
+            bars_written=result.bars_written,
+            recovered_the_window=result.ok and result.bars_written > 0,
+        )
 
     async def _publish(self, channel: str, message: dict[str, Any]) -> None:
         """Best-effort fan-out. A dead subscriber is not a reason to stop.
@@ -659,14 +707,25 @@ class StalenessMonitor:
         baseline = max([session.open_at, *known_good])
         silent_for = (now - baseline).total_seconds()
         stale = silent_for > self.max_silence_seconds
-        newest_data = max(data_witnesses) if data_witnesses else None
         # Not stale *because data arrived*, rather than because the session has
         # only just opened. The floor at `session.open_at` is what stops a feed
         # dead since yesterday being billed for the overnight, and its cost is
         # that every session begins with `max_silence_seconds` of non-stale
         # verdicts that say nothing about the feed at all. `watch` used to read
         # one of those as recovery.
-        data_is_current = not stale and newest_data is not None and newest_data >= session.open_at
+        #
+        # **`last_message_at` only, and not the storage watermark.** The
+        # watermark is a witness about *staleness* — it survives a restart,
+        # which is why it is in `known_good` above — but it is written by the
+        # reconnect path, so a reconnect that recovered nothing could forge it,
+        # and the all-clear this gate guards then went out to a phone saying the
+        # feed was flowing while no frame had arrived for minutes. A reconnect
+        # is evidence about the socket; recovery is a claim about the tape, and
+        # only a frame this process received can make it.
+        newest_message = ingestor.stats.last_message_at
+        data_is_current = (
+            not stale and newest_message is not None and newest_message >= session.open_at
+        )
         return StalenessVerdict(
             stale=stale,
             silent_for_seconds=silent_for,
