@@ -565,6 +565,32 @@ async def update_worker_config(
             detail={"revision": stored.revision, "changes": changes},
         )
     )
+    # **Logged as well as audited, and this is the whole of F12's fix.** The
+    # diff has always been computed here and it went only to the audit table, so
+    # `docker compose logs` — which is what an operator actually reads during an
+    # incident — could not answer "what did revision 3 change". Day 1 of the
+    # paper week saved a revision that changed *nothing*, took a full-stack
+    # restart 23 minutes into the session for it, and left no way to tell from
+    # the logs that it had been for nothing (docs/paper-week/day-1-review.md,
+    # F12). The worker's own `worker.config_loaded` cannot close this: the
+    # configuration is a single upserted row with no history, so a worker has
+    # nothing to diff against. This end holds both sides.
+    if changes:
+        log.info(
+            "worker_config.updated",
+            actor=actor,
+            revision=stored.revision,
+            changed=sorted(changes),
+        )
+    else:
+        log.warning(
+            "worker_config.unchanged",
+            actor=actor,
+            revision=stored.revision,
+            msg="this revision changed no field — a restart to pick it up would "
+            "cost a session interruption for nothing",
+        )
+
     if arming:
         # The loudest line this endpoint can write. An unattended loop has just
         # been authorised to place real orders, and the log is where that has to

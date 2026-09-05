@@ -741,14 +741,31 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   — core does not open sockets on its own behalf (CLAUDE.md §1.3). Synchronous,
   unlike the quote cache, because the risk chain is.
 
-  Still open, and not this item: most of the documented auto-engage triggers
-  still never call `engage()`. Each belongs to the subsystem that detects it —
-  `DATA_FEED_LOST` is wired from the stream consumer and `BROKER_UNREACHABLE`
-  from the order router (#33), leaving the daily loss limit, reconciliation
-  mismatch, rate-limit storm and repeated unhandled exceptions to the runner and
-  the reconciler. Reconciliation mismatch is wired as of the reconciliation item
-  in Phase 4 — the 5-minute job now exists and engages through the reconciler —
-  leaving three.
+  **All six documented auto-engage triggers now call `engage()`**, which was not
+  true for most of this item's life. Each belongs to the subsystem that detects
+  it: `DATA_FEED_LOST` from the stream consumer, `BROKER_UNREACHABLE` from the
+  order router (#33), `RECONCILIATION_MISMATCH` from the 5-minute job in Phase
+  4, `UNHANDLED_EXCEPTION` from the runner's consecutive-error ceiling, and —
+  last, and only after a paper week found them missing — `DAILY_LOSS_LIMIT` and
+  `RATE_LIMIT_STORM` from `StrategyRunner._escalate`
+  (docs/paper-week/day-1-review.md, F10).
+
+  Those last two are worth naming rather than ticking quietly. Both rules were
+  *working*: `DailyLossLimitRule` refused entries past the limit and permitted
+  exits, and `RateLimitRule` capped the runaway loop. What neither did was say
+  so anywhere a human would see, so a platform that hit its daily loss limit
+  spent the rest of the session silently refusing every entry — the same shape
+  as the day-1 blackout, one layer up. A halt is how this platform says
+  something out loud, and the `HaltReason` values had been sitting there naming
+  the intent since the initial commit.
+
+  The daily-loss halt is the one thing in the platform that clears itself, at
+  the next session open, via `scheduler.rollover_daily_counters`. A halt about
+  *today's* loss is meaningless tomorrow, and the alternative teaches an
+  operator to clear halts every morning without reading them — which is the
+  habit the whole engage/clear asymmetry exists to prevent. It is narrow by
+  construction: that reason only, engaged by the risk chain only, and only from
+  a session before this one.
 
   `RISK.md`'s `flatten_all_positions` is **no longer a stub and no longer a
   function**. The act it described exists as `POST /api/v1/risk/flatten-all`,

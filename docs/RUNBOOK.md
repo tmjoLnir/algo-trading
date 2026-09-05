@@ -728,6 +728,28 @@ worker logs `worker.config_loaded` with the whole configuration at every start �
 that line is the answer to "what is it actually running", and it is the one to
 quote in an incident rather than a screenshot of the form.
 
+> **Do not restart the worker during the session to pick up a save.** Wait for
+> the close, or for a deliberate pre-market deploy. A restart mid-session
+> abandons the strategy loop's in-memory state — the bars it has warmed up, what
+> it believes is working at the venue — and costs a reconciliation and a warmup
+> to rebuild, during market hours, for a setting that will still be there at
+> 16:00. Day 1 of the paper week took a full-stack restart 23 minutes after the
+> open for a revision that **changed no field at all**
+> (docs/paper-week/day-1-review.md, F12).
+>
+> The API now says which fields a revision changed. `worker_config.updated` lists
+> them, and `worker_config.unchanged` is written when a save moved nothing —
+> which is the line worth checking *before* deciding a restart is needed:
+>
+> ```bash
+> docker compose logs api | grep worker_config
+> ```
+>
+> If the running revision differs from the saved one but nothing you care about
+> changed, the difference is not worth a session interruption. The exception is
+> the kill switch, which is read from Redis per order and needs no restart at
+> all — halting is never a reason to bounce the worker.
+
 ## A backtest is stuck, or the queue is not running
 
 **Nothing here touches trading.** Backtests run in the `queue` container, which

@@ -512,6 +512,62 @@ order in production. The configured ceilings are untested numbers.
 > the ~108 bars day 1 lost, and the `METRICS_TOKEN` in item 3 remains a
 > deployment secret no commit can discharge.
 >
+> **F10 through F14 are fixed**, and two of them not as written — the review was
+> cross-checked against `1119110` and three things it named have since been
+> built, so verifying first was most of the work.
+>
+> **F10.** Two of `rollover_daily_counters`'s three clauses were already being
+> done: the runner re-runs `warmup()` at every open and anchors the daily-loss
+> baseline there, and the rate-limit "counter" is a trailing 60-second deque that
+> prunes itself on every read. Filling it in as written would have re-anchored a
+> second time from a job, which `anchor_session` names as the mistake that grants
+> a drawn-down day a second allowance. The third clause could not be built
+> because **nothing ever engaged a daily-loss halt to clear** — and that turned
+> out to be the real finding here. docs/RISK.md has always said the kill switch
+> "auto-engages on: daily loss limit breach, ... a rate-limit storm", and both
+> were `HaltReason` values with no writer. `StrategyRunner._escalate` now writes
+> them, and the rollover releases the daily-loss halt at the next open, narrowly:
+> that reason only, engaged by the risk chain only, from a previous session only.
+> `apply_corporate_actions` and `generate_daily_report` are still stubs and still
+> dormant — see below.
+>
+> **F11.** Already fixed, by `preflight.check_sizing_is_reachable`, which prices
+> the first entry off the *configured* timeframe's bars and fails when it would
+> breach the position cap. Its fix message had a bug in exactly this finding's
+> case, though: the fraction that fits on a minute series is about 0.000036, and
+> `:.4f` rendered that as `about 0.0000 fits` — an operator following the hint
+> would enter 0, which `position_size` refuses outright. Below one basis point it
+> now says the timeframe is the thing to re-decide, which is what this finding
+> concluded.
+>
+> **F12.** The diff was already computed on the save path and went only to the
+> audit table, so `docker compose logs` could not answer "what did revision 3
+> change". It is logged now, and a revision that changed *nothing* — day 1's rev
+> 2 → 3, which cost a full-stack restart 23 minutes into the session — says so on
+> its own line. The worker cannot close this end: the configuration is a single
+> upserted row with no history, so a worker has nothing to diff against.
+>
+> **F13.** ADR 0026. The week runs on IEX deliberately, and 87.6% RTH coverage is
+> recorded as the baseline rather than as an incident — a symbol with no IEX
+> print in a minute yields no bar, which is the feed answering the question it
+> was asked. What that costs is written down: the week can prove the *platform*
+> and cannot prove the *strategy*, because signal timing and fill quality both
+> need a complete tape.
+>
+> **F14.** Fixed, one condition. `no_action` carries an approved decision and is
+> no longer counted as a risk rejection, nor escalated.
+>
+> **`METRICS_TOKEN` now has a check.** It was set on the host after day 1, and
+> `scripts/preflight.py` — the command that answers "is this configuration ready
+> to spend a week trading paper?" — did not ask about the one setting whose
+> absence caused F1. It warns rather than fails: metrics are not a safety layer,
+> and a platform with no scraper still halts, still refuses and still alerts.
+>
+> **Still open after all of this:** `apply_corporate_actions` and
+> `generate_daily_report` remain stubs (the first matters more than it looks for
+> a daily-bar strategy, per F10 above), and the ~108 bars day 1 lost still need
+> `backfill_missing_bars` to actually run.
+>
 > **F9** is gated and recorded. `scripts/halt.py clear` now prompts for the
 > account password and checks it against the same hash `POST /risk/resume` does,
 > so docs/RUNBOOK.md's "clearing asks for the password, wherever you do it" is
@@ -546,13 +602,19 @@ order in production. The configured ceilings are untested numbers.
    exits too.~~ **Done** — carve-out, narrowed to orders that cannot reverse a position.
 10. ~~**F9** — gate `scripts/halt.py --clear` behind the same checks as the API, and audit it.~~
     **Done** — step-up password on `clear`, audit rows on both halves, correlation ids on each.
-11. **F10** — implement `rollover_daily_counters` (a risk guardrail), then the daily report.
+11. ~~**F10** — implement `rollover_daily_counters` (a risk guardrail), then the daily report.~~
+    **Partly done** — the rollover is real, and the guardrail it needed (nothing
+    engaged a daily-loss halt) is built. The daily report is still a stub.
 
 **P2 — decide and document**
 
-12. **F11** — re-derive the sizing row for the timeframe you actually trade.
-13. **F13** — IEX vs SIP, in an ADR.
-14. **F12** — no mid-session restarts; log which fields a config revision changed.
+12. ~~**F11** — re-derive the sizing row for the timeframe you actually trade.~~
+    **Done** — `preflight.check_sizing_is_reachable` already caught it; its fix
+    message could not express this case and now can.
+13. ~~**F13** — IEX vs SIP, in an ADR.~~ **Done** — ADR 0026, and the week is IEX.
+14. ~~**F12** — no mid-session restarts; log which fields a config revision changed.~~
+    **Done** for the logging half. "No mid-session restarts" is an operating
+    practice, not a change: docs/RUNBOOK.md says it.
 15. Someone watches during RTH, or the alerting in (8) substitutes for a human. Day 1 had
     neither for the last 5h20m.
 
