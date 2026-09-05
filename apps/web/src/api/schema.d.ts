@@ -131,10 +131,18 @@ export interface paths {
          * Daily Report
          * @description End-of-day summary: P&L, trades, rejections, halts, feed incidents.
          *
-         *     Still a stub: its own roadmap item (Phase 5, "Daily report"). Trades and P&L
-         *     are available from this module now, and the other three are not gathered
-         *     anywhere one query can reach — rejections live in the signals table, halts in
-         *     the kill switch's records, feed incidents only in the worker's logs.
+         *     **Computed on demand, and that is what unblocked it.** This was a stub whose
+         *     own note said three of its five sections "are not gathered anywhere one
+         *     query can reach", and the queue task that would have rendered it is blocked
+         *     on an object store this platform does not have. Two of the three have since
+         *     become rows — refused orders, and halts a person engaged — and the remaining
+         *     gaps do not need storage to be *reported*: `analytics.daily` names a section
+         *     it cannot answer instead of returning zero for it. A report assembled from
+         *     durable records when somebody asks needs no artifact and no key.
+         *
+         *     `day` defaults to today. A date in the past works exactly as well, because
+         *     the records it reads are the durable ones rather than anything held in a
+         *     process.
          */
         get: operations["daily_report_api_v1_analytics_reports_daily_get"];
         put?: never;
@@ -1956,6 +1964,52 @@ export interface components {
             /** Start */
             start: string | null;
         };
+        /** DailyReportView */
+        DailyReportView: {
+            /**
+             * Day
+             * Format: date
+             */
+            day: string;
+            /** Headline */
+            headline: string;
+            /** Not Measured */
+            not_measured: string[];
+            /** Orders Filled */
+            orders_filled: number;
+            /** Orders Refused */
+            orders_refused: number;
+            /** Orders Submitted */
+            orders_submitted: number;
+            /** Refusals By Rule */
+            refusals_by_rule: {
+                [key: string]: number;
+            };
+            /** Sections */
+            sections: components["schemas"]["DailySectionView"][];
+            /** Symbols */
+            symbols: string[];
+            /** Text */
+            text: string;
+        };
+        /**
+         * DailySectionView
+         * @description One section of the report, and whether it could be answered at all.
+         *
+         *     `value` is nullable and the nullability is the point: `null` means nothing
+         *     counts this, where `0` means it was counted and there were none. A client
+         *     that renders the two the same way is lying to whoever reads it.
+         */
+        DailySectionView: {
+            /** Detail */
+            detail: string;
+            /** How To Check */
+            how_to_check: string;
+            /** Name */
+            name: string;
+            /** Value */
+            value: number | null;
+        };
         /**
          * EquityCurveView
          * @description The account's equity over time, thinned to one point per bucket.
@@ -3335,7 +3389,6 @@ export interface operations {
         parameters: {
             query?: {
                 day?: string | null;
-                output_format?: string;
             };
             header?: never;
             path?: never;
@@ -3349,9 +3402,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["DailyReportView"];
                 };
             };
             /** @description Validation Error */

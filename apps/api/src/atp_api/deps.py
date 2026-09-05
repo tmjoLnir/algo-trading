@@ -198,6 +198,27 @@ async def get_audit_sink(request: Request) -> AuditSink:
     return PostgresAuditLog(factory)
 
 
+async def get_audit_reader(request: Request) -> PostgresAuditLog | None:
+    """Where to *read* audit entries from, or None when there is no database.
+
+    Tolerant in the same way `get_audit_sink` is, and for a related reason. The
+    audit page depends on `get_session_factory` directly and must 503 when the
+    record cannot be reached — it is nothing but audit rows, and an empty page
+    and an unreachable one are different sentences. A caller for which the audit
+    is *one section of several* needs the opposite: `analytics.daily` can report
+    a section it could not read without pretending it was empty, and answering
+    503 there would hide the rest of the report to announce the absence of one
+    part of it.
+
+    None rather than a null object, because the distinction is the whole value:
+    a reader that quietly returned `[]` would put this back where it started.
+    """
+    factory = getattr(request.app.state, "session_factory", None)
+    if factory is None:
+        return None
+    return PostgresAuditLog(factory)
+
+
 async def get_rate_limiter(request: Request) -> RateLimiter:
     """The limiter for the unauthenticated surface. Never refuses the request.
 

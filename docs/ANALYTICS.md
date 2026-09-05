@@ -282,7 +282,7 @@ know which is which.
 | `GET /analytics/trades` | completed round trips, newest first, with MAE/MFE |
 | `GET /analytics/attribution` | P&L grouped by one dimension |
 | `GET /analytics/live-vs-backtest/{run_id}` | live against one stored backtest run, metric by metric |
-| `GET /analytics/reports/daily` | **not built** — see below |
+| `GET /analytics/reports/daily` | one session, section by section, and what nothing counts |
 
 Every monetary value crosses the wire as a **string** and nothing downstream
 parses one back (docs/DASHBOARD.md).
@@ -368,10 +368,15 @@ day is its session day.
 
 Stated here rather than left to be discovered:
 
-- **The daily report.** Trades and P&L are available from this module now. The
-  other three things the report wants are not gathered anywhere one query can
-  reach: rejections are in `signals`, halts are in the kill switch's records,
-  and feed incidents exist only in the worker's logs.
+- **Feed incidents are still nowhere queryable**, and the daily report says so
+  rather than working around it. Reconnects, gaps and staleness are log lines —
+  `data.stream.reconnected`, `data.stream.gap_widened_from_storage`,
+  `data.staleness.detected` — with no table behind any of them, so that section
+  of the report reports **absent** and carries the grep that answers it. The
+  other two gaps this list used to name have closed: refused orders became rows,
+  and halts a person engaged became audit entries. The ones the risk layer
+  engages on its own still write no row, which the halts section states on the
+  face of its own count.
 - **No period comparison.** The screen reports one window at a time. "Is this
   month worse than last?" is answered by changing the dates and remembering,
   which is the shape of question a stored trade table would make cheap.

@@ -29,7 +29,8 @@ import pytest
 
 from atp_core.alerts.ports import Alert, Severity
 from atp_core.clock import SimulatedClock, TradingCalendar
-from atp_core.domain import Order, OrderType, Portfolio, Position, Side
+from atp_core.data.corporate_actions import Adjustment
+from atp_core.domain import Order, OrderType, Portfolio, Position, Side, Timeframe
 from atp_core.execution.reconciliation import Reconciler
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
 from atp_core.risk.rules import DAILY_LOSS_RULE
@@ -42,6 +43,7 @@ from atp_worker.scheduler import (
     SessionJobs,
     SessionWatch,
     _job_name,
+    _report_adjustment,
     build_schedule,
     next_due,
     reconcile_with_broker,
@@ -702,3 +704,73 @@ class TestTheDailyLossRollover:
         """It sat in `SCHEDULE` raising `NotImplementedError`, so the driver
         marked it dormant after one attempt and it never ran again."""
         assert "rollover_daily_counters" not in [_job_name(e) for e in SCHEDULE]
+
+
+class TestTheDailyReportJob:
+    """The stub is gone, and what replaced it reports what it cannot measure."""
+
+    def test_it_is_no_longer_in_the_dormant_list(self) -> None:
+        """It sat in `SCHEDULE` raising `NotImplementedError`, so the driver
+        marked it dormant after one attempt and it never ran again."""
+        assert "generate_daily_report" not in [_job_name(e) for e in SCHEDULE]
+
+    def test_it_runs_after_the_close_and_after_the_summary(self) -> None:
+        """The two are not the same message. `summarise_the_session` fires at
+        the bell and says whether to act tonight; this is the day written down
+        half an hour later."""
+        watch, _ = _watch()
+        schedule = build_schedule(None, watch)
+        report = next(e for e in schedule if _job_name(e) == "generate_daily_report")
+        summary = next(e for e in schedule if _job_name(e) == "summarise_the_session")
+
+        assert report["trigger"] == "market_close"
+        assert report["offset_minutes"] > summary["offset_minutes"]
+
+
+class TestTheCorporateActionsJob:
+    def test_it_is_no_longer_in_the_dormant_list(self) -> None:
+        assert "apply_corporate_actions" not in [_job_name(e) for e in SCHEDULE]
+
+    def test_it_runs_well_before_the_open(self) -> None:
+        """Far enough out that a split-shaped move is alerted with time to act
+        before the reconciler halts on the mismatch it causes."""
+        watch, _ = _watch()
+        job = next(
+            e for e in build_schedule(None, watch) if _job_name(e) == "apply_corporate_actions"
+        )
+
+        assert job["trigger"] == "market_open"
+        assert job["offset_minutes"] <= -60
+
+    def test_a_split_like_move_reaches_a_human(self) -> None:
+        """The point of running an hour early: the reconciliation halt an hour
+        later is then expected and explained rather than a mystery."""
+        watch, alerts = _watch()
+
+        _report_adjustment(watch, Adjustment("SPY", Decimal(4), 20, 20, None), Timeframe.D1)
+
+        assert len(alerts.sent) == 1
+        assert alerts.sent[0].severity is Severity.CRITICAL
+        assert "SPY" in alerts.sent[0].title
+
+    def test_a_dividend_sized_move_does_not(self) -> None:
+        """Real, worth recording, not worth a phone call at 08:30. Alerting on
+        both would train an operator to ignore the one that matters."""
+        watch, alerts = _watch()
+
+        _report_adjustment(watch, Adjustment("SPY", Decimal("1.004"), 20, 20, None), Timeframe.D1)
+
+        assert alerts.sent == []
+
+    def test_an_inconsistent_move_is_alerted_without_naming_a_factor_to_act_on(self) -> None:
+        """Not a smaller version of a detected split: the history moved in a way
+        one corporate action cannot account for, so the alert says the bars
+        disagree rather than handing over a number to adopt a share count from."""
+        watch, alerts = _watch()
+
+        _report_adjustment(watch, Adjustment("SPY", Decimal(4), 20, 11, None), Timeframe.D1)
+
+        assert len(alerts.sent) == 1
+        assert alerts.sent[0].severity is Severity.CRITICAL
+        assert "inconsistent" in alerts.sent[0].title
+        assert "11 of 20" in alerts.sent[0].body

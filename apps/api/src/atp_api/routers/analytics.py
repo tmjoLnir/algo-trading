@@ -31,11 +31,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
 from atp_api.deps import (
+    get_audit_reader,
     get_backtest_repository,
     get_bar_repository,
     get_clock,
     get_order_repository,
 )
+from atp_core.analytics.daily import render, summarise
 from atp_core.analytics.performance import (
     ATTRIBUTION_DIMENSIONS,
     PerformanceAnalyzer,
@@ -43,6 +45,7 @@ from atp_core.analytics.performance import (
     comparability_warnings,
     infer_periods_per_year,
 )
+from atp_core.audit.ports import AuditEntry
 from atp_core.backtest.metrics import METRIC_BASIS, periods_per_year_for
 from atp_core.backtest.ports import STATUS_DONE, BacktestRunRepository
 from atp_core.backtest.runner import suspicious
@@ -52,8 +55,16 @@ from atp_core.data.ports import BarRepository
 from atp_core.domain import Bar, Timeframe
 from atp_core.execution.ports import OrderRepository
 from atp_core.logging import get_logger
+from atp_core.persistence.audit import PostgresAuditLog
 
 log = get_logger(__name__)
+
+#: How many of the day's orders the report reads. A session that submitted more
+#: than this has a bigger problem than a truncated report.
+DAILY_REPORT_ORDERS = 1000
+
+#: Audit rows scanned back for the day's halts. The table holds a handful a day.
+DAILY_REPORT_AUDIT_ROWS = 500
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -710,13 +721,102 @@ async def live_vs_backtest(
     )
 
 
-@router.get("/reports/daily")
-async def daily_report(day: date | None = None, output_format: str = "json") -> dict[str, object]:
+class DailySectionView(BaseModel):
+    """One section of the report, and whether it could be answered at all.
+
+    `value` is nullable and the nullability is the point: `null` means nothing
+    counts this, where `0` means it was counted and there were none. A client
+    that renders the two the same way is lying to whoever reads it.
+    """
+
+    name: str
+    value: int | None
+    detail: str
+    how_to_check: str
+
+
+class DailyReportView(BaseModel):
+    day: date
+    headline: str
+    orders_submitted: int
+    orders_filled: int
+    orders_refused: int
+    refusals_by_rule: dict[str, int]
+    symbols: list[str]
+    sections: list[DailySectionView]
+    #: The names of the sections nothing could answer. Duplicated out of
+    #: `sections` on purpose — a caller that wants one number to decide whether
+    #: to trust the report should not have to filter for nulls to find it.
+    not_measured: list[str]
+    text: str
+
+
+@router.get("/reports/daily", response_model=DailyReportView)
+async def daily_report(
+    order_repo: Annotated[OrderRepository, Depends(get_order_repository)],
+    audit_reader: Annotated[PostgresAuditLog | None, Depends(get_audit_reader)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    clock: Annotated[Clock, Depends(get_clock)],
+    day: date | None = None,
+) -> DailyReportView:
     """End-of-day summary: P&L, trades, rejections, halts, feed incidents.
 
-    Still a stub: its own roadmap item (Phase 5, "Daily report"). Trades and P&L
-    are available from this module now, and the other three are not gathered
-    anywhere one query can reach — rejections live in the signals table, halts in
-    the kill switch's records, feed incidents only in the worker's logs.
+    **Computed on demand, and that is what unblocked it.** This was a stub whose
+    own note said three of its five sections "are not gathered anywhere one
+    query can reach", and the queue task that would have rendered it is blocked
+    on an object store this platform does not have. Two of the three have since
+    become rows — refused orders, and halts a person engaged — and the remaining
+    gaps do not need storage to be *reported*: `analytics.daily` names a section
+    it cannot answer instead of returning zero for it. A report assembled from
+    durable records when somebody asks needs no artifact and no key.
+
+    `day` defaults to today. A date in the past works exactly as well, because
+    the records it reads are the durable ones rather than anything held in a
+    process.
     """
-    raise NotImplementedError
+    target = day or clock.now().date()
+    window_start = datetime.combine(target, time.min, tzinfo=UTC)
+    window_end = window_start + timedelta(days=1)
+
+    orders = [
+        order
+        for order in await order_repo.recent_orders(
+            settings.run_mode, since=window_start, limit=DAILY_REPORT_ORDERS
+        )
+        if order.created_at is not None and order.created_at < window_end
+    ]
+
+    # **An unreadable audit table degrades this report rather than failing it**,
+    # which is the opposite of what `/audit` does and deliberately so. That page
+    # is nothing *but* audit rows, so a read it cannot make has to be a 503 —
+    # "an empty page and an unreachable record are different sentences". Here
+    # the halts are one section of five, and `analytics.daily` can say a section
+    # was not readable without pretending it was empty. Answering 503 would hide
+    # the day's trades and refusals to report the absence of one section.
+    audit: list[AuditEntry] | None = None
+    if audit_reader is not None:
+        try:
+            rows = await audit_reader.recent(limit=DAILY_REPORT_AUDIT_ROWS)
+            audit = [entry for _, entry in rows if window_start <= entry.at < window_end]
+        except Exception as exc:  # deliberate breadth — see the comment above
+            log.warning("analytics.daily_report.audit_unavailable", error=str(exc))
+            audit = None
+
+    report = summarise(target, orders, audit=audit)
+    return DailyReportView(
+        day=report.day,
+        headline=report.headline(),
+        orders_submitted=report.orders_submitted,
+        orders_filled=report.orders_filled,
+        orders_refused=report.orders_refused,
+        refusals_by_rule=report.refusals_by_rule,
+        symbols=list(report.symbols),
+        sections=[
+            DailySectionView(
+                name=s.name, value=s.value, detail=s.detail, how_to_check=s.how_to_check
+            )
+            for s in report.sections
+        ],
+        not_measured=[s.name for s in report.absent],
+        text=render(report),
+    )

@@ -15,14 +15,18 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from atp_core.alerts.ports import Alert, Severity
+from atp_core.analytics.daily import DailyReport, render, summarise
 from atp_core.clock import SystemClock, TradingCalendar
 from atp_core.config import get_settings
 from atp_core.data.backfill import GapBackfillResult, backfill_gaps
+from atp_core.data.corporate_actions import Adjustment, detect_adjustment
 from atp_core.data.gaps import SUPPORTED_TIMEFRAMES
 from atp_core.data.providers.alpaca import AlpacaHistoricalProvider
 from atp_core.logging import correlation_id, get_logger
+from atp_core.persistence.audit import PostgresAuditLog
 from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.db import create_engine, create_session_factory
+from atp_core.persistence.orders import PostgresOrderRepository
 from atp_core.risk.killswitch import HaltReason
 from atp_core.risk.rules import DAILY_LOSS_RULE
 
@@ -31,6 +35,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from atp_core.alerts.ports import AlertSink
+    from atp_core.audit.ports import AuditEntry
     from atp_core.clock import Clock
     from atp_core.domain import Order, Portfolio, Timeframe
     from atp_core.execution.reconciliation import Reconciler
@@ -45,6 +50,16 @@ log = get_logger(__name__)
 #: `scripts/backfill_bars.py --verify` over the range in question — not
 #: something a nightly cron should rediscover and re-fetch every single night.
 NIGHTLY_LOOKBACK_DAYS = 7
+
+#: How many of the day's orders the report reads. A session that submitted more
+#: than this has a bigger problem than a truncated report, and an unbounded
+#: query in an unattended job is how a slow night becomes a stuck one.
+DAILY_REPORT_ORDER_LIMIT = 1000
+
+#: Audit rows scanned back for the day's halts. The table holds a handful of
+#: rows a day — logins, halts, config saves — so this is generous rather than
+#: tight, and it is bounded for the reason above.
+DAILY_REPORT_AUDIT_LIMIT = 500
 
 #: Paces the vendor's 200/min. The nightly job runs unattended against the same
 #: rate limit as everything else; being the reason a morning fetch gets a 429 is
@@ -349,19 +364,221 @@ async def backfill_missing_bars() -> list[GapBackfillResult]:
     return results
 
 
-async def generate_daily_report() -> None:
-    """After the close: P&L, trades, risk rejections, halts, feed incidents."""
-    raise NotImplementedError
+async def generate_daily_report(watch: SessionWatch) -> DailyReport:
+    """After the close: what the session did, from what the record can support.
 
+    Half an hour after the close, and deliberately *after*
+    `summarise_the_session`, which fires at the bell. The two are not the same
+    message and neither replaces the other: that one is a sentence on a phone
+    telling an operator whether to act tonight; this is the day written down,
+    section by section, including the sections nothing can answer.
 
-async def apply_corporate_actions() -> None:
-    """Pre-open. Splits and dividends change share counts and adjusted history.
+    **What is not measurable is reported as absent, never as zero.** The API's
+    own stub said three of the five promised sections "are not gathered anywhere
+    one query can reach". Two of the three have moved since — refused orders are
+    rows, and so are halts a person engaged — and feed incidents have not moved
+    at all. `analytics.daily` carries that distinction; this job's contribution
+    is to fetch honestly, which means passing `audit=None` when the audit table
+    could not be read rather than an empty list that reads as "nothing
+    happened".
 
-    A 4:1 split that is not applied makes a position look like it lost 75%
-    overnight, which will trip stops and the daily loss limit on a day when
-    nothing actually happened.
+    There is still **no storage and no artifact**, which is why this returns the
+    report and logs it rather than writing a file. `queue.generate_report_task`
+    is blocked on an object store this platform does not have; a rendered PDF
+    nothing can fetch would be a key pointing at nowhere. A structured log line
+    and `GET /analytics/reports/daily`, which computes the same report on
+    demand from the same records, need neither.
     """
-    raise NotImplementedError
+    settings = get_settings()
+    clock = SystemClock()
+    now = clock.now()
+    session_start = now - timedelta(days=1)
+
+    engine = create_engine(settings.database_url)
+    factory = create_session_factory(engine)
+    try:
+        orders = await PostgresOrderRepository(factory).recent_orders(
+            settings.run_mode, since=session_start, limit=DAILY_REPORT_ORDER_LIMIT
+        )
+        # None, not [], when the read fails: the report renders "not recorded"
+        # for an audit table it could not reach and "0 halts" for one it could,
+        # and those are different days.
+        try:
+            rows = await PostgresAuditLog(factory).recent(limit=DAILY_REPORT_AUDIT_LIMIT)
+            audit: list[AuditEntry] | None = [
+                entry for _, entry in rows if entry.at >= session_start
+            ]
+        except Exception as exc:
+            log.warning("worker.daily_report.audit_unavailable", error=str(exc))
+            audit = None
+    finally:
+        await engine.dispose()
+
+    report = summarise(now.date(), orders, audit=audit)
+
+    log.info(
+        "worker.daily_report",
+        day=report.day.isoformat(),
+        headline=report.headline(),
+        orders_submitted=report.orders_submitted,
+        orders_filled=report.orders_filled,
+        orders_refused=report.orders_refused,
+        refusals_by_rule=report.refusals_by_rule,
+        not_measured=[s.name for s in report.absent],
+        report=render(report),
+    )
+    watch.alerts.send(
+        Alert(
+            severity=Severity.INFO,
+            title=f"Daily report — {report.day.isoformat()}",
+            body=render(report),
+            key=f"daily.report.{report.day.isoformat()}",
+            context={"orders": str(report.orders_submitted)},
+        )
+    )
+    return report
+
+
+async def apply_corporate_actions(watch: SessionWatch) -> list[Adjustment]:
+    """Pre-open. Refresh adjusted history, and say what moved overnight.
+
+    A split or a dividend restates every historical *adjusted* close for the
+    symbol at the vendor. Nothing in this platform is told: the nightly sweep
+    fills **gaps**, so it never re-fetches a bar we already hold, and a bar
+    stored last week keeps last week's `adj_close` for ever. Backtests read the
+    adjusted series (CLAUDE.md §5), so the drift lands where nobody looks until
+    a strategy is being evaluated against prices that stopped being true.
+
+    So this re-fetches the recent window **adjusted** and upserts it. That is
+    the whole correction, and it needs no new machinery:
+    `PostgresBarRepository.upsert_bars` already merges `adj_close` such that a
+    present incoming value wins, and its docstring already says why — "a
+    corporate action makes every historical `adj_close` for that symbol stale
+    and the newer figure is the correct one".
+
+    **It does not touch a position, and that is a decision rather than a gap.**
+    A 4:1 split makes a held 100 read as 400 at the venue, which
+    `Reconciler.reconcile` sees as a quantity mismatch and halts on. Applying
+    the factor here would prevent that halt — and would mean this job silently
+    rewriting share counts and cost bases from a number it *inferred from
+    prices*. `adopt_broker_state` is "deliberately NOT automatic" for the same
+    reason, in its own words: silently adopting hides whatever caused the drift,
+    and a split shares its shape with a duplicate-submission bug. The halt is
+    the right outcome. What was missing is that it arrived unexplained.
+
+    Running an hour before the open is what changes: a split-shaped move is
+    alerted *now*, naming the symbol and the factor, so the mismatch an hour
+    later reads as the thing you were already told about and the operator
+    adopts with evidence rather than investigating a phantom.
+
+    Returns what it detected, so a caller — and a test — can see the work rather
+    than infer it from a log line.
+    """
+    settings = get_settings()
+    now = SystemClock().now()
+    start = now - timedelta(days=NIGHTLY_LOOKBACK_DAYS)
+
+    engine = create_engine(settings.database_url)
+    provider = AlpacaHistoricalProvider(
+        settings, min_request_interval_seconds=60.0 / NIGHTLY_REQUESTS_PER_MINUTE
+    )
+    repository = PostgresBarRepository(create_session_factory(engine))
+    found: list[Adjustment] = []
+
+    try:
+        by_timeframe: dict[Timeframe, list[str]] = {}
+        for symbol, timeframe in await repository.stored_series():
+            if timeframe in SUPPORTED_TIMEFRAMES:
+                by_timeframe.setdefault(timeframe, []).append(symbol)
+
+        for timeframe, symbols in by_timeframe.items():
+            fresh = await provider.get_bars(symbols, timeframe, start, now, adjusted=True)
+            for symbol in symbols:
+                incoming = fresh.get(symbol, [])
+                if not incoming:
+                    continue
+                stored = await repository.get_bars(symbol, timeframe, start, now)
+                adjustment = detect_adjustment(symbol, stored, incoming)
+                # Written back whether or not one factor explains it. The fresh
+                # figures are the vendor's current truth either way, and a
+                # series this cannot *name* is still a series that should not
+                # keep last week's numbers.
+                await repository.upsert_bars(incoming)
+                if adjustment is not None:
+                    found.append(adjustment)
+                    _report_adjustment(watch, adjustment, timeframe)
+    finally:
+        await provider.aclose()
+        await engine.dispose()
+
+    log.info(
+        "worker.corporate_actions.done",
+        series=sum(len(s) for s in by_timeframe.values()),
+        adjustments=len(found),
+        split_like=sum(1 for a in found if a.is_split_like),
+    )
+    return found
+
+
+def _report_adjustment(watch: SessionWatch, adjustment: Adjustment, timeframe: Timeframe) -> None:
+    """Say what moved, at the volume the size of the move deserves.
+
+    A dividend adjustment is a fact worth recording and not worth a phone call
+    at 08:30; a split-shaped one changes what every position is worth and is
+    going to halt the platform within the hour. Alerting on both would train an
+    operator to ignore the one that matters.
+    """
+    detail = {
+        "symbol": adjustment.symbol,
+        "timeframe": timeframe.value,
+        "factor": str(adjustment.factor),
+        "bars_compared": adjustment.bars_compared,
+        "bars_agreeing": adjustment.bars_agreeing,
+        "consistent": adjustment.is_consistent,
+    }
+
+    if not adjustment.is_consistent:
+        # Not a smaller version of a detected split: the history moved in a way
+        # one corporate action cannot account for, so naming a factor would be
+        # inventing a story the bars do not support.
+        log.critical("worker.corporate_actions.inconsistent", **detail)
+        watch.alerts.send(
+            Alert(
+                severity=Severity.CRITICAL,
+                title=f"{adjustment.symbol}: adjusted history changed inconsistently",
+                body=(
+                    f"{adjustment.bars_agreeing} of {adjustment.bars_compared} bars agree on a "
+                    f"factor of {adjustment.factor}. One corporate action would move all of "
+                    f"them. The refreshed prices are stored; the cause is not a split this "
+                    f"can name. Check the vendor's series before the open."
+                ),
+                key=f"corporate_action.inconsistent.{adjustment.symbol}",
+                context={"symbol": adjustment.symbol},
+            )
+        )
+        return
+
+    if not adjustment.is_split_like:
+        log.info("worker.corporate_actions.adjusted", **detail)
+        return
+
+    log.critical("worker.corporate_actions.split_like", **detail)
+    watch.alerts.send(
+        Alert(
+            severity=Severity.CRITICAL,
+            title=f"{adjustment.symbol}: corporate action, factor {adjustment.factor}",
+            body=(
+                f"Adjusted history moved by {adjustment.factor} across "
+                f"{adjustment.bars_compared} bars. A held quantity will read "
+                f"{adjustment.implied_position_factor}x larger at the venue, so "
+                f"reconciliation will halt on the mismatch. That halt is expected: "
+                f"check the broker's position against this factor, then adopt "
+                f"(docs/RUNBOOK.md, 'Reconciliation mismatch')."
+            ),
+            key=f"corporate_action.{adjustment.symbol}.{adjustment.factor}",
+            context={"symbol": adjustment.symbol, "factor": str(adjustment.factor)},
+        )
+    )
 
 
 async def rollover_daily_counters(watch: SessionWatch) -> None:
@@ -461,8 +678,6 @@ async def rollover_daily_counters(watch: SessionWatch) -> None:
 #: arbitrate here" (`dashboard/ports.py`). A worker not running a strategy has
 #: no book to snapshot either, so there is no case the job would have covered.
 SCHEDULE: list[dict[str, Any]] = [
-    {"job": apply_corporate_actions, "trigger": "market_open", "offset_minutes": -60},
-    {"job": generate_daily_report, "trigger": "market_close", "offset_minutes": 30},
     {"job": backfill_missing_bars, "trigger": "cron", "hour": 2, "minute": 0},
 ]
 
@@ -509,6 +724,21 @@ def build_schedule(
                 "job": partial(rollover_daily_counters, watch),
                 "trigger": "market_open",
                 "offset_minutes": -5,
+            },
+            {
+                # An hour out, so a split-shaped move is alerted with time to
+                # act before the reconciler halts on the mismatch it causes.
+                "job": partial(apply_corporate_actions, watch),
+                "trigger": "market_open",
+                "offset_minutes": -60,
+            },
+            {
+                # Half an hour after the close, and after `summarise_the_session`
+                # at the bell: that one says whether to act tonight, this one is
+                # the day written down.
+                "job": partial(generate_daily_report, watch),
+                "trigger": "market_close",
+                "offset_minutes": 30,
             },
         ]
 
