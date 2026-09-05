@@ -50,6 +50,7 @@ import httpx
 
 from atp_core import ws
 from atp_core.brokers.ports import AccountSnapshot, TradeUpdate, TradeUpdatesReconnected
+from atp_core.clock import SystemClock
 from atp_core.domain import Fill, Order, OrderStatus, OrderType, Position, Side, TimeInForce
 from atp_core.domain.enums import RunMode
 from atp_core.errors import (
@@ -65,6 +66,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
 
     from atp_core.brokers.ports import TradeUpdateEvent
+    from atp_core.clock import Clock
     from atp_core.config import Settings
 
 log = get_logger(__name__)
@@ -213,7 +215,8 @@ class AlpacaBroker:
         rng: random.Random | None = None,
         stream_backoff_base_seconds: float = ws.BACKOFF_BASE_SECONDS,
         stream_backoff_max_seconds: float = ws.BACKOFF_MAX_SECONDS,
-        max_reconnect_attempts: int = ws.MAX_RECONNECT_ATTEMPTS,
+        reconnect_budget_seconds: float = ws.RECONNECT_BUDGET_SECONDS,
+        clock: Clock | None = None,
         handshake_timeout_seconds: float = ws.HANDSHAKE_TIMEOUT_SECONDS,
     ) -> None:
         if settings.run_mode is RunMode.BACKTEST:
@@ -256,7 +259,13 @@ class AlpacaBroker:
         self._rng = rng if rng is not None else random.Random()
         self._backoff_base_seconds_stream = stream_backoff_base_seconds
         self._backoff_max_seconds = stream_backoff_max_seconds
-        self._max_reconnect_attempts = max_reconnect_attempts
+        self._reconnect_budget_seconds = reconnect_budget_seconds
+        #: Injected for the same reason `sleep` is: the reconnect budget below
+        #: is measured in elapsed time, and a test cannot drive a fifteen-minute
+        #: outage off a wall clock. Used by the trade-updates loop only — the
+        #: REST half still stamps `datetime.now(UTC)` in three places, which is
+        #: a separate (and smaller) §1.2 debt this change does not widen into.
+        self._clock: Clock = clock if clock is not None else SystemClock()
         self._handshake_timeout_seconds = handshake_timeout_seconds
 
     @property
@@ -556,8 +565,15 @@ class AlpacaBroker:
         #: rather than left empty: before the first event there is nothing to
         #: be missing, and a first connection that takes four attempts to come
         #: up has genuinely missed whatever filled while it was struggling.
-        gap_since = datetime.now(UTC)
+        gap_since = self._clock.now()
         reconnecting = False
+        #: When the current run of failures began, or None while connected. The
+        #: budget is elapsed time rather than a count of attempts, so a venue
+        #: away for seven minutes is waited out instead of killing the worker
+        #: four minutes in (docs/paper-week/day-1-review.md, F6). This stream
+        #: and the market-data feed exhausted together on day 1, which is why
+        #: both ladders changed in one commit.
+        first_failure_at: datetime | None = None
 
         while True:
             try:
@@ -566,14 +582,20 @@ class AlpacaBroker:
                 raise
             except Exception as exc:  # every transport failure retries alike
                 attempts += 1
-                if attempts > self._max_reconnect_attempts:
+                now = self._clock.now()
+                if first_failure_at is None:
+                    first_failure_at = now
+                if ws.budget_exhausted(first_failure_at, now, self._reconnect_budget_seconds):
                     raise BrokerConnectionError(
-                        f"Alpaca trade updates did not come back after "
-                        f"{self._max_reconnect_attempts} attempts: {exc}"
+                        f"Alpaca trade updates did not come back within "
+                        f"{self._reconnect_budget_seconds:.0f}s "
+                        f"({attempts} attempts): {exc}"
                     ) from exc
                 log.warning(
                     "broker.alpaca.trade_updates_reconnecting",
                     attempt=attempts,
+                    trying_for_seconds=round((now - first_failure_at).total_seconds(), 1),
+                    budget_seconds=self._reconnect_budget_seconds,
                     error=str(exc),
                 )
                 await self._sleep(
@@ -591,7 +613,7 @@ class AlpacaBroker:
                 reconnecting = False
                 yield TradeUpdatesReconnected(
                     gap_since=gap_since,
-                    reconnected_at=datetime.now(UTC),
+                    reconnected_at=self._clock.now(),
                     attempts=attempts + 1,
                 )
 
@@ -612,6 +634,10 @@ class AlpacaBroker:
                 if not delivered:
                     delivered = True
                     attempts = 0
+                    #: Cleared only once the connection has *delivered*. A
+                    #: server that accepts and drops immediately would
+                    #: otherwise restart the budget every loop.
+                    first_failure_at = None
 
                 for message in _iter_messages(raw):
                     update = self._to_trade_update(message)

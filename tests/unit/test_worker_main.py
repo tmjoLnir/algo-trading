@@ -15,14 +15,23 @@ quote that stopped updating.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
 
-from atp_core.risk.killswitch import HaltReason, HaltScope
+from atp_core.alerts.ports import Alert, Severity
+from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
 from atp_core.worker import DEFAULT_WORKER_CONFIG, WorkerConfig
 from atp_core.worker.config import parse_symbol_list
-from atp_worker.main import HALT_ACTOR, WorkerError, supervise
+from atp_worker.main import (
+    HALT_ACTOR,
+    WorkerError,
+    _active_halts,
+    _announce_death,
+    _describe_halt,
+    supervise,
+)
 from tests.fakes import FakeKillSwitch
 
 if TYPE_CHECKING:
@@ -207,3 +216,129 @@ class TestWatchlist:
         ticker, so a parse that let one through would move the failure from the
         save to the worker's next boot."""
         assert WorkerConfig(symbols=parse_symbol_list("spy, qqq")).symbols == ("SPY", "QQQ")
+
+
+class RecordingAlerts:
+    """An `AlertSink` that keeps what it was handed."""
+
+    def __init__(self, *, explode: bool = False) -> None:
+        self.sent: list[Alert] = []
+        self._explode = explode
+
+    def send(self, alert: Alert) -> None:
+        if self._explode:
+            raise RuntimeError("the transport is down")
+        self.sent.append(alert)
+
+
+def halt_record(
+    scope: HaltScope = HaltScope.GLOBAL,
+    *,
+    target: str | None = None,
+    reason: HaltReason = HaltReason.DATA_FEED_LOST,
+    engaged_by: str = "staleness_monitor",
+) -> HaltRecord:
+    return HaltRecord(
+        scope=scope,
+        reason=reason,
+        engaged_at=datetime(2024, 6, 3, 18, 46, tzinfo=UTC),
+        engaged_by=engaged_by,
+        target=target,
+    )
+
+
+class TestReadingTheHaltAtBoot:
+    """F4. A worker restarted into a standing halt announced 'trading
+    sma_crossover with paper money' three times on day 1, at INFO, while nothing
+    could trade (docs/paper-week/day-1-review.md)."""
+
+    def test_it_reports_every_scope_not_just_global(self) -> None:
+        """A leftover symbol halt is the one that goes unnoticed: the loop runs
+        and one name silently never trades."""
+        switch = FakeKillSwitch()
+        switch.halts = [halt_record(HaltScope.SYMBOL, target="SPY")]
+
+        assert _active_halts(switch) == switch.halts
+
+    def test_an_unreadable_switch_does_not_stop_the_worker_booting(self) -> None:
+        """`active_halts` lets Redis errors propagate — right for a dashboard,
+        wrong on a boot path. The switch fails closed on the same outage, so
+        nothing trades either way, and a worker that cannot *describe* the halt
+        is still better than no worker at all."""
+
+        class Unreachable(FakeKillSwitch):
+            def active_halts(self) -> list[HaltRecord]:
+                raise ConnectionError("redis is gone")
+
+        assert _active_halts(Unreachable()) == []
+
+    def test_no_kill_switch_bound_is_not_an_error(self) -> None:
+        assert _active_halts(None) == []
+
+    def test_a_halt_is_described_with_who_and_when(self) -> None:
+        """The two things anyone asks about a halt they did not place."""
+        rendered = _describe_halt(halt_record(HaltScope.SYMBOL, target="SPY"))
+
+        assert "symbol:SPY" in rendered
+        assert "staleness_monitor" in rendered
+        assert "2024-06-03T18:46:00+00:00" in rendered
+
+
+class TestAnnouncingADeath:
+    """F8. Three workers died in 158 seconds on day 1 and sent zero alerts
+    between them — the halt's own notification had already fired, and `engage`
+    dedups on the Redis record."""
+
+    def test_a_death_alerts_even_though_the_halt_already_did(self) -> None:
+        alerts = RecordingAlerts()
+
+        _announce_death(alerts, "ingestor", "the feed gave up")
+
+        assert len(alerts.sent) == 1
+        assert alerts.sent[0].severity is Severity.CRITICAL
+        assert "ingestor" in alerts.sent[0].title
+
+    def test_the_key_is_the_responsibility_so_two_deaths_are_two_alerts(self) -> None:
+        """A halt is one condition however often it is re-engaged; a process
+        death is a new event every time. Keying these on the halt would have
+        collapsed day 1's crash loop into the silence it actually produced."""
+        alerts = RecordingAlerts()
+
+        _announce_death(alerts, "ingestor", "first")
+        _announce_death(alerts, "strategy_runner", "second")
+
+        assert {a.key for a in alerts.sent} == {
+            "worker.died.ingestor",
+            "worker.died.strategy_runner",
+        }
+
+    def test_a_broken_transport_does_not_replace_the_error_being_raised(self) -> None:
+        """This runs on the way out of a worker that is already failing."""
+        _announce_death(RecordingAlerts(explode=True), "ingestor", "the feed gave up")
+
+    def test_no_sink_bound_is_not_an_error(self) -> None:
+        _announce_death(None, "ingestor", "the feed gave up")
+
+    async def test_supervise_alerts_when_a_responsibility_ends(self) -> None:
+        alerts = RecordingAlerts()
+
+        with pytest.raises(RuntimeError):
+            await supervise(
+                {"ingestor": raises(RuntimeError("the feed gave up"))},
+                stop_event=asyncio.Event(),
+                kill_switch=FakeKillSwitch(),
+                alerts=alerts,
+            )
+
+        assert [a.key for a in alerts.sent] == ["worker.died.ingestor"]
+
+    async def test_a_clean_shutdown_alerts_nobody(self) -> None:
+        """A signal is an ordinary restart. Alerting on one would train an
+        operator to ignore the alerts that matter."""
+        alerts = RecordingAlerts()
+        stop = asyncio.Event()
+        stop.set()
+
+        await supervise({"ingestor": Watcher().run}, stop_event=stop, alerts=alerts)
+
+        assert alerts.sent == []

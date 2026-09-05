@@ -28,14 +28,39 @@ from atp_core.logging import get_logger
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
+    from datetime import datetime
 
 log = get_logger(__name__)
 
 #: Defaults for the ladder below. Shared so that two streams reconnecting
 #: against the same vendor behave the same way under the same outage.
 BACKOFF_BASE_SECONDS = 1.0
-BACKOFF_MAX_SECONDS = 60.0
-MAX_RECONNECT_ATTEMPTS = 8
+
+#: Ceiling on one wait. Was 60s, which is a long time to be blind during a
+#: session and — paired with the old attempt ceiling — spent most of the retry
+#: budget on the last two waits. Halved so a long outage is retried *more*
+#: often rather than less, now that the budget below is what decides when to
+#: stop.
+BACKOFF_MAX_SECONDS = 30.0
+
+#: How long a stream may keep trying before it gives up and the process halts.
+#:
+#: **This replaced an attempt ceiling, and the replacement is the fix.** Eight
+#: attempts sounds generous and is not: with a doubling backoff the budget is
+#: spent in about four minutes, because most of it goes on the last two waits.
+#: Alpaca was unreachable for roughly seven minutes on day 1 of the paper week,
+#: so both streams exhausted their attempts, raised, and killed the worker —
+#: which restarted, reset the counter, and died again, three times
+#: (docs/paper-week/day-1-review.md, F6). The crash loop then destroyed the two
+#: pieces of process-local state that would have limited the damage: the gap
+#: marker the backfill reads (F5) and the staleness clock (F7).
+#:
+#: An interval is the honest unit here. "How long can this venue be away before
+#: we stop trying" is a question an operator can answer; "how many attempts is
+#: that" depends on a backoff schedule they would have to integrate by hand.
+#: Fifteen minutes covers the venue outages this platform has actually seen with
+#: room over, and is still far short of a session.
+RECONNECT_BUDGET_SECONDS = 900.0
 
 #: How long an auth/subscribe exchange may take before the connection is
 #: written off and retried. Alpaca answers in milliseconds; ten seconds of
@@ -118,3 +143,21 @@ def backoff_delay(
     generator = rng if rng is not None else random
     delay: float = min(base_seconds * (2.0 ** (attempt - 1)), max_seconds)
     return delay * (0.5 + generator.random() / 2)
+
+
+def budget_exhausted(first_failure_at: datetime, now: datetime, budget_seconds: float) -> bool:
+    """Whether a stream has been retrying for longer than it is allowed to.
+
+    Measured from the *first* failure of the current outage, not from the last
+    attempt, so a venue that accepts a connection and immediately drops it
+    cannot refresh the budget by failing in a new way.
+
+    Takes both instants rather than reading a clock, because deciding when to
+    stop trading is not a thing this module may do on its own timeline: the
+    caller holds the injected clock, which is what lets a test drive a
+    fifteen-minute outage without waiting fifteen minutes (CLAUDE.md §1.2).
+
+    A budget of zero is exhausted immediately, which is the "do not retry at
+    all" setting the tests use to assert the give-up path.
+    """
+    return (now - first_failure_at).total_seconds() >= budget_seconds

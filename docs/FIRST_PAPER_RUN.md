@@ -138,8 +138,16 @@ Expect, in order:
 |---|---|
 | `worker.starting` `run_mode=paper` | not live — check this every time |
 | `worker.not_trading` | `no strategy is configured` — the opt-in is working |
-| `worker.ready` `trading=False` | the locks held |
+| `worker.ready` `trading=False` `halted=False` | the locks held, and nothing is halted |
 | `data.stream.started` | the market-data socket is up |
+
+`worker.ready` reports `halted` because it did not, and a worker restarted into
+a standing halt announced *"trading sma_crossover with paper money"* three times
+while nothing could reach the venue (docs/paper-week/day-1-review.md, F4). If it
+reports `halted=True` there is a `worker.ready_while_halted` CRITICAL beside it
+naming every scope and the command that clears them. Nothing was ever at risk —
+every order passes `KillSwitchRule`, which reads Redis per order and fails
+closed — but this is the line an operator reads at 09:45 and believes.
 
 Then confirm data is actually moving — the feed being *connected* and the feed
 *delivering* are different observations:

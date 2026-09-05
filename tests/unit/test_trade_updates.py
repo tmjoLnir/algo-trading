@@ -15,15 +15,17 @@ from __future__ import annotations
 
 import json
 import random
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import pytest
 from pydantic import SecretStr
 
+from atp_core import ws
 from atp_core.brokers.alpaca import AlpacaBroker
 from atp_core.brokers.ports import TradeUpdate, TradeUpdatesReconnected
+from atp_core.clock import SimulatedClock
 from atp_core.config import Settings
 from atp_core.domain import Fill, Order, OrderStatus, OrderType, Side, TimeInForce
 from atp_core.errors import BrokerConnectionError, BrokerError, ReconciliationError
@@ -125,13 +127,29 @@ def make_settings() -> Settings:
 
 
 def build(
-    *connections: FakeConnection, max_reconnect_attempts: int = 0
+    *connections: FakeConnection, reconnect_budget_seconds: float = 0.0
 ) -> tuple[AlpacaBroker, list[float], list[FakeConnection]]:
     """A broker wired to a queue of connections. Returns it, the sleeps it
-    asked for, and the connections it was handed."""
+    asked for, and the connections it was handed.
+
+    **The fake sleep advances the clock the budget is measured against**, which
+    is what makes an elapsed-time ladder testable at all: a fifteen-minute
+    outage is driven in microseconds, and the give-up point is a consequence of
+    the waits the loop actually chose rather than a number the test asserts
+    twice. The budget replaced an attempt count for the reason
+    docs/paper-week/day-1-review.md F6 gives — eight attempts expire about four
+    minutes in, and Alpaca was away for seven.
+
+    A budget of `0.0` is the default and gives up on the first failure, which is
+    what most of these tests want: they are about the handshake, not the ladder.
+    """
     queue = list(connections)
     handed: list[FakeConnection] = []
     slept: list[float] = []
+    #: After the fixture event timestamps below (14:30:00.123456), so a
+    #: reconnect marker stamped from this clock never lands before the
+    #: `gap_since` an event payload supplied.
+    clock = SimulatedClock(datetime(2024, 6, 3, 14, 31, tzinfo=UTC))
 
     async def connect(url: str) -> FakeConnection:
         if not queue:
@@ -142,13 +160,15 @@ def build(
 
     async def sleep(seconds: float) -> None:
         slept.append(seconds)
+        clock.set(clock.now() + timedelta(seconds=seconds))
 
     broker = AlpacaBroker(
         make_settings(),
         connect=connect,
         sleep=sleep,
         rng=random.Random(0),
-        max_reconnect_attempts=max_reconnect_attempts,
+        reconnect_budget_seconds=reconnect_budget_seconds,
+        clock=clock,
     )
     return broker, slept, handed
 
@@ -196,7 +216,9 @@ class TestHandshake:
     async def test_a_refused_handshake_is_not_retried(self) -> None:
         """Bad credentials are not a blip. Another connection performs the
         same refusal, and paper and live use separate key pairs."""
-        broker, slept, handed = build(FakeConnection([UNAUTHORIZED]), max_reconnect_attempts=5)
+        broker, slept, handed = build(
+            FakeConnection([UNAUTHORIZED]), reconnect_budget_seconds=600.0
+        )
 
         with pytest.raises(BrokerError, match="paper and live"):
             async for _ in broker.stream_trade_updates():
@@ -208,7 +230,7 @@ class TestHandshake:
     @pytest.mark.asyncio
     async def test_credentials_never_reach_an_error_message(self) -> None:
         """Rule §1.6."""
-        broker, _, _ = build(FakeConnection([UNAUTHORIZED]), max_reconnect_attempts=0)
+        broker, _, _ = build(FakeConnection([UNAUTHORIZED]), reconnect_budget_seconds=0.0)
 
         with pytest.raises(BrokerError) as caught:
             async for _ in broker.stream_trade_updates():
@@ -223,7 +245,7 @@ class TestHandshake:
         be refused by our own leak."""
         failed = FakeConnection([DroppedError("hung up mid-handshake")])
         good = FakeConnection([AUTHORIZED, LISTENING, fill_frame()])
-        broker, _, _ = build(failed, good, max_reconnect_attempts=3)
+        broker, _, _ = build(failed, good, reconnect_budget_seconds=600.0)
 
         await drain(broker, limit=2)
 
@@ -257,7 +279,7 @@ class TestReconnect:
         connection, and Alpaca does not replay the gap."""
         first = FakeConnection([AUTHORIZED, LISTENING, fill_frame(), DroppedError("reset")])
         second = FakeConnection([AUTHORIZED, LISTENING, fill_frame(execution_id="exec-2")])
-        broker, _, _ = build(first, second, max_reconnect_attempts=3)
+        broker, _, _ = build(first, second, reconnect_budget_seconds=600.0)
 
         events = await drain(broker, limit=3)
 
@@ -269,7 +291,7 @@ class TestReconnect:
     async def test_the_marker_spans_the_outage(self) -> None:
         first = FakeConnection([AUTHORIZED, LISTENING, fill_frame(), DroppedError("reset")])
         second = FakeConnection([AUTHORIZED, LISTENING, fill_frame(execution_id="exec-2")])
-        broker, _, _ = build(first, second, max_reconnect_attempts=3)
+        broker, _, _ = build(first, second, reconnect_budget_seconds=600.0)
 
         events = await drain(broker, limit=3)
 
@@ -282,45 +304,94 @@ class TestReconnect:
     @pytest.mark.asyncio
     async def test_backoff_is_exponential_capped_and_jittered(self) -> None:
         broker, slept, _ = build(
-            *[FakeConnection([DroppedError("refused")]) for _ in range(6)],
-            max_reconnect_attempts=5,
+            *[FakeConnection([DroppedError("refused")]) for _ in range(40)],
+            reconnect_budget_seconds=120.0,
         )
 
         with pytest.raises(BrokerConnectionError, match="did not come back"):
             async for _ in broker.stream_trade_updates():
                 pass
 
-        assert len(slept) == 5
-        assert slept == sorted(slept), "each wait should be at least as long as the last"
-        # Jittered into [delay/2, delay], never above the ceiling.
-        assert all(0 < s <= 2.0**i for i, s in enumerate(slept))
+        assert slept, "the ladder should have waited at least once"
+        # Jittered into [delay/2, delay], so never above the ceiling and never
+        # zero — a ladder that returned 0 would be a hot loop with a nice name.
+        assert all(0 < s <= ws.BACKOFF_MAX_SECONDS for s in slept)
+        # Monotonic only while the delay is still doubling. Once it saturates at
+        # the ceiling the jitter makes neighbouring waits freely comparable, and
+        # asserting order there would be asserting the seed of the RNG.
+        doubling = [s for s in slept if s < ws.BACKOFF_MAX_SECONDS / 2]
+        assert doubling == sorted(doubling), "each wait should grow until it caps"
 
     @pytest.mark.asyncio
-    async def test_gives_up_after_the_attempt_limit(self) -> None:
-        broker, _, _ = build(
-            *[FakeConnection([DroppedError("refused")]) for _ in range(4)],
-            max_reconnect_attempts=2,
+    async def test_gives_up_on_elapsed_time_rather_than_a_count_of_attempts(self) -> None:
+        """The budget is a duration, so the number of attempts it buys is
+        whatever the ladder chose — which is the point. An attempt ceiling made
+        "how long will this keep trying" a question you had to answer by
+        integrating a backoff schedule by hand, and the answer turned out to be
+        four minutes (docs/paper-week/day-1-review.md, F6)."""
+        broker, slept, _ = build(
+            *[FakeConnection([DroppedError("refused")]) for _ in range(40)],
+            reconnect_budget_seconds=120.0,
         )
 
-        with pytest.raises(BrokerConnectionError, match="after 2 attempts"):
+        with pytest.raises(BrokerConnectionError, match="within 120s"):
             async for _ in broker.stream_trade_updates():
                 pass
+
+        assert sum(slept) >= 120.0, "it must not give up before the budget is spent"
+
+    @pytest.mark.asyncio
+    async def test_a_seven_minute_venue_outage_is_survived(self) -> None:
+        """The day-1 regression, stated as the incident that produced it.
+
+        Alpaca was unreachable for roughly seven minutes. Both streams gave up
+        about four minutes in, so the worker died, restarted, reset its counter
+        and died again — three times. Each death destroyed the gap marker (F5)
+        and the staleness clock (F7), which is how a 7-minute outage became
+        ~108 permanently missing bars and a halt nobody was reminded of.
+
+        Here the venue comes back after seven minutes of failures and the stream
+        is still trying. Nothing raises, and the reconnect marker is delivered.
+        """
+        seven_minutes = 7 * 60
+        # Enough failures to span seven minutes of a capped ladder, and few
+        # enough that the good connection is still reached inside the real
+        # budget — the test is "it waited long enough", not "it waited for ever".
+        failures = [FakeConnection([DroppedError("refused")]) for _ in range(25)]
+        good = FakeConnection([[AUTHORIZED], [LISTENING]])
+        # The real default rather than a test value: the assertion is that the
+        # *shipped* budget is enough, so reading it from anywhere but the
+        # constant would prove nothing.
+        broker, slept, _ = build(
+            *failures, good, reconnect_budget_seconds=ws.RECONNECT_BUDGET_SECONDS
+        )
+
+        events = await drain(broker, limit=2)
+
+        assert sum(slept) >= seven_minutes, "the outage must actually have been waited out"
+        assert any(isinstance(event, TradeUpdatesReconnected) for event in events)
 
     @pytest.mark.asyncio
     async def test_a_connection_that_never_delivers_keeps_backing_off(self) -> None:
         """A server that accepts and immediately drops us — a flapping upstream
         — must not reset the ladder into a hot loop."""
         broker, slept, _ = build(
-            *[FakeConnection([AUTHORIZED, LISTENING, DroppedError("bye")]) for _ in range(4)],
-            max_reconnect_attempts=3,
+            *[FakeConnection([AUTHORIZED, LISTENING, DroppedError("bye")]) for _ in range(40)],
+            reconnect_budget_seconds=120.0,
         )
 
         with pytest.raises(BrokerConnectionError):
             async for _ in broker.stream_trade_updates():
                 pass
 
-        assert slept == sorted(slept)
-        assert len(slept) == 3
+        # Every retry waited, and the waits grew while they still could: a
+        # connection that opens and drops without delivering must not reset the
+        # ladder, or a flapping upstream becomes a hot loop.
+        assert all(s > 0 for s in slept)
+        doubling = [s for s in slept if s < ws.BACKOFF_MAX_SECONDS / 2]
+        assert doubling == sorted(doubling)
+        # And the budget still ends it, rather than the attempt count that used to.
+        assert sum(slept) >= 120.0
 
 
 class TestParsing:

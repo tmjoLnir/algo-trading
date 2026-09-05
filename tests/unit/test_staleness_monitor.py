@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from atp_core.alerts.ports import Alert, Severity
 from atp_core.clock import TradingCalendar
 from atp_core.data.stream import STALENESS_ACTOR, IngestorStats, StalenessMonitor
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
@@ -74,11 +75,16 @@ class StubIngestor:
     """Only `stats` is read, so only `stats` is provided."""
 
     def __init__(
-        self, *, last_message_at: datetime | None = None, connected_since: datetime | None = None
+        self,
+        *,
+        last_message_at: datetime | None = None,
+        connected_since: datetime | None = None,
+        storage_watermark: datetime | None = None,
     ) -> None:
         self.stats = IngestorStats(
             connected_since=connected_since,
             last_message_at=last_message_at,
+            storage_watermark=storage_watermark,
             symbols={"SPY"},
         )
 
@@ -188,8 +194,10 @@ class TestSilenceIsNot:
 
 
 class TestBaseline:
-    """Silence is measured from the latest of three instants. Each clause stops
-    a specific false alarm, and each gets a test."""
+    """Silence is measured from the latest instant data is known to have been
+    fine. Each clause stops a specific false alarm, and each gets a test —
+    including the one that stops a *restart* from counting as such an instant
+    (docs/paper-week/day-1-review.md, F7)."""
 
     async def test_a_worker_started_midsession_is_not_blamed_for_the_open(self) -> None:
         """Started at 14:29, checked at 14:30, no tick yet. Measuring from the
@@ -222,19 +230,46 @@ class TestBaseline:
         assert verdict.stale is True
         assert verdict.silent_for_seconds == 3600
 
-    async def test_the_latest_of_the_three_wins(self) -> None:
-        """A reconnect advances `connected_since` past a stale `last_message_at`,
-        because the gap it left has already been backfilled."""
+    async def test_a_backfilled_reconnect_is_not_stale(self) -> None:
+        """A reconnect whose gap was closed leaves the data current, even though
+        `last_message_at` still points before the outage.
+
+        The watermark is what says so. It used to be `connected_since`, which
+        also moved on a plain process restart — and a restart is not a statement
+        about the data at all (docs/paper-week/day-1-review.md, F7). The
+        ingestor advances the watermark only when `_backfill_gap` actually
+        succeeded, so a *failed* backfill cannot claim recovery.
+        """
         verdict = monitor(max_silence_seconds=60).evaluate(
             ingestor(
                 last_message_at=MIDSESSION - timedelta(minutes=10),
-                connected_since=MIDSESSION - timedelta(seconds=10),
+                storage_watermark=MIDSESSION - timedelta(seconds=10),
             ),
             MIDSESSION,
         )
 
         assert verdict.stale is False
         assert verdict.silent_for_seconds == 10
+
+    async def test_a_restart_alone_does_not_refresh_the_clock(self) -> None:
+        """The F7 regression, in one assertion.
+
+        Five workers were started in three minutes on day 1, each measuring
+        silence from its own birth, so a worker that died inside
+        `max_silence_seconds` never halted. Here the process has just booted
+        into a ten-minute-old feed outage and must say so.
+        """
+        verdict = monitor(max_silence_seconds=60).evaluate(
+            ingestor(
+                last_message_at=None,
+                storage_watermark=MIDSESSION - timedelta(minutes=10),
+                connected_since=MIDSESSION - timedelta(seconds=1),
+            ),
+            MIDSESSION,
+        )
+
+        assert verdict.stale is True
+        assert verdict.silent_for_seconds == 600
 
 
 class TestArguments:
@@ -255,11 +290,17 @@ class TestWatch:
     """The loop. A scripted clock drives it and runs out to end it."""
 
     def build(
-        self, instants: list[datetime]
+        self, instants: list[datetime], alerts: RecordingAlerts | None = None
     ) -> tuple[StalenessMonitor, FakeKillSwitch, ScriptedClock]:
         switch = FakeKillSwitch()
         clock = ScriptedClock(instants)
-        watchdog = monitor(max_silence_seconds=60, kill_switch=switch, clock=clock, sleep=_no_sleep)
+        watchdog = monitor(
+            max_silence_seconds=60,
+            kill_switch=switch,
+            clock=clock,
+            sleep=_no_sleep,
+            alerts=alerts,
+        )
         return watchdog, switch, clock
 
     async def run(self, watchdog: StalenessMonitor, target: StreamIngestor) -> None:
@@ -330,3 +371,92 @@ class TestWatch:
         )
 
         await self.run(watchdog, ingestor(last_message_at=MIDSESSION - timedelta(minutes=5)))
+
+
+class RecordingAlerts:
+    """An `AlertSink` that keeps what it was handed."""
+
+    def __init__(self, *, explode: bool = False) -> None:
+        self.sent: list[Alert] = []
+        self._explode = explode
+
+    def send(self, alert: Alert) -> None:
+        if self._explode:
+            raise RuntimeError("the transport is down")
+        self.sent.append(alert)
+
+
+class TestAnnouncingRecovery:
+    """F7. `data.staleness.recovered` was declared in the code and never fired:
+    data resumed at 18:52:26 on day 1 and nothing observed it. Even once it
+    fires, a log line is not an escalation — the halt it engaged reached a
+    phone, and the all-clear did not (docs/paper-week/day-1-review.md)."""
+
+    def build(
+        self, instants: list[datetime], alerts: RecordingAlerts
+    ) -> tuple[StalenessMonitor, FakeKillSwitch]:
+        watchdog = monitor(
+            max_silence_seconds=60,
+            kill_switch=FakeKillSwitch(),
+            clock=ScriptedClock(instants),
+            sleep=_no_sleep,
+            alerts=alerts,
+        )
+        return watchdog, FakeKillSwitch()
+
+    async def test_recovery_reaches_a_human(self) -> None:
+        alerts = RecordingAlerts()
+        watchdog, _ = self.build([MIDSESSION, MIDSESSION], alerts)
+        target = ingestor(last_message_at=MIDSESSION - timedelta(minutes=5))
+
+        with pytest.raises(_ClockExhaustedError):
+            await watchdog.watch(target)
+        # The feed comes back between polls.
+        target.stats.last_message_at = MIDSESSION
+        watchdog._clock = ScriptedClock([MIDSESSION])
+        with pytest.raises(_ClockExhaustedError):
+            await watchdog.watch(target)
+
+        assert [a.key for a in alerts.sent] == ["staleness.recovered"]
+        assert alerts.sent[0].severity is Severity.INFO
+
+    async def test_the_all_clear_says_the_halt_is_still_on(self) -> None:
+        """The watchdog deliberately never clears what it engaged, so an
+        operator who got the CRITICAL and then a bare 'recovered' would have no
+        way to tell 'still broken' from 'fixed itself, waiting for you'. On day
+        1 that gap was 2h37m."""
+        alerts = RecordingAlerts()
+        watchdog, _ = self.build([MIDSESSION], alerts)
+        target = ingestor(last_message_at=MIDSESSION - timedelta(minutes=5))
+        with pytest.raises(_ClockExhaustedError):
+            await watchdog.watch(target)
+        target.stats.last_message_at = MIDSESSION
+        watchdog._clock = ScriptedClock([MIDSESSION])
+
+        with pytest.raises(_ClockExhaustedError):
+            await watchdog.watch(target)
+
+        assert "still engaged" in alerts.sent[0].body
+
+    async def test_a_feed_that_never_broke_announces_nothing(self) -> None:
+        alerts = RecordingAlerts()
+        watchdog, _ = self.build([MIDSESSION] * 3, alerts)
+
+        with pytest.raises(_ClockExhaustedError):
+            await watchdog.watch(ingestor(last_message_at=MIDSESSION))
+
+        assert alerts.sent == []
+
+    async def test_a_broken_transport_does_not_stop_the_watchdog(self) -> None:
+        """It is still watching, and being wrong about `AlertSink` not raising
+        must not take down the thing that is."""
+        alerts = RecordingAlerts(explode=True)
+        watchdog, _ = self.build([MIDSESSION], alerts)
+        target = ingestor(last_message_at=MIDSESSION - timedelta(minutes=5))
+        with pytest.raises(_ClockExhaustedError):
+            await watchdog.watch(target)
+        target.stats.last_message_at = MIDSESSION
+        watchdog._clock = ScriptedClock([MIDSESSION])
+
+        with pytest.raises(_ClockExhaustedError):
+            await watchdog.watch(target)
