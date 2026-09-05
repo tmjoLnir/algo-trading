@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -25,8 +26,9 @@ from typing import Any
 
 import pytest
 
-from atp_api.auth import looks_like_bcrypt_hash, verify_password
+from atp_api.auth import hash_password, looks_like_bcrypt_hash, verify_password
 from atp_core.alerts import Severity
+from atp_core.audit.ports import Action
 from atp_core.config import Settings
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
 from atp_core.risk.limits import DEFAULT_RISK_LIMITS, RiskLimits
@@ -572,3 +574,224 @@ class TestTheRiskBudgetStatusPrints:
 
         assert limits == DEFAULT_RISK_LIMITS
         assert "not answering" in source
+
+
+class _RecordingSwitch:
+    """Enough kill switch to see what `halt.py` did, and no Redis.
+
+    The round trip is `RedisKillSwitch`'s to prove and it has its own tests
+    (`tests/integration/test_kill_switch.py`). What is worth asserting here is
+    the thing that lives in the script: whether it demanded a password before
+    it called `clear`, and what it wrote down afterwards.
+    """
+
+    def __init__(self, engaged: HaltRecord | None = None) -> None:
+        self.engaged_calls: list[dict[str, Any]] = []
+        self.cleared_calls: list[dict[str, Any]] = []
+        self._engaged = engaged
+
+    def engage(self, scope: HaltScope, reason: HaltReason, **kwargs: Any) -> HaltRecord:
+        self.engaged_calls.append({"scope": scope, "reason": reason, **kwargs})
+        return HaltRecord(
+            scope=scope,
+            reason=reason,
+            engaged_at=datetime(2024, 6, 3, 14, 30, tzinfo=UTC),
+            engaged_by=kwargs.get("engaged_by", ""),
+            detail=kwargs.get("detail", ""),
+            target=kwargs.get("target"),
+        )
+
+    def clear(self, scope: HaltScope, cleared_by: str, target: str | None = None) -> Any:
+        self.cleared_calls.append({"scope": scope, "cleared_by": cleared_by, "target": target})
+        return self._engaged
+
+    def active_halts(self) -> list[HaltRecord]:
+        return []
+
+
+#: Hashed once. bcrypt is deliberately slow, and these tests want the real
+#: credential check rather than a stub of it — the point of F9 is that the shell
+#: and the dashboard verify the same password against the same hash.
+_PASSWORD = "the-operator-password"
+_HASH = hash_password(_PASSWORD)
+
+
+def _gate(monkeypatch: pytest.MonkeyPatch, *, engaged: HaltRecord | None = None) -> Any:
+    """Wire `halt.py` to a fake switch and a recording audit sink."""
+    switch = _RecordingSwitch(engaged)
+    written: list[Any] = []
+    monkeypatch.setattr(
+        halt,
+        "get_settings",
+        lambda: Settings(
+            API_PASSWORD_HASH=_HASH,
+            API_USER="operator",
+            database_url="postgresql+asyncpg://nobody@127.0.0.1:1/none",
+        ),
+    )
+    monkeypatch.setattr(halt, "create_sync_redis", lambda _url: object())
+    monkeypatch.setattr(halt, "build_alert_sink", lambda _s: None)
+    monkeypatch.setattr(halt, "RedisKillSwitch", lambda *_a, **_k: switch)
+    monkeypatch.setattr(halt, "_record", lambda _settings, entry: written.append(entry))
+    switch.written = written  # type: ignore[attr-defined]
+    return switch
+
+
+class TestClearingIsGated:
+    """F9: the shell cleared a halt for anyone who could run it, while
+    docs/RUNBOOK.md said clearing asks for the password "wherever you do it"
+    (docs/paper-week/day-1-review.md)."""
+
+    def test_a_correct_password_clears_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        switch = _gate(monkeypatch)
+        monkeypatch.setattr(halt.getpass, "getpass", lambda _prompt: _PASSWORD)
+
+        assert halt.main(["clear", "--by", "jo"]) == 0
+        assert switch.cleared_calls == [
+            {"scope": HaltScope.GLOBAL, "cleared_by": "jo", "target": None}
+        ]
+
+    def test_a_wrong_password_leaves_trading_stopped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The refusal has to happen *before* the clear. A password checked
+        afterwards would be a password that did not stop anything."""
+        switch = _gate(monkeypatch)
+        monkeypatch.setattr(halt.getpass, "getpass", lambda _prompt: "not-it")
+
+        with pytest.raises(SystemExit, match="NOT resumed"):
+            halt.main(["clear", "--by", "jo"])
+
+        assert switch.cleared_calls == []
+
+    def test_an_empty_password_leaves_trading_stopped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pressing return at the prompt is not a password."""
+        switch = _gate(monkeypatch)
+        monkeypatch.setattr(halt.getpass, "getpass", lambda _prompt: "")
+
+        with pytest.raises(SystemExit, match="NOT resumed"):
+            halt.main(["clear", "--by", "jo"])
+
+        assert switch.cleared_calls == []
+
+    def test_an_unconfigured_hash_is_no_way_in_rather_than_a_free_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """docs/SAFETY.md's posture for the login form, applied here: with no
+        `API_PASSWORD_HASH` set, nothing is accepted rather than everything.
+        The message has to carry the next command, since an operator meets this
+        mid-incident."""
+        switch = _gate(monkeypatch)
+        monkeypatch.setattr(
+            halt,
+            "get_settings",
+            lambda: Settings(database_url="postgresql+asyncpg://nobody@127.0.0.1:1/none"),
+        )
+
+        with pytest.raises(SystemExit, match=re.escape("hash_password.py")):
+            halt.main(["clear", "--by", "jo"])
+
+        assert switch.cleared_calls == []
+
+    def test_engaging_still_asks_for_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The asymmetry is the design (docs/RISK.md): stopping is reflexive,
+        restarting is a decision. A prompt in front of a halt is the failure
+        this must not introduce, so it is asserted rather than assumed — the
+        stub raises if anything asks."""
+        switch = _gate(monkeypatch)
+
+        def refuse(_prompt: str) -> str:
+            raise AssertionError("engaging must never prompt for a password")
+
+        monkeypatch.setattr(halt.getpass, "getpass", refuse)
+
+        assert halt.main(["engage", "--by", "jo"]) == 0
+        assert switch.engaged_calls
+
+
+class TestTheAuditTrail:
+    """F9's second half: the record held resumes done through the API and
+    nothing else, so an incident stopped and resumed from the shell left no
+    trace on the audit tab at all."""
+
+    def test_engaging_writes_a_row_attributed_to_the_script(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ADR 0008: an actor the caller fills in is not an audit trail. Nothing
+        authenticated `--by`, so it travels in `detail` and the `actor` column
+        names the tool, which is the one attribution here that is true."""
+        switch = _gate(monkeypatch)
+
+        halt.main(["engage", "--by", "jo", "--detail", "feed looked wrong"])
+
+        entry = switch.written[-1]
+        assert entry.action == Action.HALT_ENGAGED
+        assert entry.actor == halt.SCRIPT_ACTOR
+        assert entry.detail["by"] == "jo"
+        assert entry.detail["detail"] == "feed looked wrong"
+
+    def test_clearing_writes_a_row_attributed_to_the_operator(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The password proved a person, so this row may name the account."""
+        switch = _gate(monkeypatch)
+        monkeypatch.setattr(halt.getpass, "getpass", lambda _prompt: _PASSWORD)
+
+        halt.main(["clear", "--by", "jo"])
+
+        entry = switch.written[-1]
+        assert entry.action == Action.HALT_CLEARED
+        assert entry.actor == "operator"
+        assert entry.detail["by"] == "jo"
+
+    def test_a_refused_password_is_recorded_before_it_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A wrong password against a resume is either a typo or somebody
+        working through guesses with access to the box, the two look identical
+        at the moment of refusal, and the login rate limiter only ever counted
+        attempts at the API's form."""
+        switch = _gate(monkeypatch)
+        monkeypatch.setattr(halt.getpass, "getpass", lambda _prompt: "not-it")
+
+        with pytest.raises(SystemExit):
+            halt.main(["clear", "--by", "jo"])
+
+        entry = switch.written[-1]
+        assert entry.action == Action.FORBIDDEN
+        assert entry.detail["reason"] == "step_up_failed"
+
+    def test_a_resume_says_which_halt_it_ended(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A resume and the engagement it answers are rows written hours apart,
+        often by different processes and sometimes by a trigger that wrote no
+        row at all. `engaged_at` is the only thing common to both, so without it
+        the pair cannot be joined even when both are present — which is what F9
+        means by an incident that cannot be read end to end."""
+        original = HaltRecord(
+            scope=HaltScope.GLOBAL,
+            reason=HaltReason.DATA_FEED_LOST,
+            engaged_at=datetime(2024, 6, 3, 14, 30, tzinfo=UTC),
+            engaged_by="worker",
+        )
+        switch = _gate(monkeypatch, engaged=original)
+        monkeypatch.setattr(halt.getpass, "getpass", lambda _prompt: _PASSWORD)
+
+        halt.main(["clear", "--by", "jo"])
+
+        detail = switch.written[-1].detail
+        assert detail["was_halted"] is True
+        assert detail["original_reason"] == "data_feed_lost"
+        assert detail["originally_engaged_by"] == "worker"
+        assert detail["originally_engaged_at"] == "2024-06-03T14:30:00+00:00"
+
+    def test_every_row_carries_the_correlation_id_of_its_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The key from a row on the audit tab to the log lines the same command
+        emitted. It needed no new field — `atp_core.logging` has bound one since
+        ADR 0013 and the audit row simply never carried it."""
+        switch = _gate(monkeypatch)
+
+        halt.main(["engage", "--by", "jo"])
+
+        assert switch.written[-1].detail["correlation_id"]

@@ -44,6 +44,19 @@ it, arming it demands the operator's password with the request, and every change
 is written to the audit log with its before and after. Turning it **off** asks
 for nothing — the same asymmetry `/risk/halt` has, and for the same reason.
 
+**Layer 6 stops new risk; it does not trap a position.** The kill switch refuses
+every order *except* one that can only make an existing holding smaller — a
+flatten, a take-profit exit, a protective stop. It refused those too until the
+paper week's first day found it (docs/paper-week/day-1-review.md, F3), and the
+cost of that is layer 5 in this same table: an entry that filled just before a
+halt had its protective child refused, so the position ended up with no stop
+anywhere and the two layers failed together. The carve-out is narrow. An order
+that would *reverse* a position rather than close it is still refused, because
+selling 250 against a long of 100 opens a short of 150, and that is new risk
+taken while the platform is stopped. "Do not trade on stale prices" is not this
+layer's job and is not weakened by any of it — `stale_data` refuses every order
+including exits, on the same chain.
+
 Layer 8 matters and is outside this codebase: **set position and loss limits in
 your broker's own controls too.** They are the only limits that still apply when
 this platform is the thing that is broken.
@@ -189,10 +202,16 @@ step-up is recorded too, as `forbidden` with `step_up_failed`: a wrong password
 against `/resume` is either a typo or somebody working through guesses with a
 stolen cookie, and the rate limiter only ever counted attempts at the login
 form. It does **not** yet record order flow or strategy-lifecycle changes: those
-handlers are stubs, and a write behind a stub is dead code. Nor does it see
-halts from `scripts/halt.py` or from the risk layer's own triggers, which have
-no session to attribute a row to — so an absent row means "not done from the
-dashboard", never "not done". Both halves: ADR 0010.
+handlers are stubs, and a write behind a stub is dead code. `scripts/halt.py`
+now writes both halves too, best-effort — a database that cannot be reached
+loses the row and never the halt — with `actor` set to the operator account on
+a `clear`, which proved a password, and to the script's own name on an `engage`,
+which proved nothing and must not put an unverified name in the `actor` column
+(ADR 0008). What the record still does not see is the risk layer's own automated
+triggers, which have no session to attribute a row to — so an absent row now
+means "not done by a human at either door", never "not done". Every one of these
+rows carries the `correlation_id` of the request or command that wrote it, which
+is the key from the Audit page to the log lines around it. Both halves: ADR 0010.
 
 **Still missing, and still Phase 6:** sessions cannot be revoked before they
 expire. Do not read "the API authenticates, authorises and records" as "this is

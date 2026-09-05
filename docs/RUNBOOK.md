@@ -25,8 +25,13 @@ money.
 > demands the account password in the body — stopping stays reflexive, restarting
 > stays a decision, and a read-only session may halt but may not resume.
 > `clear --by <name>` does the same job from the shell and is what you fall back
-> to when the page will not load. `scripts/halt.py status` says what is halted
-> and exits 2 when anything is.
+> to when the page will not load: it prompts for the same account password and
+> checks it against the same hash. It did not, for a while, and this paragraph
+> was the claim that made the gap worth finding — `scripts/halt.py clear` cleared
+> a halt for anyone who could run it (docs/paper-week/day-1-review.md, F9). The
+> password is prompted for rather than passed as a flag, so it stays out of shell
+> history and out of `ps`. `scripts/halt.py status` says what is halted and exits
+> 2 when anything is, and still asks for nothing.
 >
 > **Clearing one halt is not clearing all of them.** A halt is keyed on scope
 > and target, so resuming the global halt leaves a symbol halt standing. The
@@ -627,10 +632,15 @@ value loads" to.
 **Nothing about the book changed while this was happening.** The API could not
 read the database, so it wrote nothing to it either; positions, stops and the
 halt state are whatever they were, and broker-side stops are held by the venue
-regardless. `scripts/halt.py` reads Redis and the venue, not Postgres, so it is
-unaffected, and `uv run python scripts/halt.py engage --by "<your name>" --detail
-"postgres outage"` is available if you would have halted anyway (`--by` is
-required — the halt is attributed).
+regardless. `scripts/halt.py` halts through Redis and the venue, not Postgres, so
+it still works, and `uv run python scripts/halt.py engage --by "<your name>"
+--detail "postgres outage"` is available if you would have halted anyway (`--by`
+is required — the halt is attributed). It now *attempts* one Postgres write on
+the way past — the audit row — and that write can never block the halt: it is
+swallowed and logged as `audit.write_failed` at CRITICAL, on the principle that
+a platform which declined to stop trading over an unreachable database would
+have its failure modes exactly inverted (`atp_core.audit.ports`). So during this
+fault you get the halt and a warning on stderr saying the row did not land.
 
 > **This section used to say `scripts/status.py` was unaffected too, and that
 > was wrong.** It reads Redis *and* Postgres — the bars section is a database

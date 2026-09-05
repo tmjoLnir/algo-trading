@@ -2513,11 +2513,21 @@ has met a database holding a real strategy's history.
   at all — and the same change closed a gap the record had been claiming to
   cover since ADR 0009: a failed step-up now writes `forbidden` with
   `step_up_failed`, where before a wrong password on `/resume` or
-  `/flatten-all` left no trace anywhere. Halts from `scripts/halt.py` and from
-  the risk layer's own triggers are still absent from the record, and
-  attributing those needs an identity the record can stand behind rather than
-  another constant. The table's docstring is still the optimistic document and
-  this item is the honest one.
+  `/flatten-all` left no trace anywhere. Halts from `scripts/halt.py` now reach
+  the record too, both halves, after the paper week's first day found that an
+  incident stopped and resumed from the shell left no trace at all
+  (docs/paper-week/day-1-review.md, F9). The identity question this item raised
+  is what decided their shape rather than being waved past: a `clear` proves the
+  account password now, so it is attributed to the operator; an `engage` proves
+  nothing by design, so it is attributed to the script by name and the `--by`
+  label sits in `detail`, which keeps an unverified name out of the `actor`
+  column (ADR 0008). Rows from both doors carry the `correlation_id` of the
+  request or command that wrote them, so a row on the Audit page joins to the log
+  lines around it. **The risk layer's own automated triggers are still absent**,
+  and that half is unchanged: they have no session and no operator, and the
+  identity the record could stand behind for them has still not been settled.
+  The table's docstring is still the optimistic document and this item is the
+  honest one.
 
   Two rules the design turns on. A failed audit *write* never fails the action —
   the actions worth auditing include halting trading, and refusing to stop

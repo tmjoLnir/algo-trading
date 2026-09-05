@@ -104,11 +104,14 @@ ATR(14).
   additive rather than cancel-and-replace: replacing opens an unprotected window
   between the cancel landing and the replacement being acknowledged, and the
   cancel can lose the race outright.
-- **A protective stop can be refused.** Four of the nine rules judge the order
-  rather than whether it reduces a position, so the kill switch, trading hours,
-  the rate limit and stale data can each block one; two more block it whenever
-  another holding is unmarked. Only the daily loss limit, buying power and the
-  open-position cap can never refuse one. The router reports a refusal as an
+- **A protective stop can be refused.** Three of the nine rules judge the order
+  rather than whether it reduces a position, so trading hours, the rate limit and
+  stale data can each block one; two more block it whenever another holding is
+  unmarked. Only the daily loss limit, buying power, the open-position cap and
+  the kill switch can never refuse one. The kill switch was in the first list
+  until the exit carve-out — a halt refusing the protective child of an entry
+  that had just filled was SAFETY.md's layers 6 and 5 failing together
+  (docs/paper-week/day-1-review.md, F3). The router reports a refusal as an
   unprotected quantity and logs `CRITICAL` rather than exempting the order —
   see docs/RUNBOOK.md, "Position open with no stop".
 - **A stop the market has already passed is not placed.** Submitted, it is a
@@ -249,8 +252,17 @@ roadmap rather than in the skeleton.
 
 ## The kill switch
 
-Halts everything. Engaging needs no confirmation — hesitation is the expensive
-part. Clearing requires a named human and is audit-logged.
+Halts everything *new*. Engaging needs no confirmation — hesitation is the
+expensive part. Clearing requires a named human, asks for the account password at
+both doors (the dashboard's `Resume…` and `scripts/halt.py clear`), and is
+audit-logged.
+
+**An order that can only reduce a holding still goes through.** A flatten, a
+take-profit exit and a protective stop are how exposure comes *down*, and a halt
+that refused them stopped the platform reducing risk as well as taking it — see
+"Halting is not flattening" below, which is the line the carve-out restores.
+An order that would reverse a position rather than close it is not a reduction
+and is still refused.
 
 Auto-engages on: daily loss limit breach, reconciliation mismatch, data feed
 loss, broker unreachable, a rate-limit storm, repeated unhandled exceptions.

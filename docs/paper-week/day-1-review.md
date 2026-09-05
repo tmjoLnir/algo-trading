@@ -451,11 +451,34 @@ order in production. The configured ceilings are untested numbers.
 
 ## 7. Before day 2 runs
 
-> **Status.** The four P0 items are fixed in code. The sections above are left as
-> they were written — they describe what day 1 did, and that does not change.
-> `METRICS_TOKEN` in item 3 is the one part no commit can discharge: it is a
-> deployment secret, and it still has to be set on the host before day 2. The
-> P1 and P2 items below are open.
+> **Status.** The four P0 items are fixed in code, and so are **F3** and **F9**
+> from the P1 list. The sections above are left as they were written — they
+> describe what day 1 did, and that does not change. `METRICS_TOKEN` in item 3 is
+> the one part no commit can discharge: it is a deployment secret, and it still
+> has to be set on the host before day 2. The rest of P1, and all of P2, are
+> open.
+>
+> **F3** took the first of the two options it offered. `KillSwitchRule` now
+> permits an order that can only make a holding smaller — a flatten, a
+> take-profit exit, a protective stop — and still refuses one that would reverse
+> a position, which would be new risk taken while the platform is stopped.
+> docs/SAFETY.md's own incident response is what decided it: "Halting stops new
+> risk; flattening realises existing P&L." Refusing exits did both. The
+> data-outage half of that sentence is unaffected — `stale_data` refuses every
+> order including exits, on the same chain, so a feed halt still cannot dump the
+> book into a market nobody can see.
+>
+> **F9** is gated and recorded. `scripts/halt.py clear` now prompts for the
+> account password and checks it against the same hash `POST /risk/resume` does,
+> so docs/RUNBOOK.md's "clearing asks for the password, wherever you do it" is
+> true rather than aspirational. Both commands write an audit row, best-effort:
+> the halt is attributed to the script rather than to `--by`, because nothing
+> authenticated that name and ADR 0008 keeps unverified names out of the `actor`
+> column; the resume may name the operator account, because the password proved
+> one. Every row carries the `correlation_id` of its run, and a resume carries
+> the `engaged_at` of the halt it ended — the two joins the finding said were
+> missing. The risk layer's own automated triggers still write no row, which is
+> the remaining half of the gap and is not this change.
 
 **P0 — blocking**
 
@@ -472,9 +495,10 @@ order in production. The configured ceilings are untested numbers.
 7. **F7** — seed the staleness clock from the last bar; emit `staleness.recovered`.
 8. **F4/F8** — read halt state at boot; make the halt reminder durable; alert on
    `worker.halted`; add an end-of-session summary.
-9. **F3** — give `KillSwitchRule` an exit carve-out, or state explicitly that a halt freezes
-   exits too.
-10. **F9** — gate `scripts/halt.py --clear` behind the same checks as the API, and audit it.
+9. ~~**F3** — give `KillSwitchRule` an exit carve-out, or state explicitly that a halt freezes
+   exits too.~~ **Done** — carve-out, narrowed to orders that cannot reverse a position.
+10. ~~**F9** — gate `scripts/halt.py --clear` behind the same checks as the API, and audit it.~~
+    **Done** — step-up password on `clear`, audit rows on both halves, correlation ids on each.
 11. **F10** — implement `rollover_daily_counters` (a risk guardrail), then the daily report.
 
 **P2 — decide and document**

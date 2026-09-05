@@ -158,17 +158,77 @@ def _unpriced_book(rule: str, portfolio: Portfolio) -> RiskDecision | None:
 
 @dataclass(slots=True)
 class KillSwitchRule:
-    """Refuses everything while the platform-wide halt is engaged.
+    """Refuses everything while a halt covering this order is engaged — except
+    an order that can only make the position smaller.
 
     First in the chain: when a human hits stop, nothing else should get a vote.
+
+    **The exit carve-out is the whole of the subtlety, and it exists because
+    refusing exits did more than halting is for.** docs/SAFETY.md's incident
+    response draws the line — "Halting stops new risk; flattening realises
+    existing P&L" — and a rule that refused every order froze the platform's
+    ability to *reduce* risk as well, while leaving the position on. The same
+    document's layer 5 is "broker-side stops on every position", and it fails
+    when the stop is "never placed after the entry fill": an entry that filled
+    just before a halt has its protective child refused here, so the position
+    ends up with no stop anywhere and layers 5 and 6 fail together. Day 1 of the
+    paper week held a global halt for 2h37m and survived it only because the
+    book was empty throughout (docs/paper-week/day-1-review.md, F3).
+
+    Whether an order is an exit is `reduces_position`, not a property of the
+    order: a sell is an exit when you are long and an entry when you are flat.
+    `DailyLossLimitRule` and `BuyingPowerRule` already turn on that same
+    question, and `OrderRouter.submit_protective_orders` documents the contract
+    that makes the answer trustworthy — the fill is folded into the `Position`
+    before the stop is submitted, so a protective child reduces something the
+    chain can see.
+
+    **A reversal is not an exit, and here that distinction is load-bearing.**
+    `reduces_position` deliberately counts an order larger than the position it
+    opposes, because refusing one would trap the very position
+    `DailyLossLimitRule` is trying to let go of. A halt asks a different
+    question. Selling 100 against a long of 60 closes the long and *opens a
+    short of 40* — new risk, taken while the platform is stopped — so this rule
+    is stricter than the helper it shares and takes the size into account too.
+    Nothing legitimate is refused by that: `flatten` sizes at exactly
+    `abs(position.qty)`, and a protective child is capped at the exposure held.
+
+    **Deliberately blind to `HaltReason`.** Letting exits through on a `manual`
+    halt but not on `data_feed_lost` would put a market-data judgement inside
+    the one rule that exists to be a single boolean — and it would be the wrong
+    place for it. `StaleDataRule` refuses *every* order on a quote past
+    `max_quote_age_seconds`, exits included, and runs on this same chain. "Do
+    not trade on stale prices" is already enforced by the rule whose job it is,
+    so a data-feed halt still cannot dump the book into a market nobody can see.
+
+    **Not a second door.** `OrderRouter.flatten` still goes through `submit()`
+    and still meets the whole chain (ADR 0005). This widens one rule; it does
+    not add a bypass. An exit refused for stale data, trading hours or a rate
+    limit still comes back naming that rule.
     """
 
     switch: KillSwitch
     name: str = "kill_switch"
 
     def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
-        if self.switch.is_engaged(order.strategy_id, order.symbol):
+        if not self.switch.is_engaged(order.strategy_id, order.symbol):
+            return RiskDecision.allow()
+
+        if not reduces_position(order, portfolio):
             return RiskDecision.deny(self.name, "trading is halted")
+
+        # `reduces_position` is true only for a symbol holding a non-flat
+        # position, so the lookup cannot miss. Indexed rather than
+        # `portfolio.position()`, which is a `setdefault` and would insert into
+        # a book this rule is only reading.
+        held = abs(portfolio.positions[order.symbol].qty)
+        if order.qty > held:
+            return RiskDecision.deny(
+                self.name,
+                f"trading is halted — {order.qty} against {held} held in "
+                f"{order.symbol} would reverse the position rather than close "
+                f"it, and a halt permits only what reduces",
+            )
         return RiskDecision.allow()
 
 
