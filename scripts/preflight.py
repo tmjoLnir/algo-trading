@@ -116,6 +116,7 @@ async def main(argv: list[str] | None = None) -> int:
         preflight.check_strategy(config),
         preflight.check_stop_config(config),
         preflight.check_alert_transport(settings),
+        preflight.check_metrics_token(settings),
     ]
     checks.extend(await _local_checks(settings, config, timeframe))
     checks.extend(await _venue_checks(settings, config, timeframe, skip=args.no_broker))

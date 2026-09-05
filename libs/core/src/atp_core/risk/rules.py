@@ -27,6 +27,20 @@ if TYPE_CHECKING:
     from atp_core.risk.limits import RiskLimits
 
 
+#: The names of the two rules whose refusals escalate to a halt, defined once
+#: and used three ways: as the rule's own `name`, as the `rule` a `RiskDecision`
+#: carries, and as the `engaged_by` on the halt that results.
+#:
+#: One string rather than three literals, because the escalation is a *string
+#: comparison* — `StrategyRunner._escalate` matches on `decision.rule`, and
+#: `scheduler.rollover_daily_counters` matches on `engaged_by` to decide what it
+#: may release. Spelled separately, renaming a rule would silently stop the
+#: escalation and silently strand every halt it had already engaged, with
+#: nothing failing to say so.
+DAILY_LOSS_RULE = "daily_loss_limit"
+RATE_LIMIT_RULE = "rate_limit"
+
+
 def reduces_position(order: Order, portfolio: Portfolio) -> bool:
     """Whether this order shrinks the holding it touches.
 
@@ -316,7 +330,7 @@ class DailyLossLimitRule:
     order: a sell is an exit when you are long and an entry when you are flat.
     """
 
-    name: str = "daily_loss_limit"
+    name: str = DAILY_LOSS_RULE
     #: Equity at the session's open. Anchored by whoever owns the session
     #: boundary, and persisted there so a mid-session restart does not re-anchor
     #: to a drawn-down number and silently grant the day a second allowance.
@@ -366,7 +380,7 @@ class RateLimitRule:
     """
 
     clock: Clock
-    name: str = "rate_limit"
+    name: str = RATE_LIMIT_RULE
     #: Submission times inside the trailing minute, oldest first.
     _recent: deque[datetime] = field(default_factory=deque, repr=False)
 

@@ -266,6 +266,19 @@ and is still refused.
 
 Auto-engages on: daily loss limit breach, reconciliation mismatch, data feed
 loss, broker unreachable, a rate-limit storm, repeated unhandled exceptions.
+Every one of those is wired to a caller; the last two to arrive were the daily
+loss limit and the rate-limit storm, which this sentence had promised since the
+initial commit while nothing engaged either (docs/paper-week/day-1-review.md,
+F10).
+
+**The daily-loss halt clears itself at the next session open**, and it is the
+only halt in the platform that does. The limit measures *today*, so its halt is
+meaningless tomorrow — and a platform that needed a human every morning after a
+bad day would teach that human to clear halts without reading them, which is
+what the asymmetry above exists to prevent. `rollover_daily_counters` releases
+it narrowly: that reason only, engaged by the risk chain and not by a person who
+picked the same reason, and only when it was engaged before today's session.
+Nothing else halted is touched, so a feed halt standing beside it survives.
 
 **Fails closed.** The switch lives in Redis so that the API can trip it while
 the worker is mid-loop, and so that it survives a restart — a switch that

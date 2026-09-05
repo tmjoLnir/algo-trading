@@ -32,9 +32,11 @@ from atp_core.clock import SimulatedClock, TradingCalendar
 from atp_core.domain import Order, OrderType, Portfolio, Position, Side
 from atp_core.execution.reconciliation import Reconciler
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
+from atp_core.risk.rules import DAILY_LOSS_RULE
 from atp_worker.runner import RunnerStats
 from atp_worker.scheduler import (
     MAX_SLEEP_SECONDS,
+    ROLLOVER_ACTOR,
     SCHEDULE,
     SESSION_SCAN_DAYS,
     SessionJobs,
@@ -44,6 +46,7 @@ from atp_worker.scheduler import (
     next_due,
     reconcile_with_broker,
     remind_about_halts,
+    rollover_daily_counters,
     run_scheduler,
     summarise_the_session,
 )
@@ -234,7 +237,7 @@ class TestRunning:
         assert max(clock.sleeps) <= MAX_SLEEP_SECONDS
 
     async def test_an_unimplemented_job_is_tried_once_and_left_alone(self) -> None:
-        """Three of the four entries in `SCHEDULE` are still stubs. Retrying
+        """Two of the three entries in `SCHEDULE` are still stubs. Retrying
         them every interval would bury the log in one repeated traceback — and
         this is not a failure, it is a job nobody has built."""
         calls: list[int] = []
@@ -600,3 +603,102 @@ class TestSchedulingTheEscalations:
         names = [_job_name(e) for e in build_schedule(None)]
 
         assert names == [_job_name(e) for e in SCHEDULE]
+
+
+class TestTheDailyLossRollover:
+    """F10. The stub promised three things; two were already being done
+    elsewhere, and the third could not be built because nothing ever engaged a
+    daily-loss halt to clear (docs/paper-week/day-1-review.md)."""
+
+    @staticmethod
+    def _halt(**overrides: Any) -> FakeKillSwitch:
+        switch = FakeKillSwitch()
+        fields: dict[str, Any] = {
+            "scope": HaltScope.GLOBAL,
+            "reason": HaltReason.DAILY_LOSS_LIMIT,
+            "engaged_at": datetime(2024, 6, 2, 19, 30, tzinfo=UTC),  # yesterday
+            "engaged_by": DAILY_LOSS_RULE,
+            "target": None,
+        }
+        fields.update(overrides)
+        switch.halts = [HaltRecord(**fields)]
+        return switch
+
+    async def test_yesterdays_daily_loss_halt_is_released(self) -> None:
+        switch = self._halt()
+        watch, alerts = _watch(switch)
+
+        await rollover_daily_counters(watch)
+
+        assert switch.clears == [(str(HaltScope.GLOBAL), ROLLOVER_ACTOR, None)]
+        assert alerts.sent[0].severity is Severity.INFO
+
+    async def test_a_halt_breached_today_is_kept(self) -> None:
+        """A limit hit this morning is not yesterday's halt, and clearing it
+        would hand the day a second allowance against a drawn-down account."""
+        switch = self._halt(engaged_at=datetime.now(UTC))
+        watch, _ = _watch(switch)
+
+        await rollover_daily_counters(watch)
+
+        assert switch.clears == []
+
+    async def test_a_manual_halt_is_never_touched(self) -> None:
+        """The narrowness is the whole defence. docs/RISK.md is explicit that
+        clearing is deliberate where engaging is reflexive, and this is the only
+        automated clear in the platform."""
+        switch = self._halt(reason=HaltReason.MANUAL, engaged_by="jo")
+        watch, _ = _watch(switch)
+
+        await rollover_daily_counters(watch)
+
+        assert switch.clears == []
+
+    async def test_a_daily_loss_reason_a_human_chose_is_not_touched_either(self) -> None:
+        """`scripts/halt.py --reason daily_loss_limit` is a person's decision.
+        Only a halt the risk chain itself engaged is released here."""
+        switch = self._halt(engaged_by="jo")
+        watch, _ = _watch(switch)
+
+        await rollover_daily_counters(watch)
+
+        assert switch.clears == []
+
+    async def test_a_feed_halt_standing_beside_it_survives(self) -> None:
+        """Releasing the loss halt must not resume trading through an outage."""
+        switch = self._halt()
+        switch.halts.append(
+            HaltRecord(
+                scope=HaltScope.GLOBAL,
+                reason=HaltReason.DATA_FEED_LOST,
+                engaged_at=datetime(2024, 6, 2, 19, 45, tzinfo=UTC),
+                engaged_by="staleness_monitor",
+            )
+        )
+        watch, _ = _watch(switch)
+
+        await rollover_daily_counters(watch)
+
+        assert len(switch.clears) == 1, "only the daily-loss halt is released"
+
+    async def test_nothing_halted_is_a_no_op(self) -> None:
+        watch, alerts = _watch()
+
+        await rollover_daily_counters(watch)
+
+        assert alerts.sent == []
+
+    def test_it_runs_before_the_open(self) -> None:
+        """So a halt released here is released while nothing is trading."""
+        watch, _ = _watch()
+        job = next(
+            e for e in build_schedule(None, watch) if _job_name(e) == "rollover_daily_counters"
+        )
+
+        assert job["trigger"] == "market_open"
+        assert job["offset_minutes"] == -5
+
+    def test_it_is_no_longer_a_dormant_stub(self) -> None:
+        """It sat in `SCHEDULE` raising `NotImplementedError`, so the driver
+        marked it dormant after one attempt and it never ran again."""
+        assert "rollover_daily_counters" not in [_job_name(e) for e in SCHEDULE]

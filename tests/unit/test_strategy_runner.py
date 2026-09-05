@@ -44,11 +44,18 @@ from atp_core.execution.idempotency import FLATTEN, STOP_LOSS, TAKE_PROFIT, TIME
 from atp_core.execution.reconciliation import ReconciliationReport
 from atp_core.execution.router import ProtectionResult, SubmitResult
 from atp_core.risk.engine import RiskDecision, RiskEngine, backtest_rules
+from atp_core.risk.killswitch import HaltReason, HaltScope
 from atp_core.risk.limits import DEFAULT_RISK_LIMITS
+from atp_core.risk.rules import DAILY_LOSS_RULE
 from atp_core.risk.stops import StopConfig, StopManager
 from atp_core.strategy.base import Strategy
 from atp_core.strategy.rules import PositionSizeSpec
-from atp_worker.runner import MAX_CONSECUTIVE_ERRORS, LiveContext, StrategyRunner
+from atp_worker.runner import (
+    MAX_CONSECUTIVE_ERRORS,
+    RATE_LIMIT_STORM_REFUSALS,
+    LiveContext,
+    StrategyRunner,
+)
 from tests.fakes import (
     FakeKillSwitch,
     FakeOrderRepository,
@@ -208,6 +215,13 @@ class FakeRouter:
         self.flatten_purposes: list[str] = []
         self.protected: list[Order] = []
         self.refuse_signals = False
+        #: Which rule the refusal names, for the escalation tests. Default keeps
+        #: every existing test on the anonymous rule they were written against.
+        self.refuse_rule = "a_rule"
+        #: Return `no_action` instead of a refusal — an approved decision with
+        #: nothing submitted, which is what an exit for an already-flat position
+        #: produces and which must never count as a risk rejection (F14).
+        self.no_action = False
         self.refuse_protection = False
         #: What the venue is holding, by symbol. The runner asks before acting
         #: on an engine-side stop, so a fake that could not answer would let
@@ -269,8 +283,10 @@ class FakeRouter:
         self.pending_seen.append(list(pending))
         self.signals.append(signal)
         side = Side.BUY if signal.action is SignalAction.ENTER_LONG else Side.SELL
+        if self.no_action:
+            return SubmitResult.no_action(f"{signal.symbol}: already flat")
         if self.refuse_signals:
-            return self._refused(signal.symbol, side, "a_rule", "nope")
+            return self._refused(signal.symbol, side, self.refuse_rule, "nope")
         return SubmitResult(
             order=self._order(signal.symbol, side), decision=RiskDecision.allow(), submitted=True
         )
@@ -1888,3 +1904,129 @@ class TestAStrategyAskingForAnotherSeries:
                 context.history(SYMBOL, Timeframe.D1, 1)
 
         assert len([e for e in events if e["event"] == "runner.timeframe_mismatch"]) == 1
+
+
+class TestEscalatingARefusal:
+    """F10. docs/RISK.md has always said the kill switch "auto-engages on: daily
+    loss limit breach, ... a rate-limit storm", and nothing ever did — both were
+    `HaltReason` values with no writer, so a platform that hit its daily loss
+    limit spent the rest of the session silently refusing every entry
+    (docs/paper-week/day-1-review.md)."""
+
+    @staticmethod
+    async def _refuse(rule: str, *, times: int = 1) -> FakeKillSwitch:
+        strategy = ScriptedStrategy(dict.fromkeys(range(times), SignalAction.ENTER_LONG))
+        runner, router, switch, _, portfolio, _ = build(
+            strategy, bars=[bar(0)], signal_limit=times + 1
+        )
+        router.refuse_signals = True
+        router.refuse_rule = rule
+        await runner.warmup(portfolio)
+        for i in range(1, times + 1):
+            close_bar(runner, bar(i))
+            await runner.evaluate(portfolio)
+        return switch
+
+    @pytest.mark.asyncio
+    async def test_a_daily_loss_refusal_halts_on_the_first_one(self) -> None:
+        """Refusing entries was never the missing part — `DailyLossLimitRule`
+        did that correctly. What was missing is that the operator was not told,
+        and a halt is how this platform says something out loud: it alerts, it
+        is repeated every fifteen minutes while it stands, and it shows on the
+        banner. None of those reach a `RiskDecision`."""
+        switch = await self._refuse("daily_loss_limit")
+
+        assert switch.engagements
+        (scope, reason, actor, _) = switch.engagements[0]
+        assert reason == str(HaltReason.DAILY_LOSS_LIMIT)
+        assert scope == str(HaltScope.GLOBAL)
+        assert actor == DAILY_LOSS_RULE
+
+    @pytest.mark.asyncio
+    async def test_one_rate_limit_refusal_is_a_busy_minute_not_a_storm(self) -> None:
+        """`RateLimitRule`'s cap is per-minute, so hitting it once is a
+        legitimate burst. Halting the platform for one would be worse than the
+        silence it replaces."""
+        switch = await self._refuse("rate_limit", times=1)
+
+        assert switch.engagements == []
+
+    @pytest.mark.asyncio
+    async def test_a_run_of_them_is_the_runaway_loop_the_rule_names(self) -> None:
+        switch = await self._refuse("rate_limit", times=RATE_LIMIT_STORM_REFUSALS)
+
+        assert switch.engagements
+        assert switch.engagements[0][1] == str(HaltReason.RATE_LIMIT_STORM)
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_refusal_between_them_ends_the_run(self) -> None:
+        """A storm is *consecutive*. One rate-limit refusal among ordinary ones
+        is a busy minute, and counting them cumulatively would eventually halt
+        any long-running worker."""
+        strategy = ScriptedStrategy(dict.fromkeys(range(8), SignalAction.ENTER_LONG))
+        runner, router, switch, _, portfolio, _ = build(strategy, bars=[bar(0)], signal_limit=10)
+        router.refuse_signals = True
+        await runner.warmup(portfolio)
+
+        for i in range(8):
+            router.refuse_rule = "rate_limit" if i % 2 == 0 else "max_position_size"
+            close_bar(runner, bar(i))
+            await runner.evaluate(portfolio)
+
+        assert switch.engagements == [], "no run of five ever formed"
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_refusal_does_not_halt(self) -> None:
+        """Most refusals are the chain working. `max_position_size` declining an
+        oversized entry is not an incident."""
+        switch = await self._refuse("max_position_size")
+
+        assert switch.engagements == []
+
+
+class TestNoActionIsNotARejection:
+    """F14. `SubmitResult.no_action` builds an *approved* decision precisely so
+    a HOLD-shaped outcome does not inflate `orders_rejected_by_risk` — the
+    number an operator reads to decide whether the risk config is too tight —
+    and then the runner counted every unsubmitted result alike, so it did
+    anyway (docs/paper-week/day-1-review.md)."""
+
+    @pytest.mark.asyncio
+    async def test_it_is_not_counted_as_refused_by_risk(self) -> None:
+        strategy = ScriptedStrategy({0: SignalAction.EXIT})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+        router.no_action = True
+        await runner.warmup(portfolio)
+
+        close_bar(runner, bar(1))
+        await runner.evaluate(portfolio)
+
+        assert runner.stats.orders_rejected_by_risk == 0
+
+    @pytest.mark.asyncio
+    async def test_a_real_refusal_still_is(self) -> None:
+        """The control. Suppressing the counter entirely would trade one wrong
+        number for another."""
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+        router.refuse_signals = True
+        await runner.warmup(portfolio)
+
+        close_bar(runner, bar(1))
+        await runner.evaluate(portfolio)
+
+        assert runner.stats.orders_rejected_by_risk == 1
+
+    @pytest.mark.asyncio
+    async def test_a_no_action_never_escalates_to_a_halt(self) -> None:
+        """It carries an *approved* decision whose `rule` is `no_action`, so
+        nothing about it should reach the escalation path."""
+        strategy = ScriptedStrategy({0: SignalAction.EXIT})
+        runner, router, switch, _, portfolio, _ = build(strategy, bars=[bar(0)])
+        router.no_action = True
+        await runner.warmup(portfolio)
+
+        close_bar(runner, bar(1))
+        await runner.evaluate(portfolio)
+
+        assert switch.engagements == []

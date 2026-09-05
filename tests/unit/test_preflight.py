@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from pydantic import SecretStr
 
 from atp_core.config import Settings
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
@@ -200,6 +201,82 @@ class TestTheExpensiveFailures:
         )
         assert check.status is Status.PASS
         assert "under the 10% cap" in check.detail
+
+    def test_a_minute_timeframe_is_told_to_re_derive_rather_than_given_a_zero(self) -> None:
+        """F11, and the bug the message had in exactly its own case.
+
+        Day 1's `risk_pct 0.0015` is survivable on daily bars — 15 shares, 7.5%
+        of equity — and asks for over 400% of the account on the minute bars the
+        platform was actually ingesting, because a 2xATR stop on a minute bar is
+        cents wide. The fraction that *would* fit is about 0.000036, which the
+        old `:.4f` rendered as `about 0.0000 fits`. An operator following that
+        hint would enter 0, which `position_size` refuses outright
+        (docs/paper-week/day-1-review.md, F11).
+        """
+        check = preflight.check_sizing_is_reachable(
+            config(sizing_method="risk_pct", sizing_value=Decimal("0.0015")),
+            RiskLimits(),
+            equity=Decimal(100_000),
+            price=Decimal(500),
+            # 2 x a minute-scale ATR: 18 cents, against $10 on the daily series.
+            stop_price=Decimal("499.82"),
+        )
+
+        assert check.status is Status.FAIL
+        assert "0.0000 fits" not in check.fix, "the hint must never round to zero"
+        assert "re-derive the sizing for the timeframe" in check.fix
+        assert "fixed_qty" in check.fix
+
+    def test_the_same_sizing_on_a_daily_stop_is_fine(self) -> None:
+        """The control for the case above: nothing is wrong with the *fraction*,
+        which is why telling the operator to shrink it further is the wrong
+        advice. It is being applied to the wrong stop distance."""
+        check = preflight.check_sizing_is_reachable(
+            config(sizing_method="risk_pct", sizing_value=Decimal("0.0015")),
+            RiskLimits(),
+            equity=Decimal(100_000),
+            price=Decimal(500),
+            stop_price=Decimal(490),  # 2 x a daily ATR of ~$5
+        )
+
+        assert check.status is Status.PASS
+
+    def test_a_size_that_merely_overshoots_still_gets_a_usable_number(self) -> None:
+        """The message only changes shape below one basis point. A sizing that
+        is simply a bit too large is still answered with the number that fits."""
+        check = preflight.check_sizing_is_reachable(
+            config(sizing_method="risk_pct", sizing_value=Decimal("0.01")),
+            RiskLimits(),
+            equity=Decimal(100_000),
+            price=Decimal("96.76"),
+            stop_price=Decimal("93.49"),
+        )
+
+        assert check.status is Status.FAIL
+        assert "lower the sizing value" in check.fix
+        assert "re-derive" not in check.fix
+
+
+class TestTheMetricsToken:
+    """F1 and F8. `METRICS_TOKEN` was unset on all six boots of day 1, so ~390
+    evaluations exported nothing and `atp_halt_active` was uncollectable through
+    a 2h37m halt — and the command that answers "is this ready for a week?" did
+    not ask (docs/paper-week/day-1-review.md)."""
+
+    def test_a_configured_token_passes(self) -> None:
+        settings = Settings(METRICS_TOKEN=SecretStr("a-real-token"))
+
+        assert preflight.check_metrics_token(settings).status is Status.PASS
+
+    def test_an_unset_token_warns_rather_than_failing(self) -> None:
+        """Metrics are not a safety layer — docs/SAFETY.md says so, every
+        guardrail acts on its own, and alerting reaches a phone by a path that
+        does not go through Prometheus. A week without a scraper is worth being
+        told about and is not worth refusing."""
+        check = preflight.check_metrics_token(Settings(METRICS_TOKEN=SecretStr("")))
+
+        assert check.status is Status.WARN
+        assert check.fix is not None and "METRICS_TOKEN" in check.fix
 
     def test_risk_pct_with_no_derivable_stop_is_the_refusal_it_will_produce(self) -> None:
         """`position_size` refuses to invent a stop, and this reports that

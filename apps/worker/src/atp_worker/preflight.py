@@ -297,6 +297,37 @@ def check_alert_transport(settings: Settings) -> Check:
 # ── what the week will actually run on ──────────────────────────────────────
 
 
+def check_metrics_token(settings: Settings) -> Check:
+    """Is anything able to collect what this platform exports?
+
+    **This is the check that was missing when it was needed.** `METRICS_TOKEN`
+    was unset on all six boots of day 1, so the worker's metrics server refused
+    to start, `atp_strategy_evaluations_total` never exported across ~390 silent
+    evaluations, and `atp_halt_active` — the one continuous signal that would
+    have said the platform was still halted — was uncollectable for the whole
+    2h37m (docs/paper-week/day-1-review.md, F1 and F8). The command that answers
+    "is this configuration ready to spend a week trading paper?" did not ask.
+
+    A WARN and not a FAIL, and the line is worth drawing precisely. Metrics are
+    not a safety layer: docs/SAFETY.md says so outright, every guardrail acts on
+    its own, and alerting reaches a phone by a path (ADR 0012) that does not go
+    through Prometheus at all. A platform with no scrape endpoint still halts,
+    still refuses orders and still sends its alerts. What it loses is the
+    ability to answer *afterwards* what it was doing — which is not worth
+    refusing a week over, and is very much worth being told before one.
+    """
+    if settings.metrics_token.get_secret_value():
+        return Check("metrics", Status.PASS, "METRICS_TOKEN is set — /metrics is collectable")
+    return Check(
+        "metrics",
+        Status.WARN,
+        "METRICS_TOKEN is unset — the worker exports no /metrics endpoint and the "
+        "API answers a session only, so no scraper can collect anything the week does",
+        fix="set METRICS_TOKEN in .env, or in the SOPS bundle (docs/DEPLOYMENT.md)",
+        source="docs/OBSERVABILITY.md",
+    )
+
+
 def check_warmup(symbol: str, *, required: int, stored: int, newest: datetime | None) -> Check:
     """Enough stored history for the strategy to have an opinion.
 
@@ -452,11 +483,7 @@ def check_sizing_is_reachable(
             f"{method} asks for {qty} shares at {price} = {share:.1%} of equity, and "
             f"the max position ceiling caps a position at {limits.max_position_pct:.0%} — "
             f"max_position_size would refuse every entry, and the week would look silent",
-            fix=(
-                f"lower the sizing value on the Config tab (about "
-                f"{value * limits.max_position_pct * equity / notional:.4f} fits), "
-                f"or raise the max position ceiling in the risk limits below it"
-            ),
+            fix=_sizing_fix(value * limits.max_position_pct * equity / notional),
             source="docs/RISK.md, 'Why risk_pct is the default'",
         )
     return Check(
@@ -464,6 +491,44 @@ def check_sizing_is_reachable(
         Status.PASS,
         f"{method} sizes the first entry at {qty} shares = {share:.1%} of equity, "
         f"under the {limits.max_position_pct:.0%} cap",
+    )
+
+
+#: Below this, telling an operator to "lower the sizing value" stops being
+#: advice. A risk fraction of one basis point is not a smaller version of a
+#: sensible setting — it is the arithmetic saying the *stop distance* is wrong
+#: for this timeframe, which is a different decision made somewhere else.
+MIN_USEFUL_SIZING_VALUE = Decimal("0.0001")
+
+
+def _sizing_fix(fits: Decimal) -> str:
+    """What to actually do about a first entry that cannot clear its own cap.
+
+    **The number is not always the answer, and printing it anyway was a bug.**
+    `risk_pct` sizes by the distance to the stop, so on a minute series — where
+    a 2×ATR stop is cents wide — the fraction that would fit is on the order of
+    0.00004. Formatted to four places that rendered as `about 0.0000 fits`, and
+    an operator following the hint would enter `0`, which `position_size`
+    refuses outright. The one case the message existed for was the one it could
+    not express (docs/paper-week/day-1-review.md, F11).
+
+    Below `MIN_USEFUL_SIZING_VALUE` the honest answer is not a smaller number.
+    Day 1's `risk_pct 0.0015` was survivable on daily bars — 15 shares, 7.5% of
+    equity — and asks for over 400% of the account on the minute bars the
+    platform was actually ingesting. Nothing is wrong with the fraction; it is
+    being applied to a stop two orders of magnitude too tight, and the timeframe
+    is the thing to re-decide.
+    """
+    if fits < MIN_USEFUL_SIZING_VALUE:
+        return (
+            f"a value of about {fits:.6f} would fit, which is too small to be a real "
+            f"setting — re-derive the sizing for the timeframe you are actually trading "
+            f"(a 2xATR stop on a minute bar is cents wide, so risk_pct asks for a "
+            f"position the cap will always refuse), or size with fixed_qty for a first run"
+        )
+    return (
+        f"lower the sizing value on the Config tab (about {fits:.4f} fits), "
+        f"or raise the max position ceiling in the risk limits below it"
     )
 
 

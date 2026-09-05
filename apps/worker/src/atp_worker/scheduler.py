@@ -23,6 +23,8 @@ from atp_core.data.providers.alpaca import AlpacaHistoricalProvider
 from atp_core.logging import correlation_id, get_logger
 from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.db import create_engine, create_session_factory
+from atp_core.risk.killswitch import HaltReason
+from atp_core.risk.rules import DAILY_LOSS_RULE
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -68,6 +70,13 @@ class SessionJobs:
     reconciler: Reconciler
     portfolio: Portfolio
     open_orders: Callable[[], list[Order]]
+
+
+#: Who the rollover's clear is attributed to. A process name and not a person,
+#: because nothing authenticated one — the same choice `scripts/halt.py` makes
+#: for an unattended `engage`, and for ADR 0008's reason: an actor the caller
+#: filled in is not an audit trail.
+ROLLOVER_ACTOR = "daily_loss_rollover"
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,14 +364,90 @@ async def apply_corporate_actions() -> None:
     raise NotImplementedError
 
 
-async def rollover_daily_counters() -> None:
-    """At the session open: reset the daily loss limit and rate-limit counters,
-    and clear any halt that was engaged purely by the daily loss limit."""
-    raise NotImplementedError
+async def rollover_daily_counters(watch: SessionWatch) -> None:
+    """At the session open: release the halt yesterday's loss limit engaged.
+
+    **Two of the three things this stub promised were already being done, and
+    saying so is most of the fix.** The daily-loss anchor is reset by
+    `StrategyRunner.warmup`, which the run loop re-runs at every open and which
+    calls `RiskEngine.anchor_session` there (`runner.py`); and the rate-limit
+    "counter" is a trailing sixty-second deque that prunes itself on every read,
+    so there has never been anything to roll over. Filling this in as written
+    would have re-anchored a second time from a job — and `anchor_session`'s own
+    docstring names that as the mistake, because re-anchoring mid-session grants
+    the day a second allowance against a drawn-down number.
+
+    What was genuinely missing is the third clause, and it could not be built
+    because its counterpart did not exist either: **nothing ever engaged a
+    daily-loss halt.** `StrategyRunner._escalate` now does, so there is finally
+    something here to clear (docs/paper-week/day-1-review.md, F10).
+
+    **This is the only automated clear in the platform, and the narrowness is
+    what makes it defensible.** docs/RISK.md is explicit that clearing is
+    deliberate where engaging is reflexive, and that asymmetry is not being
+    softened: this releases a halt only when *every* one of these holds —
+
+    1. the reason is exactly `DAILY_LOSS_LIMIT`, so a manual halt, a feed halt
+       or a reconciliation halt standing beside it is untouched;
+    2. it was engaged by the risk chain itself and not by a human who happened
+       to pick that reason from `scripts/halt.py --reason`;
+    3. it was engaged *before today's session*, so a limit breached this morning
+       is never cleared by this morning's rollover.
+
+    A halt about *today's* loss is meaningless tomorrow, and the alternative is
+    worse than it looks: a platform that needs a human every morning after a bad
+    day teaches that human to clear halts without reading them, which is the
+    habit the whole asymmetry exists to prevent.
+
+    `cleared_by` names this job rather than a person, because nothing
+    authenticated one — the same honesty `scripts/halt.py` applies to an
+    unattended `engage` (ADR 0008).
+    """
+    now = SystemClock().now()
+    for record in watch.kill_switch.active_halts():
+        if record.reason is not HaltReason.DAILY_LOSS_LIMIT:
+            continue
+        if record.engaged_by != DAILY_LOSS_RULE:
+            continue
+        if record.engaged_at.date() >= now.date():
+            log.info(
+                "worker.rollover.halt_kept",
+                engaged_at=record.engaged_at.isoformat(),
+                msg="the loss limit was breached today — this is not yesterday's halt",
+            )
+            continue
+
+        watch.kill_switch.clear(record.scope, cleared_by=ROLLOVER_ACTOR, target=record.target)
+        log.warning(
+            "worker.rollover.halt_released",
+            scope=record.scope.value,
+            target=record.target,
+            engaged_at=record.engaged_at.isoformat(),
+            msg="a new session resets the daily loss limit, so its halt is released",
+        )
+        watch.alerts.send(
+            Alert(
+                severity=Severity.INFO,
+                title="Daily loss halt released",
+                body=(
+                    f"The halt engaged at {record.engaged_at.isoformat()} was the daily "
+                    f"loss limit, and a new session resets it. Trading may resume. "
+                    f"Nothing else that is halted has been touched."
+                ),
+                key=f"halt.rollover.{record.engaged_at.date().isoformat()}",
+                context={"scope": record.scope.value},
+            )
+        )
 
 
-#: What runs whether or not this worker is trading. Three of the four are still
+#: What runs whether or not this worker is trading. Two of the three are still
 #: stubs and the driver marks each dormant after one attempt.
+#:
+#: **`rollover_daily_counters` moved out of this list rather than being filled
+#: in here.** It needs the kill switch, so it is bound like the other two
+#: escalation jobs in `build_schedule` — and most of what it was specified to do
+#: turned out to be done already, which its own docstring now records
+#: (docs/paper-week/day-1-review.md, F10).
 #:
 #: **`snapshot_positions` is deliberately absent rather than unimplemented.** It
 #: sat here on a one-minute market-hours interval, described as feeding the
@@ -376,7 +461,6 @@ async def rollover_daily_counters() -> None:
 #: arbitrate here" (`dashboard/ports.py`). A worker not running a strategy has
 #: no book to snapshot either, so there is no case the job would have covered.
 SCHEDULE: list[dict[str, Any]] = [
-    {"job": rollover_daily_counters, "trigger": "market_open", "offset_minutes": -5},
     {"job": apply_corporate_actions, "trigger": "market_open", "offset_minutes": -60},
     {"job": generate_daily_report, "trigger": "market_close", "offset_minutes": 30},
     {"job": backfill_missing_bars, "trigger": "cron", "hour": 2, "minute": 0},
@@ -418,6 +502,13 @@ def build_schedule(
                 "job": partial(summarise_the_session, watch),
                 "trigger": "market_close",
                 "offset_minutes": 0,
+            },
+            {
+                # Before the open, so a halt released here is released while
+                # nothing is trading rather than mid-session.
+                "job": partial(rollover_daily_counters, watch),
+                "trigger": "market_open",
+                "offset_minutes": -5,
             },
         ]
 

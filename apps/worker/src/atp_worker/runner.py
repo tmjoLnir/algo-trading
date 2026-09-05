@@ -47,10 +47,12 @@ from atp_core.domain import Order, Portfolio, RunMode, Side, SignalAction
 from atp_core.domain.enums import StopType
 from atp_core.errors import ATPError, DataGapError, ExecutionError
 from atp_core.execution.idempotency import STOP_LOSS, TAKE_PROFIT, TIME_EXIT
+from atp_core.execution.router import NO_ACTION
 from atp_core.execution.trade_updates import apply_trade_update
 from atp_core.indicators import dispatch
 from atp_core.logging import correlation_id, get_logger
 from atp_core.risk.killswitch import HaltReason, HaltScope
+from atp_core.risk.rules import DAILY_LOSS_RULE, RATE_LIMIT_RULE
 from atp_core.risk.stops import target_hit
 from atp_core.strategy.ports import SignalOutcome, StrategyRecord
 
@@ -66,6 +68,7 @@ if TYPE_CHECKING:
     from atp_core.execution.ports import OrderRepository, PortfolioRepository
     from atp_core.execution.reconciliation import Reconciler
     from atp_core.execution.router import OrderRouter, SubmitResult
+    from atp_core.risk.engine import RiskDecision
     from atp_core.risk.killswitch import KillSwitch
     from atp_core.risk.stops import StopConfig, StopManager
     from atp_core.strategy.base import Strategy
@@ -79,6 +82,14 @@ log = get_logger(__name__)
 #: which is the state this counter exists to end. Three rather than one,
 #: because a single transient read failure should not stop a strategy.
 MAX_CONSECUTIVE_ERRORS = 3
+
+#: Consecutive rate-limit refusals that count as a *storm* rather than as one
+#: busy minute. `RateLimitRule` is the runaway-loop guard and its cap is
+#: per-minute, so hitting it once is a legitimate burst; hitting it five times
+#: in a row is a strategy re-emitting the same order every tick, which is the
+#: failure `HaltReason.RATE_LIMIT_STORM` was named for and which nothing has
+#: ever engaged (docs/paper-week/day-1-review.md, F10).
+RATE_LIMIT_STORM_REFUSALS = 5
 
 #: How long to sleep when the market is shut and the calendar cannot say when
 #: it next opens. A bounded nap rather than a spin, and short enough that a
@@ -312,6 +323,11 @@ class StrategyRunner:
         self.router = router
         self.stop_manager = stop_manager
         self.kill_switch = kill_switch
+        #: Consecutive refusals by `RateLimitRule`, for the storm threshold.
+        #: Process-local on purpose: a storm is a strategy looping *now*, and a
+        #: count that survived a restart would halt on a fresh worker for a loop
+        #: that died with the old one.
+        self._rate_limit_refusals = 0
         self.bar_repo = bar_repo
         self.quote_cache = quote_cache
         self.clock = clock
@@ -489,6 +505,64 @@ class StrategyRunner:
             symbols=len(self.symbols),
             bars=sum(len(b) for b in self._bars.values()),
         )
+
+    def _escalate(self, decision: RiskDecision) -> None:
+        """Turn a risk refusal that means something worse into a halt.
+
+        **docs/RISK.md has always said the kill switch "auto-engages on: daily
+        loss limit breach, ... a rate-limit storm", and nothing ever did.**
+        `HaltReason.DAILY_LOSS_LIMIT` and `HaltReason.RATE_LIMIT_STORM` were
+        enum values with no writer: both rules refused orders one at a time and
+        told nobody, so a platform that hit its daily loss limit spent the rest
+        of the session silently refusing every entry
+        (docs/paper-week/day-1-review.md, F10).
+
+        Refusing entries was never the missing part — `DailyLossLimitRule` did
+        that correctly, and still permits exits so a losing position is never
+        trapped. What was missing is that the *operator* was not told. A halt is
+        how this platform says something out loud: it alerts on engagement, it
+        is repeated every fifteen minutes while it stands, and it shows on the
+        dashboard's banner. None of those reach a `RiskDecision`.
+
+        `engage` is idempotent on the Redis record, so this may be called on
+        every refusal for the rest of the session and still produces one halt,
+        one alert and one record of when the limit was first breached — which is
+        the timestamp anyone reviewing the day actually wants.
+
+        **The daily-loss halt is cleared automatically at the next open**, by
+        `scheduler.rollover_daily_counters`. That is the other half of this and
+        the reason both could be built together: a halt about *today's* loss is
+        meaningless tomorrow, and a platform that needed a human every morning
+        after a bad day would train that human to clear halts without reading
+        them.
+        """
+        if decision.rule == DAILY_LOSS_RULE:
+            self.kill_switch.engage(
+                HaltScope.GLOBAL,
+                HaltReason.DAILY_LOSS_LIMIT,
+                engaged_by=DAILY_LOSS_RULE,
+                detail=decision.reason,
+            )
+            self._rate_limit_refusals = 0
+            return
+
+        if decision.rule == RATE_LIMIT_RULE:
+            self._rate_limit_refusals += 1
+            if self._rate_limit_refusals >= RATE_LIMIT_STORM_REFUSALS:
+                self.kill_switch.engage(
+                    HaltScope.GLOBAL,
+                    HaltReason.RATE_LIMIT_STORM,
+                    engaged_by=RATE_LIMIT_RULE,
+                    detail=(
+                        f"{self._rate_limit_refusals} consecutive rate-limit refusals: "
+                        f"{decision.reason}"
+                    ),
+                )
+            return
+
+        # Any other refusal ends the run. A storm is *consecutive*: one
+        # rate-limit refusal among ordinary ones is a busy minute, not a loop.
+        self._rate_limit_refusals = 0
 
     async def _ensure_strategy_row(self) -> None:
         """Give this strategy the row every signal and order points at.
@@ -1052,9 +1126,21 @@ class StrategyRunner:
             await self._record_signal(signal, result)
 
             if not result.submitted:
-                self.stats.orders_rejected_by_risk += 1
+                # **`no_action` is not a rejection**, and counting it as one
+                # inverted the number this counter exists to inform.
+                # `SubmitResult.no_action` builds an *approved* decision
+                # precisely so a HOLD-shaped outcome — an exit signal for a
+                # position that is already flat — does not read as the risk
+                # config being too tight. Then this line counted every
+                # unsubmitted result alike, so it did anyway
+                # (docs/paper-week/day-1-review.md, F14).
+                if result.decision.rule != NO_ACTION:
+                    self.stats.orders_rejected_by_risk += 1
+                    self._escalate(result.decision)
                 log.info(
-                    "runner.signal_refused",
+                    "runner.signal_refused"
+                    if result.decision.rule != NO_ACTION
+                    else "runner.no_action",
                     symbol=signal.symbol,
                     action=signal.action.value,
                     rule=result.decision.rule,
