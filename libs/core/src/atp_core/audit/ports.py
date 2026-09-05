@@ -95,11 +95,17 @@ class Action:
     #: with no entry, because the first is read as "we stopped" by whoever
     #: reviews the incident.
     #:
-    #: Only halts engaged through the API reach this record. `scripts/halt.py`
-    #: writes no audit row — it has no session to attribute one to — and neither
-    #: do the automated triggers inside the risk layer, which announce
-    #: themselves through alerts and `risk.killswitch.engaged` instead. So an
-    #: absent row means "not halted *from the dashboard*", never "not halted".
+    #: Written by both operator doors. `scripts/halt.py engage` reaches this
+    #: record too, best-effort — it used to write nothing, so an incident
+    #: stopped and resumed from the shell left no trace here at all
+    #: (docs/paper-week/day-1-review.md, F9). Its `actor` is the script's own
+    #: name and not the `--by` label: nothing authenticated that label, and an
+    #: actor the caller filled in is not an audit trail (ADR 0008), so the
+    #: claimed name travels in `detail["by"]` where a reader can see it for what
+    #: it is. What still writes no row is the automated triggers inside the risk
+    #: layer, which have no session at all and announce themselves through alerts
+    #: and `risk.killswitch.engaged` instead. So an absent row means "not halted
+    #: *by a human at either door*", never "not halted".
     HALT_ENGAGED = "halt_engaged"
     #: Trading resumed from the API. The counterpart to `HALT_ENGAGED`, and the
     #: reason the pair is worth having: a halt with no clear beside it is still
@@ -116,8 +122,16 @@ class Action:
     #: apart.
     #:
     #: Carries the same blind spot as `HALT_ENGAGED` and inherits it from the
-    #: same place: `scripts/halt.py clear` writes no row, so an absent entry
-    #: means "not resumed *from the dashboard*", never "still halted".
+    #: same place, now narrowed to the same width: `scripts/halt.py clear` writes
+    #: this row too, so an absent entry means "not resumed by a human at either
+    #: door", never "still halted". Unlike the halt row, this one may name the
+    #: operator account in `actor` — clearing proves a password at both doors,
+    #: and an attribution backed by a credential is the kind this column is for.
+    #:
+    #: `detail["originally_engaged_at"]` says *which* halt this ended, and it is
+    #: the only field that can: a resume and the engagement it answers are rows
+    #: written hours apart, by different processes, and sometimes the engagement
+    #: is a trigger that wrote no row at all.
     HALT_CLEARED = "halt_cleared"
     #: A strategy was stored. The first of the lifecycle verbs, and it arrives
     #: with `POST /api/v1/strategies` rather than ahead of it.

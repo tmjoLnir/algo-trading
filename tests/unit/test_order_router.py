@@ -18,6 +18,7 @@ The cases worth naming, because each is a specific loss:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -39,7 +40,7 @@ from atp_core.domain import (
 from atp_core.domain.enums import StopType
 from atp_core.errors import BrokerConnectionError, ExecutionError
 from atp_core.execution.router import NO_ACTION, ROUTING, SIZING, OrderRouter
-from atp_core.risk.engine import RiskDecision, RiskEngine, default_rules
+from atp_core.risk.engine import RiskDecision, RiskEngine, RiskRule, default_rules
 from atp_core.risk.limits import RiskLimits
 from atp_core.risk.rules import DailyLossLimitRule
 from atp_core.risk.stops import StopConfig, StopManager
@@ -77,14 +78,41 @@ def book(cash: float = 100_000, **holdings: tuple[float, float]) -> Portfolio:
     return portfolio
 
 
+@dataclass
+class Refusing:
+    """A rule that refuses whatever it is shown, switched on and off at will.
+
+    Some tests below are about what the router does with a *refused* protective
+    stop or flatten, and not about which rule refused it. They used the kill
+    switch as the lever until `KillSwitchRule` gained its exit carve-out and
+    stopped refusing exits — which is that carve-out working as intended, and
+    which would otherwise have quietly turned three tests about handling a
+    refusal into three tests where nothing is refused. An explicit lever cannot
+    stop pulling without saying so.
+    """
+
+    engaged: bool = False
+    name: str = "refuses_everything"
+
+    def check(self, order: Order, portfolio: Portfolio, lim: RiskLimits) -> RiskDecision:
+        if self.engaged:
+            return RiskDecision.deny(self.name, "refused, because this test asked it to be")
+        return RiskDecision.allow()
+
+
 def chain(
     switch: FakeKillSwitch | None = None,
     *,
+    extra: list[RiskRule] | None = None,
     anchor: Decimal | None = Decimal(100_000),
     last_tick: datetime | None = OPEN_HOURS,
     **limit_overrides: object,
 ) -> RiskEngine:
-    """The real nine-rule chain, anchored so it can evaluate the loss limit."""
+    """The real nine-rule chain, anchored so it can evaluate the loss limit.
+
+    `extra` appends rules after the nine, for a test that needs a refusal the
+    real chain will not produce on its own.
+    """
     rules = default_rules(
         kill_switch=switch or FakeKillSwitch(),
         clock=SimulatedClock(OPEN_HOURS),
@@ -95,7 +123,7 @@ def chain(
         for rule in rules:
             if isinstance(rule, DailyLossLimitRule):
                 rule.anchor(anchor)
-    return RiskEngine(limits(**limit_overrides), rules=rules)
+    return RiskEngine(limits(**limit_overrides), rules=rules + list(extra or []))
 
 
 def permissive() -> RiskEngine:
@@ -646,23 +674,23 @@ class TestProtectiveOrders:
         assert stop.stop_price == Decimal(105)
 
     async def test_a_denied_stop_cannot_be_mistaken_for_a_placed_one(self) -> None:
-        """Four of the nine rules refuse a protective stop without consulting
+        """Three of the nine rules refuse a protective stop without consulting
         whether it reduces a position, so this is ordinary rather than exotic —
         and a `list[Order]` return would report it as an empty list, exactly as
         it reports a position that needed no protection."""
         broker, portfolio = FakeBroker(), book()
-        switch = FakeKillSwitch()
-        routed = router(broker, chain(switch))
+        refusal = Refusing()
+        routed = router(broker, chain(extra=[refusal]))
         entry = await self._entry(broker, portfolio, routed)
         fill(entry, portfolio, 100, 100)
-        switch.engaged = True
+        refusal.engaged = True
 
         protection = await routed.submit_protective_orders(entry, portfolio)
 
         assert not protection.is_fully_protected
         assert protection.unprotected_qty == Decimal(100)
         assert protection.stop_order is None
-        assert protection.refused[0].decision.rule == "kill_switch"
+        assert protection.refused[0].decision.rule == "refuses_everything"
         # Armed anyway, so something is watching even though nothing is resting
         # at the venue.
         assert protection.engine_side_stop == Decimal(95)
@@ -672,13 +700,13 @@ class TestProtectiveOrders:
         """Booking a refusal as covered would make the retry a no-op and leave
         the position naked for good."""
         broker, portfolio = FakeBroker(), book()
-        switch = FakeKillSwitch(engaged=True)
-        routed = router(broker, chain(switch))
+        refusal = Refusing(engaged=True)
+        routed = router(broker, chain(extra=[refusal]))
         entry = await self._entry(broker, portfolio, routed)
         fill(entry, portfolio, 100, 100)
 
         refused = await routed.submit_protective_orders(entry, portfolio)
-        switch.engaged = False
+        refusal.engaged = False
         retried = await routed.submit_protective_orders(entry, portfolio)
 
         assert not refused.is_fully_protected
@@ -1103,19 +1131,19 @@ class TestFlatten:
         """Cancel-first has a path ending in position open, stop cancelled,
         close refused. A refused flatten must leave the position protected."""
         broker, portfolio = FakeBroker(), book()
-        switch = FakeKillSwitch()
-        routed = router(broker, chain(switch))
+        refusal = Refusing()
+        routed = router(broker, chain(extra=[refusal]))
         entry_result = await routed.submit(request(stop_loss_price=Decimal(95)), portfolio)
         entry = entry_result.order
         assert entry is not None
         fill(entry, portfolio, 100, 100)
         await routed.submit_protective_orders(entry, portfolio)
-        switch.engaged = True
+        refusal.engaged = True
 
         result = await routed.flatten("SPY", portfolio)
 
         assert not result.submitted
-        assert result.decision.rule == "kill_switch"
+        assert result.decision.rule == "refuses_everything"
         assert broker.cancelled == []
         assert routed.has_broker_side_protection("SPY", portfolio.position("SPY"))
 

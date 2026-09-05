@@ -38,7 +38,7 @@ from atp_core.dashboard.snapshot import RATIO_PLACES
 from atp_core.domain import RunMode
 from atp_core.errors import ATPError
 from atp_core.execution.ports import PortfolioRepository
-from atp_core.logging import get_logger
+from atp_core.logging import current_correlation_id, get_logger
 from atp_core.risk.killswitch import HaltReason, HaltScope, KillSwitch
 from atp_core.risk.limits import RiskLimits
 from atp_core.strategy.ports import SignalRepository
@@ -711,6 +711,13 @@ async def engage_kill_switch(
             action=Action.HALT_ENGAGED,
             target=payload.target,
             detail={
+                # The id every log line this request emitted is already tagged
+                # with (`atp_core.logging`, ADR 0013). Carried here so the row
+                # on the audit tab can be joined to them: the audit trail says
+                # a human stopped trading, and the logs say what the platform
+                # was doing when they did, and until this field existed there
+                # was no key between the two.
+                "correlation_id": current_correlation_id(),
                 "scope": payload.scope.value,
                 "reason": payload.reason.value,
                 "detail": payload.detail,
@@ -814,6 +821,9 @@ async def clear_kill_switch(
             action=Action.HALT_CLEARED,
             target=payload.target,
             detail={
+                # As on the halt row: the key from this row to the log lines of
+                # the request that wrote it.
+                "correlation_id": current_correlation_id(),
                 "scope": payload.scope.value,
                 "was_halted": cleared is not None,
                 # Who this operator overrode, when it was not themselves. An
@@ -823,6 +833,14 @@ async def clear_kill_switch(
                 # applied.
                 "original_reason": cleared.reason.value if cleared is not None else None,
                 "originally_engaged_by": cleared.engaged_by if cleared is not None else None,
+                # *Which* halt this ended. A resume and the engagement it
+                # answers are two rows written hours apart, often by different
+                # processes and sometimes by a trigger that wrote no row at all
+                # — `engaged_at` is the only thing common to both, so without it
+                # the pair cannot be joined even when both are present.
+                "originally_engaged_at": (
+                    cleared.engaged_at.isoformat() if cleared is not None else None
+                ),
             },
         )
     )

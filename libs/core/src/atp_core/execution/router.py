@@ -136,16 +136,19 @@ class ProtectionResult:
 
     A bare `list[Order]` cannot distinguish "this position needed no protection"
     from "this position is naked because the stop was refused" — both are the
-    empty list. Four of the nine default rules can refuse a protective stop
-    outright — the kill switch, trading hours, the rate limit and stale data all
-    judge the order rather than whether it reduces a position — and two more
+    empty list. Three of the nine default rules can refuse a protective stop
+    outright — trading hours, the rate limit and stale data all judge the order
+    rather than whether it reduces a position — and two more
     (`max_position_size`, `max_gross_exposure`) refuse whenever any *other*
     holding is unmarked, so a denial here is ordinary rather than exotic. Only
-    `max_open_positions`, `daily_loss_limit` and `buying_power` can never refuse
-    one. docs/SAFETY.md makes "there are no
+    `max_open_positions`, `daily_loss_limit`, `buying_power` and the kill switch
+    can never refuse one. The kill switch belonged in the first list until it
+    was given the exit carve-out `KillSwitchRule` now documents: a halt refusing
+    the protective child of an entry that had just filled was docs/SAFETY.md's
+    layers 6 and 5 failing together, since that document makes "there are no
     unprotected positions" a go-live condition and names a stop that was never
-    placed after the entry fill as the way layer 5 fails, which is not a
-    distinction to leave to the caller's memory.
+    placed after the entry fill as the way layer 5 fails. Not a distinction to
+    leave to the caller's memory.
     """
 
     placed: list[Order] = field(default_factory=list)
@@ -696,11 +699,16 @@ class OrderRouter:
 
         Exits bypass entry-blocking risk rules (e.g. the daily loss limit) but
         still pass through `validate()` — a rule that blocks an exit is a rule
-        that traps you in a losing position (see `DailyLossLimitRule`). Four
-        rules can still refuse one, the kill switch among them, and this does
-        not carve them out: a refused flatten comes back naming the rule, so
-        the human who pressed the button reads "refused by kill_switch" rather
-        than believing a position closed.
+        that traps you in a losing position (see `DailyLossLimitRule`). The
+        kill switch is now one of the rules that stands aside: it permits an
+        order that can only reduce, because refusing a flatten during a halt
+        stopped the platform from *reducing* risk when halting is only meant to
+        stop new risk (`KillSwitchRule`, docs/SAFETY.md). Rules that judge
+        whether this is a sane moment to trade at all still refuse one, and
+        this does not carve *them* out: a flatten refused for stale data or
+        outside trading hours comes back naming that rule, so the human who
+        pressed the button reads "refused by stale_data" rather than believing
+        a position closed.
 
         Goes through `submit()` rather than `BrokerPort.close_position`, which
         would reach the venue without passing the chain and is the bypass ADR

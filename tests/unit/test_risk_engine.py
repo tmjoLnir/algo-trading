@@ -21,7 +21,7 @@ import pytest
 from pydantic import ValidationError
 
 from atp_core.clock import SimulatedClock, TradingCalendar
-from atp_core.domain import Order, Portfolio, Side
+from atp_core.domain import Order, OrderType, Portfolio, Side
 from atp_core.errors import ConfigError, RiskLimitBreachedError
 from atp_core.risk.engine import RiskDecision, RiskEngine, RiskRule, default_rules
 from atp_core.risk.limits import MAX_GROSS_CEILING, RiskLimits
@@ -85,7 +85,7 @@ def order(
 
 
 class TestRiskRules:
-    def test_kill_switch_blocks_everything(self) -> None:
+    def test_kill_switch_blocks_an_entry(self) -> None:
         rule = KillSwitchRule(switch=FakeKillSwitch(engaged=True))
         decision = rule.check(order(), portfolio(), limits())
         assert not decision.approved
@@ -94,6 +94,88 @@ class TestRiskRules:
     def test_kill_switch_allows_when_clear(self) -> None:
         rule = KillSwitchRule(switch=FakeKillSwitch(engaged=False))
         assert rule.check(order(), portfolio(), limits()).approved
+
+    def test_kill_switch_blocks_adding_to_a_position_it_already_holds(self) -> None:
+        """Halted, "I already own some" is not a reason to buy more."""
+        rule = KillSwitchRule(switch=FakeKillSwitch(engaged=True))
+        decision = rule.check(order(side=Side.BUY, qty=50), portfolio(SPY=(100, 100)), limits())
+        assert not decision.approved
+        assert decision.rule == "kill_switch"
+
+    def test_kill_switch_lets_an_exit_out_of_a_long(self) -> None:
+        """docs/SAFETY.md: "Halting stops new risk; flattening realises existing
+        P&L." A halt that refused exits did both, and day 1 of the paper week
+        survived 2h37m of one only because the book was empty throughout
+        (docs/paper-week/day-1-review.md, F3)."""
+        rule = KillSwitchRule(switch=FakeKillSwitch(engaged=True))
+        decision = rule.check(order(side=Side.SELL, qty=40), portfolio(SPY=(100, 100)), limits())
+        assert decision.approved
+
+    def test_kill_switch_lets_an_exit_out_of_a_short(self) -> None:
+        """Whether an order is an exit is not a property of its side."""
+        rule = KillSwitchRule(switch=FakeKillSwitch(engaged=True))
+        decision = rule.check(order(side=Side.BUY, qty=40), portfolio(SPY=(-100, 100)), limits())
+        assert decision.approved
+
+    def test_kill_switch_lets_an_exactly_sized_flatten_out(self) -> None:
+        """`OrderRouter.flatten` sizes at exactly `abs(position.qty)`, so the
+        boundary is the case that matters rather than an edge nobody hits."""
+        rule = KillSwitchRule(switch=FakeKillSwitch(engaged=True))
+        decision = rule.check(order(side=Side.SELL, qty=100), portfolio(SPY=(100, 100)), limits())
+        assert decision.approved
+
+    def test_kill_switch_refuses_an_exit_that_would_reverse_the_position(self) -> None:
+        """The carve-out permits reducing, not trading, and this is where the
+        difference is load-bearing.
+
+        `reduces_position` counts an order larger than the position it opposes,
+        deliberately, so `DailyLossLimitRule` cannot trap a holding it is trying
+        to release. A halt cannot afford that reading: selling 250 against a long
+        of 100 closes the long and *opens a short of 150* — new risk, taken while
+        the platform is stopped. `KillSwitchRule` is stricter than the helper it
+        shares for exactly this case, and nothing legitimate is refused by it.
+        """
+        rule = KillSwitchRule(switch=FakeKillSwitch(engaged=True))
+        book = portfolio(SPY=(100, 100))
+        # The premise: the shared helper does call this a reduction.
+        assert reduces_position(order(side=Side.SELL, qty=250), book)
+
+        decision = rule.check(order(side=Side.SELL, qty=250), book, limits())
+
+        assert not decision.approved
+        assert decision.rule == "kill_switch"
+        assert "reverse" in decision.reason
+
+    def test_kill_switch_lets_a_protective_stop_through(self) -> None:
+        """The failure this carve-out exists for, in its own test.
+
+        docs/SAFETY.md layer 5 is "broker-side stops on every position" and it
+        fails when the stop is "never placed after the entry fill". An entry
+        that filled just before a halt had its protective child refused here, so
+        the position ended up with no stop anywhere — layers 6 and 5 failing
+        together. The stop is capped at the exposure held, so it can never trip
+        the reversal guard above.
+        """
+        rule = KillSwitchRule(switch=FakeKillSwitch(engaged=True))
+        stop = Order(
+            symbol="SPY",
+            side=Side.SELL,
+            qty=Decimal(100),
+            order_type=OrderType.STOP,
+            stop_price=Decimal(95),
+            strategy_id="test",
+            parent_order_id="the-entry",
+            purpose="stop_loss",
+        )
+
+        assert rule.check(stop, portfolio(SPY=(100, 100)), limits()).approved
+
+    def test_kill_switch_refuses_an_exit_in_a_symbol_it_does_not_hold(self) -> None:
+        """Nothing to reduce is not a reduction. A sell into a flat book is a
+        short entry, whatever the caller meant by it."""
+        rule = KillSwitchRule(switch=FakeKillSwitch(engaged=True))
+        decision = rule.check(order(side=Side.SELL, qty=100), portfolio(), limits())
+        assert not decision.approved
 
     def test_max_position_counts_existing_holding(self) -> None:
         """Three 4% orders must not become a 12% position."""

@@ -376,7 +376,7 @@ class TestClosingOnePosition:
         assert audit.entries[-1].action == Action.POSITION_CLOSED
         assert audit.entries[-1].detail["submitted"] is True
 
-    async def test_a_halt_refuses_it_and_the_reply_names_the_rule(
+    async def test_a_halt_does_not_trap_the_position_it_stopped_trading_around(
         self,
         client: httpx.AsyncClient,
         broker: FakeBroker,
@@ -384,12 +384,20 @@ class TestClosingOnePosition:
         portfolio_repo: FakePortfolioRepository,
         audit: RecordingAuditSink,
     ) -> None:
-        """A 200 with `submitted: false`, not an HTTP error.
+        """A halt stops new risk. It must not stop an operator reducing risk.
 
-        Collapsing "the platform considered this and said no" into the same
-        shape as "the symbol was misspelt" would hide the one of the two the
-        operator has to act on. Six of the nine rules can refuse an exit; this
-        pins the one an operator is most likely to have caused themselves.
+        This asserted the opposite until the F3 carve-out
+        (docs/paper-week/day-1-review.md): `KillSwitchRule` refused every order,
+        so an engaged halt also refused every flatten, every take-profit exit
+        and every protective stop — freezing the platform's ability to *reduce*
+        exposure while leaving the position on. docs/SAFETY.md draws the line
+        the other way in its own incident response: "Halting stops new risk;
+        flattening realises existing P&L."
+
+        The 200-with-`submitted: false` shape that a refusal takes is pinned by
+        `test_an_unpriced_book_is_refused_by_name_not_valued_at_zero` below,
+        which refuses through a rule that still refuses an exit — so nothing is
+        lost by this one no longer being a refusal.
         """
         portfolio_repo.stored = stored_book(SPY=100)
         kill_switch.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "test-operator")
@@ -398,10 +406,10 @@ class TestClosingOnePosition:
 
         assert response.status_code == 200
         body = response.json()
-        assert body["submitted"] is False
-        assert body["refused_by"] == "kill_switch"
-        assert broker.submit_calls == []
-        assert audit.entries[-1].detail["submitted"] is False
+        assert body["submitted"] is True
+        assert body["refused_by"] is None
+        assert broker.submit_calls
+        assert audit.entries[-1].detail["submitted"] is True
 
     async def test_an_unpriced_book_is_refused_by_name_not_valued_at_zero(
         self,
