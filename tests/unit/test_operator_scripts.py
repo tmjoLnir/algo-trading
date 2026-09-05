@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -30,9 +31,12 @@ from atp_api.auth import hash_password, looks_like_bcrypt_hash, verify_password
 from atp_core.alerts import Severity
 from atp_core.audit.ports import Action
 from atp_core.config import Settings
+from atp_core.domain import Timeframe
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
 from atp_core.risk.limits import DEFAULT_RISK_LIMITS, RiskLimits
 from atp_core.worker import StoredWorkerConfig, WorkerConfig
+from atp_worker import preflight
+from atp_worker.preflight import Status
 from tests.fakes import FakeWorkerConfigRepository
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
@@ -427,6 +431,90 @@ class TestPreflightArguments:
     def test_an_unknown_timeframe_lists_the_valid_ones(self) -> None:
         with pytest.raises(SystemExit, match="1m, 5m, 15m, 30m, 1h, 4h, 1d"):
             preflight_cli._timeframe("3d")
+
+    def test_the_flag_no_longer_answers_for_the_saved_row(self) -> None:
+        """The defect, at the argument layer. `--timeframe` defaulted to `1d`
+        and every priced check took it, while the worker boots on
+        `WorkerConfig.timeframe` — `1m` — so a green preflight described a
+        platform nobody was running (the day-1 fix audit, §3.3)."""
+        assert preflight_cli.parse_args([]).timeframe is None
+
+
+class TestPreflightPricesTheSavedSeries:
+    """§3.3. Which bar series the checks are measured on is the saved row's
+    answer, not an argv default's.
+
+    Driven through the gathering functions rather than through
+    `check_sizing_is_reachable` directly, because the defect was never in the
+    decision — F11's check was correct and was handed the wrong series. A test
+    that calls the check with a hand-picked timeframe cannot express that, which
+    is why the suite was green while `make preflight` was lying.
+    """
+
+    def _bars(self, monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+        """Capture every `(symbol, timeframe, n)` the script asks storage for."""
+        asked: list[Any] = []
+
+        class RecordingBars:
+            def __init__(self, _factory: Any) -> None:
+                pass
+
+            async def get_last_n_bars(self, symbol: str, timeframe: Any, n: int) -> list[Any]:
+                asked.append((symbol, timeframe, n))
+                return []
+
+        monkeypatch.setattr(preflight_cli, "PostgresBarRepository", RecordingBars)
+        monkeypatch.setattr(preflight_cli, "create_engine", lambda _url: _InertEngine())
+        monkeypatch.setattr(preflight_cli, "create_session_factory", lambda _engine: None)
+        return asked
+
+    async def test_the_history_check_reads_the_configured_series(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        asked = self._bars(monkeypatch)
+        config = WorkerConfig(symbols=("SPY",), strategy="sma_crossover", timeframe="1m")
+
+        await preflight_cli._local_checks(_settings(), config)
+
+        assert [tf for _symbol, tf, _n in asked] == [Timeframe.M1]
+
+    async def test_a_different_saved_series_is_the_one_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pinned against a constant: `1d` used to be the answer whatever the
+        row said, so a test that only ever asserts `1m` would pass on a
+        hard-coded `M1` too."""
+        asked = self._bars(monkeypatch)
+        config = WorkerConfig(symbols=("SPY",), strategy="sma_crossover", timeframe="15m")
+
+        await preflight_cli._local_checks(_settings(), config)
+
+        assert [tf for _symbol, tf, _n in asked] == [Timeframe.M15]
+
+    async def test_the_sizing_check_reads_the_configured_series(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The half that is F11's whole fix: the ATR that sets the stop
+        distance, and therefore the share count, comes off this series."""
+        asked = self._bars(monkeypatch)
+        config = WorkerConfig(symbols=("SPY",), strategy="sma_crossover", timeframe="1m")
+
+        await preflight_cli._sizing_check(_settings(), config, equity=Decimal(100_000))
+
+        assert [tf for _symbol, tf, _n in asked] == [Timeframe.M1]
+
+    def test_an_override_says_it_is_answering_a_what_if(self) -> None:
+        """The escape hatch stays — asking "would 1d fit?" before rewriting the
+        row is one of the two ways out of a sizing a minute series cannot carry
+        — but it may not answer that question in the words that describe the
+        saved configuration."""
+        same = preflight.check_timeframe(Timeframe.M1, saved=Timeframe.M1)
+        overridden = preflight.check_timeframe(Timeframe.D1, saved=Timeframe.M1)
+
+        assert same.status is Status.PASS
+        assert "saved worker_config row" in same.detail
+        assert overridden.status is Status.WARN
+        assert "the worker will boot on 1m" in overridden.detail
 
     def test_no_broker_needs_no_credentials(self) -> None:
         assert preflight_cli.parse_args(["--no-broker"]).no_broker is True

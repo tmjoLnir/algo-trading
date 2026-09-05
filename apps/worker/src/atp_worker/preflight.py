@@ -34,7 +34,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from atp_core.domain import RunMode
+from atp_core.domain import RunMode, Timeframe
 from atp_core.domain.enums import StopType
 from atp_core.errors import ATPError
 from atp_core.risk.rules import position_size
@@ -328,7 +328,9 @@ def check_metrics_token(settings: Settings) -> Check:
     )
 
 
-def check_warmup(symbol: str, *, required: int, stored: int, newest: datetime | None) -> Check:
+def check_warmup(
+    symbol: str, *, timeframe: Timeframe, required: int, stored: int, newest: datetime | None
+) -> Check:
     """Enough stored history for the strategy to have an opinion.
 
     Ranked fourth on docs/FIRST_PAPER_RUN.md's own list of what breaks first,
@@ -342,26 +344,73 @@ def check_warmup(symbol: str, *, required: int, stored: int, newest: datetime | 
     an error, but *no signals*, which is also what a correct run of a crossover
     strategy produces most weeks. A result nobody can interpret is worse than a
     refusal.
+
+    **The series is named in every verdict and in both fix lines**, and is a
+    required argument so a future caller cannot omit it. A bar count is
+    meaningless without saying which series it counted, and the fix lines invoke
+    `scripts/backfill_bars.py`, whose own `--timeframe` still defaults to `1d` —
+    so advice given without the flag, followed literally on a minute platform,
+    repairs a series nothing trades.
     """
+    backfill = (
+        f"uv run python scripts/backfill_bars.py --symbols {symbol} "
+        f"--timeframe {timeframe.value} --verify"
+    )
     if stored == 0:
         return Check(
             f"history {symbol}",
             Status.FAIL,
-            f"no stored bars for {symbol}",
-            fix=f"uv run python scripts/backfill_bars.py --symbols {symbol} --verify",
+            f"no stored {timeframe.value} bars for {symbol}",
+            fix=backfill,
         )
     if stored < required:
         return Check(
             f"history {symbol}",
             Status.FAIL,
-            f"{stored} stored bars, strategy needs {required} to warm up — "
-            f"it would decide on nothing and the week would report silence",
-            fix=f"uv run python scripts/backfill_bars.py --symbols {symbol} --verify",
+            f"{stored} stored {timeframe.value} bars, strategy needs {required} to warm "
+            f"up — it would decide on nothing and the week would report silence",
+            fix=backfill,
         )
-    detail = f"{stored} bars, needs {required}"
+    detail = f"{timeframe.value}: {stored} bars, needs {required}"
     if newest is not None:
         detail = f"{detail}, newest {newest.date().isoformat()}"
     return Check(f"history {symbol}", Status.PASS, detail)
+
+
+def check_timeframe(timeframe: Timeframe, *, saved: Timeframe) -> Check:
+    """Which bar series everything measured below was measured on.
+
+    The line exists because its absence cost a week. `scripts/preflight.py`'s
+    `--timeframe` defaulted to `1d` and every history and sizing verdict was
+    computed on it, while `WorkerConfig.timeframe` — the one value the ingestor
+    writes and the runner reads — said `1m`. A 2xATR stop is dollars wide on a
+    daily bar and cents wide on a minute one, so the same saved row passes here
+    and is refused by `max_position_size` on every entry of the week: green
+    preflight, silent week, second cause, identical symptom
+    (docs/paper-week/day-1-review.md F11, and the day-1 fix audit §3.3).
+
+    An override is a WARN rather than a FAIL for this module's usual reason.
+    Asking "would `1d` fit?" before writing the row is a real question — it is
+    one of the two ways out of a `risk_pct` sizing a minute series cannot carry
+    — and refusing it would make the tool useless at the moment it is most
+    wanted. What it must not do is answer that question in the same words it
+    answers the real one.
+    """
+    if timeframe is saved:
+        return Check(
+            "timeframe",
+            Status.PASS,
+            f"{timeframe.value} — from the saved worker_config row; the history and "
+            f"sizing checks below are measured on this series",
+        )
+    return Check(
+        "timeframe",
+        Status.WARN,
+        f"checked on {timeframe.value}, but the worker will boot on {saved.value} — "
+        f"the history and sizing checks below answer a what-if, not this configuration",
+        fix=f"re-run without --timeframe to check the saved row, or set the timeframe to "
+        f"{timeframe.value} on the Config tab to make this the configuration",
+    )
 
 
 def check_quote_freshness(symbol: str, *, age_seconds: float | None, budget: int) -> Check:
@@ -429,6 +478,7 @@ def check_sizing_is_reachable(
     config: WorkerConfig,
     limits: RiskLimits,
     *,
+    timeframe: Timeframe,
     equity: Decimal,
     price: Decimal,
     stop_price: Decimal | None,
@@ -452,6 +502,11 @@ def check_sizing_is_reachable(
     Sized through `position_size`, never re-derived: the number this predicts
     has to be the number the router computes, or the prediction is about a
     different platform (ADR 0006).
+
+    **And the series is stated, because the number is meaningless without it.**
+    The same row passes on `1d` and fails on `1m`, and the caller used to choose
+    which by an argv default that did not match the row the worker boots from
+    (the day-1 fix audit, §3.3).
     """
     method = config.sizing_method
     value = config.sizing_value
@@ -480,10 +535,11 @@ def check_sizing_is_reachable(
         return Check(
             "sizing",
             Status.FAIL,
-            f"{method} asks for {qty} shares at {price} = {share:.1%} of equity, and "
-            f"the max position ceiling caps a position at {limits.max_position_pct:.0%} — "
-            f"max_position_size would refuse every entry, and the week would look silent",
-            fix=_sizing_fix(value * limits.max_position_pct * equity / notional),
+            f"on {timeframe.value} bars, {method} asks for {qty} shares at {price} = "
+            f"{share:.1%} of equity, and the max position ceiling caps a position at "
+            f"{limits.max_position_pct:.0%} — max_position_size would refuse every "
+            f"entry, and the week would look silent",
+            fix=_sizing_fix(value * limits.max_position_pct * equity / notional, timeframe),
             source="docs/RISK.md, 'Why risk_pct is the default'",
         )
     return Check(
@@ -501,7 +557,7 @@ def check_sizing_is_reachable(
 MIN_USEFUL_SIZING_VALUE = Decimal("0.0001")
 
 
-def _sizing_fix(fits: Decimal) -> str:
+def _sizing_fix(fits: Decimal, timeframe: Timeframe) -> str:
     """What to actually do about a first entry that cannot clear its own cap.
 
     **The number is not always the answer, and printing it anyway was a bug.**
@@ -518,12 +574,17 @@ def _sizing_fix(fits: Decimal) -> str:
     platform was actually ingesting. Nothing is wrong with the fraction; it is
     being applied to a stop two orders of magnitude too tight, and the timeframe
     is the thing to re-decide.
+
+    The series is passed in rather than assumed. The sentence already argued
+    from it — "a 2xATR stop on a minute bar is cents wide" — while the check
+    that produced the message had no idea which series it had measured, so on a
+    `5m` or `15m` row it was concretely wrong while being directionally right.
     """
     if fits < MIN_USEFUL_SIZING_VALUE:
         return (
             f"a value of about {fits:.6f} would fit, which is too small to be a real "
             f"setting — re-derive the sizing for the timeframe you are actually trading "
-            f"(a 2xATR stop on a minute bar is cents wide, so risk_pct asks for a "
+            f"(a 2xATR stop on a {timeframe.value} bar is cents wide, so risk_pct asks for a "
             f"position the cap will always refuse), or size with fixed_qty for a first run"
         )
     return (

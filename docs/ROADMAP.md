@@ -1519,8 +1519,8 @@ Nothing in Phase 4 has met Alpaca; this PR does not change that and could not.
 What it changes is what happens on either side of the week, because the input
 this line needs and cannot re-run is calendar time.
 
-`scripts/preflight.py` (`make preflight`) checks eleven preconditions in about
-two seconds — every one already stated in docs/FIRST_PAPER_RUN.md, in prose or
+`scripts/preflight.py` (`make preflight`) checks every one of these
+preconditions, against the saved configuration, in about two seconds — every one already stated in docs/FIRST_PAPER_RUN.md, in prose or
 in its "most likely to break first" list. The two that matter are the two that
 produce a *silent* week, which that document warns is indistinguishable from a
 strategy that correctly never signalled: warmup history shorter than the

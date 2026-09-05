@@ -8,8 +8,15 @@
 Read-only, and every check is one docs/FIRST_PAPER_RUN.md already asks for. What
 it adds is the timing: that document states its preconditions in prose and its
 "most likely to break first" list at the end, and an operator working through
-them by hand checks four of them and assumes the rest. This checks eleven in
-about two seconds.
+them by hand checks four of them and assumes the rest. This checks every one of
+them, against the saved configuration, in about two seconds.
+
+The bar series comes from the saved `worker_config` row — the same value the
+ingestor writes and the runner reads — and is named on its own line in the
+report. `--timeframe` prices a what-if against a different series and says so.
+It used to default to `1d` while the worker ran `1m`, so the two checks that
+decide whether the week can produce an answer were both computed on a series
+nobody was trading (the day-1 fix audit, §3.3).
 
 **Why that is worth a script here specifically.** The input Phase 4's
 *Verifiable:* line needs and cannot re-run is calendar time. Almost everything
@@ -74,13 +81,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="",
         help="override the watchlist (default: the one saved on the Config tab)",
     )
-    p.add_argument("--timeframe", default="1d", help="which bar series the strategy runs on")
+    p.add_argument(
+        "--timeframe",
+        default=None,
+        help="price the checks against a different bar series — a what-if, not a "
+        "check of the configuration the worker will boot with "
+        "(default: the timeframe saved on the Config tab)",
+    )
     p.add_argument("--json", action="store_true", help="machine-readable, for a CI job or a log")
     return p.parse_args(argv)
 
 
 async def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    # Judged from the arguments alone, before anything is opened. A mistyped
+    # timeframe should say so rather than surface as whatever the config layer
+    # or an unreachable database complains about first — the order
+    # `scripts/backfill_bars.py` states and for its reason.
+    override = None if args.timeframe is None else _timeframe(args.timeframe)
 
     # Before `get_settings()`, which raises on a configuration that will not
     # validate — and this is one of the two scripts someone runs *because*
@@ -104,22 +123,30 @@ async def main(argv: list[str] | None = None) -> int:
         print("run `make up && make migrate`, then try again")
         return 1
 
-    override = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    if override:
-        config = config.with_symbols(override)
-    timeframe = _timeframe(args.timeframe)
+    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    if symbols:
+        config = config.with_symbols(symbols)
+    saved = config.bar_timeframe
+    if override is not None:
+        # Folded into the config rather than carried beside it: after this line
+        # there is one timeframe in this process and `config.bar_timeframe` is
+        # it, so one check cannot be given a series another check is not using.
+        # That is B1's argument (`WorkerConfig.timeframe`), applied to the
+        # command whose job is to verify B1 held.
+        config = config.with_timeframe(override)
 
     checks: list[Check] = [
         preflight.check_run_mode(settings),
         preflight.check_credentials(settings),
         preflight.check_locks(trading.decide(settings, config)),
         preflight.check_strategy(config),
+        preflight.check_timeframe(config.bar_timeframe, saved=saved),
         preflight.check_stop_config(config),
         preflight.check_alert_transport(settings),
         preflight.check_metrics_token(settings),
     ]
-    checks.extend(await _local_checks(settings, config, timeframe))
-    checks.extend(await _venue_checks(settings, config, timeframe, skip=args.no_broker))
+    checks.extend(await _local_checks(settings, config))
+    checks.extend(await _venue_checks(settings, config, skip=args.no_broker))
 
     report = Preflight(checks)
     if args.json:
@@ -196,9 +223,7 @@ def _timeframe(raw: str) -> Timeframe:
 # ── local state ─────────────────────────────────────────────────────────────
 
 
-async def _local_checks(
-    settings: Settings, config: WorkerConfig, timeframe: Timeframe
-) -> list[Check]:
+async def _local_checks(settings: Settings, config: WorkerConfig) -> list[Check]:
     """Redis and Postgres. Each source is caught separately, because a Redis
     that is down must not stop the history checks from running — an operator
     bringing the stack up one piece at a time is the normal case."""
@@ -214,6 +239,7 @@ async def _local_checks(
         )
 
     required = _warmup_bars(config)
+    timeframe = config.bar_timeframe
     engine = create_engine(settings.database_url)
     try:
         bars = PostgresBarRepository(create_session_factory(engine))
@@ -257,6 +283,7 @@ async def _history_check(
     stored = await bars.get_last_n_bars(symbol, timeframe, max(required, 1))
     return preflight.check_warmup(
         symbol,
+        timeframe=timeframe,
         required=required,
         stored=len(stored),
         newest=stored[-1].ts if stored else None,
@@ -298,9 +325,7 @@ def _warmup_bars(config: WorkerConfig) -> int:
 # ── the venue ───────────────────────────────────────────────────────────────
 
 
-async def _venue_checks(
-    settings: Settings, config: WorkerConfig, timeframe: Timeframe, *, skip: bool
-) -> list[Check]:
+async def _venue_checks(settings: Settings, config: WorkerConfig, *, skip: bool) -> list[Check]:
     """The account, and the one arithmetic question that needs it.
 
     Sizing lands here rather than with the local checks because it needs the
@@ -348,22 +373,27 @@ async def _venue_checks(
             is_paper_host="paper" in settings.broker_base_url,
         )
     ]
-    checks.append(await _sizing_check(settings, config, timeframe, equity=account.equity))
+    checks.append(await _sizing_check(settings, config, equity=account.equity))
     return checks
 
 
-async def _sizing_check(
-    settings: Settings, config: WorkerConfig, timeframe: Timeframe, *, equity: Decimal
-) -> Check:
+async def _sizing_check(settings: Settings, config: WorkerConfig, *, equity: Decimal) -> Check:
     """Price the first entry the way the router will, and see if it clears the cap.
 
     The stop is derived exactly as `StrategyRunner._with_stop` derives it — same
     `StopManager`, same config, same ATR — because a prediction computed any
-    other way is a prediction about a different platform.
+    other way is a prediction about a different platform. **And on the same bar
+    series**, which is the half that was missing: the series came off
+    `--timeframe`, whose default was `1d`, while the worker runs
+    `config.timeframe`, which is `1m`. A 2xATR stop is dollars wide on a daily
+    bar and cents wide on a minute one, so the same saved row passes here and is
+    refused by `max_position_size` on every entry of the week — F11's fix,
+    defeated by its own wiring (the day-1 fix audit, §3.3).
     """
     if not config.symbols:
         return Check("sizing", Status.SKIP, "no symbols to price against")
 
+    timeframe = config.bar_timeframe
     symbol = config.symbols[0]
     engine = create_engine(settings.database_url)
     try:
@@ -380,7 +410,12 @@ async def _sizing_check(
     price = series[-1].close
     stop_price = _derived_stop(config, series, price)
     return preflight.check_sizing_is_reachable(
-        config, config.risk, equity=equity, price=price, stop_price=stop_price
+        config,
+        config.risk,
+        timeframe=timeframe,
+        equity=equity,
+        price=price,
+        stop_price=stop_price,
     )
 
 

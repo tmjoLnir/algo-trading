@@ -513,6 +513,17 @@ class StalenessVerdict:
     #: when the market is shut and silence carries no information.
     silent_for_seconds: float | None
     market_open: bool
+    #: True only when this verdict rests on data **actually arriving** — a
+    #: message this process received, or a bar the store holds, timestamped at
+    #: or after this session's open. `stale is False` is not that, and reading
+    #: it as though it were is how a feed that never came back announced its
+    #: own recovery: silence also reads as not-stale when the market is shut,
+    #: and for the first `max_silence_seconds` of every session, because the
+    #: baseline is floored at the open so a feed dead since yesterday is not
+    #: billed for the overnight. Recovery is a claim about the data, so it
+    #: needs a witness about the data — the demotion F7 applied to
+    #: `connected_since`, applied to the other half of the same question.
+    data_is_current: bool
     reason: str
 
 
@@ -540,7 +551,7 @@ class StalenessMonitor:
         poll_interval_seconds: float = 5.0,
         exchange: str = "NYSE",
         sleep: Callable[[float], Awaitable[None]] | None = None,
-        alerts: AlertSink | None = None,
+        alerts: AlertSink | None,
     ) -> None:
         if max_silence_seconds < 1:
             raise ValueError(f"max_silence_seconds must be at least 1, got {max_silence_seconds}")
@@ -557,13 +568,24 @@ class StalenessMonitor:
         )
         #: Whether the current outage has already been reported. Without it a
         #: 5-second poll would engage the same halt twelve times a minute and
-        #: bury the first, most useful log line under the rest.
+        #: bury the first, most useful log line under the rest. Dropped at the
+        #: close as well as on recovery, so the next session can report its own
+        #: outage — see `watch`.
         self._alerted = False
         #: Where recovery is announced. The halt itself is alerted by the kill
         #: switch, which only ever sees the *engage*; nothing was telling anyone
         #: the feed had come back. On day 1 data resumed at 18:52:26 and the
         #: only thing that observed it was a log line nobody was watching
         #: (docs/paper-week/day-1-review.md, F7).
+        #:
+        #: **Required, unlike every other collaborator on this class**, and
+        #: deliberately so. `kill_switch`, `calendar` and `clock` default
+        #: because their adapters arrived later; this one existed and was built
+        #: ten lines above the only construction site, and was still omitted
+        #: there for a month — the all-clear F7 shipped never reached anybody
+        #: (the day-1 fix audit, §3.4). `None` is still a legitimate answer, and
+        #: a caller with no sink says so out loud rather than by omission, which
+        #: is the one shape `mypy` can refuse.
         self._alerts = alerts
 
     def evaluate(self, ingestor: StreamIngestor, now: datetime) -> StalenessVerdict:
@@ -609,6 +631,10 @@ class StalenessMonitor:
                 stale=False,
                 silent_for_seconds=None,
                 market_open=False,
+                # A shut market is silence carrying no information in either
+                # direction. It is not evidence the feed is dead, and it is
+                # emphatically not evidence the feed is alive.
+                data_is_current=False,
                 reason="market is shut — silence is expected",
             )
 
@@ -619,24 +645,39 @@ class StalenessMonitor:
         # feed had been fine for its whole life. A worker that dies faster than
         # `max_silence_seconds` then never halts at all
         # (docs/paper-week/day-1-review.md, F7).
-        known_good = [
+        # The witnesses that are statements about the *data*. Held separately
+        # from `known_good` below, because that list also carries the
+        # process-birthday fallback, and a worker starting is not a tick.
+        data_witnesses = [
             ts
             for ts in (ingestor.stats.last_message_at, ingestor.stats.storage_watermark)
             if ts is not None
         ]
+        known_good = list(data_witnesses)
         if not known_good and ingestor.stats.connected_since is not None:
             known_good = [ingestor.stats.connected_since]
         baseline = max([session.open_at, *known_good])
         silent_for = (now - baseline).total_seconds()
         stale = silent_for > self.max_silence_seconds
+        newest_data = max(data_witnesses) if data_witnesses else None
+        # Not stale *because data arrived*, rather than because the session has
+        # only just opened. The floor at `session.open_at` is what stops a feed
+        # dead since yesterday being billed for the overnight, and its cost is
+        # that every session begins with `max_silence_seconds` of non-stale
+        # verdicts that say nothing about the feed at all. `watch` used to read
+        # one of those as recovery.
+        data_is_current = not stale and newest_data is not None and newest_data >= session.open_at
         return StalenessVerdict(
             stale=stale,
             silent_for_seconds=silent_for,
             market_open=True,
+            data_is_current=data_is_current,
             reason=(
                 f"no market data for {silent_for:.0f}s during the session"
                 if stale
                 else "feed is current"
+                if data_is_current
+                else f"no data yet this session — {silent_for:.0f}s since the open"
             ),
         )
 
@@ -649,6 +690,19 @@ class StalenessMonitor:
         it engaged stays engaged until a human clears it. A watchdog that
         un-halted itself would let a feed flapping every thirty seconds trade
         through every one of the gaps.
+
+        **"Data resumes" means a witness inside the current session**, which is
+        `verdict.data_is_current` and not `not verdict.stale`. The two differ in
+        the two places it matters: at the closing bell, where the market shutting
+        makes every verdict non-stale, and for the first `max_silence_seconds`
+        of the next morning, where the baseline floored at the open does the
+        same. Reading non-stale as recovery announced *"market data is flowing
+        again"* at 16:00 for a feed that had been dead since 14:00, and reset the
+        outage as though it were over. The session boundary re-arms too — the
+        next session must be able to report its own outage, and a human may have
+        cleared the halt overnight — but it re-arms **silently**, saying only
+        that the day ended with the feed still down. The close already reaches a
+        phone through `scheduler.summarise_the_session`.
         """
         log.info(
             "data.staleness.watching",
@@ -669,7 +723,17 @@ class StalenessMonitor:
                     symbols=sorted(ingestor.stats.symbols),
                 )
                 self._halt(verdict)
-            elif not verdict.stale and self._alerted:
+            elif not verdict.market_open and self._alerted:
+                # The bell rang on an outage nobody fixed. Re-arm, and say
+                # nothing: the feed did not come back, and an all-clear here is
+                # the exact ambiguity F7 set out to remove, told the other way
+                # round.
+                self._alerted = False
+                log.warning(
+                    "data.staleness.unresolved_at_close",
+                    msg="the session ended with the feed still silent — the halt stands",
+                )
+            elif verdict.data_is_current and self._alerted:
                 self._alerted = False
                 log.warning(
                     "data.staleness.recovered",
@@ -686,13 +750,23 @@ class StalenessMonitor:
         the CRITICAL and then nothing has no way to tell "still broken" from
         "fixed itself, waiting for you". On day 1 that gap was 2h37m.
 
+        **Whether the halt still stands is asked, not assumed.** `_halt` may
+        have found no kill switch bound and logged "TRADING IS NOT HALTED", and
+        a human may have cleared it during the outage. Telling an operator a
+        halt is standing when it is not is the same class of lie as telling them
+        a dead feed recovered, and this message is now read on a phone rather
+        than in a log nobody was watching. `is_engaged` fails closed, so an
+        unreachable Redis says "still halted" and sends them to look.
+
         Swallowed like every other alert on this path (`killswitch._send_alert`):
         `AlertSink` says implementations must not raise, and being wrong about
-        that must not take down the watchdog that is still watching.
+        that must not take down the watchdog that is still watching. The
+        `is_engaged` call sits inside the same `try` for that reason.
         """
         if self._alerts is None:
             return
         try:
+            still_halted = self.kill_switch is not None and self.kill_switch.is_engaged()
             self._alerts.send(
                 Alert(
                     severity=Severity.INFO,
@@ -700,9 +774,16 @@ class StalenessMonitor:
                     body=(
                         "The feed recovered. The halt it engaged is still engaged — "
                         "clearing it is a human decision (docs/RUNBOOK.md)."
+                        if still_halted
+                        else "The feed recovered, and nothing is halted — this watchdog "
+                        "never clears what it engaged, so either it never engaged one "
+                        "or somebody else cleared it (docs/RUNBOOK.md)."
                     ),
                     key="staleness.recovered",
-                    context={"max_silence_seconds": str(self.max_silence_seconds)},
+                    context={
+                        "max_silence_seconds": str(self.max_silence_seconds),
+                        "halted": str(still_halted),
+                    },
                 )
             )
         except Exception as exc:
