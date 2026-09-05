@@ -50,8 +50,8 @@ matters more than the count:
 | State | Count | Means |
 |---|---:|---|
 | Claimed, in progress (`wip`) | 0 | Nobody has an open PR against an item here right now |
-| Built, awaiting the phase line | 28 | Phases 1, 3, 4, 5 and 6. Code merged and tested, nothing left but the demonstration |
-| Unclaimed | 2 | **Daily report** (Phase 5) and **strategy lifecycle verbs** (Phase 4) — nobody has started either |
+| Built, awaiting the phase line | 29 | Phases 1, 3, 4, 5 and 6. Code merged and tested, nothing left but the demonstration |
+| Unclaimed | 1 | **Strategy lifecycle verbs** (Phase 4) — nobody has started it |
 
 Two things a reader should take from this rather than from the counts:
 
@@ -2351,11 +2351,30 @@ metric and no per-trade one, with the annualisation warning gone from the
 response. Proposed because the numbers being *arithmetically* right is what the
 unit tests already hold, and the thing that would actually be wrong in
 production is the two halves describing different periods or different runs.
-- [ ] Daily report.
-  Trades and P&L are available from `analytics/` as of #58. The other three
-  things the report wants are not gathered anywhere one query can reach:
-  rejections are in `signals`, halts are in the kill switch's records, and feed
-  incidents exist only in the worker's logs.
+- [ ] Daily report — @claude.
+  **Built and unticked**, in the third state this file defines: the code is
+  merged and tested, and Phase 5's *Verifiable:* line is about the dashboard
+  agreeing with the worker, which a report with no screen cannot demonstrate.
+
+  What unblocked it was noticing it needed no storage. `analytics.daily`
+  assembles the report from durable records, `GET /analytics/reports/daily`
+  computes it when somebody asks, and the worker logs and alerts it half an hour
+  after the close — so `queue.generate_report_task`, which is blocked on an
+  object store this platform does not have, is not on the path. A rendered
+  artifact nothing can fetch would be a key pointing at nowhere.
+
+  Two of the three gaps this item used to name have closed since it was written:
+  refused orders became rows, and halts a person engaged became audit entries.
+  **Feed incidents have not**, and the report says so rather than working around
+  it: every section is three-valued, and one whose store does not exist reports
+  *absent* with the grep that would answer it, never zero. That is
+  `analytics.paper_run`'s posture applied to a second report, and for the same
+  reason — "0 feed incidents" read off a store that has never held one is worse
+  than no report, because somebody will believe it.
+
+  The halts a *human* engaged are counted; the ones the risk layer engages on
+  its own still write no audit row, and the section says that on the face of its
+  own number rather than letting the count imply a coverage it does not have.
 
 *Verifiable:* with the stack up and a worker trading paper, a browser opened at
 any moment shows the same positions, cash and equity the worker's own log

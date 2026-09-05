@@ -211,14 +211,50 @@ itself would let a feed flapping every thirty seconds trade through every gap.
 
 ## Corporate actions
 
-Splits and dividends change historical prices and share counts. Applied
-pre-open by a scheduled job.
+Splits and dividends change historical prices and share counts. A scheduled job
+runs an hour before the open, refreshes the adjusted history, and says what
+moved.
 
 An unapplied 4:1 split makes a position look like it lost 75% overnight — which
 will trip stops and the daily loss limit on a day when nothing happened. A
 reverse split is the same defect with the sign flipped and is far worse,
 because it reads as a profit: GE's 1:8 on 2021-08-02 octupled its raw price
 overnight.
+
+**The job detects an action by comparing two fetches of the same history**, not
+by calling a corporate-actions endpoint. A vendor restates every historical
+`adj_close` for a symbol at once, so a series stored last week and one fetched
+this morning disagree by a single constant factor across every bar they share —
+and `get_bars(adjusted=True)` is the one method here that every backfill has
+already exercised against the real endpoint. An adapter written against a
+remembered API shape is a thing that passes every test and fails on the first
+real split; `tests/` reaches no network, so the shape could not be verified from
+inside this repository. Less informative, more certain.
+
+Refreshing is the whole correction and needed no new machinery:
+`PostgresBarRepository.upsert_bars` already merges `adj_close` so that a present
+incoming value wins, and its docstring already said why — "a corporate action
+makes every historical `adj_close` for that symbol stale and the newer figure is
+the correct one". **The nightly sweep does not do this**: it fills *gaps*, so it
+never re-fetches a bar the store already holds, and a bar written last week
+keeps last week's adjusted close for ever.
+
+**It does not touch a position, and that is a decision.** A 4:1 split makes a
+held 100 read as 400 at the venue, which `Reconciler.reconcile` sees as a
+quantity mismatch and halts on. Applying the factor here would prevent that halt
+— and would mean an unattended job rewriting share counts and cost bases from a
+number it *inferred from prices*. `adopt_broker_state` is "deliberately NOT
+automatic" for the same reason in its own words: silently adopting hides
+whatever caused the drift, and a split shares its shape with a
+duplicate-submission bug. The halt is the right outcome. What was missing is
+that it arrived unexplained, which is why the job runs an hour early and alerts
+a split-sized move by name and factor.
+
+A move too small to be split-shaped — a dividend — is stored and logged and does
+not alert. A series whose bars **disagree** about the factor is neither: one
+corporate action moves all of them, so the fresh prices are still written and
+the alert says the bars disagree rather than handing over a number to adopt a
+share count from.
 
 **Backtests do not rely on that job.** `BacktestEngine.run` converts every bar
 into adjusted space itself, scaling the whole candle by `adj_close / close` and

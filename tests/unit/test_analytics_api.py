@@ -24,6 +24,7 @@ import pytest
 
 from atp_api.auth import Scope, Session
 from atp_api.deps import (
+    get_audit_reader,
     get_backtest_repository,
     get_bar_repository,
     get_clock,
@@ -217,6 +218,23 @@ class RecordingOrderRepo:
 
     async def open_orders(self, run_mode: object) -> list[Order]:  # pragma: no cover
         return []
+
+    async def recent_orders(
+        self,
+        run_mode: object,
+        *,
+        status: object = None,
+        symbol: str | None = None,
+        strategy_id: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[Order]:
+        self.calls.append({"since": since, "limit": limit})
+        return [
+            o
+            for o in self.orders
+            if o.created_at is not None and (since is None or o.created_at >= since)
+        ][:limit]
 
     async def filled_orders(
         self, run_mode: object, *, until: datetime, strategy_id: str | None = None
@@ -567,19 +585,112 @@ class TestPerformance:
         assert body["equity_points"] == 0
 
 
-class TestStillStubs:
-    """One endpoint on this router is still a separate roadmap item.
+class TestTheDailyReport:
+    """The last stub on this router, and the rule that governed it.
 
-    Held by a test so that "this is unbuilt" stays a fact about the code rather
-    than a claim in a docstring — and so that building it has to delete the test
-    that says it is not built. `/live-vs-backtest` was the other one, and
-    deleting its entry here is what that rule looks like when it fires.
+    `TestStillStubs` held "this is unbuilt" as a fact about the code rather than
+    a claim in a docstring, so that building it had to delete the test saying it
+    was not built. `/live-vs-backtest` went the same way before it. This class is
+    what replaced the entry.
     """
 
     @pytest.mark.asyncio
-    async def test_the_daily_report_is_not_built(self, client: httpx.AsyncClient) -> None:
-        with pytest.raises(NotImplementedError):
-            await client.get("/api/v1/analytics/reports/daily")
+    async def test_it_reports_a_day_that_traded(
+        self, client: httpx.AsyncClient, orders: RecordingOrderRepo
+    ) -> None:
+        orders.orders = list(round_trip(at(0), at(1), exit_price="130"))
+
+        response = await client.get(f"/api/v1/analytics/reports/daily?day={T0.date().isoformat()}")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["orders_filled"] == 2
+        assert "SPY" in body["symbols"]
+
+    @pytest.mark.asyncio
+    async def test_a_day_the_orders_fall_outside_reports_that_day(
+        self, client: httpx.AsyncClient, orders: RecordingOrderRepo
+    ) -> None:
+        """The window is the requested day, not "everything since". A report
+        that quietly included yesterday's trades would make two days look like
+        one good one."""
+        orders.orders = list(round_trip(at(0), at(1), exit_price="130"))
+
+        body = (await client.get("/api/v1/analytics/reports/daily")).json()
+
+        assert body["orders_submitted"] == 0, "T0 is eighteen days before the pinned now"
+
+    @pytest.mark.asyncio
+    async def test_a_day_that_submitted_nothing_says_so_first(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """The outcome this platform has actually produced. Day 1 of the paper
+        week ran ten hours, submitted zero orders and reported it nowhere."""
+        response = await client.get("/api/v1/analytics/reports/daily")
+
+        assert response.status_code == 200
+        assert response.json()["headline"] == "no orders submitted"
+
+    @pytest.mark.asyncio
+    async def test_feed_incidents_are_null_and_never_zero(self, client: httpx.AsyncClient) -> None:
+        """The whole design of this report in one assertion.
+
+        Nothing counts feed incidents — reconnects, gaps and staleness are log
+        lines with no table behind them. Rendering `0` for them would be
+        believed, and the day this report summarises is exactly the day a reader
+        wants to know whether the feed misbehaved.
+        """
+        body = (await client.get("/api/v1/analytics/reports/daily")).json()
+
+        feed = next(s for s in body["sections"] if s["name"] == "feed incidents")
+        assert feed["value"] is None
+        assert feed["how_to_check"]
+        assert "feed incidents" in body["not_measured"]
+
+    @pytest.mark.asyncio
+    async def test_a_countable_section_is_zero_and_never_null(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """The control for the case above. Refused orders *are* rows, so a day
+        with none is a measured zero and must not read as unmeasured."""
+        body = (await client.get("/api/v1/analytics/reports/daily")).json()
+
+        refusals = next(s for s in body["sections"] if s["name"] == "risk rejections")
+        assert refusals["value"] == 0
+        assert "risk rejections" not in body["not_measured"]
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_audit_table_degrades_rather_than_502s(
+        self, app: FastAPI, orders: RecordingOrderRepo
+    ) -> None:
+        """Deliberately the opposite of what `/audit` does, and for a reason.
+
+        That page is nothing but audit rows, so a read it cannot make has to be
+        a 503. Here the halts are one section of five, and answering 503 would
+        hide the day's trades to report the absence of one section.
+        """
+        app.dependency_overrides[get_audit_reader] = lambda: _UnreadableAudit()
+        orders.orders = list(round_trip(at(0), at(1), exit_price="130"))
+        transport = httpx.ASGITransport(app=app)
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+            response = await http.get(
+                f"/api/v1/analytics/reports/daily?day={T0.date().isoformat()}"
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["orders_filled"] == 2, "the day's trades survive an unreadable audit table"
+        halts = next(s for s in body["sections"] if s["name"] == "halts")
+        assert halts["value"] is None
+        assert "halts" in body["not_measured"]
+
+
+class _UnreadableAudit:
+    """An audit reader whose table cannot be reached, for the degradation test."""
+
+    async def recent(self, **kwargs: object) -> list[object]:
+        raise ConnectionError("the database is gone")
 
 
 class TestLiveVsBacktest:

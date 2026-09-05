@@ -258,10 +258,11 @@ labelled as such.
 
 **Outstanding**
 
-- `/analytics/reports/daily` is a stub (`analytics.py:722`) and has no screen.
-  The roadmap explains why it is hard rather than merely undone: rejections live
-  in `signals`, halts in the kill switch's records, and feed incidents only in
-  the worker's logs — no one query reaches all three.
+- `/analytics/reports/daily` is built and has **no screen**. It is computed on
+  demand from the durable records rather than stored, so a panel would be a
+  fetch and a table. What it cannot answer it reports as absent rather than as
+  zero — feed incidents have no table behind them — and a screen for it has to
+  render that third state distinctly or it will be read as "none happened".
 - No price charts anywhere in the UI. `/market-data/bars/{symbol}`,
   `/quote/{symbol}` and `/search` are stubs (`marketdata.py:34,41,46`), and
   `/market-data/calendar` is implemented with no consumer at all. The equity
@@ -400,7 +401,7 @@ cannot show a strategy the server would reject.
 | `/strategies` other writes, `/available`, `/{id}` | **stub** | none |
 | `/analytics/{performance,trades,attribution}` | built | Analytics |
 | `/analytics/live-vs-backtest/{run_id}` | built | Analytics |
-| `/analytics/reports/daily` | **stub** | none |
+| `/analytics/reports/daily` | built | none |
 | `/backtests` + `/compare` + `/{id}/*` | built | Backtests |
 | `/audit` | built | Audit |
 | `/market-data/calendar` | built | **none** |
