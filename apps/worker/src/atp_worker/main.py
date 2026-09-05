@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any
 
 from atp_core import __version__
 from atp_core.alerts import build_alert_sink
+from atp_core.alerts.ports import Alert, Severity
 from atp_core.brokers.alpaca import AlpacaBroker
 from atp_core.clock import SystemClock, TradingCalendar
 from atp_core.config import get_settings
@@ -63,13 +64,15 @@ from atp_core.worker.config import DEFAULT_WORKER_CONFIG
 from atp_core.worker.ports import RunningWorkerConfig
 from atp_worker import trading
 from atp_worker.metrics_server import start_metrics_server
-from atp_worker.scheduler import SessionJobs, build_schedule, run_scheduler
+from atp_worker.scheduler import SessionJobs, SessionWatch, build_schedule, run_scheduler
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine, Mapping
 
+    from atp_core.alerts.ports import AlertSink
     from atp_core.config import Settings
-    from atp_core.risk.killswitch import KillSwitch
+    from atp_core.risk.killswitch import HaltRecord, KillSwitch
+    from atp_worker.runner import RunnerStats
 
     #: A thing the supervisor runs. A factory rather than a coroutine because a
     #: coroutine is single-use, and the supervisor is the only thing entitled to
@@ -156,7 +159,12 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
         # reconciliation mismatch, a supervised task dying — goes through this
         # object, so binding the sink here is what makes all three reach a
         # phone rather than only a log file (docs/SAFETY.md).
-        kill_switch = RedisKillSwitch(sync_redis, alerts=build_alert_sink(settings))
+        #: One sink, shared. The kill switch alerts on engagement; the
+        #: scheduler's halt reminder and session summary alert on the two
+        #: things day 1 proved nobody hears otherwise — that a halt is *still*
+        #: standing, and what the session actually did.
+        alerts = build_alert_sink(settings)
+        kill_switch = RedisKillSwitch(sync_redis, alerts=alerts)
         session_factory = create_session_factory(engine)
 
         # What to trade, from the row the dashboard writes.
@@ -231,6 +239,9 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
         #: runs depends on it: reconciliation needs the runner's live book, and
         #: a worker that is not trading has none.
         session_jobs: SessionJobs | None = None
+        #: How the session summary reads the day's numbers, or None when no
+        #: strategy ran. Set beside `session_jobs` and for the same reason.
+        session_stats: Callable[[], RunnerStats] | None = None
 
         if symbols:
             ingestor = StreamIngestor(
@@ -306,8 +317,19 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
                 portfolio=portfolio,
                 open_orders=lambda: runner.open_orders,
             )
+            session_stats = lambda: runner.stats  # noqa: E731
 
-        responsibilities["scheduler"] = lambda: run_scheduler(schedule=build_schedule(session_jobs))
+        # Bound whether or not this worker trades: a data-only worker on a
+        # halted platform is precisely the one that owed somebody a message on
+        # day 1 and sent none (docs/paper-week/day-1-review.md, F8).
+        session_watch = SessionWatch(
+            kill_switch=kill_switch,
+            alerts=alerts,
+            stats=session_stats,
+        )
+        responsibilities["scheduler"] = lambda: run_scheduler(
+            schedule=build_schedule(session_jobs, session_watch)
+        )
 
         if decision.enabled and settings.is_live:
             log.critical("worker.trading_live", msg=decision.reason)
@@ -346,17 +368,43 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
                 msg="the Config tab will report no worker running; trading is unaffected",
             )
 
+        # **Read the halt before announcing readiness.** Day 1 of the paper week
+        # restarted a worker three times into a standing global halt, and each
+        # one announced "trading sma_crossover with paper money" at INFO while
+        # nothing could trade (docs/paper-week/day-1-review.md, F4). That was an
+        # observability defect and not a safety hole — every order still passes
+        # `KillSwitchRule`, which reads Redis per order and fails closed — but a
+        # worker that says the opposite of the truth about whether it is trading
+        # is the log line an operator reads at 09:45 and believes.
+        halts = _active_halts(kill_switch)
+
         log.info(
             "worker.ready",
             run_mode=settings.run_mode,
             symbols=symbols,
             config_revision=revision,
             responsibilities=sorted(responsibilities),
-            trading=decision.enabled,
-            msg=decision.reason,
+            # Folded into this line rather than left to the separate CRITICAL
+            # below, because this is the line that gets grepped after the fact
+            # and the two must not be able to drift apart.
+            halted=bool(halts),
+            trading=decision.enabled and not halts,
+            msg=decision.reason if not halts else "HALTED — no order will reach the venue",
         )
+        if halts:
+            log.critical(
+                "worker.ready_while_halted",
+                halts=[_describe_halt(record) for record in halts],
+                effect="every order will be refused by kill_switch until a human clears it",
+                fix='uv run python scripts/halt.py clear --by "<your name>"',
+            )
 
-        await supervise(responsibilities, stop_event=stop_event, kill_switch=kill_switch)
+        await supervise(
+            responsibilities,
+            stop_event=stop_event,
+            kill_switch=kill_switch,
+            alerts=alerts,
+        )
 
 
 async def supervise(
@@ -364,6 +412,7 @@ async def supervise(
     *,
     stop_event: asyncio.Event,
     kill_switch: KillSwitch | None = None,
+    alerts: AlertSink | None = None,
 ) -> None:
     """Run every responsibility until one ends or a signal arrives.
 
@@ -419,10 +468,84 @@ async def supervise(
 
     log.critical("worker.responsibility_ended", responsibility=name, detail=detail)
     _halt(kill_switch, detail)
+    _announce_death(alerts, name, detail)
 
     if error is not None:
         raise error
     raise WorkerError(detail)
+
+
+def _announce_death(alerts: AlertSink | None, name: str, detail: str) -> None:
+    """Tell a human this process is going down. Never let it matter if it fails.
+
+    **The halt's own alert does not cover this**, and day 1 is the proof. Three
+    workers died in 158 seconds and produced zero alerts between them: the first
+    halt had already sent its notification, `engage` is idempotent by the Redis
+    record, and so the second and third deaths — and the crash loop they formed
+    — reached nobody (docs/paper-week/day-1-review.md, F8). That dedup is right
+    for a halt, which is one condition however many times it is re-engaged, and
+    wrong for a process death, which is a new event every time.
+
+    So the key is the *responsibility*, not the halt: a feed that dies twice
+    sends two alerts, while a transport that collapses on `key` still folds a
+    storm of identical restarts into something readable.
+
+    Swallowed for the reason `killswitch._send_alert` is: this runs on the way
+    out of a worker that is already failing, and an exception from a
+    notification must not replace the error that is about to be raised.
+    """
+    if alerts is None:
+        return
+    try:
+        alerts.send(
+            Alert(
+                severity=Severity.CRITICAL,
+                title=f"Worker stopping — {name} ended",
+                body=f"{detail}\nTrading is halted. The process will exit; "
+                f"check whether it is restarting in a loop.",
+                key=f"worker.died.{name}",
+                context={"responsibility": name},
+            )
+        )
+    except Exception as exc:
+        log.error("worker.death_alert_failed", error=str(exc))
+
+
+def _active_halts(kill_switch: KillSwitch | None) -> list[HaltRecord]:
+    """What is halted right now, for the readiness line. Never raises.
+
+    `active_halts` deliberately lets a Redis failure propagate — it is a display
+    read, and "nothing is halted" is the wrong thing to show a human when the
+    truth is unknown (`risk.killswitch`). That is right for the dashboard and
+    wrong here: this runs on the boot path, and a worker that refused to start
+    because it could not *describe* the halt state would be strictly worse than
+    one that starts and says so. The kill switch itself fails closed on the same
+    outage, so nothing trades either way.
+
+    Every scope, not just global. A leftover symbol-scoped halt is the one that
+    goes unnoticed — the loop runs, and one name silently never trades — which
+    is the argument `preflight.check_not_halted` already makes.
+    """
+    if kill_switch is None:
+        return []
+    try:
+        return kill_switch.active_halts()
+    except Exception as exc:
+        log.error(
+            "worker.halt_state_unknown",
+            error=str(exc),
+            msg="could not read the kill switch at startup; it fails closed, so "
+            "orders are being refused if a halt stands",
+        )
+        return []
+
+
+def _describe_halt(record: HaltRecord) -> str:
+    """One halt, short enough to sit inline in a log line."""
+    scope = record.scope.value if record.target is None else f"{record.scope.value}:{record.target}"
+    return (
+        f"{scope} by {record.engaged_by} ({record.reason.value}) at {record.engaged_at.isoformat()}"
+    )
 
 
 def _halt(kill_switch: KillSwitch | None, detail: str) -> None:

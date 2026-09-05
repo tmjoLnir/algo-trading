@@ -14,6 +14,7 @@ from datetime import timedelta
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
+from atp_core.alerts.ports import Alert, Severity
 from atp_core.clock import SystemClock, TradingCalendar
 from atp_core.config import get_settings
 from atp_core.data.backfill import GapBackfillResult, backfill_gaps
@@ -27,9 +28,12 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
     from datetime import datetime
 
+    from atp_core.alerts.ports import AlertSink
     from atp_core.clock import Clock
     from atp_core.domain import Order, Portfolio, Timeframe
     from atp_core.execution.reconciliation import Reconciler
+    from atp_core.risk.killswitch import KillSwitch
+    from atp_worker.runner import RunnerStats
 
 log = get_logger(__name__)
 
@@ -64,6 +68,145 @@ class SessionJobs:
     reconciler: Reconciler
     portfolio: Portfolio
     open_orders: Callable[[], list[Order]]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionWatch:
+    """What the two escalation jobs below need, supplied by `main.py`.
+
+    Separate from `SessionJobs` because the two answer different questions and
+    are available at different times. `SessionJobs` is the live *book* and
+    exists only when this worker is trading; this is the *halt state and a way
+    to reach a human*, which matter whether or not it is — a worker ingesting
+    data for a platform that is halted is exactly the case day 1 produced.
+
+    `stats` is optional and callable for the reason `SessionJobs.open_orders` is
+    one: the numbers change under the job, and a snapshot taken at wiring time
+    would report the day the worker started rather than the day it is closing.
+    """
+
+    kill_switch: KillSwitch
+    alerts: AlertSink
+    stats: Callable[[], RunnerStats] | None = None
+
+
+async def remind_about_halts(watch: SessionWatch) -> None:
+    """While anything is halted, keep saying so. Every 15 minutes, in session.
+
+    **The reminder is durable because its state is Redis, not this process.**
+    That is the whole of the fix. On day 1 a global halt stood for 2h37m and
+    produced exactly one alert, at the moment it engaged: the halt's own
+    deduplication is the Redis record (`killswitch.engage` returns early when a
+    halt is already active), which is correct for *engagement* and meant nothing
+    ever repeated it. The other continuous signal, the `atp_halt_active` metric,
+    was uncollectable because `METRICS_TOKEN` was unset. Both escalation paths
+    failed for the same underlying reason, and an operator went home
+    (docs/paper-week/day-1-review.md, F8).
+
+    Reading `active_halts` each time is what makes this survive a restart: five
+    workers died that afternoon and any per-process reminder flag would have
+    died with them.
+
+    The alert `key` carries the reminder's own count so a transport that
+    collapses repeats — which is what `key` is for (`alerts.ports`) — does not
+    collapse the reminders into the original halt and silence the thing whose
+    entire job is not to be silent.
+    """
+    halts = watch.kill_switch.active_halts()
+    if not halts:
+        return
+
+    _HALT_REMINDERS["count"] += 1
+    count = _HALT_REMINDERS["count"]
+    lines = [
+        f"{h.scope.value}{f' [{h.target}]' if h.target else ''} — {h.reason.value}, "
+        f"by {h.engaged_by}, since {h.engaged_at.isoformat()}"
+        for h in halts
+    ]
+    log.critical("worker.halt_reminder", halts=len(halts), reminder=count)
+    watch.alerts.send(
+        Alert(
+            severity=Severity.CRITICAL,
+            title=f"Still halted — {len(halts)} active",
+            body="\n".join([*lines, "Nothing is trading. docs/RUNBOOK.md."]),
+            key=f"halt.reminder.{count}",
+            context={"active": str(len(halts))},
+        )
+    )
+
+
+async def summarise_the_session(watch: SessionWatch) -> None:
+    """At the close: say what the day actually did, to a human, once.
+
+    Day 1 ran ten hours, submitted zero orders, spent its last 74 minutes
+    halted, and told nobody any of it — the two alerts all day were the halt
+    engaging and, hours later, a human clearing it. A summary is the one message
+    that is worth sending when *nothing* happened, because nothing happening is
+    indistinguishable from working perfectly until somebody says so
+    (docs/paper-week/day-1-review.md, F8).
+
+    Deliberately not `generate_daily_report`, which sits half an hour after this
+    and is still a stub. That is a document; this is a sentence on a phone, and
+    it must not wait on the report being built.
+    """
+    halts = watch.kill_switch.active_halts()
+    stats = watch.stats() if watch.stats is not None else None
+
+    if stats is None:
+        headline = "no strategy ran today"
+    else:
+        headline = (
+            f"{stats.orders_submitted} orders submitted, "
+            f"{stats.signals_generated} signals, "
+            f"{stats.evaluations} evaluations, "
+            f"{stats.orders_rejected_by_risk} refused by risk"
+        )
+
+    lines = [headline]
+    if halts:
+        lines.append(f"STILL HALTED at the close — {len(halts)} active:")
+        lines += [
+            f"  {h.scope.value}{f' [{h.target}]' if h.target else ''} since "
+            f"{h.engaged_at.isoformat()} ({h.reason.value})"
+            for h in halts
+        ]
+    else:
+        lines.append("Not halted.")
+
+    log.info(
+        "worker.session_summary",
+        orders_submitted=stats.orders_submitted if stats else None,
+        evaluations=stats.evaluations if stats else None,
+        halted=bool(halts),
+    )
+    watch.alerts.send(
+        Alert(
+            # CRITICAL when the day ended halted, because that is a state
+            # somebody has to act on before tomorrow's open; INFO otherwise.
+            severity=Severity.CRITICAL if halts else Severity.INFO,
+            title="Session closed" + (" — STILL HALTED" if halts else ""),
+            body="\n".join(lines),
+            # Dated, so one summary a day survives a transport that collapses
+            # on `key` and two summaries never do.
+            key=f"session.summary.{_session_day(watch)}",
+            context={"halted": str(bool(halts))},
+        )
+    )
+
+
+#: The reminder counter. Module state, and the one piece of this that is *not*
+#: durable — deliberately, because it only has to make consecutive alert keys
+#: differ. What must survive a restart is the halt itself, and that is in Redis.
+_HALT_REMINDERS: dict[str, int] = {"count": 0}
+
+
+def _session_day(watch: SessionWatch) -> str:
+    """Today, for the summary's alert key. Off the halt record when there is
+    one, so the key cannot depend on a clock this module does not own."""
+    halts = watch.kill_switch.active_halts()
+    if halts:
+        return halts[0].engaged_at.date().isoformat()
+    return SystemClock().now().date().isoformat()
 
 
 async def reconcile_with_broker(session: SessionJobs) -> None:
@@ -240,7 +383,9 @@ SCHEDULE: list[dict[str, Any]] = [
 ]
 
 
-def build_schedule(session: SessionJobs | None = None) -> list[dict[str, Any]]:
+def build_schedule(
+    session: SessionJobs | None = None, watch: SessionWatch | None = None
+) -> list[dict[str, Any]]:
     """The schedule this worker will actually run.
 
     `SCHEDULE` is the part that needs nothing from the trading loop. The jobs
@@ -248,9 +393,36 @@ def build_schedule(session: SessionJobs | None = None) -> list[dict[str, Any]]:
     strategy configured holds no portfolio and has no broker to compare it
     against, and an entry that failed every five minutes for want of either
     would be indistinguishable in the log from a venue that had gone away.
+
+    `watch` is added on a *different* condition and that is the point: the halt
+    reminder and the session summary need a kill switch and a way to reach a
+    human, not a book. A worker ingesting data for a halted platform still owes
+    somebody both messages, and on day 1 it was exactly that worker which sent
+    neither (docs/paper-week/day-1-review.md, F8).
     """
+    watching: list[dict[str, Any]] = []
+    if watch is not None:
+        watching = [
+            {
+                # Fifteen minutes: often enough that nobody goes home believing
+                # the platform is trading, rare enough not to be the thing an
+                # operator mutes. Day 1's halt would have produced ten of these.
+                "job": partial(remind_about_halts, watch),
+                "trigger": "interval",
+                "minutes": 15,
+                "market_hours_only": True,
+            },
+            {
+                # At the close itself rather than with the report half an hour
+                # later: this is the message that says whether to act tonight.
+                "job": partial(summarise_the_session, watch),
+                "trigger": "market_close",
+                "offset_minutes": 0,
+            },
+        ]
+
     if session is None:
-        return list(SCHEDULE)
+        return [*watching, *SCHEDULE]
     return [
         {
             "job": partial(reconcile_with_broker, session),
@@ -258,6 +430,7 @@ def build_schedule(session: SessionJobs | None = None) -> list[dict[str, Any]]:
             "minutes": 5,
             "market_hours_only": True,
         },
+        *watching,
         *SCHEDULE,
     ]
 

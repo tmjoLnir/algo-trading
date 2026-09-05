@@ -99,11 +99,34 @@ A second process asking for the same key is refused with code 406, and
 ingestors fighting over one connection is worse than one that fails loudly.
 
 **Reconnecting and gap-filling are split, deliberately.** The feed adapter owns
-the socket: exponential backoff 1s → 60s with jitter, subscriptions replayed on
+the socket: exponential backoff 1s → 30s with jitter, subscriptions replayed on
 the way back up, and it gives up rather than looping forever on an error another
 connection would not fix (bad credentials, a plan that does not cover the feed,
 the connection limit). The `StreamIngestor` owns the *data* gap, because the
 historical provider and the bar store are its dependencies, not the feed's.
+
+**It gives up on a stopwatch, not a counter.** The ladder ran for eight attempts
+until day 1 of the paper week, which sounds generous and is not: a doubling
+backoff spends most of its budget on the last two waits, so eight attempts
+expired about four minutes in. Alpaca was unreachable for roughly seven minutes,
+so the stream raised, the worker died, restarted, reset the counter and died
+again — three times (docs/paper-week/day-1-review.md, F6). It is now bounded by
+`ws.RECONNECT_BUDGET_SECONDS`, fifteen minutes of elapsed time, and the
+per-attempt ceiling was halved so a long outage is retried more often rather
+than less. "How long can this venue be away before we stop trying" is a question
+an operator can answer; "how many attempts is that" was one they had to
+integrate by hand.
+
+The window is derived from **the last bar in storage** as well as from the
+feed's own gap marker, whichever is earlier. The marker is measured from the
+current process's stream start, so a restart mid-outage silently shrinks it —
+which is exactly what happened on day 1: the fourth worker believed the gap was
+23 seconds rather than eight minutes, asked for a one-minute window, and
+succeeded by its own definition. None of `backfill_failed`, `backfill_skipped`
+or `backfill_truncated` fired and ~108 bars are permanently absent (F5). The bar
+table cannot be reset by a restart, so it is the second opinion; a disagreement
+is logged as `data.stream.gap_widened_from_storage`. An over-wide window costs a
+few redundant upserts, and a too-narrow one costs the data.
 
 **On reconnect, backfill before resuming.** Events during the gap are gone, and
 indicators computed across an unfilled hole are wrong in a way nothing

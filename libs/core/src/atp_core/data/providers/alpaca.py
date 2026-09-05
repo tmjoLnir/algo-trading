@@ -447,7 +447,7 @@ _HANDSHAKE_TIMEOUT_SECONDS = ws.HANDSHAKE_TIMEOUT_SECONDS
 _MAX_HANDSHAKE_FRAMES = ws.MAX_HANDSHAKE_FRAMES
 _STREAM_BACKOFF_BASE_SECONDS = ws.BACKOFF_BASE_SECONDS
 _STREAM_BACKOFF_MAX_SECONDS = ws.BACKOFF_MAX_SECONDS
-_MAX_RECONNECT_ATTEMPTS = ws.MAX_RECONNECT_ATTEMPTS
+_RECONNECT_BUDGET_SECONDS = ws.RECONNECT_BUDGET_SECONDS
 
 
 class _PermanentFeedError(DataError):
@@ -488,7 +488,7 @@ class AlpacaRealtimeFeed:
         rng: random.Random | None = None,
         backoff_base_seconds: float = _STREAM_BACKOFF_BASE_SECONDS,
         backoff_max_seconds: float = _STREAM_BACKOFF_MAX_SECONDS,
-        max_reconnect_attempts: int = _MAX_RECONNECT_ATTEMPTS,
+        reconnect_budget_seconds: float = _RECONNECT_BUDGET_SECONDS,
         handshake_timeout_seconds: float = _HANDSHAKE_TIMEOUT_SECONDS,
     ) -> None:
         self._settings = settings
@@ -504,7 +504,7 @@ class AlpacaRealtimeFeed:
         self._rng = rng if rng is not None else random.Random()
         self._backoff_base_seconds = backoff_base_seconds
         self._backoff_max_seconds = backoff_max_seconds
-        self._max_reconnect_attempts = max_reconnect_attempts
+        self._reconnect_budget_seconds = reconnect_budget_seconds
         self._handshake_timeout_seconds = handshake_timeout_seconds
 
         self._connected = False
@@ -593,6 +593,11 @@ class AlpacaRealtimeFeed:
         #: has genuinely lost whatever traded while it was struggling.
         gap_since = self._clock.now()
         reconnecting = False
+        #: When the current run of failures began, or None while connected. The
+        #: retry budget is measured from here rather than counted in attempts,
+        #: so a venue away for seven minutes is waited out instead of killing
+        #: the process four minutes in (docs/paper-week/day-1-review.md, F6).
+        first_failure_at: datetime | None = None
 
         while True:
             try:
@@ -602,12 +607,22 @@ class AlpacaRealtimeFeed:
             except Exception as exc:  # every transport failure retries alike
                 attempts += 1
                 self._note_disconnect(exc)
-                if attempts > self._max_reconnect_attempts:
+                now = self._clock.now()
+                if first_failure_at is None:
+                    first_failure_at = now
+                if ws.budget_exhausted(first_failure_at, now, self._reconnect_budget_seconds):
                     raise DataError(
-                        f"Alpaca stream did not come back after {self._max_reconnect_attempts} "
-                        f"attempts: {exc}"
+                        f"Alpaca stream did not come back within "
+                        f"{self._reconnect_budget_seconds:.0f}s "
+                        f"({attempts} attempts): {exc}"
                     ) from exc
-                log.warning("data.alpaca.stream_reconnecting", attempt=attempts, error=str(exc))
+                log.warning(
+                    "data.alpaca.stream_reconnecting",
+                    attempt=attempts,
+                    trying_for_seconds=round((now - first_failure_at).total_seconds(), 1),
+                    budget_seconds=self._reconnect_budget_seconds,
+                    error=str(exc),
+                )
                 await self._sleep(self._backoff_delay(attempts))
                 reconnecting = True
                 continue
@@ -633,6 +648,11 @@ class AlpacaRealtimeFeed:
                 if not delivered:
                     delivered = True
                     attempts = 0
+                    #: Cleared only once the connection has *delivered*, not
+                    #: when it opened. A server that accepts and immediately
+                    #: drops us would otherwise restart the budget on every
+                    #: loop and retry for ever.
+                    first_failure_at = None
                 for event in frame:
                     yield event
                 gap_since = self._last_message_at or gap_since

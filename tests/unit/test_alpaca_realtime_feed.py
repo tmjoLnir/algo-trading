@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from pydantic import SecretStr
 
+from atp_core import ws
 from atp_core.config import Settings
 from atp_core.data.ports import FeedReconnected
 from atp_core.data.providers.alpaca import AlpacaRealtimeFeed
@@ -152,7 +153,14 @@ class FakeConnection:
 
 
 class FakeClock:
-    """Advances a fixed step per read, so timestamps in assertions are exact."""
+    """Advances a fixed step per read, so timestamps in assertions are exact.
+
+    `advance` is the other half, used by `build`'s fake sleep: the reconnect
+    budget is measured in elapsed time, so a ladder test needs waiting to *be*
+    the passage of time. Those tests pass `step=timedelta(0)` as well, which
+    makes the elapsed total exactly the sum of the waits rather than the waits
+    plus however many times the loop happened to read the clock.
+    """
 
     def __init__(self, start: datetime, step: timedelta = timedelta(seconds=1)) -> None:
         self._now = start
@@ -162,6 +170,9 @@ class FakeClock:
         current = self._now
         self._now += self._step
         return current
+
+    def advance(self, seconds: float) -> None:
+        self._now += timedelta(seconds=seconds)
 
 
 def make_settings() -> Settings:
@@ -173,16 +184,33 @@ def make_settings() -> Settings:
     )
 
 
+def ladder_clock() -> FakeClock:
+    """A clock that moves only when the ladder waits.
+
+    The default `FakeClock` steps a second per *read*, which is what makes
+    timestamp assertions elsewhere exact — and which would quietly inflate the
+    reconnect budget here by however many times the loop consulted it. With a
+    zero step, elapsed time is exactly the sum of the waits.
+    """
+    return FakeClock(datetime(2024, 6, 3, 14, 30, tzinfo=UTC), step=timedelta(0))
+
+
 def build(
     *connections: FakeConnection,
-    max_reconnect_attempts: int = 0,
+    reconnect_budget_seconds: float = 0.0,
     clock: FakeClock | None = None,
 ) -> tuple[AlpacaRealtimeFeed, list[float], list[FakeConnection]]:
     """A feed wired to a queue of connections. Returns it, the sleeps it asked
-    for, and the connections it was handed."""
+    for, and the connections it was handed.
+
+    The fake sleep advances the clock, because the reconnect budget is elapsed
+    time (docs/paper-week/day-1-review.md, F6): waiting has to move the clock or
+    a fifteen-minute budget would never expire in a test and never be tested.
+    """
     queue = list(connections)
     handed: list[FakeConnection] = []
     slept: list[float] = []
+    the_clock = clock or FakeClock(datetime(2024, 6, 3, 14, 30, tzinfo=UTC))
 
     async def connect(url: str) -> FakeConnection:
         if not queue:
@@ -193,14 +221,15 @@ def build(
 
     async def sleep(seconds: float) -> None:
         slept.append(seconds)
+        the_clock.advance(seconds)
 
     feed = AlpacaRealtimeFeed(
         make_settings(),
         connect=connect,
         sleep=sleep,
-        clock=clock or FakeClock(datetime(2024, 6, 3, 14, 30, tzinfo=UTC)),
+        clock=the_clock,
         rng=random.Random(0),
-        max_reconnect_attempts=max_reconnect_attempts,
+        reconnect_budget_seconds=reconnect_budget_seconds,
     )
     return feed, slept, handed
 
@@ -522,27 +551,63 @@ class TestReconnect:
 
         assert not any(isinstance(e, FeedReconnected) for e in events)
 
-    async def test_backs_off_exponentially_and_gives_up(self) -> None:
-        feed, slept, _ = build(max_reconnect_attempts=3)  # no connections at all
+    async def test_backs_off_exponentially_and_gives_up_on_elapsed_time(self) -> None:
+        """The ladder shape is unchanged; what ends it is now a duration.
+
+        An attempt ceiling made "how long will this keep trying" a question you
+        had to answer by integrating the backoff schedule by hand — and on day 1
+        the answer was about four minutes against a seven-minute outage
+        (docs/paper-week/day-1-review.md, F6).
+        """
+        feed, slept, _ = build(  # no connections at all
+            reconnect_budget_seconds=120.0, clock=ladder_clock()
+        )
         await feed.subscribe(["SPY"])
 
         _, error = await collect(feed)
 
-        assert error is not None and "did not come back after 3 attempts" in str(error)
-        assert len(slept) == 3
+        assert error is not None and "did not come back within 120s" in str(error)
+        assert sum(slept) >= 120.0, "it must not give up before the budget is spent"
         # Jittered into [d/2, d], so the ladder is bounded rather than exact —
         # an assertion on exact delays would be testing `random`.
-        for delay, unjittered in zip(slept, [1.0, 2.0, 4.0], strict=True):
+        for delay, unjittered in zip(slept[:3], [1.0, 2.0, 4.0], strict=True):
             assert unjittered / 2 <= delay <= unjittered
 
     async def test_backoff_is_capped(self) -> None:
-        feed, slept, _ = build(max_reconnect_attempts=12)
+        feed, slept, _ = build(reconnect_budget_seconds=600.0, clock=ladder_clock())
         await feed.subscribe(["SPY"])
 
         _, error = await collect(feed)
 
         assert error is not None
-        assert max(slept) <= 60.0
+        assert max(slept) <= ws.BACKOFF_MAX_SECONDS
+
+    async def test_a_seven_minute_venue_outage_is_survived(self) -> None:
+        """The day-1 regression, on the feed side.
+
+        Alpaca was unreachable for roughly seven minutes. This stream gave up
+        about four minutes in and took the worker with it — and each restart
+        reset the gap marker, which is how a seven-minute outage became ~108
+        permanently missing bars (F5) with the staleness clock reset under it
+        (F7). Here the venue comes back after seven minutes and the feed is
+        still trying.
+        """
+        failures = [FakeConnection(self.script(DroppedError("closed"))) for _ in range(25)]
+        good = FakeConnection(self.script([BAR_MSG]))
+        # The shipped default, not a test value: the claim is that what actually
+        # runs in production is enough to outlast the outage that broke day 1.
+        feed, slept, _ = build(
+            *failures,
+            good,
+            reconnect_budget_seconds=ws.RECONNECT_BUDGET_SECONDS,
+            clock=ladder_clock(),
+        )
+        await feed.subscribe(["SPY"])
+
+        events, _ = await collect(feed)
+
+        assert sum(slept) >= 7 * 60, "the outage must actually have been waited out"
+        assert any(isinstance(e, FeedReconnected) for e in events)
 
     async def test_a_connection_that_delivers_resets_the_ladder(self) -> None:
         first = FakeConnection(self.script([QUOTE_MSG], DroppedError("closed")))
@@ -560,7 +625,7 @@ class TestReconnect:
         """A server that accepts and immediately hangs up — a connection-limit
         fight, a flapping upstream — must not become a hot loop."""
         flapping = [FakeConnection(self.script(DroppedError("closed"))) for _ in range(4)]
-        feed, slept, _ = build(*flapping, max_reconnect_attempts=2)
+        feed, slept, _ = build(*flapping, reconnect_budget_seconds=120.0, clock=ladder_clock())
         await feed.subscribe(["SPY"])
 
         _, error = await collect(feed)

@@ -2578,6 +2578,19 @@ has met a database holding a real strategy's history.
   That second one was a real bug caught by its own test — the first draft let a
   raising sink propagate straight out of `engage`.
 
+  **One notification per halt is right, and it is not the whole story.** Day 1
+  of the paper week held a global halt for 2h37m and produced exactly one alert,
+  at the moment it engaged — the dedup above working exactly as designed, and an
+  operator going home believing the platform was trading
+  (docs/paper-week/day-1-review.md, F8). So *engagement* is still deduplicated
+  and a separate scheduler job, `remind_about_halts`, repeats a standing halt
+  every fifteen minutes in session. It reads `active_halts` each time rather
+  than holding a flag, which is what makes it survive the crash loop that
+  suppressed everything else that afternoon. Three more events joined it for the
+  same reason: a worker responsibility dying (keyed on the responsibility, since
+  a process death is a new event every time where a halt is one condition), a
+  feed recovering, and one summary at the close.
+
   Alerts carry the reason and the scope and never a balance, a position or a
   P&L: the transport is a third party, the notification renders on a lock
   screen, and on a public ntfy server a guessable topic is all that is in front

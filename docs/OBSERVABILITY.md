@@ -241,9 +241,17 @@ slow" question to answer.
   rule in this repo. What exists is the exporter and the format; a scrape config
   is four lines and is not committed here because no host has been chosen (ADR
   0011).
-- **No alerting rules.** The PromQL above is illustrative. The one alerting path
-  that exists is the kill switch reaching a phone (ADR 0012), which is a
-  different mechanism and deliberately narrower.
+- **No alerting rules.** The PromQL above is illustrative. Alerting that exists
+  reaches a phone directly (ADR 0012) rather than through a rule engine, and is
+  deliberately narrow: the kill switch engaging and clearing, a data feed
+  recovering, a worker responsibility dying, a halt that is *still* standing
+  (every fifteen minutes, in session), and one summary at the close.
+  The last four were added after day 1 of the paper week, where three process
+  deaths in 158 seconds and a 2h37m halt produced **two** alerts between them —
+  the halt engaging, and a human clearing it hours later
+  (docs/paper-week/day-1-review.md, F7 and F8). The halt reminder is driven off
+  the Redis halt record rather than a flag in the worker, which is what makes it
+  survive the crash loop that suppressed it.
 - **No P&L, no balances, no positions.** Metrics never carry the book, which is
   the same rule alerts follow and for the same reason: this is transport to a
   third party and the numbers belong on the dashboard, behind authentication.

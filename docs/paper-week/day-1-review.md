@@ -468,6 +468,50 @@ order in production. The configured ceilings are untested numbers.
 > order including exits, on the same chain, so a feed halt still cannot dump the
 > book into a market nobody can see.
 >
+> **F4 through F8 are fixed too**, and they are one causal chain rather than
+> five findings: F6 (both retry budgets expired in about four minutes against a
+> seven-minute venue outage) caused the three process deaths, and those deaths
+> caused F5 (each restart reset the feed's gap origin), F7 (each restart reset
+> the staleness clock) and half of F8 (the escalation state was per-process).
+>
+> **F6.** Both streams are now bounded by elapsed time — fifteen minutes — in
+> place of an attempt ceiling, and the per-attempt cap is halved to 30s so a long
+> outage is retried more often rather than less. Each has a regression test that
+> plays the day-1 outage: seven minutes of failures, then the venue returns, and
+> nothing raises.
+>
+> **F5.** The reconnect window now starts at the earlier of the feed's gap
+> marker and the last bar in storage, and says so as
+> `data.stream.gap_widened_from_storage` when the two disagree. A restart cannot
+> shrink a gap any more. `FakeBarRepo` answered every read with "no bars", which
+> is why no test caught this: a fake that cannot express the failure cannot catch
+> it, so it now holds bars.
+>
+> **F7.** `connected_since` is demoted from a peer of `last_message_at` to the
+> fallback of last resort. The baseline is the storage watermark, which a restart
+> cannot reset — so a worker that dies inside `max_silence_seconds` now still
+> reports the outage it was born into. `data.staleness.recovered` also reaches a
+> phone now, and says that the halt it engaged is still engaged, because a
+> CRITICAL followed by silence cannot be told from "fixed itself, waiting for
+> you".
+>
+> **F4.** `worker.ready` reads `active_halts()` first, carries `halted`, and is
+> followed by a CRITICAL naming every scope and the command that clears it.
+> Still an observability fix and not a safety one — every order passed
+> `KillSwitchRule` throughout — but it is the line an operator believes.
+>
+> **F8.** The halt reminder is a scheduler job reading Redis every fifteen
+> minutes in session, so the crash loop that destroyed the old per-process state
+> cannot suppress it. A worker responsibility dying now alerts on its own key,
+> because the halt's alert is deduplicated by design and the second and third
+> deaths reached nobody. And the session closes with a summary — the message
+> worth sending precisely when nothing happened, since nothing happening is
+> indistinguishable from working perfectly until somebody says so.
+>
+> What is **not** fixed here: `backfill_missing_bars` still has to run to repair
+> the ~108 bars day 1 lost, and the `METRICS_TOKEN` in item 3 remains a
+> deployment secret no commit can discharge.
+>
 > **F9** is gated and recorded. `scripts/halt.py clear` now prompts for the
 > account password and checks it against the same hash `POST /risk/resume` does,
 > so docs/RUNBOOK.md's "clearing asks for the password, wherever you do it" is
@@ -490,11 +534,14 @@ order in production. The configured ceilings are untested numbers.
 
 **P1 — this week**
 
-5. **F5** — derive the reconnect gap from the last stored bar.
-6. **F6** — bound retry budgets by elapsed time; survive 10–15 minutes.
-7. **F7** — seed the staleness clock from the last bar; emit `staleness.recovered`.
-8. **F4/F8** — read halt state at boot; make the halt reminder durable; alert on
-   `worker.halted`; add an end-of-session summary.
+5. ~~**F5** — derive the reconnect gap from the last stored bar.~~ **Done** — the
+   earlier of the feed's marker and storage wins, and a disagreement is logged.
+6. ~~**F6** — bound retry budgets by elapsed time; survive 10–15 minutes.~~
+   **Done** — 15 minutes of elapsed time on both streams, per-attempt cap 30s.
+7. ~~**F7** — seed the staleness clock from the last bar; emit `staleness.recovered`.~~
+   **Done** — and the all-clear alerts, saying the halt is still engaged.
+8. ~~**F4/F8** — read halt state at boot; make the halt reminder durable; alert on
+   `worker.halted`; add an end-of-session summary.~~ **Done** — all four.
 9. ~~**F3** — give `KillSwitchRule` an exit carve-out, or state explicitly that a halt freezes
    exits too.~~ **Done** — carve-out, narrowed to orders that cannot reverse a position.
 10. ~~**F9** — gate `scripts/halt.py --clear` behind the same checks as the API, and audit it.~~

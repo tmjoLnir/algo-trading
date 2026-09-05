@@ -27,20 +27,25 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from atp_core.alerts.ports import Alert, Severity
 from atp_core.clock import SimulatedClock, TradingCalendar
 from atp_core.domain import Order, OrderType, Portfolio, Position, Side
 from atp_core.execution.reconciliation import Reconciler
-from atp_core.risk.killswitch import HaltReason
+from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
+from atp_worker.runner import RunnerStats
 from atp_worker.scheduler import (
     MAX_SLEEP_SECONDS,
     SCHEDULE,
     SESSION_SCAN_DAYS,
     SessionJobs,
+    SessionWatch,
     _job_name,
     build_schedule,
     next_due,
     reconcile_with_broker,
+    remind_about_halts,
     run_scheduler,
+    summarise_the_session,
 )
 from tests.fakes import FakeBroker, FakeKillSwitch
 
@@ -437,3 +442,161 @@ class TestReconcileWithBroker:
         await reconcile_with_broker(session)
 
         assert switch.is_engaged() is False, "a known order was reported as an orphan"
+
+
+class RecordingAlerts:
+    """An `AlertSink` that keeps what it was handed."""
+
+    def __init__(self) -> None:
+        self.sent: list[Alert] = []
+
+    def send(self, alert: Alert) -> None:
+        self.sent.append(alert)
+
+
+def _watch(
+    switch: FakeKillSwitch | None = None,
+    *,
+    stats: RunnerStats | None = None,
+) -> tuple[SessionWatch, RecordingAlerts]:
+    alerts = RecordingAlerts()
+    watch = SessionWatch(
+        kill_switch=switch or FakeKillSwitch(),
+        alerts=alerts,
+        stats=(lambda: stats) if stats is not None else None,
+    )
+    return watch, alerts
+
+
+def _halted(**overrides: Any) -> FakeKillSwitch:
+    switch = FakeKillSwitch()
+    fields: dict[str, Any] = {
+        "scope": HaltScope.GLOBAL,
+        "reason": HaltReason.DATA_FEED_LOST,
+        "engaged_at": datetime(2024, 6, 3, 18, 46, tzinfo=UTC),
+        "engaged_by": "staleness_monitor",
+        "target": None,
+    }
+    fields.update(overrides)
+    switch.halts = [HaltRecord(**fields)]
+    return switch
+
+
+class TestTheHaltReminder:
+    """F8. A global halt stood for 2h37m on day 1 and produced exactly one
+    alert — the one that engaged it. Nothing ever said it was *still* on."""
+
+    async def test_it_says_nothing_when_nothing_is_halted(self) -> None:
+        watch, alerts = _watch()
+
+        await remind_about_halts(watch)
+
+        assert alerts.sent == []
+
+    async def test_a_standing_halt_is_repeated(self) -> None:
+        watch, alerts = _watch(_halted())
+
+        await remind_about_halts(watch)
+
+        assert len(alerts.sent) == 1
+        assert alerts.sent[0].severity is Severity.CRITICAL
+        assert "staleness_monitor" in alerts.sent[0].body
+
+    async def test_consecutive_reminders_do_not_collapse_into_one(self) -> None:
+        """`key` is what a transport collapses repeats on (`alerts.ports`), so
+        a fixed key would make the reminder mute itself after the first — which
+        is precisely the silence being fixed."""
+        watch, alerts = _watch(_halted())
+
+        await remind_about_halts(watch)
+        await remind_about_halts(watch)
+
+        assert len({a.key for a in alerts.sent}) == 2
+
+    async def test_it_reads_redis_every_time_rather_than_a_local_flag(self) -> None:
+        """This is what "durable" means here: the state driving the reminder is
+        the halt record, which survives the restart that killed five workers on
+        day 1. A per-process flag would have died with each of them."""
+        switch = _halted()
+        watch, alerts = _watch(switch)
+
+        await remind_about_halts(watch)
+        switch.halts = []
+        await remind_about_halts(watch)
+
+        assert len(alerts.sent) == 1, "a cleared halt must stop the reminders"
+
+
+class TestTheSessionSummary:
+    """F8. Day 1 ran ten hours, submitted zero orders, spent its last 74
+    minutes halted, and told nobody any of it."""
+
+    async def test_it_reports_the_numbers(self) -> None:
+        watch, alerts = _watch(stats=RunnerStats(evaluations=390, orders_submitted=0))
+
+        await summarise_the_session(watch)
+
+        assert "0 orders submitted" in alerts.sent[0].body
+        assert "390 evaluations" in alerts.sent[0].body
+
+    async def test_a_day_that_ended_halted_is_critical_not_informational(self) -> None:
+        """A halt still standing at the close is something to act on before
+        tomorrow's open, not something to read in the morning."""
+        watch, alerts = _watch(_halted(), stats=RunnerStats())
+
+        await summarise_the_session(watch)
+
+        assert alerts.sent[0].severity is Severity.CRITICAL
+        assert "STILL HALTED" in alerts.sent[0].title
+
+    async def test_an_ordinary_day_is_informational(self) -> None:
+        watch, alerts = _watch(stats=RunnerStats(orders_submitted=4))
+
+        await summarise_the_session(watch)
+
+        assert alerts.sent[0].severity is Severity.INFO
+        assert "Not halted." in alerts.sent[0].body
+
+    async def test_a_data_only_worker_still_reports(self) -> None:
+        """The worker that owed somebody a message on day 1 was the one *not*
+        trading, so no strategy must not mean no summary."""
+        watch, alerts = _watch(_halted())
+
+        await summarise_the_session(watch)
+
+        assert "no strategy ran today" in alerts.sent[0].body
+
+
+class TestSchedulingTheEscalations:
+    def test_they_are_scheduled_without_a_trading_session(self) -> None:
+        watch, _ = _watch()
+        names = [_job_name(e) for e in build_schedule(None, watch)]
+
+        assert "remind_about_halts" in names
+        assert "summarise_the_session" in names
+        assert "reconcile_with_broker" not in names
+
+    def test_the_reminder_runs_in_session_only(self) -> None:
+        """Reminding an operator at 03:00 that the platform is not trading is
+        how an alert channel gets muted."""
+        watch, _ = _watch()
+        reminder = next(
+            e for e in build_schedule(None, watch) if _job_name(e) == "remind_about_halts"
+        )
+
+        assert reminder["trigger"] == "interval"
+        assert reminder["market_hours_only"] is True
+
+    def test_the_summary_lands_at_the_close(self) -> None:
+        watch, _ = _watch()
+        summary = next(
+            e for e in build_schedule(None, watch) if _job_name(e) == "summarise_the_session"
+        )
+
+        assert summary["trigger"] == "market_close"
+        assert summary["offset_minutes"] == 0
+
+    def test_without_a_watch_nothing_escalates(self) -> None:
+        names = [_job_name(e) for e in build_schedule(None)]
+
+        assert names == [_job_name(e) for e in SCHEDULE]

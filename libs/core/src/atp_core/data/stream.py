@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from atp_core import metrics
+from atp_core.alerts.ports import Alert, Severity
 from atp_core.channels import CHANNEL_BARS, CHANNEL_QUOTES
 from atp_core.clock import SystemClock
 from atp_core.data.backfill import backfill_bars
@@ -39,6 +40,7 @@ from atp_core.risk.killswitch import HaltReason, HaltScope
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
 
+    from atp_core.alerts.ports import AlertSink
     from atp_core.clock import Clock, TradingCalendar
     from atp_core.data.ports import (
         BarRepository,
@@ -86,6 +88,20 @@ class IngestorStats:
     #: one symbol has not traded for an hour. `StaleDataRule` has to refuse an
     #: order priced off the halted one, so it needs the per-symbol answer.
     last_tick_at: dict[str, datetime] = field(default_factory=dict)
+
+    #: When data was last demonstrably flowing, according to the **bar table**
+    #: rather than to anything this process saw. Read once at startup and never
+    #: updated, because after that `last_message_at` is both fresher and more
+    #: direct.
+    #:
+    #: It exists because every other field here dies with the process, and on
+    #: day 1 of the paper week the process died three times in 158 seconds. Each
+    #: restart told the staleness watchdog the feed had been fine since boot and
+    #: told the reconnect backfill the gap had opened at boot — so a worker that
+    #: lived for 60 seconds never halted, and an eight-minute hole was refetched
+    #: as a one-minute window (docs/paper-week/day-1-review.md, F5 and F7).
+    #: Storage is the one witness a restart cannot reset.
+    storage_watermark: datetime | None = None
 
 
 class StreamIngestor:
@@ -136,12 +152,14 @@ class StreamIngestor:
     async def run(self, symbols: Sequence[str]) -> None:
         """Connect, subscribe, and pump until cancelled.
 
-        Reconnect policy lives in the feed: exponential backoff, 1s → 60s,
-        jittered, subscriptions restored on the way back up. What is enforced
-        here is the other half — after each reconnect, backfill from the last
-        message we actually saw before handling anything from the new
-        connection. Indicators computed across an unfilled gap are wrong in a
-        way nothing downstream can detect.
+        Reconnect policy lives in the feed: exponential backoff, 1s → 30s,
+        jittered, bounded by `ws.RECONNECT_BUDGET_SECONDS` of elapsed time, with
+        subscriptions restored on the way back up. What is enforced here is the
+        other half — after each reconnect, backfill from the last message we
+        actually saw *or from where the bar table stops*, whichever is earlier,
+        before handling anything from the new connection. Indicators computed
+        across an unfilled gap are wrong in a way nothing downstream can
+        detect.
 
         If the feed gives up — attempts exhausted, or an error retrying cannot
         fix — the kill switch is engaged and the exception propagates. Not
@@ -162,12 +180,21 @@ class StreamIngestor:
         self._symbols = tuple(dict.fromkeys(symbols))
         self.stats.symbols = set(self._symbols)
         self.stats.connected_since = self._clock.now()
+        # Before subscribing, so the watchdog and the first reconnect both see
+        # it. This is the single read that carries what the last process knew
+        # across a restart.
+        self.stats.storage_watermark = await self._read_storage_watermark()
 
         await self.feed.subscribe(list(self._symbols), bars=True, quotes=True, trades=False)
         log.info(
             "data.stream.started",
             symbols=len(self._symbols),
             timeframe=self._bar_timeframe.value,
+            storage_watermark=(
+                self.stats.storage_watermark.isoformat()
+                if self.stats.storage_watermark is not None
+                else None
+            ),
         )
 
         stream = self.feed.stream()
@@ -190,6 +217,40 @@ class StreamIngestor:
                 await stream.aclose()
 
         log.warning("data.stream.ended", msg="the feed's stream finished without an error")
+
+    async def _read_storage_watermark(self) -> datetime | None:
+        """When the bar table last shows data arriving, across the watchlist.
+
+        The **maximum** across symbols, deliberately, and the alternative is the
+        trap: a symbol that simply did not print in a minute produces no bar at
+        all on IEX, so a minimum would treat the least liquid name on the
+        watchlist as a permanent outage. What this answers is "when was the feed
+        last demonstrably alive", and one bar from one symbol proves that.
+
+        Returned as the instant the bar *closed*, not its `ts`. A bar is stamped
+        at its open, so a freshly delivered one already looks a full bar old —
+        and this feeds a watchdog whose whole job is to notice a feed that is a
+        minute behind. Reporting the open would make every healthy restart look
+        stale by exactly one bar.
+
+        Best-effort: a bar store that cannot be reached returns None and the
+        callers fall back to what they did before. This runs on the startup path
+        of the process that owns the market-data connection, and refusing to
+        ingest because a watermark could not be read would trade a degraded
+        signal for no data at all.
+        """
+        newest: datetime | None = None
+        try:
+            for symbol in self._symbols:
+                bars = await self.bar_repo.get_last_n_bars(symbol, self._bar_timeframe, 1)
+                if bars and (newest is None or bars[-1].ts > newest):
+                    newest = bars[-1].ts
+        except Exception as exc:  # deliberate breadth — see the docstring
+            log.warning("data.stream.watermark_unavailable", error=str(exc))
+            return None
+        if newest is None:
+            return None
+        return newest + timedelta(seconds=self._bar_timeframe.seconds)
 
     def last_tick_at(self, symbol: str) -> datetime | None:
         """When `symbol` last printed, for `risk.rules.StaleDataRule`.
@@ -259,10 +320,21 @@ class StreamIngestor:
             symbols=len(self._symbols),
         )
         backfilled = await self._backfill_gap(event.gap_since)
+        if backfilled is None:
+            # The gap could not be closed; `_backfill_gap` has already halted.
+            # The watermark must not move — claiming data is good up to now is
+            # exactly the false "recovered" this whole change is about.
+            return
         self.stats.gaps_backfilled += backfilled
         metrics.stream_gap_bars(backfilled)
+        # Data is known good again, and the watermark has to say so or the
+        # watchdog would read the pre-outage `last_message_at` and halt a feed
+        # that has just come back. This is the case `connected_since` used to
+        # cover before it was demoted: a reconnect whose gap *was* backfilled is
+        # a true statement about the data, where a process restart is not.
+        self.stats.storage_watermark = event.reconnected_at
 
-    async def _backfill_gap(self, since: datetime) -> int:
+    async def _backfill_gap(self, since: datetime) -> int | None:
         """Fetch and store bars missed while disconnected.
 
         Raw prices, not adjusted. That halves the requests — the provider makes
@@ -287,11 +359,58 @@ class StreamIngestor:
         reads, and trading through it is the failure this module exists to
         prevent. Stopping the ingestor too would take the dashboard and the
         quote cache down with it for no gain.
+
+        Returns the bars written, or **None when the gap could not be closed** —
+        which the caller needs told apart from a legitimate zero, because zero
+        is the ordinary answer for an outage that did not span a completed bar.
+        Conflating them would let a failed backfill advance the watermark that
+        says data is good.
         """
         # The last bar that has actually finished: everything up to here is
         # fetchable and everything after it is still being built.
         end = _floor_to_grid(self._clock.now(), self._bar_timeframe)
         start = _floor_to_grid(since, self._bar_timeframe)
+
+        # **A restart must not be able to shrink a gap.** `since` comes from the
+        # feed adapter, which measures it from *this process's* stream start —
+        # so on day 1, three crashes inside an eight-minute outage each reset the
+        # origin, and the fourth worker asked for a one-minute window against an
+        # eight-minute hole. It succeeded by its own definition and ~108 bars are
+        # permanently absent (docs/paper-week/day-1-review.md, F5).
+        #
+        # The bar table cannot be reset by a restart, so it is the second
+        # opinion. Whichever start is *earlier* wins: an over-wide window costs
+        # a few redundant upserts, and a too-narrow one costs the data.
+        #
+        # The second opinion is the **later** of the watermark and what this
+        # process has actually seen, and that `max` is load-bearing rather than
+        # defensive. The watermark is read once at startup and is only ever
+        # evidence about what a *previous* process knew; six hours into a
+        # healthy session it is six hours stale, and comparing a thirty-second
+        # blip against it alone would turn every reconnect into a six-hour
+        # refetch. `last_message_at` is the better witness whenever it exists,
+        # and the day-1 case is precisely the one where it does not: worker #4
+        # had received nothing at all when it reconnected.
+        known_good = max(
+            [
+                ts
+                for ts in (self.stats.storage_watermark, self.stats.last_message_at)
+                if ts is not None
+            ],
+            default=None,
+        )
+        if known_good is not None:
+            from_storage = _floor_to_grid(known_good, self._bar_timeframe)
+            if from_storage < start:
+                log.warning(
+                    "data.stream.gap_widened_from_storage",
+                    feed_claimed_from=start.isoformat(),
+                    storage_says_from=from_storage.isoformat(),
+                    widened_by_seconds=round((start - from_storage).total_seconds(), 1),
+                    hint="the feed's gap origin was reset by a restart",
+                )
+                start = from_storage
+
         if start >= end:
             log.debug(
                 "data.stream.backfill_skipped",
@@ -332,7 +451,7 @@ class StreamIngestor:
                 f"could not backfill {start.isoformat()} to {end.isoformat()} after a "
                 f"feed reconnect — the bar history has a hole in it",
             )
-            return 0
+            return None
 
         for window in result.empty_windows:
             # Ordinary for a symbol that simply did not trade in the gap; a
@@ -421,6 +540,7 @@ class StalenessMonitor:
         poll_interval_seconds: float = 5.0,
         exchange: str = "NYSE",
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        alerts: AlertSink | None = None,
     ) -> None:
         if max_silence_seconds < 1:
             raise ValueError(f"max_silence_seconds must be at least 1, got {max_silence_seconds}")
@@ -439,17 +559,22 @@ class StalenessMonitor:
         #: 5-second poll would engage the same halt twelve times a minute and
         #: bury the first, most useful log line under the rest.
         self._alerted = False
+        #: Where recovery is announced. The halt itself is alerted by the kill
+        #: switch, which only ever sees the *engage*; nothing was telling anyone
+        #: the feed had come back. On day 1 data resumed at 18:52:26 and the
+        #: only thing that observed it was a log line nobody was watching
+        #: (docs/paper-week/day-1-review.md, F7).
+        self._alerts = alerts
 
     def evaluate(self, ingestor: StreamIngestor, now: datetime) -> StalenessVerdict:
         """Is the feed too quiet, right now?
 
-        Silence is measured from the latest of three instants, and all three
-        matter:
+        Silence is measured from the latest instant at which data is known to
+        have been fine:
 
-        - the last message actually received — the obvious one;
-        - when the current connection came up (`connected_since`), so a worker
-          started at 11:00 is not immediately accused of having missed the
-          09:30 open it was never running for;
+        - the last message this process received — the obvious one;
+        - the **storage watermark**, when data last reached the bar table,
+          which is the only one of these that survives a restart;
         - the session open, so a feed that died at yesterday's close does not
           register as silent for eighteen hours the moment the bell rings —
           the fifteen hours the market was shut were not an outage.
@@ -458,6 +583,17 @@ class StalenessMonitor:
         restart and every morning. Take only `last_message_at` and it cannot
         speak at all before the first tick of the day, which is exactly when a
         broken feed most needs reporting.
+
+        **`connected_since` is now the fallback and not a peer**, and that
+        demotion is the fix. It says "this worker booted", which a crash loop
+        makes into a lie about the feed: on day 1 each restart reset the clock,
+        so five workers each measured silence from their own birth and a worker
+        that died in under `max_silence_seconds` never halted at all
+        (docs/paper-week/day-1-review.md, F7). The halt that day was engaged
+        only because the *first* worker happened to live long enough. It is
+        still used when nothing else is known — a fresh deployment with an empty
+        bar table, mid-session — where it is the correct answer to "a worker
+        started at 11:00 must not be blamed for the 09:30 open".
         """
         if now.tzinfo is None:
             raise ValueError(f"now must be timezone-aware (rule §1.2), got naive {now!r}")
@@ -476,14 +612,21 @@ class StalenessMonitor:
                 reason="market is shut — silence is expected",
             )
 
-        baseline = max(
-            [session.open_at]
-            + [
-                ts
-                for ts in (ingestor.stats.last_message_at, ingestor.stats.connected_since)
-                if ts is not None
-            ]
-        )
+        # What we actually know about the *data*, as opposed to about this
+        # process. `connected_since` is the fallback of last resort and no
+        # longer competes with the rest: it says only "this worker booted", and
+        # on day 1 that was enough to make every 60-second worker believe the
+        # feed had been fine for its whole life. A worker that dies faster than
+        # `max_silence_seconds` then never halts at all
+        # (docs/paper-week/day-1-review.md, F7).
+        known_good = [
+            ts
+            for ts in (ingestor.stats.last_message_at, ingestor.stats.storage_watermark)
+            if ts is not None
+        ]
+        if not known_good and ingestor.stats.connected_since is not None:
+            known_good = [ingestor.stats.connected_since]
+        baseline = max([session.open_at, *known_good])
         silent_for = (now - baseline).total_seconds()
         stale = silent_for > self.max_silence_seconds
         return StalenessVerdict(
@@ -532,6 +675,38 @@ class StalenessMonitor:
                     "data.staleness.recovered",
                     msg="market data is flowing again — the halt it engaged is still engaged",
                 )
+                self._announce_recovery()
+
+    def _announce_recovery(self) -> None:
+        """Tell a human the feed came back, and that the halt did not.
+
+        INFO rather than CRITICAL: this is good news. It is worth sending
+        anyway, and the second half of the sentence is why — the watchdog
+        deliberately never clears the halt it engaged, so an operator who got
+        the CRITICAL and then nothing has no way to tell "still broken" from
+        "fixed itself, waiting for you". On day 1 that gap was 2h37m.
+
+        Swallowed like every other alert on this path (`killswitch._send_alert`):
+        `AlertSink` says implementations must not raise, and being wrong about
+        that must not take down the watchdog that is still watching.
+        """
+        if self._alerts is None:
+            return
+        try:
+            self._alerts.send(
+                Alert(
+                    severity=Severity.INFO,
+                    title="Market data is flowing again",
+                    body=(
+                        "The feed recovered. The halt it engaged is still engaged — "
+                        "clearing it is a human decision (docs/RUNBOOK.md)."
+                    ),
+                    key="staleness.recovered",
+                    context={"max_silence_seconds": str(self.max_silence_seconds)},
+                )
+            )
+        except Exception as exc:
+            log.error("data.staleness.recovery_alert_failed", error=str(exc))
 
     def _halt(self, verdict: StalenessVerdict) -> None:
         if self.kill_switch is None:

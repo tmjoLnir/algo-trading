@@ -118,10 +118,21 @@ class FakeQuoteCache:
 
 
 class FakeRepository:
-    """Records writes in order — which is what the ordering test reads."""
+    """Records writes in order — which is what the ordering test reads.
 
-    def __init__(self) -> None:
+    `stored` is the *newest* bar the table would answer with, per symbol. It
+    exists because the reconnect backfill and the staleness watchdog now both
+    read storage rather than trusting process-local state: on day 1 three
+    crashes reset the feed's gap origin and ~108 bars were lost as a result
+    (docs/paper-week/day-1-review.md, F5). A fake that always answered "no bars"
+    could not express that failure, and a fake that cannot express a failure
+    cannot catch it.
+    """
+
+    def __init__(self, stored: dict[str, Bar] | None = None) -> None:
         self.batches: list[list[Bar]] = []
+        self.stored = stored or {}
+        self.raise_on_read: Exception | None = None
 
     async def upsert_bars(self, bars: list[Bar]) -> int:
         self.batches.append(list(bars))
@@ -133,7 +144,10 @@ class FakeRepository:
         return []
 
     async def get_last_n_bars(self, symbol: str, timeframe: Timeframe, n: int) -> list[Bar]:
-        return []
+        if self.raise_on_read is not None:
+            raise self.raise_on_read
+        bar = self.stored.get(symbol)
+        return [bar] if bar is not None else []
 
     async def find_gaps(
         self, symbol: str, timeframe: Timeframe, start: datetime, end: datetime
@@ -223,9 +237,11 @@ def build(
     provider: FakeProvider | None = None,
     publisher: FakePublisher | None = None,
     kill_switch: FakeKillSwitch | None = None,
+    repo: FakeRepository | None = None,
     **kwargs: Any,
 ) -> tuple[StreamIngestor, FakeQuoteCache, FakeRepository, FakeProvider]:
-    cache, repo = FakeQuoteCache(), FakeRepository()
+    cache = FakeQuoteCache()
+    repo = repo if repo is not None else FakeRepository()
     provider = provider if provider is not None else FakeProvider()
     ingestor = StreamIngestor(
         FakeFeed(events, raises=raises),
@@ -481,3 +497,157 @@ class TestHalting:
 
         assert "2024-06-03T14:25:00+00:00" in switch.engaged[0].detail
         assert switch.engaged[0].engaged_by == "stream_ingestor"
+
+
+class TestTheStorageWatermark:
+    """F5 and F7. Every field on `IngestorStats` dies with the process, and on
+    day 1 the process died three times in 158 seconds. Storage is the one
+    witness a restart cannot reset (docs/paper-week/day-1-review.md)."""
+
+    async def test_it_is_read_at_startup(self) -> None:
+        stored = make_bar(ts=NOW - timedelta(minutes=8))
+        ingestor, _, _, _ = build(repo=FakeRepository({"SPY": stored}))
+
+        await ingestor.run(["SPY"])
+
+        # The bar's *close*, not its open: a bar is stamped at its open, so
+        # reporting the open would make every healthy restart look one bar
+        # stale to a watchdog whose budget is a minute.
+        assert ingestor.stats.storage_watermark == stored.ts + timedelta(minutes=1)
+
+    async def test_it_takes_the_newest_across_the_watchlist(self) -> None:
+        """The maximum, and the alternative is the trap: a symbol that simply
+        did not print in a minute produces no bar at all on IEX, so a minimum
+        would treat the least liquid name as a permanent outage."""
+        repo = FakeRepository(
+            {
+                "SPY": make_bar("SPY", ts=NOW - timedelta(minutes=30)),
+                "QQQ": make_bar("QQQ", ts=NOW - timedelta(minutes=2)),
+            }
+        )
+        ingestor, _, _, _ = build(repo=repo)
+
+        await ingestor.run(["SPY", "QQQ"])
+
+        assert ingestor.stats.storage_watermark == NOW - timedelta(minutes=1)
+
+    async def test_an_empty_table_leaves_it_unset(self) -> None:
+        ingestor, _, _, _ = build()
+
+        await ingestor.run(["SPY"])
+
+        assert ingestor.stats.storage_watermark is None
+
+    async def test_an_unreadable_store_does_not_stop_ingestion(self) -> None:
+        """This runs on the startup path of the process that owns the
+        market-data connection. Refusing to ingest because a watermark could not
+        be read would trade a degraded signal for no data at all."""
+        repo = FakeRepository()
+        repo.raise_on_read = ConnectionError("the table is gone")
+        ingestor, _, _, _ = build(repo=repo)
+
+        await ingestor.run(["SPY"])
+
+        assert ingestor.stats.storage_watermark is None
+
+
+class TestARestartCannotShrinkAGap:
+    """F5, stated as the incident. The feed measures `gap_since` from *this
+    process's* stream start, so three crashes inside an eight-minute outage each
+    reset the origin — and the fourth worker asked for a one-minute window
+    against an eight-minute hole. It succeeded by its own definition, fired none
+    of `backfill_failed`, `backfill_skipped` or `backfill_truncated`, and ~108
+    bars are permanently absent."""
+
+    async def test_storage_widens_a_gap_the_feed_understates(self) -> None:
+        stored = make_bar(ts=NOW - timedelta(minutes=8))
+        reconnect = FeedReconnected(
+            # What a restarted process believes: a 23-second blip.
+            gap_since=NOW - timedelta(seconds=23),
+            reconnected_at=NOW,
+            attempts=3,
+        )
+        provider = FakeProvider()
+        ingestor, _, _, _ = build(
+            [reconnect], provider=provider, repo=FakeRepository({"SPY": stored})
+        )
+
+        await ingestor.run(["SPY"])
+
+        (_, _, start, _, _) = provider.calls[0]
+        assert start <= stored.ts + timedelta(minutes=1), (
+            "the refetch must start where storage stops, not where this process booted"
+        )
+
+    async def test_a_gap_the_feed_states_correctly_is_left_alone(self) -> None:
+        """Storage is a second opinion, not a replacement. When the feed's
+        origin is the earlier one — the ordinary case — it wins."""
+        stored = make_bar(ts=NOW - timedelta(minutes=1))
+        reconnect = FeedReconnected(
+            gap_since=NOW - timedelta(minutes=20),
+            reconnected_at=NOW,
+            attempts=1,
+        )
+        provider = FakeProvider()
+        ingestor, _, _, _ = build(
+            [reconnect], provider=provider, repo=FakeRepository({"SPY": stored})
+        )
+
+        await ingestor.run(["SPY"])
+
+        (_, _, start, _, _) = provider.calls[0]
+        assert start == NOW.replace(second=0, microsecond=0) - timedelta(minutes=20)
+
+    async def test_a_stale_watermark_does_not_widen_a_short_blip(self) -> None:
+        """The regression the first draft of this fix would have shipped.
+
+        The watermark is read once at startup, so six hours into a healthy
+        session it is six hours old — and comparing a thirty-second blip against
+        it alone would turn every reconnect into a six-hour refetch. What this
+        process has actually *seen* is the better witness whenever it exists;
+        the day-1 case is exactly the one where it does not, because worker #4
+        had received nothing at all by the time it reconnected.
+        """
+        stored = make_bar(ts=NOW - timedelta(hours=6))
+        events: list[StreamEvent] = [
+            make_bar(ts=NOW - timedelta(seconds=30)),
+            FeedReconnected(gap_since=NOW - timedelta(seconds=20), reconnected_at=NOW, attempts=1),
+        ]
+        provider = FakeProvider()
+        ingestor, _, _, _ = build(events, provider=provider, repo=FakeRepository({"SPY": stored}))
+
+        await ingestor.run(["SPY"])
+
+        assert provider.calls == [], (
+            "a blip inside one bar must still cost nothing, however old the watermark is"
+        )
+
+    async def test_a_successful_reconnect_marks_the_data_current_again(self) -> None:
+        """Otherwise the watchdog would read the pre-outage `last_message_at`
+        and halt a feed that has just come back and been backfilled."""
+        reconnect = FeedReconnected(
+            gap_since=NOW - timedelta(minutes=5), reconnected_at=NOW, attempts=2
+        )
+        ingestor, _, _, _ = build([reconnect])
+
+        await ingestor.run(["SPY"])
+
+        assert ingestor.stats.storage_watermark == NOW
+
+    async def test_a_failed_backfill_does_not_claim_the_data_is_current(self) -> None:
+        """A halt is engaged and the hole is still there. Advancing the
+        watermark would be the false 'recovered' this whole change is about."""
+        switch = FakeKillSwitch()
+        reconnect = FeedReconnected(
+            gap_since=NOW - timedelta(minutes=5), reconnected_at=NOW, attempts=2
+        )
+        ingestor, _, _, _ = build(
+            [reconnect],
+            provider=FakeProvider(error=DataError("the provider is down")),
+            kill_switch=switch,
+        )
+
+        await ingestor.run(["SPY"])
+
+        assert ingestor.stats.storage_watermark is None
+        assert switch.engaged, "a gap that could not be closed must halt trading"
