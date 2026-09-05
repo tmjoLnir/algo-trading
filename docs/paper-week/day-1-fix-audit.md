@@ -412,9 +412,12 @@ is the trigger, and the consequence is hammering the venue rather than backing o
 
 ```python
 frame = await self._receive(connection)
-if frame is None: break
+if frame is None:
+    break
 if not delivered:
-    delivered = True; attempts = 0; first_failure_at = None
+    delivered = True
+    attempts = 0
+    first_failure_at = None
 ```
 
 `_receive` returns `self._parse_frame(raw)` for any frame it can parse, and a subscription
@@ -654,7 +657,7 @@ on `None` (`stream.py:325`), so a backfill that recovered **nothing** is treated
 advances the watermark:
 
 ```python
-self.stats.storage_watermark = event.reconnected_at   # stream.py:335
+self.stats.storage_watermark = event.reconnected_at  # stream.py:335
 ```
 
 `StalenessMonitor.evaluate` reads `storage_watermark` as a peer witness (`stream.py:622-629`). So
