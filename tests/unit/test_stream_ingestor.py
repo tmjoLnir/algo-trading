@@ -634,6 +634,42 @@ class TestARestartCannotShrinkAGap:
 
         assert ingestor.stats.storage_watermark == NOW
 
+    async def test_a_backfill_that_recovered_nothing_does_not_move_the_watermark(self) -> None:
+        """The venue had no data for the window either — which is exactly what a
+        venue-wide outage looks like from in here.
+
+        `_backfill_gap` returned a bare count and zero meant two different
+        things, so `_on_reconnect` treated "we asked and got nothing" as a
+        repair and stamped the watermark at `reconnected_at`. `StalenessMonitor`
+        reads that watermark as a witness about the data, so every reconnect
+        during an outage reset the watchdog's baseline: measured at seven
+        simulated minutes of a dead feed and 2,548 reconnects, **zero halts**
+        (the day-1 fix audit, §4.4b).
+        """
+        reconnect = FeedReconnected(
+            gap_since=NOW - timedelta(minutes=5), reconnected_at=NOW, attempts=2
+        )
+        ingestor, _, _, _ = build([reconnect], provider=FakeProvider(bars=0))
+
+        await ingestor.run(["SPY"])
+
+        assert ingestor.stats.storage_watermark is None, (
+            "a backfill that wrote no bars is not evidence the tape is flowing"
+        )
+
+    async def test_a_sub_bar_flap_does_not_move_the_watermark_either(self) -> None:
+        """The other zero. Nothing was missing, so nothing was recovered — and a
+        hot loop of these must not be able to hold the baseline open."""
+        reconnect = FeedReconnected(
+            gap_since=NOW - timedelta(seconds=20), reconnected_at=NOW, attempts=1
+        )
+        ingestor, _, _, provider = build([reconnect])
+
+        await ingestor.run(["SPY"])
+
+        assert provider.calls == [], "the outage did not span a completed bar"
+        assert ingestor.stats.storage_watermark is None
+
     async def test_a_failed_backfill_does_not_claim_the_data_is_current(self) -> None:
         """A halt is engaged and the hole is still there. Advancing the
         watermark would be the false 'recovered' this whole change is about."""

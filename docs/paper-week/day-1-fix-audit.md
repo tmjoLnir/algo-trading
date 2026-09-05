@@ -18,11 +18,14 @@ that claims to fix them, across PRs #134–#139.
 > since yesterday reads as non-stale for the first `max_silence_seconds` of every morning.
 > An all-clear there reaches the operator at 09:30 — where they actually read it — and is
 > followed by a CRITICAL two minutes later for a feed whose state never changed. The
-> verdict now carries `data_is_current`, which is true only when a witness about the
-> *data* (a message received, or a bar in storage) is timestamped at or after this
-> session's open; recovery reads that, the close re-arms silently, and
-> `connected_since` — the process's birthday, which F7 already demoted — cannot satisfy
-> it.
+> verdict now carries `data_is_current`, which is true only when **a message this
+> process received** (`last_message_at`) is timestamped at or after this session's open
+> and is younger than `max_silence_seconds`; recovery reads that, the close re-arms
+> silently, and neither `connected_since` — the process's birthday, which F7 already
+> demoted — nor `storage_watermark`, which the reconnect path writes, can satisfy it. The
+> first version of this gate did read the watermark, and §4.4b's forged one satisfied it:
+> the all-clear still lied, and #140 had just wired it to a phone. A reconnect is
+> evidence about the socket; recovery is a claim about the tape.
 >
 > **§3.3 was implemented with the flag kept.** Deleting `--timeframe` outright would
 > remove the only read-only way to ask "would `1d` fit?", which is one of the two ways out
@@ -651,6 +654,14 @@ refetched at all only because worker #4's own connect flapped.
 
 ### 4.4b A zero-bar backfill counts as recovery, and refreshes the watchdog `high`
 
+> **Fixed.** `_backfill_gap` returns a `_GapRepair` rather than a bare count, because zero
+> meant two incompatible things — "the outage did not span a completed bar" and "we asked
+> the venue for the window and it had nothing either" — and only the second is a lie. The
+> watermark moves only on a window that came back whole. This section's own prescription
+> (gate on `result.ok`) was necessary and not sufficient: most flaps in the measured hot
+> loop are sub-bar, take the `start >= end` early return, never consult the provider, and
+> still advanced the watermark.
+
 `_backfill_gap` returns `result.bars_written` (`stream.py:475`), which is **0** when the provider
 had no data for the window, and `None` only on a `DataError`. `_on_reconnect` returns early only
 on `None` (`stream.py:325`), so a backfill that recovered **nothing** is treated as success and
@@ -982,7 +993,14 @@ Then:
    the series is now named in every verdict measured on it.
 3. `reduces_position` exemption on `MaxPositionSizeRule` and `MaxExposureRule` (§3.2)
 4. `KillSwitchRule` reads the settled book (§3.1)
-5. Throttle the flap path in both stream adapters (§3.5)
+5. ~~Throttle the flap path in both stream adapters (§3.5)~~ **Done** — on both, and the
+   discriminator is not the one this section proposed. Gating on *whether the connection
+   delivered* halts the platform on a legitimately silent stream: the account stream
+   carries nothing whenever nobody is trading, and ADR 0026 records 12.4% of IEX minutes
+   with no print at all. It gates on **how long the connection lived** instead
+   (`ws.is_flap`, 30s), which is a question a socket can answer on its own; deciding that
+   silence is pathological stays `StalenessMonitor`'s job, which has a calendar to do it
+   with.
 6. `_stop_is_missing` does the arithmetic rather than the membership check (§4.2)
 7. Stamp the streamed bar from the configured timeframe, or narrow the dropdown (§4.1)
 8. Repair day 1's lost bars with an explicit ranged `scripts/backfill_bars.py` run rather than
@@ -992,6 +1010,23 @@ Then:
 
 Items 1–4 are what stand between the current commit and a day 2 that can be believed. Items 1
 and 2 are done; **3 and 4 are still open, and they are one change rather than two.**
+
+**Two blockers this audit did not find** were added by a later readiness sweep and are
+fixed alongside item 5:
+
+- **A strategy EXIT never cancelled its protective stop.** `cancel_protection` had exactly
+  one caller, inside `flatten`, and a strategy exit goes through `submit_signal`. The
+  leaked GTC stop later filled into a flat book and opened a short that `sma_crossover`
+  could never close. Fixed at the moment the position goes flat rather than at the exit's
+  acknowledgement — an exit is `DAY` and may be `LIMIT`, so de-arming on acknowledgement
+  strips the stop off a position whose exit has not filled. It also closes the reversal
+  case, where an entry lands flat on its way through zero and `_protect` returns early.
+- **A protective submission that raised took the worker with it and lost the fact.**
+  `_route` raises out of `_resolve_indeterminate` by design; nothing caught it before
+  `_unprotected` was written, so the restart read the position as "unknown", which
+  `_stop_is_missing` treats as safe. The fact is now recorded before the error
+  propagates. It is still in-memory only: the restart reads a CRITICAL log line, not a
+  row, which is a smaller gap than the one it replaces but not nothing.
 
 The investigation for them found both prescriptions unsafe as written, which is why they are
 not a diff to rush:

@@ -130,23 +130,40 @@ class FakeConnection:
 
     A script entry is either a list of messages (one frame) or an exception to
     raise from `recv`.
+
+    `lifetime` is how long the connection is to have been up when it ends, and
+    it exists because the adapter now decides "flap or ordinary disconnect" on
+    exactly that. The clock is advanced by it at the moment the script runs out,
+    so a test can say "this one lived a minute and then dropped" — which no
+    fake here could express before, which is why nothing caught that the guard
+    it replaced would have throttled a healthy silent feed.
     """
 
-    def __init__(self, script: Sequence[Any]) -> None:
+    def __init__(self, script: Sequence[Any], *, lifetime: float = 0.0) -> None:
         self._script = list(script)
         self.sent: list[dict[str, Any]] = []
         self.closed = False
+        self.lifetime = lifetime
+        #: Set by `build` so the drop can move the clock.
+        self.clock: FakeClock | None = None
 
     async def send(self, message: str) -> None:
         self.sent.append(json.loads(message))
 
     async def recv(self) -> str:
         if not self._script:
+            self._age()
             raise DroppedError("script exhausted")
         item = self._script.pop(0)
         if isinstance(item, Exception):
+            self._age()
             raise item
         return json.dumps(item)
+
+    def _age(self) -> None:
+        """The connection has ended; say how long it had been up."""
+        if self.clock is not None and self.lifetime:
+            self.clock.advance(self.lifetime)
 
     async def close(self) -> None:
         self.closed = True
@@ -216,6 +233,7 @@ def build(
         if not queue:
             raise DroppedError("nothing left to connect to")
         connection = queue.pop(0)
+        connection.clock = the_clock
         handed.append(connection)
         return connection
 
@@ -520,7 +538,12 @@ class TestReconnect:
         return [[CONNECTED], [AUTHENTICATED], *tail]
 
     async def test_resubscribes_and_announces_the_gap(self) -> None:
-        first = FakeConnection(self.script([QUOTE_MSG], DroppedError("socket closed")))
+        # A connection that was up for a minute and then dropped: an ordinary
+        # disconnect, which is what this test is about. A zero-lifetime one
+        # would be a flap, and the adapter would (correctly) back off first.
+        first = FakeConnection(
+            self.script([QUOTE_MSG], DroppedError("socket closed")), lifetime=60.0
+        )
         second = FakeConnection(self.script([BAR_MSG]))
         feed, _, _ = build(first, second)
         await feed.subscribe(["SPY"], bars=True, quotes=True)
@@ -534,8 +557,14 @@ class TestReconnect:
         # what came after the quote is missing.
         reconnected = events[1]
         assert isinstance(reconnected, FeedReconnected)
-        assert reconnected.gap_since == datetime(2024, 6, 3, 14, 30, 1, tzinfo=UTC)
-        assert reconnected.reconnected_at == datetime(2024, 6, 3, 14, 30, 2, tzinfo=UTC)
+        # One tick later than it used to be: the adapter now reads the clock
+        # once more, when the connection is established, and `FakeClock` steps
+        # per read. The behaviour asserted — the gap opens at the last message
+        # seen — is unchanged.
+        assert reconnected.gap_since == datetime(2024, 6, 3, 14, 30, 2, tzinfo=UTC)
+        # The drop is stamped with how long the connection had been up, so the
+        # reconnect lands a minute later on this scripted clock.
+        assert reconnected.reconnected_at == datetime(2024, 6, 3, 14, 31, 4, tzinfo=UTC)
         assert reconnected.attempts == 1
         # The whole point of holding the subscription set: it comes back up
         # subscribed to what it went down with.
@@ -621,10 +650,82 @@ class TestReconnect:
         # Two clean reconnects, each on the first attempt: nothing to sleep for.
         assert slept == []
 
+    async def test_a_connection_that_dies_on_arrival_is_a_failed_attempt(self) -> None:
+        """The shape a venue actually produces: accepted, authenticated,
+        subscription confirmed, then hung up seconds later.
+
+        Nothing counted it. `_open()` raises only when the *connection* fails,
+        so the inner loop simply broke and the outer loop reopened with no
+        sleep, no attempt and no budget check — 2,962 reconnects a second
+        against the real adapter, and an elapsed-time budget that could
+        therefore never expire.
+        """
+        flapping = [
+            FakeConnection(
+                self.script([REAL_SUBSCRIPTION_MSG], DroppedError("closed")), lifetime=0.0
+            )
+            for _ in range(3)
+        ]
+        good = FakeConnection(self.script([BAR_MSG]))
+        feed, slept, _ = build(
+            *flapping, good, reconnect_budget_seconds=900.0, clock=ladder_clock()
+        )
+        await feed.subscribe(["SPY"])
+
+        # Stopped at the bar, before the scripted queue runs dry. Letting it run
+        # on would fill `slept` with waits from the *exhausted queue* instead —
+        # which is precisely how the pre-existing flap test passed while the
+        # flap path itself never slept once.
+        await collect(feed, limit=4)
+
+        assert len(slept) >= 3, (
+            "a connection that acked and dropped without market data is a failed "
+            f"attempt and must be waited out; slept {slept}"
+        )
+
+    async def test_a_quiet_connection_that_lived_is_not_a_flap(self) -> None:
+        """**The direction that matters more than the bug.** An IEX symbol can
+        legitimately print nothing for minutes (ADR 0026: 12.4% of minutes have
+        no bar), and the account stream is silent whenever nobody is trading. A
+        guard that read silence as failure would spend the retry budget on a
+        healthy socket and then halt trading on a working feed — worse than the
+        hot loop it replaced. The discriminator is how long the connection
+        lived, not whether the tape printed."""
+        quiet = [
+            FakeConnection(self.script(DroppedError("closed")), lifetime=120.0) for _ in range(3)
+        ]
+        good = FakeConnection(self.script([BAR_MSG]))
+        feed, slept, _ = build(*quiet, good, reconnect_budget_seconds=900.0, clock=ladder_clock())
+        await feed.subscribe(["SPY"])
+
+        await collect(feed, limit=4)
+
+        assert slept == [], "a connection that stayed up and saw no prints is not a failure"
+
+    async def test_the_flap_budget_can_expire(self) -> None:
+        """The give-up path was unreachable: with the budget never consumed, the
+        `DataError` that stops the worker and halts trading could not be raised
+        however long the venue misbehaved."""
+        flapping = [
+            FakeConnection(
+                self.script([REAL_SUBSCRIPTION_MSG], DroppedError("closed")), lifetime=0.0
+            )
+            for _ in range(40)
+        ]
+        feed, _, _ = build(*flapping, reconnect_budget_seconds=120.0, clock=ladder_clock())
+        await feed.subscribe(["SPY"])
+
+        _, error = await collect(feed)
+
+        assert error is not None
+        assert "kept dropping" in str(error)
+
     async def test_a_connection_that_never_delivers_keeps_backing_off(self) -> None:
         """A server that accepts and immediately hangs up — a connection-limit
         fight, a flapping upstream — must not become a hot loop."""
-        flapping = [FakeConnection(self.script(DroppedError("closed"))) for _ in range(4)]
+        flapping = [
+            FakeConnection(self.script(DroppedError("closed")), lifetime=0.0) for _ in range(4)
+        ]
         feed, slept, _ = build(*flapping, reconnect_budget_seconds=120.0, clock=ladder_clock())
         await feed.subscribe(["SPY"])
 
@@ -639,7 +740,11 @@ class TestReconnect:
         slow = [{"T": "error", "code": 407, "msg": "slow client"}]
         first = FakeConnection(self.script([QUOTE_MSG], slow))
         second = FakeConnection(self.script([BAR_MSG]))
-        feed, _, handed = build(first, second)
+        # A budget, because a 407 ends the connection through the adapter's own
+        # error path rather than the fake's, so it reads as a short life and the
+        # default budget of zero would make one flap fatal. This test is about
+        # coming back from a transient error, not about the ladder.
+        feed, _, handed = build(first, second, reconnect_budget_seconds=600.0)
         await feed.subscribe(["SPY"])
 
         events, _ = await collect(feed)
@@ -651,7 +756,7 @@ class TestReconnect:
         seen: list[str] = []
         first = FakeConnection(self.script([QUOTE_MSG], DroppedError("closed")))
         second = FakeConnection(self.script([BAR_MSG]))
-        feed, _, _ = build(first, second)
+        feed, _, _ = build(first, second, reconnect_budget_seconds=600.0)
         feed.on_disconnect(lambda exc: seen.append(str(exc)))
         feed.on_disconnect(lambda exc: (_ for _ in ()).throw(RuntimeError("handler is broken")))
         await feed.subscribe(["SPY"])

@@ -243,7 +243,8 @@ most of the time. Check `worker.ready`'s `responsibilities` list includes
 
 | Event | Why it matters |
 |---|---|
-| `runner.position_unprotected` | you own something with no stop. `SAFETY.md`'s go-live condition is that this never happens. |
+| `runner.position_unprotected` | you own something with no stop. `SAFETY.md`'s go-live condition is that this never happens. `reason="protective submission raised"` is the CRITICAL variant: the stop's outcome was unknown, a global halt is engaged and the worker has exited — there is no next attempt, and the fact lives only in this line. |
+| `data.alpaca.stream_flapping` / `broker.alpaca.trade_updates_flapping` | the venue is accepting the socket and dropping it before it could have been established. Being waited out; `budget_seconds` is how long before the worker gives up and halts. |
 | `execution.reconcile.mismatch` | the book diverged; trading has halted. `RUNBOOK.md` 'Reconciliation mismatch'. |
 | `runner.fill_for_unknown_order` | a fill arrived for an order the runner does not know — expected only if something else is trading the account. |
 | `runner.evaluation_failed` | three in a row halts the strategy. |

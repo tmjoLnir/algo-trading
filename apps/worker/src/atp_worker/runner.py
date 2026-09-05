@@ -1362,6 +1362,7 @@ class StrategyRunner:
                 self._apply_to_portfolio(order, fill, portfolio)
                 self.stats.fills_applied += 1
                 self._pending_fills.append(_AppliedFill(order=order, fill=fill))
+                await self._disarm_if_flat(order, portfolio)
                 await self._protect(order, portfolio)
                 # Announced only now: after the book has it and after the stop
                 # is armed. A dashboard told about a fill before the position
@@ -1393,6 +1394,37 @@ class StrategyRunner:
             # `_protect` has had a chance to say otherwise.
             self._unprotected.pop(order.symbol, None)
 
+    async def _disarm_if_flat(self, order: Order, portfolio: Portfolio) -> None:
+        """Take the protective stop with the position when it closes.
+
+        **The position going flat is the moment, not the exit being accepted.**
+        `flatten` cancels protection right after its submit, and copying that
+        ordering onto the strategy's own EXIT looked equivalent and is not:
+        `flatten` pins `MARKET`/`GTC`, while `submit_signal` builds an exit that
+        is `LIMIT` when the signal carries a price and `DAY` either way. So a
+        cancel at acknowledgement de-arms a position whose exit may never fill —
+        a limit that never trades, or a partial that leaves shares behind — and
+        the remainder sits with no venue stop, no engine-side watch (the symbol
+        is absent from `_unprotected`), and no line anywhere saying so. That is
+        the state this file calls the worst one in the system, reached while
+        trying to leave it.
+
+        Waiting for flat costs the window between the exit filling and this
+        line, which is the same event handler. What it buys is that the stop is
+        only ever cancelled against a position that has actually gone.
+
+        It also closes the case the EXIT branch could not see at all: an entry
+        that *reverses* into an opposing position lands flat on its way through
+        zero, and `_protect` returns early on a flat book, so nothing cancelled
+        the old side's stop either.
+
+        A cancel that fails is best-effort by `cancel_protection`'s contract,
+        and the order stays tracked either way.
+        """
+        if not portfolio.position(order.symbol).is_flat:
+            return
+        await self.router.cancel_protection(order.symbol)
+
     async def _protect(self, order: Order, portfolio: Portfolio) -> None:
         """Arm protection on a position that just opened or grew.
 
@@ -1405,9 +1437,36 @@ class StrategyRunner:
         if (position.qty > 0) != (order.side is Side.BUY):
             return  # a reducing fill
 
-        result = await self.router.submit_protective_orders(
-            order, portfolio, stop_config=self.stop_config, atr_value=self._atr(order.symbol)
-        )
+        try:
+            result = await self.router.submit_protective_orders(
+                order, portfolio, stop_config=self.stop_config, atr_value=self._atr(order.symbol)
+            )
+        except Exception:
+            # **The position exists; record that nothing is holding it, then let
+            # the error go.** `_route` raises `BrokerConnectionError` out of
+            # `_resolve_indeterminate` when a protective child's outcome is
+            # unknown — by design, and it engages a global halt on its way. But
+            # nothing between here and the task boundary caught it, so the
+            # trade-updates responsibility ended, the supervisor halted and the
+            # worker exited *before* this method could write down what had
+            # happened. The restart then found `_unprotected` empty, which
+            # `_stop_is_missing` reads as "nothing in this process ever tried" —
+            # the one state it treats as safe — so the engine declined to watch
+            # the level the router had already armed and persisted. A position
+            # with no venue stop and no engine stop, and no line anywhere saying
+            # so.
+            #
+            # Written before the re-raise so the fact survives the crash into
+            # the log, and so a caller that chooses to swallow this inherits a
+            # position in the "known short" state rather than the unknown one.
+            self._unprotected[order.symbol] = abs(position.qty)
+            log.critical(
+                "runner.position_unprotected",
+                symbol=order.symbol,
+                unprotected_qty=str(abs(position.qty)),
+                reason="protective submission raised",
+            )
+            raise
         for protective in result.placed:
             self._track(protective)
         if result.is_fully_protected:

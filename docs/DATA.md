@@ -192,14 +192,28 @@ It is the only thing that catches a feed that is *connected and frozen*. A
 dropped socket is the feed adapter's problem and it reconnects; a socket that
 stays open and stops delivering looks healthy from every other vantage point.
 
-Silence is measured from the **latest** of three instants, and each one stops a
-specific false alarm:
+Silence is measured from the **latest** of these, and each one stops a specific
+false alarm:
 
 | Instant | Without it |
 |---|---|
 | last message received | — the obvious baseline |
-| `connected_since` | a worker started at 11:00 is accused of missing the 09:30 open it was never running for |
+| the storage watermark | a worker that dies inside `max_silence_seconds` measures silence from its own birth and never halts (day 1, F7). The one witness a restart cannot reset |
 | the session open | a feed that died at yesterday's close registers as silent for eighteen hours the moment the bell rings |
+| `connected_since` | *fallback of last resort*, used only when nothing above is known: a worker started at 11:00 is not accused of missing the 09:30 open |
+
+The watermark is advanced by a reconnect **only when the backfill recovered the
+whole window it asked for**. A backfill that wrote nothing — which is what a
+venue-wide outage looks like from inside the ingestor, since the historical
+endpoint has no data for the window either — used to advance it anyway, and the
+watchdog then read its own reconnects as evidence the data was fine: seven
+simulated minutes of a dead feed, 2,548 reconnects, zero halts.
+
+**Recovery is a narrower claim than staleness and rests on less.** The all-clear
+(`data.staleness.recovered`, which reaches a phone) fires only on a message this
+process actually received, inside the current session and younger than
+`max_silence_seconds`. Neither the watermark nor `connected_since` can satisfy
+it: a reconnect is evidence about the socket, not about the tape.
 
 Take the earliest instead and the watchdog fires on every restart and every
 morning. Take only the last message and it cannot speak before the day's first

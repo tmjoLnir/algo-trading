@@ -96,23 +96,40 @@ class DroppedError(Exception):
 
 
 class FakeConnection:
-    """Hands back scripted frames, then whatever ends the connection."""
+    """Hands back scripted frames, then whatever ends the connection.
 
-    def __init__(self, script: Sequence[Any]) -> None:
+    `lifetime` is how long the connection is to have been up when it ends. The
+    adapter decides "flap or ordinary disconnect" on exactly that — not on
+    whether anything was delivered, because this stream is silent whenever
+    nobody is trading — so a fake that could not express uptime could not
+    express the difference.
+    """
+
+    def __init__(self, script: Sequence[Any], *, lifetime: float = 0.0) -> None:
         self._script = list(script)
         self.sent: list[dict[str, Any]] = []
         self.closed = False
+        self.lifetime = lifetime
+        #: Set by `build` so the drop can move the clock.
+        self.clock: SimulatedClock | None = None
 
     async def send(self, message: str) -> None:
         self.sent.append(json.loads(message))
 
     async def recv(self) -> str:
         if not self._script:
+            self._age()
             raise DroppedError("script exhausted")
         item = self._script.pop(0)
         if isinstance(item, Exception):
+            self._age()
             raise item
         return json.dumps(item)
+
+    def _age(self) -> None:
+        """The connection has ended; say how long it had been up."""
+        if self.clock is not None and self.lifetime:
+            self.clock.set(self.clock.now() + timedelta(seconds=self.lifetime))
 
     async def close(self) -> None:
         self.closed = True
@@ -155,6 +172,7 @@ def build(
         if not queue:
             raise DroppedError("no connection left")
         connection = queue.pop(0)
+        connection.clock = clock
         handed.append(connection)
         return connection
 
@@ -271,6 +289,64 @@ class TestTheStreamUrl:
         assert live.stream_url == "wss://api.alpaca.markets/stream"
 
 
+class TestAFlappingAccountStream:
+    """A connection accepted and closed before delivering is a failed attempt.
+
+    Without this the outer loop reopened with no sleep, no attempt counted and
+    no budget check, so the elapsed-time ladder F6 installed could never expire
+    and the give-up path was unreachable. Worse here than on the market-data
+    socket: `consume_trade_updates` calls `reconciler.reconcile()` on every
+    reconnect marker — three unpaced REST calls — so the loop rate-limits the
+    venue and the five-attempt REST ladder engages a global halt. Day 1's crash
+    loop through a different door (the day-1 fix audit, sweep finding B3).
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_handshake_without_an_update_is_waited_out(self) -> None:
+        flapping = [
+            FakeConnection([AUTHORIZED, LISTENING, DroppedError("reset")], lifetime=0.0)
+            for _ in range(3)
+        ]
+        good = FakeConnection([AUTHORIZED, LISTENING, fill_frame()])
+        broker, slept, _ = build(*flapping, good, reconnect_budget_seconds=900.0)
+
+        await drain(broker, limit=4)
+
+        assert len(slept) >= 3, f"three flaps must be three waits; slept {slept}"
+
+    @pytest.mark.asyncio
+    async def test_an_idle_stream_that_stayed_up_is_not_a_flap(self) -> None:
+        """**The direction that matters more than the bug.** This stream carries
+        nothing whenever nobody is trading, which on a quiet afternoon is most
+        of it. A guard that read silence as failure would spend the retry budget
+        on a healthy socket and then halt the platform — so the discriminator is
+        how long the connection lived, not whether it spoke."""
+        idle = [
+            FakeConnection([AUTHORIZED, LISTENING, DroppedError("reset")], lifetime=900.0)
+            for _ in range(3)
+        ]
+        good = FakeConnection([AUTHORIZED, LISTENING, fill_frame()])
+        broker, slept, _ = build(*idle, good, reconnect_budget_seconds=900.0)
+
+        await drain(broker, limit=4)
+
+        assert slept == [], "a stream that stayed up and carried nothing is not a failure"
+
+    @pytest.mark.asyncio
+    async def test_the_flap_budget_can_expire(self) -> None:
+        flapping = [
+            FakeConnection([AUTHORIZED, LISTENING, DroppedError("reset")], lifetime=0.0)
+            for _ in range(40)
+        ]
+        broker, _, _ = build(*flapping, reconnect_budget_seconds=120.0)
+
+        # Iterated directly rather than through `drain`, which swallows the
+        # error it is asserting about — the message is the whole point here.
+        with pytest.raises(BrokerConnectionError, match="kept dropping"):
+            async for _event in broker.stream_trade_updates():  # pragma: no cover
+                pass
+
+
 class TestReconnect:
     @pytest.mark.asyncio
     async def test_a_drop_yields_the_reconnect_marker_before_the_next_event(self) -> None:
@@ -289,7 +365,11 @@ class TestReconnect:
 
     @pytest.mark.asyncio
     async def test_the_marker_spans_the_outage(self) -> None:
-        first = FakeConnection([AUTHORIZED, LISTENING, fill_frame(), DroppedError("reset")])
+        # Up for a minute, then dropped: an ordinary disconnect rather than a
+        # flap, which is the case this test is about.
+        first = FakeConnection(
+            [AUTHORIZED, LISTENING, fill_frame(), DroppedError("reset")], lifetime=60.0
+        )
         second = FakeConnection([AUTHORIZED, LISTENING, fill_frame(execution_id="exec-2")])
         broker, _, _ = build(first, second, reconnect_budget_seconds=600.0)
 
