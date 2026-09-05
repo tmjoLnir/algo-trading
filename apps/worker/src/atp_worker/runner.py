@@ -1362,6 +1362,7 @@ class StrategyRunner:
                 self._apply_to_portfolio(order, fill, portfolio)
                 self.stats.fills_applied += 1
                 self._pending_fills.append(_AppliedFill(order=order, fill=fill))
+                await self._disarm_if_flat(order, portfolio)
                 await self._protect(order, portfolio)
                 # Announced only now: after the book has it and after the stop
                 # is armed. A dashboard told about a fill before the position
@@ -1392,6 +1393,37 @@ class StrategyRunner:
             # make the next entry in this symbol look known-unprotected before
             # `_protect` has had a chance to say otherwise.
             self._unprotected.pop(order.symbol, None)
+
+    async def _disarm_if_flat(self, order: Order, portfolio: Portfolio) -> None:
+        """Take the protective stop with the position when it closes.
+
+        **The position going flat is the moment, not the exit being accepted.**
+        `flatten` cancels protection right after its submit, and copying that
+        ordering onto the strategy's own EXIT looked equivalent and is not:
+        `flatten` pins `MARKET`/`GTC`, while `submit_signal` builds an exit that
+        is `LIMIT` when the signal carries a price and `DAY` either way. So a
+        cancel at acknowledgement de-arms a position whose exit may never fill —
+        a limit that never trades, or a partial that leaves shares behind — and
+        the remainder sits with no venue stop, no engine-side watch (the symbol
+        is absent from `_unprotected`), and no line anywhere saying so. That is
+        the state this file calls the worst one in the system, reached while
+        trying to leave it.
+
+        Waiting for flat costs the window between the exit filling and this
+        line, which is the same event handler. What it buys is that the stop is
+        only ever cancelled against a position that has actually gone.
+
+        It also closes the case the EXIT branch could not see at all: an entry
+        that *reverses* into an opposing position lands flat on its way through
+        zero, and `_protect` returns early on a flat book, so nothing cancelled
+        the old side's stop either.
+
+        A cancel that fails is best-effort by `cancel_protection`'s contract,
+        and the order stays tracked either way.
+        """
+        if not portfolio.position(order.symbol).is_flat:
+            return
+        await self.router.cancel_protection(order.symbol)
 
     async def _protect(self, order: Order, portfolio: Portfolio) -> None:
         """Arm protection on a position that just opened or grew.

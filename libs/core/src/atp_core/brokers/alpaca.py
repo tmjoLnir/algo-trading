@@ -617,11 +617,9 @@ class AlpacaBroker:
                     attempts=attempts + 1,
                 )
 
-            #: Reset only once the connection has proved itself by delivering
-            #: something. Resetting on connect alone would turn a server that
-            #: accepts and immediately drops us into a hot loop that never
-            #: backs off.
-            delivered = False
+            #: When this connection was established. The ladder is cleared, or
+            #: not, on how long it goes on to live — see the end of this loop.
+            connected_at = self._clock.now()
 
             while True:
                 try:
@@ -631,43 +629,38 @@ class AlpacaBroker:
                     await ws.close_quietly(connection)
                     break
 
-                updates = [
-                    update
-                    for message in _iter_messages(raw)
-                    if (update := self._to_trade_update(message)) is not None
-                ]
-                # **A protocol frame is not delivery.** The account stream's
-                # authorization and listen confirmations arrive before any trade
-                # update and parse to nothing, so `recv()` returning was enough
-                # to reset the budget on a connection that had proved nothing.
-                if updates and not delivered:
-                    delivered = True
-                    attempts = 0
-                    #: Cleared only once the connection has *delivered*. A
-                    #: server that accepts and drops immediately would
-                    #: otherwise restart the budget every loop.
-                    first_failure_at = None
-
-                for update in updates:
-                    gap_since = update.at
-                    yield update
+                for message in _iter_messages(raw):
+                    update = self._to_trade_update(message)
+                    if update is not None:
+                        gap_since = update.at
+                        yield update
 
             reconnecting = True
-            if not delivered:
-                # A connection accepted and closed before delivering is a failed
-                # attempt. Without this the outer loop spun with no sleep and no
-                # budget check, so the give-up path was unreachable — and each
-                # turn calls `reconciler.reconcile()` through
+            now = self._clock.now()
+            if not ws.is_flap(connected_at, now):
+                # A connection that lived is an ordinary disconnect. **Not
+                # whether it carried anything**: this stream is silent whenever
+                # nobody is trading, so a guard that read silence as failure
+                # would exhaust the budget on a healthy socket and halt the
+                # platform on a quiet afternoon — worse than the loop it
+                # replaced.
+                attempts = 0
+                first_failure_at = None
+            else:
+                # A connection that ended before it could have been real is a
+                # failed attempt. Without this the outer loop spun with no sleep
+                # and no budget check, so the give-up path was unreachable — and
+                # each turn calls `reconciler.reconcile()` through
                 # `consume_trade_updates`, three unpaced REST calls, until the
-                # venue rate-limits and the five-attempt ladder engages a global
-                # halt. That is day 1's crash loop through a different door.
+                # venue rate-limits and the five-attempt REST ladder engages a
+                # global halt. Day 1's crash loop through a different door.
                 attempts += 1
-                now = self._clock.now()
                 if first_failure_at is None:
                     first_failure_at = now
                 if ws.budget_exhausted(first_failure_at, now, self._reconnect_budget_seconds):
                     raise BrokerConnectionError(
-                        f"Alpaca trade updates accepted and dropped without delivering for "
+                        f"Alpaca trade updates kept dropping within "
+                        f"{ws.MIN_HEALTHY_UPTIME_SECONDS:.0f}s of connecting for "
                         f"{self._reconnect_budget_seconds:.0f}s ({attempts} attempts)"
                     )
                 log.warning(
@@ -675,7 +668,7 @@ class AlpacaBroker:
                     attempt=attempts,
                     trying_for_seconds=round((now - first_failure_at).total_seconds(), 1),
                     budget_seconds=self._reconnect_budget_seconds,
-                    msg="the connection was accepted and closed before any update arrived",
+                    msg="the connection was dropped before it could have been established",
                 )
                 await self._sleep(
                     ws.backoff_delay(

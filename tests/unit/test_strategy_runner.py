@@ -223,6 +223,8 @@ class FakeRouter:
         #: produces and which must never count as a risk rejection (F14).
         self.no_action = False
         self.refuse_protection = False
+        #: Symbols whose protective orders were cancelled.
+        self.protection_cancelled: list[str] = []
         #: An exception to raise from `submit_protective_orders`, or None.
         self.protection_raises: Exception | None = None
         #: What the venue is holding, by symbol. The runner asks before acting
@@ -327,6 +329,11 @@ class FakeRouter:
         return ProtectionResult(
             placed=[stop], covered_qty=Decimal("10"), unprotected_qty=Decimal(0)
         )
+
+    async def cancel_protection(self, symbol: str) -> int:
+        self.calls.append("cancel_protection")
+        self.protection_cancelled.append(symbol)
+        return 1
 
     async def flatten(
         self,
@@ -2095,4 +2102,66 @@ class TestAProtectiveSubmissionThatRaises:
             fill=Fill(
                 order_id="x", ts=START, qty=Decimal("10"), price=Decimal("100"), venue_fill_id="e1"
             ),
+        )
+
+
+class TestAClosedPositionTakesItsStopWithIt:
+    """A protective stop must not outlive the position it protects.
+
+    `cancel_protection` had exactly one caller, inside `OrderRouter.flatten`,
+    and a strategy's own EXIT goes through `submit_signal` instead. So a
+    position closed by a cross-down left a GTC stop working at the venue with
+    nothing behind it; when price later traded through the level it filled and
+    opened a *short*, for an order this process still tracked — so no reconciler
+    flagged it, `_protect` read the fill as reducing and armed nothing, and
+    `sma_crossover` could emit neither an entry nor an exit for the symbol
+    again (the day-1 fix audit, sweep finding B1).
+
+    Driven from the fill rather than from the submit, which is the correction a
+    review of the first attempt forced: an exit is `DAY` and may be `LIMIT`, so
+    cancelling on acknowledgement de-armed positions whose exit never filled.
+    """
+
+    @staticmethod
+    def fill(client_order_id: str, qty: str = "10") -> TradeUpdate:
+        return TradeUpdate(
+            event="fill",
+            client_order_id=client_order_id,
+            broker_order_id="brk-1",
+            symbol=SYMBOL,
+            at=START,
+            fill=Fill(
+                order_id="x", ts=START, qty=Decimal(qty), price=Decimal("100"), venue_fill_id="e1"
+            ),
+        )
+
+    async def _long_then_exit(self) -> tuple[Any, Any, Portfolio]:
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG, 1: SignalAction.EXIT})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0), bar(1)])
+        await runner.evaluate(portfolio)
+        await runner.on_fill_event(self.fill("atp-1"), portfolio)
+        await runner.evaluate(portfolio)
+        router.protection_cancelled.clear()
+        return runner, router, portfolio
+
+    @pytest.mark.asyncio
+    async def test_the_fill_that_closes_the_position_cancels_the_stop(self) -> None:
+        runner, router, portfolio = await self._long_then_exit()
+
+        await runner.on_fill_event(self.fill("atp-2"), portfolio)
+
+        assert portfolio.position(SYMBOL).is_flat
+        assert router.protection_cancelled == [SYMBOL]
+
+    @pytest.mark.asyncio
+    async def test_a_partial_exit_leaves_the_stop_alone(self) -> None:
+        """The failure the first attempt introduced: cancelling when the exit is
+        merely accepted strips the stop off shares that are still held."""
+        runner, router, portfolio = await self._long_then_exit()
+
+        await runner.on_fill_event(self.fill("atp-2", qty="4"), portfolio)
+
+        assert not portfolio.position(SYMBOL).is_flat
+        assert router.protection_cancelled == [], (
+            "shares are still held; the stop over them must stay working"
         )

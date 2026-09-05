@@ -161,3 +161,35 @@ def budget_exhausted(first_failure_at: datetime, now: datetime, budget_seconds: 
     all" setting the tests use to assert the give-up path.
     """
     return (now - first_failure_at).total_seconds() >= budget_seconds
+
+
+#: How long a connection has to survive before its ending counts as an ordinary
+#: disconnect rather than a flap.
+#:
+#: The discriminator has to be **how long the connection lived**, not whether it
+#: carried anything. Judging it on payload is the obvious reading and it is
+#: wrong in the direction that stops the platform: the account stream is silent
+#: whenever nobody is trading, and the market-data stream is silent on a thin
+#: symbol, before the open, and — per ADR 0026 — for 12.4% of minutes on IEX. A
+#: guard that calls silence a flap would spend the retry budget on a healthy
+#: socket and then halt trading on a feed that was working perfectly.
+#:
+#: Deciding that *silence* is pathological is `StalenessMonitor`'s job, and it
+#: has a calendar to do it with. This one answers a narrower question a socket
+#: can answer on its own: was it up long enough to have been real?
+MIN_HEALTHY_UPTIME_SECONDS = 30.0
+
+
+def is_flap(connected_at: datetime, now: datetime) -> bool:
+    """Whether a connection that has just ended was never really established.
+
+    True when it lived for less than `MIN_HEALTHY_UPTIME_SECONDS` — the shape a
+    venue produces when it accepts, authenticates, acknowledges and then hangs
+    up: a slow-client rejection, a load balancer draining a node, the
+    connection-limit fight one-connection-per-key venues produce under a
+    restart. Until this was counted as a failed attempt the outer loop reopened
+    immediately, so the elapsed-time budget could never expire and the give-up
+    path that halts trading was unreachable — measured at 2,962 reconnects per
+    second against a real adapter.
+    """
+    return (now - connected_at).total_seconds() < MIN_HEALTHY_UPTIME_SECONDS

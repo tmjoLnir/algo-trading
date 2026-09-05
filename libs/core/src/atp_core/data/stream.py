@@ -110,10 +110,14 @@ class IngestorStats:
     #: order priced off the halted one, so it needs the per-symbol answer.
     last_tick_at: dict[str, datetime] = field(default_factory=dict)
 
-    #: When data was last demonstrably flowing, according to the **bar table**
-    #: rather than to anything this process saw. Read once at startup and never
-    #: updated, because after that `last_message_at` is both fresher and more
-    #: direct.
+    #: When data was last demonstrably good, according to the **bar table**
+    #: rather than to anything this process saw. Seeded at startup, and
+    #: afterwards advanced by `_on_reconnect` — but only when the backfill
+    #: recovered the whole window it asked for (`_GapRepair`). That restriction
+    #: is the point: it is written by the reconnect path, so without it a
+    #: reconnect that recovered nothing could forge a claim about the data. It
+    #: answers the *staleness* question; it may not answer the *recovery* one,
+    #: which rests on `last_message_at` alone.
     #:
     #: It exists because every other field here dies with the process, and on
     #: day 1 of the paper week the process died three times in 158 seconds. Each
@@ -722,9 +726,16 @@ class StalenessMonitor:
         # feed was flowing while no frame had arrived for minutes. A reconnect
         # is evidence about the socket; recovery is a claim about the tape, and
         # only a frame this process received can make it.
+        #
+        # And it is its OWN freshness question, not `not stale` plus a witness:
+        # `stale` is computed from the shared baseline, which the watermark is
+        # in, so a reconnect that recovered nothing could still make this true
+        # by suppressing staleness. Asked directly of the frame, it cannot.
         newest_message = ingestor.stats.last_message_at
         data_is_current = (
-            not stale and newest_message is not None and newest_message >= session.open_at
+            newest_message is not None
+            and newest_message >= session.open_at
+            and (now - newest_message).total_seconds() <= self.max_silence_seconds
         )
         return StalenessVerdict(
             stale=stale,
