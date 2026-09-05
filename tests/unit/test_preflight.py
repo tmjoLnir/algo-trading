@@ -27,6 +27,7 @@ import pytest
 from pydantic import SecretStr
 
 from atp_core.config import Settings
+from atp_core.domain import Timeframe
 from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
 from atp_core.risk.limits import RiskLimits
 from atp_core.worker import WorkerConfig
@@ -153,7 +154,9 @@ class TestTheExpensiveFailures:
     """The two that cost a week and present as silence."""
 
     def test_short_history_fails_rather_than_warns(self) -> None:
-        check = preflight.check_warmup("SPY", required=51, stored=30, newest=None)
+        check = preflight.check_warmup(
+            "SPY", timeframe=Timeframe.D1, required=51, stored=30, newest=None
+        )
         assert check.status is Status.FAIL
         # Says what it would produce, not just that it is short — the reason
         # this is a FAIL is that the failure mode is unreadable, not that it
@@ -162,13 +165,19 @@ class TestTheExpensiveFailures:
         assert "backfill_bars.py" in check.fix
 
     def test_no_history_at_all_names_the_backfill_command(self) -> None:
-        check = preflight.check_warmup("SPY", required=51, stored=0, newest=None)
+        check = preflight.check_warmup(
+            "SPY", timeframe=Timeframe.D1, required=51, stored=0, newest=None
+        )
         assert check.status is Status.FAIL
         assert "--symbols SPY" in check.fix
 
     def test_enough_history_passes_and_reports_how_stale_it_is(self) -> None:
         check = preflight.check_warmup(
-            "SPY", required=51, stored=200, newest=datetime(2026, 8, 20, tzinfo=UTC)
+            "SPY",
+            timeframe=Timeframe.D1,
+            required=51,
+            stored=200,
+            newest=datetime(2026, 8, 20, tzinfo=UTC),
         )
         assert check.status is Status.PASS
         assert "2026-08-20" in check.detail
@@ -181,6 +190,7 @@ class TestTheExpensiveFailures:
         check = preflight.check_sizing_is_reachable(
             config(sizing_method="risk_pct", sizing_value=Decimal("0.01")),
             RiskLimits(),
+            timeframe=Timeframe.D1,
             equity=Decimal(100_000),
             price=Decimal("96.76"),
             stop_price=Decimal("93.49"),
@@ -195,6 +205,7 @@ class TestTheExpensiveFailures:
         check = preflight.check_sizing_is_reachable(
             config(sizing_method="risk_pct", sizing_value=Decimal("0.003")),
             RiskLimits(),
+            timeframe=Timeframe.D1,
             equity=Decimal(100_000),
             price=Decimal("96.76"),
             stop_price=Decimal("93.49"),
@@ -216,6 +227,7 @@ class TestTheExpensiveFailures:
         check = preflight.check_sizing_is_reachable(
             config(sizing_method="risk_pct", sizing_value=Decimal("0.0015")),
             RiskLimits(),
+            timeframe=Timeframe.M1,
             equity=Decimal(100_000),
             price=Decimal(500),
             # 2 x a minute-scale ATR: 18 cents, against $10 on the daily series.
@@ -234,6 +246,7 @@ class TestTheExpensiveFailures:
         check = preflight.check_sizing_is_reachable(
             config(sizing_method="risk_pct", sizing_value=Decimal("0.0015")),
             RiskLimits(),
+            timeframe=Timeframe.D1,
             equity=Decimal(100_000),
             price=Decimal(500),
             stop_price=Decimal(490),  # 2 x a daily ATR of ~$5
@@ -247,6 +260,7 @@ class TestTheExpensiveFailures:
         check = preflight.check_sizing_is_reachable(
             config(sizing_method="risk_pct", sizing_value=Decimal("0.01")),
             RiskLimits(),
+            timeframe=Timeframe.D1,
             equity=Decimal(100_000),
             price=Decimal("96.76"),
             stop_price=Decimal("93.49"),
@@ -284,6 +298,7 @@ class TestTheMetricsToken:
         check = preflight.check_sizing_is_reachable(
             config(sizing_method="risk_pct"),
             RiskLimits(),
+            timeframe=Timeframe.D1,
             equity=Decimal(100_000),
             price=Decimal(100),
             stop_price=None,
@@ -306,6 +321,7 @@ class TestTheMetricsToken:
         check = preflight.check_sizing_is_reachable(
             config(sizing_method="risk_pct", sizing_value=Decimal("0.001")),
             RiskLimits(),
+            timeframe=Timeframe.D1,
             equity=Decimal(100_000),
             price=Decimal(100),
             stop_price=Decimal(95),

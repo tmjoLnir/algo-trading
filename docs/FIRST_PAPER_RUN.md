@@ -89,8 +89,11 @@ still hold when this platform is the thing that is broken.
 make preflight            # or: uv run python scripts/preflight.py
 ```
 
-Eleven checks in about two seconds, each one a precondition stated above or an
-entry from "the things most likely to break first" below. It exits non-zero on
+A dozen-odd checks in about two seconds, each one a precondition stated above
+or an entry from "the things most likely to break first" below. They are
+measured on the bar series the saved `worker_config` row names — the report says
+which on its own line — because the same sizing row passes on daily bars and is
+refused on every entry of the week on minute ones. It exits non-zero on
 anything that would stop the week producing an answer, and prints the command or
 the setting that fixes it.
 

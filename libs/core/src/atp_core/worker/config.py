@@ -497,6 +497,19 @@ class WorkerConfig:
         """A copy watching `symbols`, normalised the way a stored row holds them."""
         return replace(self, symbols=normalise_symbols(symbols))
 
+    def with_timeframe(self, timeframe: Timeframe) -> WorkerConfig:
+        """A copy priced against a different bar series.
+
+        The inverse of `bar_timeframe`, and it exists for one caller:
+        `scripts/preflight.py --timeframe`, which answers "would the saved
+        sizing survive on another series?" without writing the row the dashboard
+        owns. Taking the enum rather than the stored string means the only way to
+        ask is with a series the platform has — the two vocabularies are the
+        same seven strings, and a test keeps them so — and `__post_init__`
+        re-validates the rest of the row on the way through.
+        """
+        return replace(self, timeframe=timeframe.value)
+
 
 #: What a worker runs on when nothing has been saved: no watchlist, no strategy,
 #: and docs/RISK.md's defaults for everything that has one — the ceilings

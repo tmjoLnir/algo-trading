@@ -96,6 +96,11 @@ CALENDAR = TradingCalendar("NYSE")
 
 def monitor(**kwargs: Any) -> StalenessMonitor:
     kwargs.setdefault("calendar", CALENDAR)
+    # `alerts` is required rather than defaulted on the real constructor, so
+    # that the production wiring cannot omit it silently again — see the
+    # constructor's own note. Defaulted here, where "no sink" is what most of
+    # these tests mean.
+    kwargs.setdefault("alerts", None)
     return StalenessMonitor(**kwargs)
 
 
@@ -460,3 +465,148 @@ class TestAnnouncingRecovery:
 
         with pytest.raises(_ClockExhaustedError):
             await watchdog.watch(target)
+
+
+class TestRecoveryIsAboutTheData:
+    """The audit's §3.4a. Wiring the sink to a phone (§3.4) is only safe once
+    the all-clear is a claim about *data arriving*, because `not stale` is not
+    that claim: the market being shut makes every verdict non-stale, and so
+    does the baseline being floored at the session open. A feed that died at
+    14:00 and never came back announced "market data is flowing again" at the
+    closing bell, and reset the outage as though it were over.
+
+    These drive `watch` end to end, so reverting the branch in `watch` — or the
+    `data_is_current` field it reads — turns them red.
+    """
+
+    #: 20:00 UTC, 16:00 in New York: the bell, and the first poll at which
+    #: `evaluate` reports the market shut.
+    THE_CLOSE = datetime(2024, 6, 3, 20, 0, tzinfo=UTC)
+    #: The next session's open, Tuesday 4 June.
+    NEXT_OPEN = datetime(2024, 6, 4, 13, 30, tzinfo=UTC)
+
+    def build(
+        self, instants: list[datetime], alerts: RecordingAlerts
+    ) -> tuple[StalenessMonitor, FakeKillSwitch]:
+        switch = FakeKillSwitch()
+        watchdog = monitor(
+            max_silence_seconds=60,
+            kill_switch=switch,
+            clock=ScriptedClock(instants),
+            sleep=_no_sleep,
+            alerts=alerts,
+        )
+        return watchdog, switch
+
+    async def run(self, watchdog: StalenessMonitor, target: StreamIngestor) -> None:
+        with pytest.raises(_ClockExhaustedError):
+            await watchdog.watch(target)
+
+    async def test_the_closing_bell_is_not_a_recovery(self) -> None:
+        """The headline case. Two polls, one dead feed: the outage at 14:30 and
+        the bell at 20:00. Nothing recovered in between."""
+        alerts = RecordingAlerts()
+        watchdog, switch = self.build([MIDSESSION, self.THE_CLOSE], alerts)
+        dead = ingestor(last_message_at=MIDSESSION - timedelta(minutes=5))
+
+        await self.run(watchdog, dead)
+
+        assert len(switch.engaged) == 1, "the outage is still one halt"
+        assert alerts.sent == [], "a feed that never came back has nothing to announce"
+
+    async def test_the_next_open_is_not_a_recovery_either(self) -> None:
+        """Where gating on `market_open` alone would have put the lie.
+
+        The baseline is floored at the session open, so a feed dead since
+        yesterday reads as non-stale for the first `max_silence_seconds` of
+        every morning — deliberately, so the overnight is not billed to it. An
+        all-clear there would reach the operator at 09:30, which is worse than
+        at the bell, and be followed by a CRITICAL two minutes later.
+        """
+        alerts = RecordingAlerts()
+        watchdog, switch = self.build(
+            [
+                MIDSESSION,
+                self.THE_CLOSE,
+                self.NEXT_OPEN + timedelta(seconds=5),
+                self.NEXT_OPEN + timedelta(minutes=2),
+            ],
+            alerts,
+        )
+        dead = ingestor(last_message_at=MIDSESSION - timedelta(minutes=5))
+
+        await self.run(watchdog, dead)
+
+        assert alerts.sent == [], "nothing arrived overnight, so nothing recovered"
+        assert len(switch.engaged) == 2, (
+            "the close re-arms, so the second session reports its own outage"
+        )
+
+    async def test_a_feed_that_really_comes_back_still_says_so(self) -> None:
+        """The other direction, so the gate cannot be satisfied by silence."""
+        alerts = RecordingAlerts()
+        watchdog, _ = self.build([MIDSESSION, MIDSESSION + timedelta(minutes=5)], alerts)
+        target = ingestor(last_message_at=MIDSESSION - timedelta(minutes=5))
+
+        with pytest.raises(_ClockExhaustedError):
+            await watchdog.watch(target)
+        target.stats.last_message_at = MIDSESSION + timedelta(minutes=5)
+        watchdog._clock = ScriptedClock([MIDSESSION + timedelta(minutes=5)])
+        with pytest.raises(_ClockExhaustedError):
+            await watchdog.watch(target)
+
+        assert [a.key for a in alerts.sent] == ["staleness.recovered"]
+
+    async def test_data_from_before_the_open_is_not_current(self) -> None:
+        """`evaluate` in isolation: yesterday's last bar is what makes the
+        morning non-stale, and it is not a witness that the feed is alive."""
+        verdict = monitor(max_silence_seconds=60).evaluate(
+            ingestor(last_message_at=SESSION_OPEN - timedelta(hours=3)),
+            SESSION_OPEN + timedelta(seconds=5),
+        )
+
+        assert verdict.stale is False
+        assert verdict.market_open is True
+        assert verdict.data_is_current is False
+        assert "no data yet this session" in verdict.reason
+
+    async def test_a_worker_that_has_only_just_booted_is_not_current_either(self) -> None:
+        """`connected_since` is the process's birthday, which F7 demoted for
+        exactly this reason. It keeps the watchdog quiet; it must not be able
+        to announce a recovery."""
+        verdict = monitor(max_silence_seconds=60).evaluate(
+            ingestor(connected_since=MIDSESSION - timedelta(seconds=10)),
+            MIDSESSION,
+        )
+
+        assert verdict.stale is False
+        assert verdict.data_is_current is False
+
+
+class TestTheAllClearDoesNotOverclaim:
+    """The all-clear now reaches a phone, so its second sentence has to be true
+    as well as its first."""
+
+    async def test_it_does_not_claim_a_halt_nobody_holds(self) -> None:
+        """`_halt` with no kill switch bound logs "TRADING IS NOT HALTED". An
+        all-clear that then said "the halt it engaged is still engaged" would
+        be inventing one."""
+        alerts = RecordingAlerts()
+        watchdog = monitor(
+            max_silence_seconds=60,
+            kill_switch=None,
+            clock=ScriptedClock([MIDSESSION]),
+            sleep=_no_sleep,
+            alerts=alerts,
+        )
+        target = ingestor(last_message_at=MIDSESSION - timedelta(minutes=5))
+        with pytest.raises(_ClockExhaustedError):
+            await watchdog.watch(target)
+        target.stats.last_message_at = MIDSESSION
+        watchdog._clock = ScriptedClock([MIDSESSION])
+
+        with pytest.raises(_ClockExhaustedError):
+            await watchdog.watch(target)
+
+        assert alerts.sent[0].context["halted"] == "False"
+        assert "nothing is halted" in alerts.sent[0].body

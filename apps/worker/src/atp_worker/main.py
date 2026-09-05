@@ -258,7 +258,16 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
                 # (docs/paper-week/day-1-review.md).
                 bar_timeframe=config.bar_timeframe,
             )
-            monitor = StalenessMonitor(config.max_silence_seconds, kill_switch=kill_switch)
+            monitor = StalenessMonitor(
+                config.max_silence_seconds,
+                kill_switch=kill_switch,
+                # The all-clear reaches a phone, not only the log. The halt this
+                # engages alerts through the kill switch (ADR 0012); nothing was
+                # telling anyone it had ended, and a CRITICAL followed by
+                # silence cannot be told from "fixed itself, waiting for you".
+                # On day 1 that gap was 2h37m (docs/OBSERVABILITY.md, F7).
+                alerts=alerts,
+            )
             responsibilities["ingestor"] = lambda: ingestor.run(symbols)
             responsibilities["staleness_monitor"] = lambda: monitor.watch(ingestor)
         else:
