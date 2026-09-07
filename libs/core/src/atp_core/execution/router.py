@@ -142,11 +142,18 @@ class ProtectionResult:
     ordinary rather than exotic. The other six can never refuse one.
 
     Two of those six only stopped being able to at ADR 0027. `max_position_size`
-    and `max_gross_exposure` measure the *committed* book, and so refused a stop
-    whenever the position it protects had more in flight behind it, or whenever
-    any *other* holding was unmarked — a cap refusing the order that shrinks the
-    book, which is docs/SAFETY.md's layers 6 and 5 failing together exactly as
-    the kill switch did before its own carve-out. That document makes "there are
+    and `max_gross_exposure` refused a stop whenever any *other* holding was
+    unmarked — a cap refusing the order that shrinks the book, which is
+    docs/SAFETY.md's layers 6 and 5 failing together exactly as the kill switch
+    did before its own carve-out.
+
+    Only the unmarked half was ever reachable *here*, and the reason is worth
+    knowing: `_route` takes `pending=()` by default and this method does not
+    override it, so a protective child is validated against a book with nothing
+    projected onto it. The runner's working orders never reach the chain on this
+    path. Whether they should is a real question and deliberately not answered
+    here — projecting them would make a stop harder to place, which is the wrong
+    direction for the one order that exists to reduce risk. That document makes "there are
     no unprotected positions" a go-live condition and names a stop that was
     never placed after the entry fill as the way layer 5 fails. Not a
     distinction to leave to the caller's memory.

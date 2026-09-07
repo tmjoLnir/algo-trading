@@ -113,8 +113,10 @@ ATR(14).
   went when it was given its exit carve-out — a halt refusing the protective
   child of an entry that had just filled was SAFETY.md's layers 6 and 5 failing
   together (docs/paper-week/day-1-review.md, F3). The two ceilings went when
-  they stopped refusing an order that leaves no more behind than the book has
-  already committed to, which was the same failure one rule along. The router reports a refusal as an
+  they stopped refusing an order that closes into a position the account
+  actually holds without reversing through it — `rules.closes_without_reversing`,
+  asked of the *settled* book like every other exit question on this chain,
+  which was the same failure one rule along. The router reports a refusal as an
   unprotected quantity and logs `CRITICAL` rather than exempting the order —
   see docs/RUNBOOK.md, "Position open with no stop".
 - **A stop the market has already passed is not placed.** Submitted, it is a
