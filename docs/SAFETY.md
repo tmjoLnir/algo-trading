@@ -53,7 +53,15 @@ halt had its protective child refused, so the position ended up with no stop
 anywhere and the two layers failed together. The carve-out is narrow. An order
 that would *reverse* a position rather than close it is still refused, because
 selling 250 against a long of 100 opens a short of 150, and that is new risk
-taken while the platform is stopped. "Do not trade on stale prices" is not this
+taken while the platform is stopped.
+
+**"An existing holding" means one the account actually holds.** The carve-out
+asks that of the settled book, not of the book with in-flight orders projected
+onto it (ADR 0027). It read the projection until 2026-09-07, and a working
+`BUY 100` against a flat account was enough to make `SELL 100` look like an exit
+— so this layer approved an order that opened a short while the platform was
+stopped. An entry that is still working is not exposure to be let out of;
+cancelling it is how you undo it. "Do not trade on stale prices" is not this
 layer's job and is not weakened by any of it — `stale_data` refuses every order
 including exits, on the same chain.
 

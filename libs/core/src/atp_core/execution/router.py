@@ -136,19 +136,20 @@ class ProtectionResult:
 
     A bare `list[Order]` cannot distinguish "this position needed no protection"
     from "this position is naked because the stop was refused" — both are the
-    empty list. Three of the nine default rules can refuse a protective stop
-    outright — trading hours, the rate limit and stale data all judge the order
-    rather than whether it reduces a position — and two more
-    (`max_position_size`, `max_gross_exposure`) refuse whenever any *other*
-    holding is unmarked, so a denial here is ordinary rather than exotic. Only
-    `max_open_positions`, `daily_loss_limit`, `buying_power` and the kill switch
-    can never refuse one. The kill switch belonged in the first list until it
-    was given the exit carve-out `KillSwitchRule` now documents: a halt refusing
-    the protective child of an entry that had just filled was docs/SAFETY.md's
-    layers 6 and 5 failing together, since that document makes "there are no
-    unprotected positions" a go-live condition and names a stop that was never
-    placed after the entry fill as the way layer 5 fails. Not a distinction to
-    leave to the caller's memory.
+    empty list. Three of the nine default rules can refuse a protective stop —
+    trading hours, the rate limit and stale data, which all judge the order
+    rather than the book (`rules.EXIT_BLIND_RULES`) — so a denial here is
+    ordinary rather than exotic. The other six can never refuse one.
+
+    Two of those six only stopped being able to at ADR 0027. `max_position_size`
+    and `max_gross_exposure` measure the *committed* book, and so refused a stop
+    whenever the position it protects had more in flight behind it, or whenever
+    any *other* holding was unmarked — a cap refusing the order that shrinks the
+    book, which is docs/SAFETY.md's layers 6 and 5 failing together exactly as
+    the kill switch did before its own carve-out. That document makes "there are
+    no unprotected positions" a go-live condition and names a stop that was
+    never placed after the entry fill as the way layer 5 fails. Not a
+    distinction to leave to the caller's memory.
     """
 
     placed: list[Order] = field(default_factory=list)

@@ -23,9 +23,10 @@ from pydantic import ValidationError
 from atp_core.clock import SimulatedClock, TradingCalendar
 from atp_core.domain import Order, OrderType, Portfolio, Side
 from atp_core.errors import ConfigError, RiskLimitBreachedError
-from atp_core.risk.engine import RiskDecision, RiskEngine, RiskRule, default_rules
+from atp_core.risk.engine import RiskBooks, RiskDecision, RiskEngine, RiskRule, default_rules
 from atp_core.risk.limits import MAX_GROSS_CEILING, RiskLimits
 from atp_core.risk.rules import (
+    EXIT_BLIND_RULES,
     BuyingPowerRule,
     DailyLossLimitRule,
     KillSwitchRule,
@@ -87,18 +88,20 @@ def order(
 class TestRiskRules:
     def test_kill_switch_blocks_an_entry(self) -> None:
         rule = KillSwitchRule(switch=FakeKillSwitch(engaged=True))
-        decision = rule.check(order(), portfolio(), limits())
+        decision = rule.check(order(), RiskBooks.of(portfolio()), limits())
         assert not decision.approved
         assert decision.rule == "kill_switch"
 
     def test_kill_switch_allows_when_clear(self) -> None:
         rule = KillSwitchRule(switch=FakeKillSwitch(engaged=False))
-        assert rule.check(order(), portfolio(), limits()).approved
+        assert rule.check(order(), RiskBooks.of(portfolio()), limits()).approved
 
     def test_kill_switch_blocks_adding_to_a_position_it_already_holds(self) -> None:
         """Halted, "I already own some" is not a reason to buy more."""
         rule = KillSwitchRule(switch=FakeKillSwitch(engaged=True))
-        decision = rule.check(order(side=Side.BUY, qty=50), portfolio(SPY=(100, 100)), limits())
+        decision = rule.check(
+            order(side=Side.BUY, qty=50), RiskBooks.of(portfolio(SPY=(100, 100))), limits()
+        )
         assert not decision.approved
         assert decision.rule == "kill_switch"
 
@@ -108,20 +111,26 @@ class TestRiskRules:
         survived 2h37m of one only because the book was empty throughout
         (docs/paper-week/day-1-review.md, F3)."""
         rule = KillSwitchRule(switch=FakeKillSwitch(engaged=True))
-        decision = rule.check(order(side=Side.SELL, qty=40), portfolio(SPY=(100, 100)), limits())
+        decision = rule.check(
+            order(side=Side.SELL, qty=40), RiskBooks.of(portfolio(SPY=(100, 100))), limits()
+        )
         assert decision.approved
 
     def test_kill_switch_lets_an_exit_out_of_a_short(self) -> None:
         """Whether an order is an exit is not a property of its side."""
         rule = KillSwitchRule(switch=FakeKillSwitch(engaged=True))
-        decision = rule.check(order(side=Side.BUY, qty=40), portfolio(SPY=(-100, 100)), limits())
+        decision = rule.check(
+            order(side=Side.BUY, qty=40), RiskBooks.of(portfolio(SPY=(-100, 100))), limits()
+        )
         assert decision.approved
 
     def test_kill_switch_lets_an_exactly_sized_flatten_out(self) -> None:
         """`OrderRouter.flatten` sizes at exactly `abs(position.qty)`, so the
         boundary is the case that matters rather than an edge nobody hits."""
         rule = KillSwitchRule(switch=FakeKillSwitch(engaged=True))
-        decision = rule.check(order(side=Side.SELL, qty=100), portfolio(SPY=(100, 100)), limits())
+        decision = rule.check(
+            order(side=Side.SELL, qty=100), RiskBooks.of(portfolio(SPY=(100, 100))), limits()
+        )
         assert decision.approved
 
     def test_kill_switch_refuses_an_exit_that_would_reverse_the_position(self) -> None:
@@ -140,7 +149,7 @@ class TestRiskRules:
         # The premise: the shared helper does call this a reduction.
         assert reduces_position(order(side=Side.SELL, qty=250), book)
 
-        decision = rule.check(order(side=Side.SELL, qty=250), book, limits())
+        decision = rule.check(order(side=Side.SELL, qty=250), RiskBooks.of(book), limits())
 
         assert not decision.approved
         assert decision.rule == "kill_switch"
@@ -168,13 +177,13 @@ class TestRiskRules:
             purpose="stop_loss",
         )
 
-        assert rule.check(stop, portfolio(SPY=(100, 100)), limits()).approved
+        assert rule.check(stop, RiskBooks.of(portfolio(SPY=(100, 100))), limits()).approved
 
     def test_kill_switch_refuses_an_exit_in_a_symbol_it_does_not_hold(self) -> None:
         """Nothing to reduce is not a reduction. A sell into a flat book is a
         short entry, whatever the caller meant by it."""
         rule = KillSwitchRule(switch=FakeKillSwitch(engaged=True))
-        decision = rule.check(order(side=Side.SELL, qty=100), portfolio(), limits())
+        decision = rule.check(order(side=Side.SELL, qty=100), RiskBooks.of(portfolio()), limits())
         assert not decision.approved
 
     def test_max_position_counts_existing_holding(self) -> None:
@@ -183,17 +192,21 @@ class TestRiskRules:
         # 100k equity, 10% cap = 10,000. Already holding 40 @ 100 = 4,000.
         book = portfolio(cash=96_000, SPY=(40, 100))
         # +40 → 8,000, still inside.
-        assert rule.check(order(qty=40), book, limits()).approved
+        assert rule.check(order(qty=40), RiskBooks.of(book), limits()).approved
         # +80 → 12,000, over. The order alone is only 8,000 — the rule has to
         # be looking at the resulting position, not the order.
-        denied = rule.check(order(qty=80), book, limits())
+        denied = rule.check(order(qty=80), RiskBooks.of(book), limits())
         assert not denied.approved
         assert "of equity" in denied.reason
 
     def test_max_position_allows_a_full_exit_of_an_oversized_holding(self) -> None:
         """Selling down never breaches a size cap, however big the holding."""
         book = portfolio(cash=0, SPY=(500, 100))
-        assert MaxPositionSizeRule().check(order(side=Side.SELL, qty=500), book, limits()).approved
+        assert (
+            MaxPositionSizeRule()
+            .check(order(side=Side.SELL, qty=500), RiskBooks.of(book), limits())
+            .approved
+        )
 
     def test_gross_exposure_counts_shorts(self) -> None:
         """A market-neutral book still consumes buying power."""
@@ -203,15 +216,15 @@ class TestRiskRules:
         assert book.net_exposure == 0
         assert book.gross_exposure == Decimal(80_000)
         # Equity is 100k cash + 40k - 40k = 100k, so the 100% cap is 100,000.
-        assert rule.check(order(qty=100), book, limits()).approved  # → 90,000
-        denied = rule.check(order(qty=300), book, limits())  # → 110,000
+        assert rule.check(order(qty=100), RiskBooks.of(book), limits()).approved  # → 90,000
+        denied = rule.check(order(qty=300), RiskBooks.of(book), limits())  # → 110,000
         assert not denied.approved
         assert "gross exposure" in denied.reason
 
     def test_gross_exposure_treats_growing_a_short_like_growing_a_long(self) -> None:
         book = portfolio(cash=100_000, QQQ=(-900, 100))
         denied = MaxExposureRule().check(
-            order(symbol="QQQ", side=Side.SELL, qty=300), book, limits()
+            order(symbol="QQQ", side=Side.SELL, qty=300), RiskBooks.of(book), limits()
         )
         assert not denied.approved
 
@@ -219,7 +232,7 @@ class TestRiskRules:
         rule = DailyLossLimitRule()
         rule.anchor(Decimal(100_000))
         # Down 4% on the day, past the 3% limit.
-        assert not rule.check(order(), portfolio(cash=96_000), limits()).approved
+        assert not rule.check(order(), RiskBooks.of(portfolio(cash=96_000)), limits()).approved
 
     def test_daily_loss_limit_allows_exits(self) -> None:
         """Critical: blocking an exit traps you in a losing position and turns
@@ -229,17 +242,17 @@ class TestRiskRules:
         book = portfolio(cash=50_000, SPY=(100, 100))  # equity 60,000 — down 40%
         exit_order = order(side=Side.SELL, qty=100)
         assert reduces_position(exit_order, book)
-        assert rule.check(exit_order, book, limits()).approved
+        assert rule.check(exit_order, RiskBooks.of(book), limits()).approved
 
     def test_daily_loss_limit_allows_entries_while_inside_the_limit(self) -> None:
         rule = DailyLossLimitRule()
         rule.anchor(Decimal(100_000))
-        assert rule.check(order(), portfolio(cash=98_000), limits()).approved
+        assert rule.check(order(), RiskBooks.of(portfolio(cash=98_000)), limits()).approved
 
     def test_daily_loss_limit_denies_when_the_day_is_not_anchored(self) -> None:
         """Default-closed. An unanchored day cannot be evaluated, and guessing
         the anchor is how the day quietly gets a second allowance."""
-        denied = DailyLossLimitRule().check(order(), portfolio(), limits())
+        denied = DailyLossLimitRule().check(order(), RiskBooks.of(portfolio()), limits())
         assert not denied.approved
         assert "anchored" in denied.reason
 
@@ -247,15 +260,19 @@ class TestRiskRules:
         """The exit carve-out outranks the refusal to evaluate — an unanchored
         day must not be able to trap a position either."""
         book = portfolio(cash=0, SPY=(100, 100))
-        assert DailyLossLimitRule().check(order(side=Side.SELL, qty=100), book, limits()).approved
+        assert (
+            DailyLossLimitRule()
+            .check(order(side=Side.SELL, qty=100), RiskBooks.of(book), limits())
+            .approved
+        )
 
     def test_rate_limit_stops_runaway_loop(self) -> None:
         clock = SimulatedClock(OPEN_HOURS)
         rule = RateLimitRule(clock=clock)
         capped = limits(max_orders_per_minute=3)
         for _ in range(3):
-            assert rule.check(order(), portfolio(), capped).approved
-        denied = rule.check(order(), portfolio(), capped)
+            assert rule.check(order(), RiskBooks.of(portfolio()), capped).approved
+        denied = rule.check(order(), RiskBooks.of(portfolio()), capped)
         assert not denied.approved
         assert "last minute" in denied.reason
 
@@ -263,43 +280,43 @@ class TestRiskRules:
         clock = SimulatedClock(OPEN_HOURS)
         rule = RateLimitRule(clock=clock)
         capped = limits(max_orders_per_minute=2)
-        assert rule.check(order(), portfolio(), capped).approved
-        assert rule.check(order(), portfolio(), capped).approved
-        assert not rule.check(order(), portfolio(), capped).approved
+        assert rule.check(order(), RiskBooks.of(portfolio()), capped).approved
+        assert rule.check(order(), RiskBooks.of(portfolio()), capped).approved
+        assert not rule.check(order(), RiskBooks.of(portfolio()), capped).approved
         clock.set(OPEN_HOURS + timedelta(seconds=61))
-        assert rule.check(order(), portfolio(), capped).approved
+        assert rule.check(order(), RiskBooks.of(portfolio()), capped).approved
 
     def test_stale_quote_blocks_order(self) -> None:
         clock = SimulatedClock(OPEN_HOURS)
         rule = StaleDataRule(
             clock=clock, last_tick_at=lambda _s: OPEN_HOURS - timedelta(seconds=45)
         )
-        denied = rule.check(order(), portfolio(), limits())
+        denied = rule.check(order(), RiskBooks.of(portfolio()), limits())
         assert not denied.approved
         assert "old" in denied.reason
 
     def test_fresh_quote_passes(self) -> None:
         clock = SimulatedClock(OPEN_HOURS)
         rule = StaleDataRule(clock=clock, last_tick_at=lambda _s: OPEN_HOURS - timedelta(seconds=5))
-        assert rule.check(order(), portfolio(), limits()).approved
+        assert rule.check(order(), RiskBooks.of(portfolio()), limits()).approved
 
     def test_a_feed_that_never_ticked_is_the_stalest_of_all(self) -> None:
         """The case a bare max-age comparison skips: there is no timestamp to
         be older than the limit."""
         rule = StaleDataRule(clock=SimulatedClock(OPEN_HOURS), last_tick_at=lambda _s: None)
-        denied = rule.check(order(), portfolio(), limits())
+        denied = rule.check(order(), RiskBooks.of(portfolio()), limits())
         assert not denied.approved
         assert "no market data" in denied.reason
 
     def test_trading_hours_blocks_outside_the_session(self) -> None:
         rule = TradingHoursRule(calendar=TradingCalendar(), clock=SimulatedClock(CLOSED))
-        denied = rule.check(order(), portfolio(), limits())
+        denied = rule.check(order(), RiskBooks.of(portfolio()), limits())
         assert not denied.approved
         assert "closed" in denied.reason
 
     def test_trading_hours_allows_inside_the_session(self) -> None:
         rule = TradingHoursRule(calendar=TradingCalendar(), clock=SimulatedClock(OPEN_HOURS))
-        assert rule.check(order(), portfolio(), limits()).approved
+        assert rule.check(order(), RiskBooks.of(portfolio()), limits()).approved
 
     def test_extended_hours_strategies_are_not_blocked(self) -> None:
         rule = TradingHoursRule(
@@ -307,10 +324,12 @@ class TestRiskRules:
             clock=SimulatedClock(CLOSED),
             allow_extended_hours=True,
         )
-        assert rule.check(order(), portfolio(), limits()).approved
+        assert rule.check(order(), RiskBooks.of(portfolio()), limits()).approved
 
     def test_buying_power_rejects_what_cannot_be_paid_for(self) -> None:
-        denied = BuyingPowerRule().check(order(qty=100, limit=100), portfolio(cash=5_000), limits())
+        denied = BuyingPowerRule().check(
+            order(qty=100, limit=100), RiskBooks.of(portfolio(cash=5_000)), limits()
+        )
         assert not denied.approved
         assert "cash" in denied.reason
 
@@ -318,16 +337,20 @@ class TestRiskRules:
         """A sale returns cash. Refusing one for want of buying power would be
         perverse, and would strand a position in an account with no cash."""
         book = portfolio(cash=0, SPY=(100, 100))
-        assert BuyingPowerRule().check(order(side=Side.SELL, qty=100), book, limits()).approved
+        assert (
+            BuyingPowerRule()
+            .check(order(side=Side.SELL, qty=100), RiskBooks.of(book), limits())
+            .approved
+        )
 
     def test_max_open_positions_blocks_a_new_symbol_at_the_limit(self) -> None:
         holdings = {f"S{i}": (10.0, 100.0) for i in range(3)}
         book = portfolio(cash=100_000, **holdings)
         capped = limits(max_open_positions=3)
-        denied = MaxOpenPositionsRule().check(order(symbol="NEW"), book, capped)
+        denied = MaxOpenPositionsRule().check(order(symbol="NEW"), RiskBooks.of(book), capped)
         assert not denied.approved
         # ...but adding to one already held does not increase the count.
-        assert MaxOpenPositionsRule().check(order(symbol="S1"), book, capped).approved
+        assert MaxOpenPositionsRule().check(order(symbol="S1"), RiskBooks.of(book), capped).approved
 
     def test_rule_that_cannot_evaluate_denies(self) -> None:
         """Default-closed: an unpriced position is when you least want to trade.
@@ -340,14 +363,14 @@ class TestRiskRules:
         assert book.unmarked_symbols == ["SPY"]
 
         for rule in (MaxPositionSizeRule(), MaxExposureRule()):
-            decision = rule.check(order(symbol="QQQ"), book, limits())
+            decision = rule.check(order(symbol="QQQ"), RiskBooks.of(book), limits())
             assert not decision.approved, f"{rule.name} approved an unpriced book"
             assert "no mark" in decision.reason
 
     def test_no_price_anywhere_denies(self) -> None:
         """A market order on a symbol that has never printed has no price to
         measure against."""
-        denied = MaxPositionSizeRule().check(order(limit=None), portfolio(), limits())
+        denied = MaxPositionSizeRule().check(order(limit=None), RiskBooks.of(portfolio()), limits())
         assert not denied.approved
         assert "no price" in denied.reason
 
@@ -448,13 +471,13 @@ class TestChain:
         class Shrinker:
             name = "shrinker"
 
-            def check(self, o: Order, p: Portfolio, l: RiskLimits) -> RiskDecision:  # noqa: E741
+            def check(self, o: Order, b: RiskBooks, l: RiskLimits) -> RiskDecision:  # noqa: E741
                 return RiskDecision.shrink(self.name, "too big", Decimal(10))
 
         class Observer:
             name = "observer"
 
-            def check(self, o: Order, p: Portfolio, l: RiskLimits) -> RiskDecision:  # noqa: E741
+            def check(self, o: Order, b: RiskBooks, l: RiskLimits) -> RiskDecision:  # noqa: E741
                 seen.append(o.qty)
                 return RiskDecision.allow()
 
@@ -881,3 +904,305 @@ class TestTheProjectionItself:
         exit_order = order(symbol="SPY", side=Side.SELL, qty=100, limit=100)
 
         assert project_pending(book, [exit_order]) is book
+
+
+class TestTheTwoBooks:
+    """A permission reads the settled book; a ceiling reads the committed one.
+
+    ADR 0020 gave the whole chain the projected book, which is right for a
+    ceiling and wrong for the three carve-outs that ask whether an order is an
+    *exit*. A projected book answers that with a position that has not filled,
+    so a working entry vouches for the order that opposes it. Every case below
+    was approved by the chain before ADR 0027 and is refused now — and the
+    allow-cases guard the opposite mistake, because a carve-out that stops
+    working traps the position it exists to release.
+    """
+
+    @staticmethod
+    def _books(settled: Portfolio, *pending: Order) -> RiskBooks:
+        return RiskBooks(committed=project_pending(settled, pending), settled=settled)
+
+    def test_a_halt_refuses_a_sell_that_only_a_working_buy_makes_look_like_an_exit(
+        self,
+    ) -> None:
+        """The one that matters: flat account, one working BUY, platform halted.
+
+        The projection carries a long of 100, so `reduces_position` called on it
+        says this SELL is an exit and the halt lets it through — opening a short
+        while trading is stopped. docs/SAFETY.md states the opposite guarantee
+        without qualification, and Phase 3's roadmap tick rests on it.
+        """
+        settled = portfolio(SPY=(0.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", qty=100, limit=100))
+        assert books.committed.position("SPY").qty == Decimal(100)
+
+        decision = KillSwitchRule(switch=FakeKillSwitch(engaged=True)).check(
+            order(symbol="SPY", side=Side.SELL, qty=100, limit=100), books, limits()
+        )
+
+        assert not decision.approved
+        assert decision.reason == "trading is halted"
+
+    def test_a_halt_still_lets_a_real_position_out(self) -> None:
+        """The carve-out this must not break. A halt stops new risk; it does not
+        trap a position — docs/SAFETY.md, and day 1's F3."""
+        settled = portfolio(SPY=(100.0, 100.0))
+        decision = KillSwitchRule(switch=FakeKillSwitch(engaged=True)).check(
+            order(symbol="SPY", side=Side.SELL, qty=100, limit=100),
+            self._books(settled),
+            limits(),
+        )
+
+        assert decision.approved
+
+    def test_a_halt_sizes_the_exit_against_the_settled_holding(self) -> None:
+        """A working entry must not enlarge what a halt will let out. Held 40,
+        another 60 in flight: selling 100 reverses into a short of 60 unless the
+        rule measures the 40 that actually exist."""
+        settled = portfolio(SPY=(40.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", qty=60, limit=100))
+
+        decision = KillSwitchRule(switch=FakeKillSwitch(engaged=True)).check(
+            order(symbol="SPY", side=Side.SELL, qty=100, limit=100), books, limits()
+        )
+
+        assert not decision.approved
+        assert "would reverse the position" in decision.reason
+
+    def test_the_daily_loss_limit_is_not_talked_past_by_a_working_entry(self) -> None:
+        """Same shape, one layer down: the loss limit's exit carve-out asked of
+        the projection approves a *new* entry past a breached limit."""
+        settled = portfolio(SPY=(0.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", qty=100, limit=100))
+        rule = DailyLossLimitRule(day_start_equity=Decimal(200_000))  # down 50%
+
+        decision = rule.check(
+            order(symbol="SPY", side=Side.SELL, qty=100, limit=100), books, limits()
+        )
+
+        assert not decision.approved
+        assert decision.rule == "daily_loss_limit"
+
+    def test_the_daily_loss_limit_still_lets_a_real_exit_out(self) -> None:
+        settled = portfolio(SPY=(100.0, 100.0))
+        rule = DailyLossLimitRule(day_start_equity=Decimal(200_000))
+
+        assert rule.check(
+            order(symbol="SPY", side=Side.SELL, qty=100, limit=100),
+            self._books(settled),
+            limits(),
+        ).approved
+
+    def test_buying_power_is_not_exempted_by_a_working_short(self) -> None:
+        """A working SELL does not put cash in the account. Read off the
+        projection it makes the opposing BUY look like an exit, which exempts a
+        purchase from the one rule that exists to say it is unaffordable."""
+        settled = portfolio(cash=10, SPY=(0.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", side=Side.SELL, qty=100, limit=1))
+
+        decision = BuyingPowerRule().check(order(symbol="SPY", qty=100, limit=100), books, limits())
+
+        assert not decision.approved
+        assert "against 110.00 cash" in decision.reason
+
+    def test_buying_power_still_exempts_a_genuine_reduction(self) -> None:
+        settled = portfolio(cash=0, SPY=(-100.0, 100.0))
+
+        assert (
+            BuyingPowerRule()
+            .check(order(symbol="SPY", qty=100, limit=100), self._books(settled), limits())
+            .approved
+        )
+
+
+class TestACeilingDoesNotRefuseWhatShrinksTheBook:
+    """`max_position_size` and `max_gross_exposure` measure the committed book,
+    and so refused an order that made that book *smaller*.
+
+    Held 40 with 200 more in flight, a genuine `SELL 40` leaves 200 — over the
+    cap, so the cap refused the exit and left the position on. That is the same
+    failure the kill switch's carve-out exists to prevent, one rule along. The
+    exemption is `increases_exposure`, not `reduces_position`: the latter is
+    quantity-blind and would let a reversal skip the cap entirely.
+    """
+
+    @staticmethod
+    def _books(settled: Portfolio, *pending: Order) -> RiskBooks:
+        return RiskBooks(committed=project_pending(settled, pending), settled=settled)
+
+    def test_the_position_cap_allows_an_exit_that_leaves_less_than_is_committed(
+        self,
+    ) -> None:
+        settled = portfolio(SPY=(40.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", qty=200, limit=100))
+        assert books.committed.position("SPY").qty == Decimal(240)
+
+        assert (
+            MaxPositionSizeRule()
+            .check(order(symbol="SPY", side=Side.SELL, qty=40, limit=100), books, limits())
+            .approved
+        )
+
+    def test_the_position_cap_still_refuses_a_reversal(self) -> None:
+        """`SELL 500` against 240 committed leaves a short of 260 — *more* than
+        is held, so it is an entry wearing an exit's clothes and meets the cap."""
+        settled = portfolio(SPY=(40.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", qty=200, limit=100))
+
+        decision = MaxPositionSizeRule().check(
+            order(symbol="SPY", side=Side.SELL, qty=500, limit=100), books, limits()
+        )
+
+        assert not decision.approved
+        assert decision.rule == "max_position_size"
+
+    def test_the_position_cap_still_refuses_an_order_that_grows_the_book(self) -> None:
+        settled = portfolio(SPY=(40.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", qty=200, limit=100))
+
+        assert (
+            not MaxPositionSizeRule()
+            .check(order(symbol="SPY", qty=40, limit=100), books, limits())
+            .approved
+        )
+
+    def test_the_exposure_cap_allows_what_shrinks_it(self) -> None:
+        settled = portfolio(SPY=(40.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", qty=200, limit=100))
+
+        assert (
+            MaxExposureRule()
+            .check(
+                order(symbol="SPY", side=Side.SELL, qty=40, limit=100),
+                books,
+                limits(max_gross_exposure_pct=Decimal("0.05"), max_position_pct=Decimal("0.05")),
+            )
+            .approved
+        )
+
+    def test_the_exposure_cap_still_refuses_a_reversal(self) -> None:
+        settled = portfolio(SPY=(40.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", qty=200, limit=100))
+
+        assert (
+            not MaxExposureRule()
+            .check(
+                order(symbol="SPY", side=Side.SELL, qty=500, limit=100),
+                books,
+                limits(max_gross_exposure_pct=Decimal("0.05"), max_position_pct=Decimal("0.05")),
+            )
+            .approved
+        )
+
+    def test_an_unmarked_holding_elsewhere_cannot_refuse_a_reduction(self) -> None:
+        """The exemption is asked *before* the book is valued, deliberately.
+
+        A stop reducing SPY does not need IWM to have a mark, and refusing it
+        because IWM has none leaves a position naked — docs/SAFETY.md's layers 5
+        and 6 failing together, which is the pairing docs/RISK.md warns about.
+        """
+        settled = portfolio(SPY=(100.0, 100.0), IWM=(50.0, 0.0))  # IWM unmarked
+        books = RiskBooks.of(settled)
+        exit_order = order(symbol="SPY", side=Side.SELL, qty=100, limit=100)
+
+        assert MaxPositionSizeRule().check(exit_order, books, limits()).approved
+        assert MaxExposureRule().check(exit_order, books, limits()).approved
+        # ...and an order that grows the book is still refused for want of the mark.
+        entry = order(symbol="SPY", qty=100, limit=100)
+        assert (
+            MaxPositionSizeRule()
+            .check(entry, books, limits())
+            .reason.startswith("cannot value the book")
+        )
+
+
+class TestTheEngineHandsBothBooksToTheChain:
+    def test_validate_gives_a_permission_the_settled_book(self) -> None:
+        """End to end through `RiskEngine.validate`, which is the only place the
+        two books are built — a rule tested in isolation proves nothing about
+        what the engine actually passes it."""
+        settled = portfolio(SPY=(0.0, 100.0))
+        working = order(symbol="SPY", qty=100, limit=100)
+        engine = RiskEngine(limits(), rules=[KillSwitchRule(switch=FakeKillSwitch(engaged=True))])
+
+        decision = engine.validate(
+            order(symbol="SPY", side=Side.SELL, qty=100, limit=100), settled, [working]
+        )
+
+        assert not decision.approved
+        assert decision.rule == "kill_switch"
+
+    def test_validate_gives_a_ceiling_the_committed_book(self) -> None:
+        """The other half, and the one ADR 0020 bought: two entries in one name
+        must be measured together even though neither has settled."""
+        settled = portfolio(SPY=(0.0, 100.0))
+        working = order(symbol="SPY", qty=60, limit=100)
+        engine = RiskEngine(limits(), rules=[MaxPositionSizeRule()])
+
+        decision = engine.validate(order(symbol="SPY", qty=60, limit=100), settled, [working])
+
+        assert not decision.approved
+        assert decision.rule == "max_position_size"
+
+    def test_of_makes_both_books_the_same_book(self) -> None:
+        book = portfolio()
+        books = RiskBooks.of(book)
+
+        assert books.committed is book
+        assert books.settled is book
+
+
+class TestWhatCanRefuseAnExit:
+    """`EXIT_BLIND_RULES` is quoted by five documents and three docstrings, and
+    has been wrong in all of them at least once. Derived here from the real
+    chain rather than trusted, exactly as `REPLAY_BLIND_RULES` is."""
+
+    @staticmethod
+    def _chain() -> list[RiskRule]:
+        """Every default rule, each configured to refuse whatever it can."""
+        return default_rules(
+            kill_switch=FakeKillSwitch(engaged=True),
+            clock=SimulatedClock(CLOSED),  # outside the session
+            calendar=TradingCalendar(),
+            last_tick_at=lambda _symbol: None,  # never ticked: maximally stale
+        )
+
+    def test_exactly_three_rules_can_refuse_a_reduction(self) -> None:
+        """A pure exit — 100 held, 100 sold — put to every rule with each one
+        set up to refuse if it is able to.
+
+        The book is deliberately hostile: no cash, a position far over the
+        tightened caps, an unmarked second holding, a halt engaged, the session
+        shut, and a feed that has never ticked. Every rule that *can* say no to
+        a reduction says no here.
+
+        Run twice, taking the union, because `RateLimitRule` refuses only once
+        its window is full — the first pass consumes its single slot. A
+        one-pass version of this test silently reported two rules and passed
+        for the wrong reason.
+        """
+        settled = portfolio(cash=0, SPY=(100.0, 100.0), IWM=(50.0, 0.0))
+        exit_order = order(symbol="SPY", side=Side.SELL, qty=100, limit=100)
+        tight = limits(
+            max_position_pct=Decimal("0.01"),
+            max_gross_exposure_pct=Decimal("0.01"),
+            max_orders_per_minute=1,
+        )
+
+        chain = self._chain()
+        refused = {
+            rule.name
+            for _pass in range(2)
+            for rule in chain
+            if not rule.check(exit_order, RiskBooks.of(settled), tight).approved
+        }
+
+        assert refused == set(EXIT_BLIND_RULES)
+
+    def test_the_list_names_rules_the_chain_actually_has(self) -> None:
+        """A typo here would silently shrink the set the test above compares
+        against, and the assertion would still pass."""
+        names = {rule.name for rule in self._chain()}
+
+        assert set(EXIT_BLIND_RULES) <= names
+        assert len(EXIT_BLIND_RULES) == len(set(EXIT_BLIND_RULES))

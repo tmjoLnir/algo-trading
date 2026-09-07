@@ -106,12 +106,15 @@ ATR(14).
   cancel can lose the race outright.
 - **A protective stop can be refused.** Three of the nine rules judge the order
   rather than whether it reduces a position, so trading hours, the rate limit and
-  stale data can each block one; two more block it whenever another holding is
-  unmarked. Only the daily loss limit, buying power, the open-position cap and
-  the kill switch can never refuse one. The kill switch was in the first list
-  until the exit carve-out — a halt refusing the protective child of an entry
-  that had just filled was SAFETY.md's layers 6 and 5 failing together
-  (docs/paper-week/day-1-review.md, F3). The router reports a refusal as an
+  stale data can each block one. The other six can never refuse one; the list is
+  `rules.EXIT_BLIND_RULES`, and a unit test derives it from the real chain
+  because the count has been wrong in every document that quoted it.
+  Two rules left that list at ADR 0027 and one left it earlier. The kill switch
+  went when it was given its exit carve-out — a halt refusing the protective
+  child of an entry that had just filled was SAFETY.md's layers 6 and 5 failing
+  together (docs/paper-week/day-1-review.md, F3). The two ceilings went when
+  they stopped refusing an order that leaves no more behind than the book has
+  already committed to, which was the same failure one rule along. The router reports a refusal as an
   unprotected quantity and logs `CRITICAL` rather than exempting the order —
   see docs/RUNBOOK.md, "Position open with no stop".
 - **A stop the market has already passed is not placed.** Submitted, it is a

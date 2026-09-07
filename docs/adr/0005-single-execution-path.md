@@ -31,11 +31,13 @@ manual orders and protective stops.
   confidence in, and so the thing you cannot build a correct `OrderRequest`
   from. It requires a typed confirmation and it is audit-logged. No automated
   path may call either method.
-- Six of the nine default rules can refuse an exit. Four judge the order rather
-  than whether it reduces a position — the kill switch, trading hours, the rate
-  limit and stale data — and two more refuse whenever any holding is unmarked.
-  Passing through the engine therefore means a flatten
-  or a protective stop *can* be refused. The answer is not an exemption: it is
+- Three of the nine default rules can refuse an exit, and all three judge the
+  order rather than the book: trading hours, the rate limit and stale data
+  (`rules.EXIT_BLIND_RULES`). Passing through the engine therefore means a
+  flatten or a protective stop *can* be refused.
+  This read "six ... the kill switch among them" until ADR 0027. The kill
+  switch left the list when it was given its exit carve-out, and the two
+  ceilings left it when they stopped refusing orders that shrink the book. The answer is not an exemption: it is
   that the refusal names the rule, loudly, so the human who pressed the button
   reads "refused by kill_switch" instead of believing a position closed.
 

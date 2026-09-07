@@ -60,13 +60,67 @@ class RiskDecision:
         return cls(approved=True, rule=rule, reason=reason, adjusted_qty=qty)
 
 
+@dataclass(frozen=True, slots=True)
+class RiskBooks:
+    """The two books a rule measures, and the question each one answers.
+
+    ADR 0020 gave every rule the **committed** book — the settled account with
+    everything in flight projected onto it — because a ceiling that reads the
+    settled book is defeated by a batch: forty orders at 5% of equity each pass
+    a 100% cap one at a time and land at 200%. That is right, and it is still
+    what a ceiling reads.
+
+    It is the wrong book for the other question the chain asks. Three rules do
+    not ask "how big does this leave the book" but "is this order *permitted*" —
+    the kill switch's exit carve-out, the daily loss limit's, and buying power's.
+    All three answer it with `reduces_position`, and a projected book answers it
+    with a position that does not exist: a working `BUY 100` against a flat
+    account makes `SELL 100` look like an exit, so a halted platform approves an
+    order that opens a short. Reproduced, and the reason ADR 0027 exists.
+
+    **A permission is about what the account actually holds; a ceiling is about
+    what it would hold.** Both are here, named, so a rule states which question
+    it is asking rather than inheriting whichever book the engine happened to
+    pass.
+
+    `committed` is `settled` itself when nothing is in flight — `project_pending`
+    returns the portfolio unchanged in that case, which is the overwhelmingly
+    common path and copies nothing.
+    """
+
+    #: The settled book with every in-flight order projected onto it. What a
+    #: **ceiling** measures: the position, exposure, count or cash this order
+    #: would leave behind if everything already committed fills.
+    committed: Portfolio
+    #: What the account holds right now, moved only by fills. What a
+    #: **permission** measures: whether there is a position here to reduce.
+    settled: Portfolio
+
+    @classmethod
+    def of(cls, portfolio: Portfolio) -> RiskBooks:
+        """Both books when nothing is in flight, where they are the same book.
+
+        For a caller that has nothing committed — most tests, and any one-off
+        submission — rather than making them write the same portfolio twice and
+        invite a typo that silently tests the wrong thing.
+        """
+        return cls(committed=portfolio, settled=portfolio)
+
+
 class RiskRule(Protocol):
-    """One independent check."""
+    """One independent check.
+
+    Takes `RiskBooks` rather than a `Portfolio` so that a rule asking a
+    permission question and a rule asking a ceiling question read different
+    books without either of them knowing that in-flight orders exist. The
+    engine still projects exactly once (ADR 0020); what ADR 0027 added is that
+    the rule says which of the two results it wants.
+    """
 
     @property
     def name(self) -> str: ...
 
-    def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision: ...
+    def check(self, order: Order, books: RiskBooks, limits: RiskLimits) -> RiskDecision: ...
 
 
 class SessionAnchored(Protocol):
@@ -123,6 +177,14 @@ class RiskEngine:
         it: `BacktestEngine` its resting orders, `OrderRouter` whatever the
         runner believes is working at the venue.
 
+        **The projection is handed to the chain alongside the book it was
+        projected from, not instead of it** (`RiskBooks`, ADR 0027). A ceiling
+        reads the projection, because a batch defeats a ceiling measured on the
+        settled book. A permission — the kill switch's exit carve-out and the
+        two that share it — reads the settled book, because an order cannot
+        exit a position that has not filled yet, and a projection that says
+        otherwise licenses new risk during a halt.
+
         Rules run in order and the first denial wins, so cheap checks (kill
         switch, rate limit) belong before expensive ones (exposure maths).
 
@@ -145,11 +207,11 @@ class RiskEngine:
         # resolve.
         from atp_core.risk.rules import project_pending
 
-        book = project_pending(portfolio, pending)
+        books = RiskBooks(committed=project_pending(portfolio, pending), settled=portfolio)
 
         adjusted: Decimal | None = None
         for rule in self.rules:
-            decision = rule.check(order, book, self.limits)
+            decision = rule.check(order, books, self.limits)
             if not decision.approved:
                 # Counted with the rule that refused, which is the only label on
                 # these worth having: "risk denied 40 orders today" is a
