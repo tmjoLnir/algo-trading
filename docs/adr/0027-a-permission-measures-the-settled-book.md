@@ -98,9 +98,20 @@ Three properties, each chosen against the alternative:
   > of the symbol behind" — and that has a hole in the middle. `SELL 400`
   > against a long of 200 leaves a short of 200: no larger, so exempt, while
   > being a brand-new opposite-side position opened at full size with the symbol
-  > over its cap. An adversarial review of the diff that introduced it found it
-  > before the branch was two hours old. A reversal is new risk however neatly
-  > it balances the old, and the magnitude framing could not see that.
+  > over its cap. A reversal is new risk however neatly it balances the old, and
+  > the magnitude framing could not see that.
+  >
+  > **And it was asked of the wrong book**, which is this ADR's own defect one
+  > rule along. The exemption is an *exit* question, so it reads `settled` like
+  > every other exit question here. Read off `committed`, a flat account with a
+  > working `BUY 100` makes `SELL 100` look like closing a long that does not
+  > exist, and the cap stands aside for an order that opens a short.
+  >
+  > Both were found by an adversarial review of the diff that introduced them,
+  > before the branch was two hours old; three independent reviewers reached the
+  > second one. Recorded rather than quietly restated, because the shape of the
+  > mistake — a permission question asked of the projection — is exactly what
+  > this ADR is about, and it was made *in* the ADR.
 
 The exemption is asked **before** the book is valued, so a reduction needs no
 price. Refusing to shrink a position because some *other* holding is unmarked is

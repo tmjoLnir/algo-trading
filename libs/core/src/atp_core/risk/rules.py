@@ -330,15 +330,21 @@ class MaxPositionSizeRule:
         # A ceiling measures the **committed** book (ADR 0020): three orders of
         # 4% each are a 12% position whether or not the first two have settled.
         portfolio = books.committed
-        # Before valuing anything: an order that leaves no more of the symbol
-        # behind than is already committed cannot breach a cap on how much of
-        # the symbol is held. Asked first because it needs no price — refusing
-        # to let a book shrink because some other holding is unmarked leaves a
-        # position naked, which is the failure the carve-out below it exists to
-        # prevent. `closes_without_reversing` rather than `reduces_position`:
-        # the cap keeps its teeth on a reversal, which is new risk however
-        # neatly it balances the old.
-        if closes_without_reversing(order, portfolio):
+        # Before valuing anything: an order that closes into a position the
+        # account actually holds, without reversing through it, cannot breach a
+        # cap on how much of the symbol is held. Asked first because it needs no
+        # price — refusing to let a book shrink because some other holding is
+        # unmarked leaves a position naked, which is the failure this carve-out
+        # exists to prevent.
+        #
+        # Of the **settled** book, like every other exit question on this chain
+        # (ADR 0027). Asked of the projection it exempts an order that is not an
+        # exit at all: flat account, a working BUY 100, and `SELL 100` reads as
+        # closing the phantom long, so the cap stands aside for an order that
+        # opens a short of 100 if that BUY never fills. That is ADR 0027's own
+        # defect, one rule along, and it shipped in the first version of this
+        # exemption.
+        if closes_without_reversing(order, books.settled):
             return RiskDecision.allow()
         if (denial := _unpriced_book(self.name, portfolio)) is not None:
             return denial
@@ -381,7 +387,8 @@ class MaxExposureRule:
         # over symbols, so an order that does not grow this symbol's magnitude
         # cannot grow the total either.
         portfolio = books.committed
-        if closes_without_reversing(order, portfolio):
+        # The settled book, for the reason `MaxPositionSizeRule` gives above.
+        if closes_without_reversing(order, books.settled):
             return RiskDecision.allow()
         if (denial := _unpriced_book(self.name, portfolio)) is not None:
             return denial

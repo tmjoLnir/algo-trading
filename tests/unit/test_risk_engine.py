@@ -1324,3 +1324,60 @@ class TestAReversalIsNotAReduction:
                 limits(),
             )
             assert decision.approved is allowed, f"BUY {qty} against a short of 200"
+
+
+class TestTheExemptionIsAnExitQuestionToo:
+    """The ceiling exemption asks "is this an exit?", so it reads the settled
+    book like every other exit question on this chain.
+
+    It shipped reading the committed one, which is ADR 0027's own defect
+    reintroduced one rule along: with a flat account and a working `BUY 100`,
+    the projection carries a long of 100, so `SELL 100` reads as closing it and
+    the cap stands aside — for an order that opens a short of 100 if that BUY
+    never fills. Three independent reviewers found it on the same diff.
+    """
+
+    @staticmethod
+    def _books(settled: Portfolio, *pending: Order) -> RiskBooks:
+        return RiskBooks(committed=project_pending(settled, pending), settled=settled)
+
+    def test_a_working_entry_does_not_exempt_the_order_that_opposes_it(self) -> None:
+        settled = portfolio(SPY=(0.0, 100.0))  # flat
+        books = self._books(settled, order(symbol="SPY", qty=100, limit=100))
+        sell = order(symbol="SPY", side=Side.SELL, qty=100, limit=100)
+
+        assert books.committed.position("SPY").qty == Decimal(100)
+        assert closes_without_reversing(sell, books.committed) is True, "the phantom long"
+        assert closes_without_reversing(sell, books.settled) is False, "what the rule must ask"
+
+    def test_the_cap_judges_that_order_rather_than_exempting_it(self) -> None:
+        """Not exempt means measured, not refused — here the resulting committed
+        position is flat, so the cap approves. What matters is that it *looked*."""
+        settled = portfolio(cash=0, SPY=(0.0, 100.0), IWM=(200.0, 300.0))
+        books = self._books(settled, order(symbol="SPY", qty=700, limit=100))
+        sell = order(symbol="SPY", side=Side.SELL, qty=100, limit=100)
+
+        # Committed carries a long of 700; SELL 100 leaves 600, well over the cap.
+        decision = MaxPositionSizeRule().check(sell, books, limits())
+
+        assert not decision.approved
+        assert decision.rule == "max_position_size"
+
+    def test_a_genuine_exit_behind_a_working_entry_is_still_exempt(self) -> None:
+        """The case #142 existed to fix must survive the correction."""
+        settled = portfolio(SPY=(40.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", qty=200, limit=100))
+
+        assert (
+            MaxPositionSizeRule()
+            .check(order(symbol="SPY", side=Side.SELL, qty=40, limit=100), books, limits())
+            .approved
+        )
+
+    def test_the_exposure_cap_asks_the_same_book(self) -> None:
+        settled = portfolio(SPY=(0.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", qty=100, limit=100))
+        sell = order(symbol="SPY", side=Side.SELL, qty=100, limit=100)
+
+        assert closes_without_reversing(sell, books.settled) is False
+        assert MaxExposureRule().check(sell, books, limits()).approved  # judged, and fine

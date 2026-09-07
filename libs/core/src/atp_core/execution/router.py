@@ -513,12 +513,15 @@ class OrderRouter:
         outcome = await self._route(stop_child, portfolio)
 
         if not outcome.submitted:
-            # Not a kill-switch escalation. `KillSwitchRule` refuses everything
-            # with no exit carve-out, so halting here would block both the retry
-            # of this stop and any `flatten` of the position it is warning
-            # about. Loud, surfaced, and left retryable instead — a transient
-            # denial clears, and the deterministic key makes the retry the same
-            # order to the venue rather than a second stop.
+            # Not a kill-switch escalation, and the reason has outlived the
+            # sentence that used to be here ("`KillSwitchRule` refuses
+            # everything with no exit carve-out"), which stopped being true when
+            # the carve-out was added. Halting here would still be wrong: it
+            # cannot refuse this stop, but it would refuse every *entry* on the
+            # strategy over one child that a transient rule declined. Loud,
+            # surfaced, and left retryable instead — the denial clears, and the
+            # deterministic key makes the retry the same order to the venue
+            # rather than a second stop.
             log.critical(
                 "order.position_unprotected",
                 symbol=symbol,

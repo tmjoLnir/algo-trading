@@ -708,9 +708,10 @@ strategy evaluated without them is flattered by 1.3 points over five years on
 
   Unticked all the same, and for a sharper reason than before: broker-side stops
   are docs/SAFETY.md's layer 5, and a layer is only demonstrated by watching it
-  hold. Nothing has yet placed one of these against a real venue, and four of
-  the nine rules can refuse a protective stop — which the router reports rather
-  than hides, but which no *Verifiable:* line yet exercises. Phase 4's paper
+  hold. Nothing has yet placed one of these against a real venue, and three of
+  the nine rules can refuse a protective stop (`rules.EXIT_BLIND_RULES`) — which
+  the router reports rather than hides, but which no *Verifiable:* line yet
+  exercises. Phase 4's paper
   week is the demonstration.
 
   That reason is untouched by the above, and this PR does not weaken it. A

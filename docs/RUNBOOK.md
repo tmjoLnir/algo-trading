@@ -832,9 +832,17 @@ place. The position is live and the venue holds nothing against it. An
 engine-side level may be armed, which protects you only while the worker is up —
 that is not the guarantee a broker-side stop gives.
 
-1. Read `rule` in the log line. A transient refusal (`stale_data`,
-   `trading_hours`, `rate_limit`) clears on its own and the runner's next
-   attempt places the stop; `kill_switch` will not clear until someone clears it.
+1. Read `rule` in the log line. It will name one of exactly three rules
+   (`rules.EXIT_BLIND_RULES`): `stale_data`, `trading_hours` or `rate_limit`.
+   All three are transient and clear on their own, and the runner's next
+   attempt places the stop.
+
+   **`kill_switch` cannot appear here**, and has not been able to since it was
+   given its exit carve-out — a halt does not refuse a protective stop, because
+   a halt that left a position naked was SAFETY.md's layers 6 and 5 failing
+   together. Neither can `max_position_size` or `max_gross_exposure` since
+   ADR 0027. If you see any of the three, the carve-outs have regressed and
+   that is the incident, not the stop.
 2. If it will not clear promptly, place the stop through the broker's own UI.
 3. `no stop level was requested and no stop_config was supplied` is a strategy
    configuration bug, not an incident: the strategy is trading without a stop.
