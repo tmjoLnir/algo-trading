@@ -144,6 +144,17 @@ cannot lower projected exposure), and that call is correctly about the settled
 book because that is the book being projected. It is the one place the predicate
 reads the same book it always did.
 
+The *predicate* there is a known hole, and it is left open deliberately.
+`reduces_position` is quantity-blind, so a working reversal — `SELL 300` against
+a settled long of 100 — is dropped from the projection entirely, and the
+committed book still shows a long of 100 when that fill would leave it short
+200. A batch of flip orders is therefore invisible to both ceilings.
+`closes_without_reversing` is the obvious substitute and it is *not* obviously
+right: projecting that order also credits its cash, which makes `buying_power`
+more permissive, and ADR 0020 chose the "reductions are not credited" asymmetry
+on purpose. Changing it is a decision about ADR 0020, not a correction to this
+one, and it wants its own record.
+
 ## Alternatives considered
 
 **Project only for the ceilings and give permissions the raw portfolio, without
