@@ -87,14 +87,20 @@ Three properties, each chosen against the alternative:
   permission rules implement, in the shape of `SessionAnchored` — leaves a rule
   added later silently reading the committed book. A guard nobody is told they
   have opted out of is the failure mode this codebase keeps finding.
-- **A ceiling exempts what shrinks it, by magnitude and not by
-  `reduces_position`.** `increases_exposure` asks whether the order leaves
-  *more* of the symbol behind than is already committed. That subsumes the exit
-  exemption and keeps the cap's teeth on a reversal: `SELL 40` against a
-  committed long of 100 leaves 60 and is exempt, `SELL 300` leaves a short of
-  200 and is not. Using `reduces_position` here — which is quantity-blind by
-  design — would have let an uncapped short through the rule whose whole job is
-  capping what an order leaves behind.
+- **A ceiling exempts an order that closes into the position without reversing
+  through it**, which is `closes_without_reversing` — the same test the kill
+  switch applies to a halt, drawn once rather than in three places. Not
+  `reduces_position`, which is quantity-blind by design and would let a
+  `SELL 300` against a long of 100 skip `max_position_size` entirely.
+
+  > **Corrected 2026-09-07, before the paper week.** This first shipped as
+  > `increases_exposure`, a pure magnitude comparison — "does this leave *more*
+  > of the symbol behind" — and that has a hole in the middle. `SELL 400`
+  > against a long of 200 leaves a short of 200: no larger, so exempt, while
+  > being a brand-new opposite-side position opened at full size with the symbol
+  > over its cap. An adversarial review of the diff that introduced it found it
+  > before the branch was two hours old. A reversal is new risk however neatly
+  > it balances the old, and the magnitude framing could not see that.
 
 The exemption is asked **before** the book is valued, so a reduction needs no
 price. Refusing to shrink a position because some *other* holding is unmarked is
