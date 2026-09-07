@@ -726,6 +726,15 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   and confirm orders are actually refused"* — engaged, the chain refuses and
   names `kill_switch`; cleared, the same order passes.
 
+  **That sentence was false between #135 and ADR 0027, and this line stayed
+  ticked through it.** The exit carve-out asked "is this an exit?" of the
+  projected book, so a single working entry made the opposing order look like a
+  reduction and the halt approved it — a short opened while the platform was
+  stopped. Recorded rather than quietly re-ticked, per `CLAUDE.md` §6: a tick
+  that does not hold is corrected in the diff that finds it, and what this one
+  was resting on is exactly the sentence quoted above. It holds again, and
+  `test_risk_engine.py::TestTheTwoBooks` is the assertion that says so.
+
   **It fails closed.** docs/SAFETY.md is explicit that layer 6 fails "Redis
   unreachable — fail closed", so an unreachable Redis reports engaged and
   trading stops. Shown against a genuinely dead port, not a fake that raises.

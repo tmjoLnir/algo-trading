@@ -82,7 +82,7 @@ interval. Pre-existing (PR #89), unrelated to the day-1 fixes.
 | **B2** | Market entry into a flat symbol cannot be priced | fixed | **fixed** |
 | **F1** | Strategy loop is unobservable | fixed | **fixed** (code half; token is a host action) |
 | **F2** | Engine-side stop fallback unreachable | fixed | **partial** — a second entry drops the gap flag |
-| **F3** | Kill switch has no exit carve-out | fixed | **partial** — the reversal guard reads the projected book |
+| **F3** | Kill switch has no exit carve-out | fixed | **partial** — projected book fixed (ADR 0027, §3.1/§3.2); §3.1a's halt-reason blindness open |
 | **F4** | Worker never reads halt state at boot | fixed | **fixed** |
 | **F5** | Six minutes of data lost, reported as recovered | fixed | **partial** — a quote can still shrink a gap |
 | **F6** | Crashes were self-inflicted | fixed | **partial** — REST half untouched; flap loop unthrottled |
@@ -226,6 +226,19 @@ the dashboard form — and not through the status blob.
 
 ### 3.1 The halt carve-out approves orders that reverse a position `critical`
 
+> **Fixed** (#TBD, ADR 0027) — the projected-book half of it, which is the whole of this
+> section. `RiskEngine.validate` now builds a `RiskBooks` carrying the projection *and* the
+> book it was projected from, and the carve-out asks `reduces_position` of the settled one:
+> an entry that is still working is not exposure to be let out of, and cancelling it is how
+> you undo it. `DailyLossLimitRule` and `BuyingPowerRule` shared the defect and are fixed with
+> it. Pinned by `test_risk_engine.py::TestTheTwoBooks`, which fails on every mutation that
+> puts a permission back on the committed book.
+>
+> **§3.1a below is NOT fixed and is not closed by this.** It is a different question — which
+> *halt reasons* should void the carve-out at all — and answering it reverses a rationale
+> `KillSwitchRule` documents deliberately. It needs its own ADR and its own diff.
+
+
 `KillSwitchRule` (`libs/core/src/atp_core/risk/rules.py:227-246`) permits an order that reduces
 a holding and refuses one larger than the position — `order.qty > held`. But
 `RiskEngine.validate` hands every rule the **projected** book (`risk/engine.py:148`), which adds
@@ -282,6 +295,17 @@ for `manual` and `data_feed_lost`; it does not hold for the two reasons that mea
 itself is untrustworthy*.
 
 ### 3.2 A partially filled entry blocks its own protective stop `high`
+
+> **Fixed** (#TBD, ADR 0027), and not with the exemption this section prescribes.
+> `reduces_position` is quantity-blind by design, so exempting the cap on it would let a
+> `SELL 300` against a long of 100 skip `max_position_size` entirely — an uncapped short of
+> 200, approved by the rule whose whole job is capping what an order leaves behind. The
+> predicate is `increases_exposure`: does this order leave *more* of the symbol behind than
+> the committed book already carries. That subsumes the exemption and keeps the cap's teeth
+> on a reversal. `MaxExposureRule` had the same hole and gets the same fix, and both ask it
+> *before* valuing the book, so an unmarked holding elsewhere can no longer refuse the stop
+> that protects this one.
+
 
 Halt-independent, and visible in the same trace above. `MaxPositionSizeRule`
 (`risk/rules.py:260-283`) judges `abs(held + order.qty * sign)` against the projected book and —

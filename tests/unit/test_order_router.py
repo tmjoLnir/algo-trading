@@ -40,7 +40,7 @@ from atp_core.domain import (
 from atp_core.domain.enums import StopType
 from atp_core.errors import BrokerConnectionError, ExecutionError
 from atp_core.execution.router import NO_ACTION, ROUTING, SIZING, OrderRouter
-from atp_core.risk.engine import RiskDecision, RiskEngine, RiskRule, default_rules
+from atp_core.risk.engine import RiskBooks, RiskDecision, RiskEngine, RiskRule, default_rules
 from atp_core.risk.limits import RiskLimits
 from atp_core.risk.rules import DailyLossLimitRule
 from atp_core.risk.stops import StopConfig, StopManager
@@ -94,7 +94,7 @@ class Refusing:
     engaged: bool = False
     name: str = "refuses_everything"
 
-    def check(self, order: Order, portfolio: Portfolio, lim: RiskLimits) -> RiskDecision:
+    def check(self, order: Order, books: RiskBooks, lim: RiskLimits) -> RiskDecision:
         if self.engaged:
             return RiskDecision.deny(self.name, "refused, because this test asked it to be")
         return RiskDecision.allow()
@@ -312,7 +312,7 @@ class TestSubmit:
         class ShrinkToZero:
             name = "shrink_to_zero"
 
-            def check(self, order: Order, portfolio: Portfolio, lim: RiskLimits) -> RiskDecision:
+            def check(self, order: Order, books: RiskBooks, lim: RiskLimits) -> RiskDecision:
                 return RiskDecision(approved=True, adjusted_qty=Decimal(0))
 
         broker = FakeBroker()

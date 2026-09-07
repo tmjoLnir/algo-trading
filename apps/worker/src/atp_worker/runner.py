@@ -940,8 +940,9 @@ class StrategyRunner:
         not a price level at all.
 
         A triggered level exits through `OrderRouter.flatten`, so the exit
-        passes the risk chain like everything else. Six of the nine default
-        rules can refuse an exit; a refusal is logged loudly rather than
+        passes the risk chain like everything else. Three of the nine default
+        rules can refuse an exit (`rules.EXIT_BLIND_RULES`); a refusal is
+        logged loudly rather than
         retried around, because a stop that silently did not fire is the worst
         thing this file could hide.
         """

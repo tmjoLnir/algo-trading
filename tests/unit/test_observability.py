@@ -202,7 +202,7 @@ class TestTheRiskEngineIsCounted:
             def name(self) -> str:
                 return "always_denies"
 
-            def check(self, order: Any, portfolio: Any, limits: Any) -> RiskDecision:
+            def check(self, order: Any, books: Any, limits: Any) -> RiskDecision:
                 return RiskDecision.deny("always_denies", "no")
 
         engine = RiskEngine(RiskLimits(), rules=[AlwaysDenies()])
@@ -231,7 +231,7 @@ class TestTheRiskEngineIsCounted:
             def name(self) -> str:
                 return "shrinks"
 
-            def check(self, order: Any, portfolio: Any, limits: Any) -> RiskDecision:
+            def check(self, order: Any, books: Any, limits: Any) -> RiskDecision:
                 return RiskDecision.shrink("shrinks", "too big", Decimal("5"))
 
         order = Order(

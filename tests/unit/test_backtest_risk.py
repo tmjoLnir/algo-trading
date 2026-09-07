@@ -56,6 +56,7 @@ from atp_core.domain import (
 from atp_core.errors import ConfigError
 from atp_core.risk.engine import (
     REPLAY_BLIND_RULES,
+    RiskBooks,
     RiskEngine,
     backtest_rules,
     default_rules,
@@ -193,7 +194,7 @@ class TestTheChainAReplayCanEvaluate:
         rule = TradingHoursRule(calendar=calendar, clock=clock)
         decision = rule.check(
             an_order(),
-            Portfolio(cash=Decimal("100000"), starting_equity=Decimal("100000")),
+            RiskBooks.of(Portfolio(cash=Decimal("100000"), starting_equity=Decimal("100000"))),
             RiskLimits(),
         )
 

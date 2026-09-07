@@ -164,8 +164,9 @@ class TestProtectiveChildren:
         assert placed != top_up
 
     def test_retrying_a_refused_child_is_the_same_order(self) -> None:
-        """Four of the nine rules can refuse a protective stop, so the retry is
-        an ordinary path — and it must not place a second stop."""
+        """Three of the nine rules can refuse a protective stop
+        (`rules.EXIT_BLIND_RULES`), so the retry is an ordinary path — and it
+        must not place a second stop."""
         first = protective_client_order_id(self.parent(), STOP_LOSS, Decimal(0), Decimal(100))
         retry = protective_client_order_id(self.parent(), STOP_LOSS, Decimal(0), Decimal(100))
         assert first == retry

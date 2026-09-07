@@ -15,7 +15,7 @@ from decimal import ROUND_DOWN, Decimal
 from typing import TYPE_CHECKING
 
 from atp_core.domain import Position, Side
-from atp_core.risk.engine import RiskDecision
+from atp_core.risk.engine import RiskBooks, RiskDecision
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -40,6 +40,28 @@ if TYPE_CHECKING:
 DAILY_LOSS_RULE = "daily_loss_limit"
 RATE_LIMIT_RULE = "rate_limit"
 
+#: The rules that can refuse an order which only *reduces* a position, and so
+#: the complete list of ways a flatten or a protective stop can come back
+#: refused (ADR 0005, `ProtectionResult`, docs/RISK.md).
+#:
+#: All three judge the order rather than the book, which is why no carve-out
+#: reaches them and why that is correct: "do not trade outside the session", "do
+#: not run away", and "do not trade on a price nobody can see" are true of an
+#: exit too. `StaleDataRule` in particular is what lets `KillSwitchRule` stay
+#: blind to `HaltReason` — a data-feed halt still cannot dump the book into a
+#: market nobody can see, because the rule whose job that is refuses first.
+#:
+#: The other six can never refuse a reduction: the kill switch, the daily loss
+#: limit and buying power each carve exits out explicitly, the two ceilings
+#: exempt an order that leaves no more behind than is already committed
+#: (`increases_exposure`), and the open-position cap cannot be reached by an
+#: order in a symbol already held.
+#:
+#: Declared once because five documents and three docstrings quote the number,
+#: and it has been wrong in all of them at least once. `test_risk_engine.py`
+#: derives it from `default_rules()` rather than trusting it.
+EXIT_BLIND_RULES: tuple[str, ...] = ("trading_hours", RATE_LIMIT_RULE, "stale_data")
+
 
 def reduces_position(order: Order, portfolio: Portfolio) -> bool:
     """Whether this order shrinks the holding it touches.
@@ -57,6 +79,37 @@ def reduces_position(order: Order, portfolio: Portfolio) -> bool:
     if position is None or position.is_flat:
         return False
     return position.is_long if order.side is Side.SELL else position.is_short
+
+
+def increases_exposure(order: Order, portfolio: Portfolio) -> bool:
+    """Whether this order leaves *more* of the symbol behind than is held now.
+
+    The predicate a **ceiling** wants, and deliberately not `reduces_position`,
+    which is the predicate a **permission** wants. The two differ on exactly one
+    case and it is the dangerous one: `reduces_position` is quantity-blind by
+    design — an order larger than the position it opposes still counts as
+    reducing, because refusing one would trap the position a loss limit is
+    trying to let go of. Exempting a cap on that answer would let a `SELL 300`
+    against a long of 100 skip `max_position_size` entirely: an uncapped short
+    of 200, approved by the rule whose whole job is capping what an order leaves
+    behind.
+
+    Asking about magnitude instead subsumes the exemption and keeps its teeth on
+    a reversal. `SELL 40` against a long of 100 leaves 60 and is exempt; `SELL
+    300` leaves 200, which is *more* than is held, and meets the cap.
+
+    Measured against whichever book the rule is judging — the committed one for
+    the two ceilings that use it, so that an order reducing an exposure the
+    account has already committed to is exempt even while the book sits over the
+    cap because a mark moved. Needs no price, which is why the two rules can ask
+    it before they value anything: a position that is getting smaller does not
+    have to be valued to be allowed, and refusing to shrink a book for want of a
+    mark on some *other* symbol is how layers 5 and 6 of docs/SAFETY.md fail
+    together.
+    """
+    position = portfolio.positions.get(order.symbol)
+    held = position.qty if position is not None else Decimal(0)
+    return abs(held + order.qty * order.side.sign) > abs(held)
 
 
 def reference_price(
@@ -224,18 +277,26 @@ class KillSwitchRule:
     switch: KillSwitch
     name: str = "kill_switch"
 
-    def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
+    def check(self, order: Order, books: RiskBooks, limits: RiskLimits) -> RiskDecision:
         if not self.switch.is_engaged(order.strategy_id, order.symbol):
             return RiskDecision.allow()
 
-        if not reduces_position(order, portfolio):
+        # The **settled** book, not the committed one (`RiskBooks`, ADR 0027).
+        # This is a permission, and the permission is "there is a position here
+        # to close". A projected book answers that with a position that has not
+        # filled: a working BUY 100 against a flat account makes SELL 100 read
+        # as an exit of 100, and this rule approves an order that opens a short
+        # while the platform is stopped. An entry that is still working is not
+        # exposure to be let out of; cancelling it is how you undo it.
+        settled = books.settled
+        if not reduces_position(order, settled):
             return RiskDecision.deny(self.name, "trading is halted")
 
         # `reduces_position` is true only for a symbol holding a non-flat
         # position, so the lookup cannot miss. Indexed rather than
         # `portfolio.position()`, which is a `setdefault` and would insert into
         # a book this rule is only reading.
-        held = abs(portfolio.positions[order.symbol].qty)
+        held = abs(settled.positions[order.symbol].qty)
         if order.qty > held:
             return RiskDecision.deny(
                 self.name,
@@ -257,7 +318,19 @@ class MaxPositionSizeRule:
 
     name: str = "max_position_size"
 
-    def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
+    def check(self, order: Order, books: RiskBooks, limits: RiskLimits) -> RiskDecision:
+        # A ceiling measures the **committed** book (ADR 0020): three orders of
+        # 4% each are a 12% position whether or not the first two have settled.
+        portfolio = books.committed
+        # Before valuing anything: an order that leaves no more of the symbol
+        # behind than is already committed cannot breach a cap on how much of
+        # the symbol is held. Asked first because it needs no price — refusing
+        # to let a book shrink because some other holding is unmarked leaves a
+        # position naked, which is the failure the carve-out below it exists to
+        # prevent. `increases_exposure` rather than `reduces_position`: the cap
+        # keeps its teeth on a reversal, which leaves *more* behind.
+        if not increases_exposure(order, portfolio):
+            return RiskDecision.allow()
         if (denial := _unpriced_book(self.name, portfolio)) is not None:
             return denial
         price = _price_for(order, portfolio)
@@ -293,7 +366,14 @@ class MaxExposureRule:
 
     name: str = "max_gross_exposure"
 
-    def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
+    def check(self, order: Order, books: RiskBooks, limits: RiskLimits) -> RiskDecision:
+        # The **committed** book, and the same unpriced carve-out as
+        # `MaxPositionSizeRule` for the same reason. Gross exposure is a sum
+        # over symbols, so an order that does not grow this symbol's magnitude
+        # cannot grow the total either.
+        portfolio = books.committed
+        if not increases_exposure(order, portfolio):
+            return RiskDecision.allow()
         if (denial := _unpriced_book(self.name, portfolio)) is not None:
             return denial
         price = _price_for(order, portfolio)
@@ -340,14 +420,22 @@ class DailyLossLimitRule:
         """Set the day's starting point. Call once, at the session open."""
         self.day_start_equity = equity
 
-    def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
+    def check(self, order: Order, books: RiskBooks, limits: RiskLimits) -> RiskDecision:
         # First, and before any other consideration: an exit is always allowed.
         # Refusing to let a losing position close turns a bad day into an
         # unbounded one, so this outranks even the checks below that would
         # otherwise refuse for want of information.
-        if reduces_position(order, portfolio):
+        #
+        # The **settled** book (ADR 0027). This carve-out is a permission, and
+        # asking it of the projection lets a working entry vouch for an entry:
+        # with a BUY 100 in flight against a flat account, SELL 100 reads as an
+        # exit and the day's loss limit approves new risk past its own breach.
+        if reduces_position(order, books.settled):
             return RiskDecision.allow()
 
+        # Everything below is a measurement of the book's *size*, so it reads
+        # the committed one.
+        portfolio = books.committed
         if self.day_start_equity is None:
             return RiskDecision.deny(
                 self.name,
@@ -384,7 +472,9 @@ class RateLimitRule:
     #: Submission times inside the trailing minute, oldest first.
     _recent: deque[datetime] = field(default_factory=deque, repr=False)
 
-    def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
+    def check(self, order: Order, books: RiskBooks, limits: RiskLimits) -> RiskDecision:
+        # Reads neither book. A runaway loop is a property of the caller, not of
+        # the account, and this rule refuses an exit as readily as an entry.
         now = self.clock.now()
         cutoff = now - timedelta(seconds=60)
         while self._recent and self._recent[0] <= cutoff:
@@ -415,7 +505,11 @@ class MaxOpenPositionsRule:
 
     name: str = "max_open_positions"
 
-    def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
+    def check(self, order: Order, books: RiskBooks, limits: RiskLimits) -> RiskDecision:
+        # A ceiling, so the **committed** book: a batch of entries submitted at
+        # nineteen open is exactly what this cap is for, and every one of them
+        # sees nineteen if it reads the settled one.
+        portfolio = books.committed
         # Only an order that opens a symbol we do not already hold can add to
         # the count. Adding to an existing position, or closing one, never can.
         position = portfolio.positions.get(order.symbol)
@@ -442,12 +536,21 @@ class BuyingPowerRule:
 
     name: str = "buying_power"
 
-    def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
+    def check(self, order: Order, books: RiskBooks, limits: RiskLimits) -> RiskDecision:
         # An order that reduces a holding returns cash rather than consuming it,
         # and refusing one for want of buying power would be perverse.
-        if reduces_position(order, portfolio):
+        #
+        # The **settled** book (ADR 0027): a working SELL does not put cash in
+        # the account, so letting it make the opposing BUY look like an exit
+        # exempts a purchase the account cannot pay for from the rule that
+        # exists to say so.
+        if reduces_position(order, books.settled):
             return RiskDecision.allow()
 
+        # The cash this order is priced against is the committed one — every
+        # order in a batch charged against the opening balance is the hole
+        # ADR 0020 closed.
+        portfolio = books.committed
         price = _price_for(order, portfolio)
         if price is None:
             return RiskDecision.deny(self.name, f"no price available for {order.symbol}")
@@ -476,7 +579,8 @@ class TradingHoursRule:
     #: and has priced the wider spreads there in.
     allow_extended_hours: bool = False
 
-    def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
+    def check(self, order: Order, books: RiskBooks, limits: RiskLimits) -> RiskDecision:
+        # Reads neither book — it judges the clock, so it refuses an exit too.
         if self.allow_extended_hours:
             return RiskDecision.allow()
         now = self.clock.now()
@@ -501,7 +605,10 @@ class StaleDataRule:
     last_tick_at: Callable[[str], datetime | None]
     name: str = "stale_data"
 
-    def check(self, order: Order, portfolio: Portfolio, limits: RiskLimits) -> RiskDecision:
+    def check(self, order: Order, books: RiskBooks, limits: RiskLimits) -> RiskDecision:
+        # Reads neither book. Refusing an exit here is deliberate and is what
+        # lets `KillSwitchRule` stay blind to `HaltReason`: "do not trade on
+        # stale prices" is enforced once, by the rule whose job it is.
         seen = self.last_tick_at(order.symbol)
         if seen is None:
             # Never having seen a price is the most stale a feed can be, and it
