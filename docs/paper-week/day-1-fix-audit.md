@@ -5,10 +5,11 @@
 that claims to fix them, across PRs #134–#139.
 
 > **Status.** Items **1 and 2** of §8's order of work are fixed — §3.4 with §3.4a, and
-> §3.3. Items 3 and 4 (§3.2 and §3.1/§3.1a) are **open and deliberately deferred**: the
-> investigation for them found the audit's own prescriptions unsafe as written, and the
-> two are one change to the risk chain rather than two, so they are not a diff to rush.
-> See the notes under those sections' headings. Everything in §4 onward is open. The
+> §3.3. Items 3 and 4 are now **partly closed**: §3.2 and the projected-book half of §3.1
+> landed in #142 with ADR 0027, corrected by #143. §3.1a is still open, and is now known to
+> have a prerequisite — `RedisKillSwitch.engage` is first-writer-wins, so a standing halt
+> swallows a later `broker_unreachable` and a reason-aware carve-out would read the wrong
+> reason. Everything in §4 onward is open except §4.4b. The
 > sections below are left as they were written; where a fix corrected the audit, the
 > correction is recorded at the section rather than by editing the finding.
 >
@@ -226,7 +227,7 @@ the dashboard form — and not through the status blob.
 
 ### 3.1 The halt carve-out approves orders that reverse a position `critical`
 
-> **Fixed** (#TBD, ADR 0027) — the projected-book half of it, which is the whole of this
+> **Fixed** (#142, ADR 0027) — the projected-book half of it, which is the whole of this
 > section. `RiskEngine.validate` now builds a `RiskBooks` carrying the projection *and* the
 > book it was projected from, and the carve-out asks `reduces_position` of the settled one:
 > an entry that is still working is not exposure to be let out of, and cancelling it is how
@@ -296,15 +297,20 @@ itself is untrustworthy*.
 
 ### 3.2 A partially filled entry blocks its own protective stop `high`
 
-> **Fixed** (#TBD, ADR 0027), and not with the exemption this section prescribes.
+> **Fixed** (#142, ADR 0027), and not with the exemption this section prescribes.
 > `reduces_position` is quantity-blind by design, so exempting the cap on it would let a
 > `SELL 300` against a long of 100 skip `max_position_size` entirely — an uncapped short of
 > 200, approved by the rule whose whole job is capping what an order leaves behind. The
-> predicate is `increases_exposure`: does this order leave *more* of the symbol behind than
-> the committed book already carries. That subsumes the exemption and keeps the cap's teeth
-> on a reversal. `MaxExposureRule` had the same hole and gets the same fix, and both ask it
+> predicate is `closes_without_reversing`: does this order close *into* the settled position
+> without carrying it through flat. That subsumes the exemption and keeps the cap's teeth on
+> a reversal. `MaxExposureRule` had the same hole and gets the same fix, and both ask it
 > *before* valuing the book, so an unmarked holding elsewhere can no longer refuse the stop
 > that protects this one.
+>
+> Two corrections landed in #143, both found by adversarial review of #142's own diff. The
+> predicate first shipped as `increases_exposure`, a magnitude comparison that exempted an
+> equal-sized reversal (`SELL 400` against a long of 200); and it was asked of the committed
+> book, which exempts an order that only a *working entry* makes look like an exit.
 
 
 Halt-independent, and visible in the same trace above. `MaxPositionSizeRule`
@@ -1015,8 +1021,12 @@ Then:
 2. ~~Read `config.bar_timeframe` in `scripts/preflight.py` — one line plus removing the
    flag (§3.3)~~ **Done** — the flag is kept as an explicit what-if with no default, and
    the series is now named in every verdict measured on it.
-3. `reduces_position` exemption on `MaxPositionSizeRule` and `MaxExposureRule` (§3.2)
-4. `KillSwitchRule` reads the settled book (§3.1)
+3. ~~`reduces_position` exemption on `MaxPositionSizeRule` and `MaxExposureRule` (§3.2)~~
+   **Done** (#142, corrected in #143) — as `closes_without_reversing`, not `reduces_position`,
+   which is quantity-blind and would have let a reversal skip the cap.
+4. ~~`KillSwitchRule` reads the settled book (§3.1)~~ **Done** (#142) — and so do the daily
+   loss limit and buying power, which shared the defect. §3.1a is **not** done: see the
+   status block for the prerequisite that has to be decided first.
 5. ~~Throttle the flap path in both stream adapters (§3.5)~~ **Done** — on both, and the
    discriminator is not the one this section proposed. Gating on *whether the connection
    delivered* halts the platform on a legitimately silent stream: the account stream

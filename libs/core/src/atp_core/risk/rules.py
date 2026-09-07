@@ -53,9 +53,9 @@ RATE_LIMIT_RULE = "rate_limit"
 #:
 #: The other six can never refuse a reduction: the kill switch, the daily loss
 #: limit and buying power each carve exits out explicitly, the two ceilings
-#: exempt an order that leaves no more behind than is already committed
-#: (`increases_exposure`), and the open-position cap cannot be reached by an
-#: order in a symbol already held.
+#: exempt an order that closes into the position without reversing through it
+#: (`closes_without_reversing`), and the open-position cap cannot be reached by
+#: an order in a symbol already held.
 #:
 #: Declared once because five documents and three docstrings quote the number,
 #: and it has been wrong in all of them at least once. `test_risk_engine.py`
@@ -81,35 +81,42 @@ def reduces_position(order: Order, portfolio: Portfolio) -> bool:
     return position.is_long if order.side is Side.SELL else position.is_short
 
 
-def increases_exposure(order: Order, portfolio: Portfolio) -> bool:
-    """Whether this order leaves *more* of the symbol behind than is held now.
+def closes_without_reversing(order: Order, portfolio: Portfolio) -> bool:
+    """Whether this order shrinks the holding *toward* flat without going past it.
 
-    The predicate a **ceiling** wants, and deliberately not `reduces_position`,
-    which is the predicate a **permission** wants. The two differ on exactly one
-    case and it is the dangerous one: `reduces_position` is quantity-blind by
-    design — an order larger than the position it opposes still counts as
-    reducing, because refusing one would trap the position a loss limit is
-    trying to let go of. Exempting a cap on that answer would let a `SELL 300`
-    against a long of 100 skip `max_position_size` entirely: an uncapped short
-    of 200, approved by the rule whose whole job is capping what an order leaves
-    behind.
+    The predicate a **ceiling** exempts on, and deliberately neither of the
+    obvious two.
 
-    Asking about magnitude instead subsumes the exemption and keeps its teeth on
-    a reversal. `SELL 40` against a long of 100 leaves 60 and is exempt; `SELL
-    300` leaves 200, which is *more* than is held, and meets the cap.
+    Not `reduces_position`, which is quantity-blind by design: an order larger
+    than the position it opposes still counts as reducing, because refusing one
+    would trap the position a loss limit is trying to let go of. Exempting a cap
+    on that answer would let a `SELL 300` against a long of 100 skip
+    `max_position_size` entirely — an uncapped short of 200, approved by the
+    rule whose whole job is capping what an order leaves behind.
 
-    Measured against whichever book the rule is judging — the committed one for
-    the two ceilings that use it, so that an order reducing an exposure the
-    account has already committed to is exempt even while the book sits over the
-    cap because a mark moved. Needs no price, which is why the two rules can ask
-    it before they value anything: a position that is getting smaller does not
-    have to be valued to be allowed, and refusing to shrink a book for want of a
-    mark on some *other* symbol is how layers 5 and 6 of docs/SAFETY.md fail
-    together.
+    And not "does this leave less of the symbol behind", which was the first
+    version of this and had a hole in the middle: `SELL 400` against a long of
+    200 leaves a *short* of 200, no larger in magnitude, so a magnitude
+    comparison exempts it. That is not a reduction. It is a brand-new
+    opposite-side position, opened at full size while the symbol sits over its
+    cap — and the cap is exactly what should have refused it. A reversal is new
+    risk however neatly it happens to balance the old.
+
+    So: an exit is an order that closes into the position and stops there. The
+    same test `KillSwitchRule` applies to a halt, for the same reason — "a
+    reversal is not an exit" — and written once rather than twice.
+
+    Needs no price, which is why the two ceilings can ask it before they value
+    anything: a position getting smaller does not have to be valued to be
+    allowed, and refusing to shrink a book for want of a mark on some *other*
+    symbol is how layers 5 and 6 of docs/SAFETY.md fail together.
     """
-    position = portfolio.positions.get(order.symbol)
-    held = position.qty if position is not None else Decimal(0)
-    return abs(held + order.qty * order.side.sign) > abs(held)
+    if not reduces_position(order, portfolio):
+        return False
+    # `reduces_position` is true only for a non-flat position, so this cannot
+    # miss. Indexed rather than `portfolio.position()`, which is a `setdefault`
+    # and would insert into a book this is only reading.
+    return order.qty <= abs(portfolio.positions[order.symbol].qty)
 
 
 def reference_price(
@@ -292,12 +299,13 @@ class KillSwitchRule:
         if not reduces_position(order, settled):
             return RiskDecision.deny(self.name, "trading is halted")
 
-        # `reduces_position` is true only for a symbol holding a non-flat
-        # position, so the lookup cannot miss. Indexed rather than
-        # `portfolio.position()`, which is a `setdefault` and would insert into
-        # a book this rule is only reading.
+        # `closes_without_reversing` asks exactly this rule's second question,
+        # and the two ceilings now exempt on it — so the "a reversal is not an
+        # exit" line is drawn once rather than in three places that could drift
+        # apart. Spelled out here rather than delegated because the denial has
+        # to name the numbers.
         held = abs(settled.positions[order.symbol].qty)
-        if order.qty > held:
+        if not closes_without_reversing(order, settled):
             return RiskDecision.deny(
                 self.name,
                 f"trading is halted — {order.qty} against {held} held in "
@@ -322,14 +330,21 @@ class MaxPositionSizeRule:
         # A ceiling measures the **committed** book (ADR 0020): three orders of
         # 4% each are a 12% position whether or not the first two have settled.
         portfolio = books.committed
-        # Before valuing anything: an order that leaves no more of the symbol
-        # behind than is already committed cannot breach a cap on how much of
-        # the symbol is held. Asked first because it needs no price — refusing
-        # to let a book shrink because some other holding is unmarked leaves a
-        # position naked, which is the failure the carve-out below it exists to
-        # prevent. `increases_exposure` rather than `reduces_position`: the cap
-        # keeps its teeth on a reversal, which leaves *more* behind.
-        if not increases_exposure(order, portfolio):
+        # Before valuing anything: an order that closes into a position the
+        # account actually holds, without reversing through it, cannot breach a
+        # cap on how much of the symbol is held. Asked first because it needs no
+        # price — refusing to let a book shrink because some other holding is
+        # unmarked leaves a position naked, which is the failure this carve-out
+        # exists to prevent.
+        #
+        # Of the **settled** book, like every other exit question on this chain
+        # (ADR 0027). Asked of the projection it exempts an order that is not an
+        # exit at all: flat account, a working BUY 100, and `SELL 100` reads as
+        # closing the phantom long, so the cap stands aside for an order that
+        # opens a short of 100 if that BUY never fills. That is ADR 0027's own
+        # defect, one rule along, and it shipped in the first version of this
+        # exemption.
+        if closes_without_reversing(order, books.settled):
             return RiskDecision.allow()
         if (denial := _unpriced_book(self.name, portfolio)) is not None:
             return denial
@@ -372,7 +387,8 @@ class MaxExposureRule:
         # over symbols, so an order that does not grow this symbol's magnitude
         # cannot grow the total either.
         portfolio = books.committed
-        if not increases_exposure(order, portfolio):
+        # The settled book, for the reason `MaxPositionSizeRule` gives above.
+        if closes_without_reversing(order, books.settled):
             return RiskDecision.allow()
         if (denial := _unpriced_book(self.name, portfolio)) is not None:
             return denial

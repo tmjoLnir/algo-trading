@@ -36,6 +36,7 @@ from atp_core.risk.rules import (
     RateLimitRule,
     StaleDataRule,
     TradingHoursRule,
+    closes_without_reversing,
     position_size,
     project_pending,
     reduces_position,
@@ -1022,15 +1023,18 @@ class TestACeilingDoesNotRefuseWhatShrinksTheBook:
     Held 40 with 200 more in flight, a genuine `SELL 40` leaves 200 — over the
     cap, so the cap refused the exit and left the position on. That is the same
     failure the kill switch's carve-out exists to prevent, one rule along. The
-    exemption is `increases_exposure`, not `reduces_position`: the latter is
-    quantity-blind and would let a reversal skip the cap entirely.
+    The exemption is `closes_without_reversing`, and it is neither of the two
+    obvious predicates. `reduces_position` is quantity-blind and would let a
+    `SELL 300` against a long of 100 skip the cap entirely. A pure magnitude
+    comparison — "does this leave less behind" — has a hole in the middle, and
+    `TestAReversalIsNotAReduction` below is that hole.
     """
 
     @staticmethod
     def _books(settled: Portfolio, *pending: Order) -> RiskBooks:
         return RiskBooks(committed=project_pending(settled, pending), settled=settled)
 
-    def test_the_position_cap_allows_an_exit_that_leaves_less_than_is_committed(
+    def test_the_position_cap_allows_an_exit_that_closes_into_the_position(
         self,
     ) -> None:
         settled = portfolio(SPY=(40.0, 100.0))
@@ -1206,3 +1210,174 @@ class TestWhatCanRefuseAnExit:
 
         assert set(EXIT_BLIND_RULES) <= names
         assert len(EXIT_BLIND_RULES) == len(set(EXIT_BLIND_RULES))
+
+
+class TestAReversalIsNotAReduction:
+    """The hole the first version of the ceiling exemption had, pinned open.
+
+    `closes_without_reversing` shipped as `increases_exposure`: a pure magnitude
+    comparison asking whether the order left *more* of the symbol behind. An
+    adversarial review of that diff found what the framing could not see —
+    `SELL 400` against a long of 200 leaves a short of 200, no larger, so the
+    magnitude test exempted it. That is not a reduction. It is a brand-new
+    opposite-side position opened at full size, and these tests run it with the
+    symbol already at 25% of equity against a 10% cap, which is exactly the
+    state the cap exists to refuse from.
+
+    Every quantity from "closes part of it" to "reverses past it" is asserted,
+    because the defect lived in the middle of that range and both ends were
+    already covered.
+    """
+
+    @staticmethod
+    def _over_cap_book() -> Portfolio:
+        """SPY at 25% of equity against a 10% cap — the book after a mark moved."""
+        book = portfolio(cash=0, SPY=(200.0, 100.0), IWM=(200.0, 300.0))
+        assert book.equity == Decimal(80_000)
+        assert Decimal(200) * Decimal(100) / book.equity == Decimal("0.25")
+        return book
+
+    @pytest.mark.parametrize(
+        ("qty", "exempt", "what"),
+        [
+            (100, True, "closes half the long"),
+            (200, True, "closes the long exactly, to flat"),
+            (201, False, "one share past flat is already a short"),
+            (300, False, "reverses to a short of 100"),
+            (400, False, "reverses to a short of 200 — same size, opposite side"),
+            (500, False, "reverses to a short of 300"),
+        ],
+    )
+    def test_no_reversal_is_exempt_from_the_ceilings(
+        self, qty: int, exempt: bool, what: str
+    ) -> None:
+        """The predicate itself. Exemption stops the moment the order would
+        carry the position through flat — at 201, not at 401 where a magnitude
+        comparison put it."""
+        assert (
+            closes_without_reversing(
+                order(symbol="SPY", side=Side.SELL, qty=qty, limit=100), self._over_cap_book()
+            )
+            is exempt
+        ), f"SELL {qty} {what}"
+
+    @pytest.mark.parametrize(
+        ("qty", "allowed", "what"),
+        [
+            (100, True, "exempt: closes into the long"),
+            (200, True, "exempt: closes to flat"),
+            (201, True, "not exempt, but a 1-share short is inside the cap"),
+            (300, False, "a short of 100 is 12.5% of equity, over the 10% cap"),
+            (400, False, "a short of 200 is 25% — the case the magnitude test let through"),
+            (500, False, "a short of 300 is 37.5%"),
+        ],
+    )
+    def test_the_position_cap_measures_every_reversal_it_does_not_exempt(
+        self, qty: int, allowed: bool, what: str
+    ) -> None:
+        """And the verdict, which is not the same question. Losing the exemption
+        means the cap gets to *evaluate* the order, not that it refuses it: a
+        reversal small enough to sit inside the ceiling is still fine."""
+        decision = MaxPositionSizeRule().check(
+            order(symbol="SPY", side=Side.SELL, qty=qty, limit=100),
+            RiskBooks.of(self._over_cap_book()),
+            limits(),
+        )
+
+        assert decision.approved is allowed, f"SELL {qty} — {what}"
+
+    @pytest.mark.parametrize(("qty", "allowed"), [(200, True), (400, False)])
+    def test_the_exposure_cap_refuses_every_reversal(self, qty: int, allowed: bool) -> None:
+        """Gross exposure is unchanged by a same-size flip, which is precisely
+        why a magnitude test could not refuse one."""
+        book = self._over_cap_book()
+        decision = MaxExposureRule().check(
+            order(symbol="SPY", side=Side.SELL, qty=qty, limit=100),
+            RiskBooks.of(book),
+            limits(max_gross_exposure_pct=Decimal("0.10"), max_position_pct=Decimal("0.10")),
+        )
+
+        assert decision.approved is allowed
+
+    def test_the_predicate_agrees_with_the_kill_switch(self) -> None:
+        """`closes_without_reversing` is the same line `KillSwitchRule` draws.
+        Drawn twice, the two would drift; this asserts they have not."""
+        book = self._over_cap_book()
+        halted = KillSwitchRule(switch=FakeKillSwitch(engaged=True))
+
+        for qty in (100, 200, 201, 300, 400, 500):
+            sell = order(symbol="SPY", side=Side.SELL, qty=qty, limit=100)
+            assert (
+                closes_without_reversing(sell, book)
+                is halted.check(sell, RiskBooks.of(book), limits()).approved
+            ), f"disagreement at SELL {qty}"
+
+    def test_a_short_book_reverses_the_same_way(self) -> None:
+        """The long case is the readable one; the short case is where a sign
+        error would hide."""
+        book = portfolio(cash=0, SPY=(-200.0, 100.0))
+
+        for qty, allowed in ((200, True), (400, False)):
+            decision = MaxPositionSizeRule().check(
+                order(symbol="SPY", side=Side.BUY, qty=qty, limit=100),
+                RiskBooks.of(book),
+                limits(),
+            )
+            assert decision.approved is allowed, f"BUY {qty} against a short of 200"
+
+
+class TestTheExemptionIsAnExitQuestionToo:
+    """The ceiling exemption asks "is this an exit?", so it reads the settled
+    book like every other exit question on this chain.
+
+    It shipped reading the committed one, which is ADR 0027's own defect
+    reintroduced one rule along: with a flat account and a working `BUY 100`,
+    the projection carries a long of 100, so `SELL 100` reads as closing it and
+    the cap stands aside — for an order that opens a short of 100 if that BUY
+    never fills. Three independent reviewers found it on the same diff.
+    """
+
+    @staticmethod
+    def _books(settled: Portfolio, *pending: Order) -> RiskBooks:
+        return RiskBooks(committed=project_pending(settled, pending), settled=settled)
+
+    def test_a_working_entry_does_not_exempt_the_order_that_opposes_it(self) -> None:
+        settled = portfolio(SPY=(0.0, 100.0))  # flat
+        books = self._books(settled, order(symbol="SPY", qty=100, limit=100))
+        sell = order(symbol="SPY", side=Side.SELL, qty=100, limit=100)
+
+        assert books.committed.position("SPY").qty == Decimal(100)
+        assert closes_without_reversing(sell, books.committed) is True, "the phantom long"
+        assert closes_without_reversing(sell, books.settled) is False, "what the rule must ask"
+
+    def test_the_cap_judges_that_order_rather_than_exempting_it(self) -> None:
+        """Not exempt means measured, not refused — here the resulting committed
+        position is flat, so the cap approves. What matters is that it *looked*."""
+        settled = portfolio(cash=0, SPY=(0.0, 100.0), IWM=(200.0, 300.0))
+        books = self._books(settled, order(symbol="SPY", qty=700, limit=100))
+        sell = order(symbol="SPY", side=Side.SELL, qty=100, limit=100)
+
+        # Committed carries a long of 700; SELL 100 leaves 600, well over the cap.
+        decision = MaxPositionSizeRule().check(sell, books, limits())
+
+        assert not decision.approved
+        assert decision.rule == "max_position_size"
+
+    def test_a_genuine_exit_behind_a_working_entry_is_still_exempt(self) -> None:
+        """The case #142 existed to fix must survive the correction."""
+        settled = portfolio(SPY=(40.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", qty=200, limit=100))
+
+        assert (
+            MaxPositionSizeRule()
+            .check(order(symbol="SPY", side=Side.SELL, qty=40, limit=100), books, limits())
+            .approved
+        )
+
+    def test_the_exposure_cap_asks_the_same_book(self) -> None:
+        settled = portfolio(SPY=(0.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", qty=100, limit=100))
+        sell = order(symbol="SPY", side=Side.SELL, qty=100, limit=100)
+
+        assert closes_without_reversing(sell, books.settled) is False
+        assert MaxExposureRule().check(sell, books, limits()).approved  # judged, and fine
