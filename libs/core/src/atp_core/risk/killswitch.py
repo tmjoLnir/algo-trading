@@ -48,13 +48,77 @@ class HaltReason(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class HaltEscalation:
+    """The reason this halt was engaged under, before it was raised.
+
+    Written at most once. It exists because `reason` is the reason *in force* —
+    the field the banner, the alert and the metrics read — and moving that
+    field would otherwise erase what the person or process who actually stopped
+    trading chose at the time.
+    """
+
+    from_reason: HaltReason
+    at: datetime
+    by: str
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class Impugnment:
+    """One event that put named positions beyond proof.
+
+    `symbols` plural and not one symbol: a reconcile compares the whole book at
+    a single instant, and its findings are one event rather than five.
+
+    This is what `KillSwitchRule`'s exit carve-out actually reads (ADR 0028) —
+    *not* `reason`. A halt's reason answers "what stopped trading"; an
+    impugnment answers "which positions we cannot prove". They are different
+    questions, and the same `HaltReason` warrants opposite verdicts depending
+    on the evidence behind it: `broker_unreachable` from
+    `OrderRouter._resolve_indeterminate` names the one order whose outcome is
+    unknown, while `broker_unreachable` from the reconciler means only that we
+    could not read the venue — an unverified book, not a disproven one.
+    """
+
+    #: Sorted, non-empty, uppercase tickers.
+    symbols: tuple[str, ...]
+    reason: HaltReason
+    at: datetime
+    by: str
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class HaltRecord:
     scope: HaltScope
+    #: The reason **in force**. Every existing reader — the dashboard banner,
+    #: `_alert_engaged`, `metrics.halt_engaged`, `rollover_daily_counters`,
+    #: `HaltEngagedView`, `_halt_summary` — means this one, so it is this field
+    #: that moves when a halt is raised and `escalation` that keeps the original.
     reason: HaltReason
+    #: When trading stopped. Never moves — a halt that re-stamps itself erases
+    #: the only evidence of when it actually started.
     engaged_at: datetime
+    #: Who stopped it. Never moves, for the same reason.
     engaged_by: str
     detail: str = ""
     target: str | None = None  # strategy_id or symbol when scope is not GLOBAL
+    escalation: HaltEscalation | None = None
+    #: Append-only. Everything the platform has found that it cannot prove.
+    impugned: tuple[Impugnment, ...] = ()
+
+    @property
+    def unproven_symbols(self) -> frozenset[str]:
+        """The symbols whose held quantity cannot be relied on to size an exit.
+
+        Derived rather than stored beside `impugned`, so the set the rule reads
+        and the evidence an operator reads can never disagree.
+        """
+        return frozenset(symbol for item in self.impugned for symbol in item.symbols)
+
+    @property
+    def book_is_unproven(self) -> bool:
+        return bool(self.impugned)
 
 
 class KillSwitch(Protocol):
@@ -107,20 +171,54 @@ def _sync(value: object) -> Any:
 
 
 def _encode(record: HaltRecord) -> str:
-    return json.dumps(
-        {
-            "scope": record.scope.value,
-            "reason": record.reason.value,
-            "engaged_at": record.engaged_at.isoformat(),
-            "engaged_by": record.engaged_by,
-            "detail": record.detail,
-            "target": record.target,
+    payload: dict[str, Any] = {
+        "scope": record.scope.value,
+        "reason": record.reason.value,
+        "engaged_at": record.engaged_at.isoformat(),
+        "engaged_by": record.engaged_by,
+        "detail": record.detail,
+        "target": record.target,
+    }
+    # Written only when present, so a record from before ADR 0028 and one
+    # engaged today with nothing impugned encode identically. A rolling deploy
+    # then cannot tell them apart, which is the point.
+    if record.escalation is not None:
+        payload["escalation"] = {
+            "from_reason": record.escalation.from_reason.value,
+            "at": record.escalation.at.isoformat(),
+            "by": record.escalation.by,
+            "detail": record.escalation.detail,
         }
-    )
+    if record.impugned:
+        payload["impugned"] = [
+            {
+                "symbols": list(item.symbols),
+                "reason": item.reason.value,
+                "at": item.at.isoformat(),
+                "by": item.by,
+                "detail": item.detail,
+            }
+            for item in record.impugned
+        ]
+    return json.dumps(payload)
 
 
 def _decode(raw: str | bytes) -> HaltRecord:
     payload: dict[str, Any] = json.loads(raw)
+    # `.get` on both new fields: a record written by a process from before
+    # ADR 0028 reads back as un-escalated and un-impugned, which is the
+    # default-closed answer — nothing is claimed to be proven that was not.
+    escalation_payload = payload.get("escalation")
+    escalation = (
+        HaltEscalation(
+            from_reason=HaltReason(escalation_payload["from_reason"]),
+            at=datetime.fromisoformat(escalation_payload["at"]),
+            by=escalation_payload["by"],
+            detail=escalation_payload.get("detail", ""),
+        )
+        if escalation_payload is not None
+        else None
+    )
     return HaltRecord(
         scope=HaltScope(payload["scope"]),
         reason=HaltReason(payload["reason"]),
@@ -128,6 +226,17 @@ def _decode(raw: str | bytes) -> HaltRecord:
         engaged_by=payload["engaged_by"],
         detail=payload.get("detail", ""),
         target=payload.get("target"),
+        escalation=escalation,
+        impugned=tuple(
+            Impugnment(
+                symbols=tuple(item["symbols"]),
+                reason=HaltReason(item["reason"]),
+                at=datetime.fromisoformat(item["at"]),
+                by=item["by"],
+                detail=item.get("detail", ""),
+            )
+            for item in payload.get("impugned", ())
+        ),
     )
 
 

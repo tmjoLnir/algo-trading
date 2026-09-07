@@ -99,9 +99,7 @@ GLANCE_ROW = re.compile(r"^\| +(\d+) \| (.+?) \| `([^`]+)` \| (\S+) \|$")
 STATE_EMOJI = {"Closed": "🟢", "Half-closed": "🟡", "Open": "🔴"}
 
 #: `Of the 74 still open, **51 have never been re-checked by anyone**`
-NEVER_RECHECKED = re.compile(
-    r"Of the (\d+) still open, \*\*(\d+) are still marked ⚠️ Reported\*\*"
-)
+NEVER_RECHECKED = re.compile(r"Of the (\d+) still open, \*\*(\d+) are still marked ⚠️ Reported\*\*")
 
 #: §8.1: `57 of the 82 findings are marked ⚠️ … I verified 25 myself, including
 #: 8 of the 14 high-severity findings.` The sentence that tells a reader how
