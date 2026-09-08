@@ -65,6 +65,22 @@ Three consequences follow:
 3. **The end-of-day report counts the failures as successes.** `orders_submitted=201` is
    76 real orders + 85 rejected stops + 40 risk refusals, added together as one number.
 
+**This is the one condition the paper week exists to test.** `docs/SAFETY.md:125` lists as a
+go-live gate: *"Every strategy has a stop loss configured; there are no unprotected
+positions."* And `analytics/paper_run.py:261` carries a clause written for exactly this:
+
+> *SAFETY.md's go-live condition is that `runner.position_unprotected` never happens. A paper
+> week is the first and only place that condition can be observed at all.*
+
+Day 2 violated it **85 times across 38 positions**. Layer 5 did not hold.
+
+Worse, the platform's own verdict tool cannot see it: `_stops_on_every_position` returns
+*"no durable record — an unprotected position is a CRITICAL log line, not a row"* and tells the
+operator to `docker compose logs worker | grep runner.position_unprotected`. The go-live gate
+is checked by grepping container logs, which is precisely how this review found it. There is no
+metric either — `metrics/registry.py` declares 19 metric names covering halts, risk, orders,
+stream, strategy, alerts and the API, and **none** for protection.
+
 Separately and independently: a **global halt fired at 17:00:52 on a false positive** and
 covered the last 2h59m of RTH. The reconciler compares two book snapshots taken 1.4 seconds
 apart while orders are in flight. It is not a real divergence — the very next run, five
@@ -232,7 +248,10 @@ the platform woke a human 11 times for a **false-positive halt**, and zero times
 loss of protection**.
 
 **Fix.** Route `order.position_unprotected` to the alert port, deduplicated by symbol with a
-session-level "N symbols unprotected" rollup so 85 events become one actionable page.
+session-level "N symbols unprotected" rollup so 85 events become one actionable page. Add
+`atp_positions_unprotected` to `metrics/registry.py` — there is no metric for it today — and
+persist it, so SAFETY.md's go-live gate can be evaluated from the database rather than from
+`docker compose logs`.
 
 ### F4 — The reconciler reads its two books at different times, and halts on the difference `critical`
 
@@ -381,11 +400,18 @@ config that must equal the worker's. Warning-and-continuing on a disagreement ab
 the strategy trades* is the class of silent substitution CLAUDE.md §5 exists to prevent.
 Whatever day 3 measures, it is not the configured strategy until this is closed.
 
-### F9 — The tape is 91.4% complete and nothing says so `medium`
+### F9 — The tape is 91.67% complete and nothing says so `medium`
 
-7,130 bars ingested during RTH against 7,800 expected (390 min × 20 symbols) = **91.4%**. Only
-78 of 388 minutes carried all 20 symbols; the mode is 18–19. Two RTH minutes have no bars at
-all: **13:30 — the opening minute** — and 15:57.
+7,150 bars ingested during RTH against 7,800 expected (390 min × 20 symbols) = **91.67%**.
+Median 18 symbols per minute; only 79 of 389 minutes carried all 20. Exactly one RTH minute has
+no bars at all: **15:56**.
+
+*(A bar for minute M is written just after M closes, so the arrival timestamp must be shifted
+back one minute before bucketing. Doing this naively makes 13:30 look empty and shifts the
+whole distribution — the corrected figures are above.)*
+
+**Day 2 is better than day 1 on this axis**: 91.67% against day 1's 87.6% (6,830/7,800), and no
+multi-minute blackout — day 1 lost 18:45–18:51 entirely.
 
 This is the IEX partial tape doing exactly what ADR 0026 says it does. But an `SMA(20)` over a
 gappy series is not a 20-minute average; it is an average of "the last 20 bars that happened to
@@ -396,13 +422,45 @@ here.)*
 **Fix.** Record per-symbol bar coverage per session and surface it in the daily report. A
 strategy result computed over an unmeasured 91% tape is not reproducible.
 
-### F10 — The pre-market reconnect gap was never backfilled `low`
+### F10 — The log reported a 28-minute feed outage that did not happen `medium`
 
-`data.stream.reconnected gap_seconds=1707.4` (28m27s, 11:15:14 → 11:43:41), followed by
-`data.stream.backfill_truncated` — *"the rest is left to the nightly gap sweep"* — and 20
-`data.stream.backfill_empty`. Under CLAUDE.md §5 the gap should be backfilled before resuming.
-It was not. **Impact this session: none** — the gap is entirely pre-market and the runner did
-not warm up until 13:32. It matters the day it happens at 15:00.
+`data.stream.reconnected gap_seconds=1707.439 gap_since=2026-09-08T11:15:14` reads as a
+28m27s loss of market data. It was not one. The real data-socket downtime was **1.13 seconds**:
+`data.alpaca.stream_disconnected` at 11:43:40.744, `data.alpaca.stream_connected feed=iex
+symbols=20` at 11:43:41.872.
+
+`providers/alpaca.py:592` seeds `gap_since = self._clock.now()` when the stream generator
+starts, and only advances it from `self._last_message_at`. No frame had ever arrived — IEX
+publishes nothing before 12:00Z, which the tape's own first bar-minute of 12:00 corroborates —
+so `gap_since` never moved off the process start time. **1707 seconds is the ingestor's age,
+not a gap.**
+
+Everything downstream then behaved correctly on a false premise: `gap_widened_from_storage
+storage_says_from=2026-09-04T20:57` is right (Friday 4 Sep post-market was the last stored bar;
+Monday 7 Sep was Labor Day); `backfill_truncated` clipped 3.6 days to the 6-hour
+`MAX_RECONNECT_BACKFILL` (`stream.py:74`), producing a 05:43–11:43Z window lying **entirely
+before IEX opens**; and so all 20 symbols came back empty (`backfill_empty` × 20,
+`data.backfill.done bars=0 empty_windows=20 requests=21`).
+
+So CLAUDE.md §5's reconnect-gap rule was honoured — the backfill ran and correctly recovered
+nothing, because there was nothing to recover. The defect is the telemetry: a reviewer reading
+this log would spend an hour on an outage that lasted a second, and the same line will
+under-report a real gap whose first message arrives late.
+
+**Fix.** Report the gap only once a message has been seen; before that, say `no data yet` and
+report process age separately. Make the reconnect backfill calendar-aware so a window spanning
+a closure says "the venue was shut", not "the venue had nothing".
+
+### F10a — `get_bars` is all-or-nothing, and this caller skipped both guards `medium`
+
+`AlpacaHistoricalProvider.get_bars` (`providers/alpaca.py:326-333`) raises `DataGapError` on
+the **first** symbol that returns empty, discarding the whole batch — the failure mode behind
+F7. Both request passes (`symbols=41`, raw and adjusted) had already been paid for. The
+codebase has guards for this contract elsewhere; `apply_corporate_actions` uses neither.
+
+**Fix.** Return per-symbol results and let the caller decide, or give the batch path a
+`skip_empty` mode. A whole-batch abort on one dead ticker is not a data-integrity guarantee, it
+is a single point of failure.
 
 ### F11 — `worker.starting` is absent, so boot-time state is unverifiable `low`
 
@@ -416,8 +474,13 @@ config revision was loaded. Day 1 could confirm all three. Start the capture bef
 - **TimescaleDB is 15 minor versions behind** — `2.15.2` installed, `2.30.0` current (13:12:11).
 - **Redis is churning**: `10000 changes in 60 seconds` throughout RTH, and an AOF rewrite
   triggered at `1553588% growth`. 2,500 log lines for one session.
-- **7,237 `data.bars.upserted` lines, every one `batches=1 rows=1`** — one database round trip
-  per bar, and one log line per bar. Batch the writes; log the batch.
+- **7,237 `data.bars.upserted` lines, every one `batches=1 rows=1`** — `stream.py:331` calls
+  `upsert_bars([bar])`, so it is one database round trip and one log line per bar. Batch the
+  writes; log the batch. The line also carries **no `symbol`** (`bars.py:118`), so ADR 0026's
+  own per-symbol coverage baseline cannot be reproduced from the log at all.
+- **A 129.6-second whole-host stall at 11:43:47**, mid-backfill and pre-market. It explains why
+  `stream_subscribed` lands 2m17s after `stream_connected`. No trading impact, but a stall that
+  long during RTH would be a staleness halt.
 
 ### F13 — A reconciliation halt clears in 49 seconds with no evidence trail `medium`
 
@@ -532,7 +595,7 @@ Worth stating plainly, because day 2 fixed real things:
 | **F2** engine-side stop fallback unreachable | **Fixed** — 19 `runner.stop_triggered` |
 | **F3** kill switch has no exit carve-out | **Fixed** — 5 exits allowed, 40 entries refused |
 | **F4** worker never reads halt state at boot | **Untestable** — no boot in this capture (F11) |
-| **F5** market data lost and reported as recovered | **Partly fixed** — the truncation is now *stated* (F10), still not backfilled |
+| **F5** market data lost and reported as recovered | **Fixed, with a new twist** — no data was lost this time; the log now over-reports a gap instead (F10) |
 | **F6** crashes self-inflicted | **Fixed** — zero crashes |
 | **F7** crash-looping worker cannot halt itself | **Fixed** — no crash loop |
 | **F8** nothing repeated the halt | **Fixed** — 11 reminders, all alerting |
@@ -540,7 +603,7 @@ Worth stating plainly, because day 2 fixed real things:
 | **F10** three scheduled jobs are dormant stubs | **Partly fixed** — `generate_daily_report` and `rollover_daily_counters` now run; `apply_corporate_actions` runs and **crashes** (F7) |
 | **F11** sizing not survivable on the intended timeframe | **Open** — folded into F8 |
 | **F12** full-stack restart during RTH | **Fixed** — zero restarts |
-| **F13** the feed is structurally thin | **Confirmed, now quantified** — 91.4% (F9) |
+| **F13** the feed is structurally thin | **Confirmed, quantified, improving** — 91.67%, up from 87.6% (F9) |
 | **F14** `no_action` inflates the rejection counter | **Superseded** — the counter is now wrong in a bigger way (F1) |
 
 Day 1 recommended verifying with one SQL query before re-running. **No evidence in the log or
@@ -553,8 +616,9 @@ the repository that it was run.**
 1. **B1 — quantise every price sent to a broker.** One call to the `round_price` that already
    exists, rounded conservatively by side, plus a test asserting two decimal places in the
    submitted body. Nothing else on this list matters as much.
-2. **F3 — alert on `order.position_unprotected`.** The platform must be able to wake someone
-   for a loss of protection, not only for a halt.
+2. **F3 — alert on `order.position_unprotected`, and give it a metric and a row.** The
+   platform must be able to wake someone for a loss of protection, not only for a halt — and
+   SAFETY.md's go-live gate must be answerable from the database, not from a log grep.
 3. **F4 — stop the reconciler racing itself.** Quiescence check, or re-read once before halting.
 4. **F2/F1 — make the daily report say what happened.** Add protection counts; label the
    denominators.
@@ -570,6 +634,12 @@ where purpose = 'stop_loss' and created_at::date = current_date;
 ```
 
 Day 2 is **readable but not conclusive**. The platform is sound in its safety design — the
-halt, the carve-out, the reminders and the engine-side fallback all did their jobs. What it
-lacks is the last inch of wiring on three guards that were already written: `round_price`,
-`RESERVED_TEST_SYMBOLS`, and an alert route for the one condition that most needed one.
+halt, the carve-out, the reminders and the engine-side fallback all did their jobs, and the
+book ended flat. What it lacks is the last inch of wiring on three guards that were already
+written: `round_price`, `RESERVED_TEST_SYMBOLS`, and an alert route for the one condition that
+most needed one.
+
+The pattern is worth naming, because it is the same pattern three times. This codebase reasons
+carefully — the docstrings on `round_price`, on `Decimal(str(...))`, on the GTC stop, on the
+exit carve-out are all correct, and several of them predict the exact failure that then
+occurred. What is missing is not judgement. It is the call site.
