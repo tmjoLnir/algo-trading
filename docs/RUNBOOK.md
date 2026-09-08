@@ -83,9 +83,13 @@ existing P&L and is a separate decision.
 > a position it cannot confirm, and that includes the protective stop, so those
 > positions are uncovered until you act. Then work the mismatch below.
 >
-> `scripts/halt.py status` shows the halt; the alert body and the
-> `risk.killswitch.escalated` log line both name the symbols and where the
-> finding came from.
+> `scripts/halt.py status` shows the halt and every symbol it names. In the logs
+> the field to grep is `unproven`, not an event name: a halt **born** carrying
+> evidence — the usual case, since the five-minute reconcile normally finds its
+> mismatch on a platform that was trading happily — logs
+> `risk.killswitch.engaged ... unproven=[...]`, while evidence arriving at a
+> halt that already stood logs `risk.killswitch.escalated`. Both alerts read the
+> same; only the log event differs.
 
 ## Reading the numbers
 

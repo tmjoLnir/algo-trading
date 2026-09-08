@@ -678,28 +678,47 @@ async def engage_kill_switch(
             payload.target,
         )
     except KillSwitchUnavailableError as exc:
-        # A *contended* write, which is the opposite state from the outage
-        # handled below and must not be reported as one. Every round found the
-        # key occupied, so the store is answering and a halt is standing: what
-        # failed is merging this request's reason — and any impugnment it
-        # carried — into the record that already stands. Telling an operator
-        # "nothing was written, trading resumes when the store recovers" here
-        # would send them to re-halt a platform that is already halted, and
-        # leave them believing trading is about to resume when it is not.
+        # A *contended* write, and it raises in two opposite states. Branch on
+        # `halt_stands`, never on the message: reporting one as the other is
+        # what that split exists to prevent.
         #
-        # 409 rather than 503 for the same reason: this is a conflict with
-        # another writer, not an unavailable dependency, and a client retrying
-        # on 503 semantics would be retrying the wrong thing.
+        # `halt_stands` — every round found the key occupied, so the store is
+        # answering and a halt is standing; what failed is merging this
+        # request's reason, and any impugnment it carried, into the record that
+        # already stands. 409 rather than 503, because this is a conflict with
+        # another writer and not an unavailable dependency; a client retrying on
+        # 503 semantics would be retrying the wrong thing. Telling an operator
+        # "nothing was written, trading resumes when the store recovers" here
+        # would send them to re-halt an already halted platform.
+        #
+        # Not `halt_stands` — the last round found the key cleared under us, so
+        # nothing was written and nothing may be halted. Claiming "trading IS
+        # halted" there is the more dangerous of the two errors, because it
+        # tells someone to walk away from a live account.
         log.critical(
             "risk.halt_contended",
             error=str(exc),
             actor=actor,
             scope=payload.scope.value,
-            effect="a halt stands; this request's reason was not merged into it",
+            halt_stands=exc.halt_stands,
+            effect=(
+                "a halt stands; this request's reason was not merged into it"
+                if exc.halt_stands
+                else "the key was cleared under us — nothing was written and nothing may be halted"
+            ),
         )
+        if exc.halt_stands:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"trading IS halted, but this request was not what recorded it: {exc}",
+            ) from exc
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(f"trading IS halted, but this request was not what recorded it: {exc}"),
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"the halt was NOT recorded: {exc}. The store is answering, so this is "
+                "not the fail-closed case — do NOT assume anything is stopped. Retry, and "
+                "confirm with `scripts/halt.py status`."
+            ),
         ) from exc
     except Exception as exc:
         log.critical(

@@ -258,21 +258,31 @@ def _producible_quantities(symbol: str, books: RiskBooks) -> list[Decimal]:
     the close — which is the one outcome always available, and the one the
     magnitude filter below can otherwise leave uncovered.
 
-    That filter is ADR 0020's asymmetry, unchanged and stated as a property of
-    the *outcome* rather than of a predicate: an outcome showing less of the
-    symbol than the account holds is not considered, because assuming a resting
-    reduction filled would lower a ceiling on the strength of an exit that has
-    not happened. `held` always survives it, so the list is never empty.
+    **Every endpoint is kept, unfiltered.** ADR 0020's asymmetry — that a
+    resting reduction must not lower a ceiling on the strength of an exit that
+    has not happened — is a property of the *bound*, and a bound taken as a
+    maximum already has it: adding an outcome to a `max` can only raise it.
 
-    The committed quantity is appended unfiltered. For any `RiskBooks` the
-    engine builds it already lies inside the interval and adds nothing — but
-    including it is what makes "no ceiling measures less than it did before
-    ADR 0028" true of *every* `RiskBooks`, including one assembled by hand.
+    > **Corrected before merge.** This first shipped with a magnitude filter,
+    > `abs(q) >= abs(held)`, written as if that asymmetry needed enforcing here.
+    > It does not, and the filter actively broke the bound: the callers maximise
+    > `|q + signed|`, not `|q|`, and a *small* `q` produces the *largest*
+    > result when the order opposes it. Held 100 with a resting `SELL 150`
+    > reaches −50; a new `SELL 300` from there leaves −350, and the filter
+    > dropped −50 for being smaller than 100, so the bound reported 200.
+    > Reproduced by execution. Removing it is strictly conservative in every
+    > case and a no-op for `worst_magnitude`, where `signed` is zero and the
+    > dropped candidates could never have been the maximum anyway.
+
+    The committed quantity is appended too. For any `RiskBooks` the engine
+    builds it already lies inside the interval and adds nothing — but including
+    it is what makes "no ceiling measures less than it did before ADR 0028" true
+    of *every* `RiskBooks`, including one assembled by hand.
     """
     settled = books.settled.positions.get(symbol)
     held = settled.qty if settled is not None else Decimal(0)
     buys, sells = books.in_flight.get(symbol, (Decimal(0), Decimal(0)))
-    outcomes = [q for q in (held, held + buys, held - sells) if abs(q) >= abs(held)]
+    outcomes = [held, held + buys, held - sells]
     committed = books.committed.positions.get(symbol)
     outcomes.append(committed.qty if committed is not None else Decimal(0))
     return outcomes

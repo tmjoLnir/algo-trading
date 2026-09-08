@@ -305,10 +305,16 @@ what the asymmetry above exists to prevent. `rollover_daily_counters` releases
 it narrowly: that reason only, engaged by the risk chain and not by a person who
 picked the same reason, and only when it was engaged before today's session.
 Nothing else halted is touched, so a feed halt standing beside it survives.
-A daily-loss halt that has since escalated — evidence arrived and its reason
-rose — is no longer that reason and so is no longer this job's to release. It is
-kept, and the rollover says so in a log line naming the symbols rather than
-skipping it silently.
+**A fourth condition trumps the other three: the halt must impugn nothing.** If
+it carries an `Impugnment` — a symbol whose quantity the platform cannot prove
+(ADR 0029) — the rollover refuses to release it whatever its reason says, and
+logs `worker.rollover.halt_unproven_not_released` naming the symbols rather than
+skipping it silently. The guard is on the *evidence*, not on the reason and not
+on who supplied it: `scripts/halt.py` offers `--unproven` alongside `--reason`,
+so an operator can add evidence to yesterday's daily-loss halt without changing
+either its reason or its original engager, and all three conditions above would
+otherwise still pass. Nothing automated may decide a disputed position is proven
+again.
 
 **Fails closed.** The switch lives in Redis so that the API can trip it while
 the worker is mid-loop, and so that it survives a restart — a switch that

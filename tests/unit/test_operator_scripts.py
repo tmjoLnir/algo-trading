@@ -991,8 +991,66 @@ class TestTheStatusOutputCarriesTheEvidence:
         assert "escalated from manual" in rendered
         assert "by       jo" in rendered, "the original engager is not overwritten"
 
+    def test_it_does_not_claim_an_escalation_that_did_not_happen(self) -> None:
+        """`_merge` records an escalation whenever evidence *first* arrives, and
+        the reason it records may be the one already in force.
+
+        docs/RUNBOOK.md's "first move, always" is a manual halt; its next
+        paragraph says to add `--unproven` if you found a bad quantity. Both
+        default to `manual`, so the merged record carries
+        `HaltEscalation(from_reason=manual)` on a halt whose reason is still
+        manual. Rendering "escalated from manual" there describes a transition
+        the operator did not see, because it did not occur.
+        """
+        at = datetime(2024, 6, 3, 14, 30, tzinfo=UTC)
+        rendered = halt._render(
+            self.a_halt(
+                reason=HaltReason.MANUAL,
+                escalation=HaltEscalation(from_reason=HaltReason.MANUAL, at=at, by="jo"),
+            )
+        )
+
+        assert "escalated" not in rendered
+        assert "unproven" in rendered, "the evidence itself still shows"
+
     def test_a_halt_that_impugns_nothing_says_nothing_extra(self) -> None:
         rendered = halt._render(self.a_halt(reason=HaltReason.MANUAL, impugned=()))
 
         assert "unproven" not in rendered
         assert "escalated" not in rendered
+
+
+class TestABlankUnprovenCannotSilenceTheStopButton:
+    """`--unproven ""` must not turn a halt into an exception.
+
+    `_clean_symbols` refuses a blank inside `engage`, and rightly — a blank
+    would be an impugnment no order can match and nothing can clear. But it
+    refuses by raising *before the record is written*, so on the platform's stop
+    button an argument typo would record nothing and stop nothing. Caught at the
+    argument boundary instead, where a wrong flag costs a message rather than a
+    halt.
+    """
+
+    def test_a_blank_symbol_is_refused_before_the_switch_is_touched(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        switch = _gate(monkeypatch)
+
+        with pytest.raises(SystemExit, match="NOT halted"):
+            halt.main(["engage", "--by", "jo", "--unproven", ""])
+
+        assert switch.engaged_calls == []
+
+    def test_whitespace_counts_as_blank(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        switch = _gate(monkeypatch)
+
+        with pytest.raises(SystemExit):
+            halt.main(["engage", "--by", "jo", "--unproven", "SPY", "--unproven", "   "])
+
+        assert switch.engaged_calls == []
+
+    def test_a_real_symbol_still_goes_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        switch = _gate(monkeypatch)
+
+        assert halt.main(["engage", "--by", "jo", "--unproven", " spy "]) == 0
+        assert switch.engaged_calls[0]["unproven_symbols"] == [" spy "]

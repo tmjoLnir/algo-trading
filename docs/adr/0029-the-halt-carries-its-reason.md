@@ -38,7 +38,7 @@ Key the exception on `HaltReason`: refuse exits under `reconciliation_mismatch`
 and `broker_unreachable`, permit them otherwise. One line, and it is a
 platform-wide outage.
 
-`ReconciliationReport.is_clean` is false for **five** kinds of finding, and three
+`ReconciliationReport.is_clean` is false for **five** kinds of finding, and two
 of them say nothing about any quantity:
 
 | Finding | Says the book is wrong? |
@@ -83,10 +83,13 @@ class HaltRecord:
     impugned: tuple[Impugnment, ...] = ()  # append-only: what we cannot prove
 ```
 
-`engage` gains a keyword-only `unproven_symbols`. Two callers supply it — the
+`engage` gains a keyword-only `unproven_symbols`. Three callers supply it — the
 reconciler, with the symbols from findings whose `DiscrepancyKind.impugns_position`
-is true, and the router, with the one symbol it could not resolve. Every other
-caller supplies nothing and every other halt behaves exactly as it did.
+is true; the router, with the one symbol it could not resolve; and
+`scripts/halt.py --unproven`, where a person says so (see *Consequences*). Every
+other caller supplies nothing and every other halt behaves exactly as it did.
+That the operator is one of the three is what forced the rollover guard below to
+key on the evidence rather than on who supplied it.
 
 `KillSwitch.halt_state()` replaces `is_engaged` **on the Protocol**, returning
 every halt covering the order. The rule asks `state.position_is_unproven(symbol)`.
@@ -102,9 +105,12 @@ Five properties, each chosen against the alternative:
 - **`halt_state` replaces the boolean on the Protocol, rather than joining it.**
   A rule that can still ask "am I halted" will, and it gets the pre-0029
   behaviour silently. `mypy --strict` names every implementation and every
-  double. `RedisKillSwitch.is_engaged` survives for the callers that genuinely
-  want a boolean and are not risk rules — the staleness monitor, the dashboard's
-  banner, `scripts/halt.py status` — documented as "not for a risk rule".
+  double. `RedisKillSwitch.is_engaged` survives as a boolean read kept off the
+  contract a rule is handed — though this change left it with **no production
+  caller at all**: the staleness monitor and the dashboard both moved to
+  `halt_state().engaged` here, and `scripts/halt.py status` had always used
+  `active_halts()`. It is a test convenience now, and its docstring says so
+  rather than naming constituents it does not have.
 - **`unreadable` does not impugn.** A Redis outage fails closed on `engaged`, so
   entries stop. It is *not* evidence about any position, and treating it as such
   would refuse every protective stop on every blip — layers 5 and 6 failing
@@ -226,16 +232,16 @@ One incident must not read as two on the graph. What it marks is different in
 kind: not that trading stopped, but that exits stopped too, for the symbols
 named.
 
-**The only automated clear in the platform stays out of reach of an escalated
-halt.** `rollover_daily_counters` releases yesterday's `daily_loss_limit` halt,
-gated on `record.reason`. An escalated halt no longer carries that reason, so it
-is skipped — the right answer, since a halt covering an unproven quantity is not
-a cron job's to release. It is now skipped *loudly*:
-`worker.rollover.halt_escalated_not_released` names the symbols, keyed on
-`escalation.from_reason` so halts that were never in this job's reach stay quiet.
-Escalation can only move a halt **out** of the auto-clear set and never into it:
-`engaged_by` never moves, and the only caller that engages as `DAILY_LOSS_RULE`
-supplies no symbols.
+**The only automated clear in the platform cannot release a halt that impugns
+anything.** `rollover_daily_counters` releases yesterday's `daily_loss_limit`
+halt, and it now refuses outright when `record.book_is_unproven` — keyed on the
+evidence rather than on the reason or on who supplied it, because the argument
+does not depend on the source: nothing automated may decide a disputed position
+is proven again. It is refused *loudly*:
+`worker.rollover.halt_unproven_not_released` names the symbols and, when the
+reason rose, where it rose from. That guard subsumes a reason-based one, because
+`_merge` raises a reason only when fresh evidence arrives, so an escalated record
+always carries an impugnment.
 
 **Verified by mutation, not by argument.** Twenty-six mutants — the latch
 removed, the dedup removed, the carve-out keyed on `HaltReason`, the impugnment

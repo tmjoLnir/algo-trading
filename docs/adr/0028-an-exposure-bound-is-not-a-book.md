@@ -92,17 +92,37 @@ itself — the outcome where **nothing** fills: a cancel, a reject, an expiry, a
 DAY limit dying at the close. That is the one outcome always available, and it
 is the one a magnitude filter can otherwise leave uncovered.
 
-**ADR 0020's asymmetry is unchanged**, restated as a property of the outcome
-rather than of a predicate: an outcome showing less of the symbol than the
-account holds is not considered, so a resting protective stop still cannot lower
-a ceiling on the strength of an exit that has not happened.
+**ADR 0020's asymmetry is unchanged**, and it needs no enforcement here: a bound
+taken as a *maximum* already has it, because adding an outcome to a `max` can
+only raise it. A resting protective stop therefore cannot lower a ceiling on the
+strength of an exit that has not happened, whatever endpoints are in the list.
+
+> **Corrected before merge.** This first shipped with a magnitude filter,
+> `abs(q) >= abs(held)`, written as if the asymmetry had to be enforced at the
+> endpoint. It does not, and the filter discarded the worst case: the callers
+> maximise `|q + signed|`, not `|q|`, and a *small* `q` produces the *largest*
+> result when the order opposes it. Long 100 with a working `SELL 150` reaches
+> −50; a new `SELL 300` from there leaves −350, and the filter dropped −50 for
+> being smaller than 100, so the bound reported **200**. Reproduced by execution
+> against the branch that introduced it. Removing the filter is a no-op for
+> `worst_magnitude`, where `signed` is zero and a dropped candidate could never
+> have been the maximum — and it is strictly conservative everywhere else.
+>
+> An ordinary protective stop is unaffected in practice: it is capped at the
+> exposure held, so `held − sells` never exceeds `held` in magnitude and the
+> extra endpoint cannot become the maximum. Only a working *reversal* moves the
+> bound, which is precisely what this ADR exists to see.
 
 ## Consequences
 
-**The invariant, verified by execution rather than argued.** Over 4,000
-randomised books × 2 ceilings: **0 looser, 50 tighter, 7,950 unchanged**, with
-513 working reversals where the bound exceeds what the committed book reports.
-No rule approves what it refused before this change.
+**The invariant, verified by execution rather than argued.** Re-run after the
+correction above, over 4,000 randomised books: **0 looser** than the pre-0028
+committed-quantity measure — the property the whole ADR rests on — with the
+bound strictly tighter wherever a working order can carry the position past what
+`project_pending` reports. The earlier run of this sweep reported "50 tighter",
+and that number was itself evidence of the filter: it was discarding the
+reachable endpoint in nearly every book that had one. No rule approves what it
+refused before this change.
 
 **The literal instruction was refused, and this is what replaced it.** The ask
 was that `project_pending` project working reversals. It still does not. What

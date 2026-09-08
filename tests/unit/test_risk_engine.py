@@ -1738,3 +1738,66 @@ class TestTheCarveOutIsVoidWhereTheQuantityIsUnproven:
         assert rule.check(
             order(side=Side.SELL, qty=100), RiskBooks.of(portfolio(SPY=(100, 100))), limits()
         ).approved
+
+
+class TestTheBoundKeepsEveryReachableOutcome:
+    """ADR 0028's bound, and the filter that broke it.
+
+    `_producible_quantities` shipped with `abs(q) >= abs(held)`, written as if
+    ADR 0020's asymmetry needed enforcing there. It does not — a bound taken as
+    a maximum already has it, because adding an outcome to a `max` can only
+    raise it — and the filter actively discarded the worst case, because the
+    callers maximise `|q + signed|` and a *small* q produces the *largest*
+    result when the order opposes it.
+    """
+
+    @staticmethod
+    def _books(held: str, buys: str, sells: str) -> RiskBooks:
+        settled = portfolio(SPY=(float(held), 100.0))
+        # `project_pending` drops reducing orders, so the committed book still
+        # shows what is held. That is the state ADR 0028 works around.
+        committed = portfolio(SPY=(float(held), 100.0))
+        return RiskBooks(
+            committed=committed,
+            settled=settled,
+            in_flight={"SPY": (Decimal(buys), Decimal(sells))},
+        )
+
+    def test_a_resting_reduction_is_a_reachable_outcome(self) -> None:
+        """Long 100 with a working `SELL 150` reaches −50. A new `SELL 300` from
+        there leaves −350 — the largest position these orders can produce, and
+        the number `max_position_size` has to cap."""
+        books = self._books("100", "0", "150")
+
+        assert worst_resulting_qty(order(side=Side.SELL, qty=300), books) == Decimal(350)
+
+    def test_it_never_reports_less_than_the_committed_book_would(self) -> None:
+        """The invariant ADR 0028 rests on: no ceiling approves what it refused
+        before. Verified here at the boundary rather than only in the sweep."""
+        for held, buys, sells, side, qty in [
+            ("100", "0", "150", Side.SELL, 300),
+            ("100", "200", "0", Side.BUY, 50),
+            ("-100", "300", "0", Side.BUY, 200),
+            ("0", "0", "0", Side.SELL, 100),
+        ]:
+            books = self._books(held, buys, sells)
+            signed = Decimal(qty) if side is Side.BUY else -Decimal(qty)
+            committed = books.committed.positions["SPY"].qty
+            assert worst_resulting_qty(order(side=side, qty=qty), books) >= abs(
+                committed + signed
+            ), f"{held=} {buys=} {sells=} {side=} {qty=}"
+
+    def test_an_ordinary_protective_stop_does_not_tighten_anything(self) -> None:
+        """The reason removing the filter is not over-conservative in practice.
+
+        A protective child is capped at the exposure held (`submit_protective_orders`),
+        so `held - sells` never exceeds `held` in magnitude and the extra
+        endpoint cannot become the maximum. Only a working *reversal* — an order
+        larger than the position it opposes — moves the bound, which is exactly
+        what ADR 0028 exists to see.
+        """
+        with_stop = self._books("100", "0", "100")
+        without = self._books("100", "0", "0")
+        entry = order(side=Side.BUY, qty=50)
+
+        assert worst_resulting_qty(entry, with_stop) == worst_resulting_qty(entry, without)

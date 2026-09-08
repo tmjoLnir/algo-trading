@@ -241,6 +241,14 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"--scope {scope.value} needs --target (a strategy id or a symbol)")
     if scope is HaltScope.GLOBAL and args.target:
         raise SystemExit("--target is meaningless with --scope global")
+    # Checked here, before the switch is touched. `_clean_symbols` refuses a
+    # blank symbol inside `engage`, and rightly — a blank would be an
+    # impugnment no order can match and nothing can clear. But it refuses by
+    # raising *before the halt is written*, so `--unproven ""` on the platform's
+    # stop button would record nothing at all and stop nothing. An argument typo
+    # must not be able to do that.
+    if getattr(args, "unproven", None) and any(not s.strip() for s in args.unproven):
+        raise SystemExit("--unproven needs a symbol. Trading was NOT halted.")
 
     settings = get_settings()
     # No `try` around this. A kill switch that cannot reach Redis must fail
@@ -401,10 +409,17 @@ def _render(record: HaltRecord) -> str:
     ]
     if record.detail:
         lines.append(f"  detail   {record.detail}")
-    if record.escalation is not None:
+    escalation = record.escalation
+    if escalation is not None and escalation.from_reason is not record.reason:
+        # Only when the reason actually moved. `_merge` records an escalation
+        # whenever evidence *first* arrives, and both of docs/RUNBOOK.md's
+        # operator halts default to `manual` — so a manual halt met by
+        # `--unproven` carries `from_reason=manual` on a record whose reason is
+        # still manual. "escalated from manual" there describes a transition
+        # nobody saw, because it did not happen.
         lines.append(
-            f"  escalated from {record.escalation.from_reason.value} "
-            f"by {record.escalation.by} at {record.escalation.at.isoformat()}"
+            f"  escalated from {escalation.from_reason.value} "
+            f"by {escalation.by} at {escalation.at.isoformat()}"
         )
     for item in record.impugned:
         lines.append(

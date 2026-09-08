@@ -503,11 +503,19 @@ class RedisKillSwitch:
         **Not for a risk rule** — `KillSwitchRule` reads `halt_state`, because a
         bare boolean cannot say which positions a halt puts beyond proof and a
         rule that asks this question lets a flatten through against a quantity
-        nobody can vouch for (ADR 0029). This is for the callers that genuinely
-        want the boolean: the staleness monitor deciding whether to re-halt, the
-        dashboard's banner, `scripts/halt.py status`. It is deliberately absent
-        from the `KillSwitch` Protocol so a rule cannot reach it through the
-        contract it is handed.
+        nobody can vouch for (ADR 0029). It is deliberately absent from the
+        `KillSwitch` Protocol so a rule cannot reach it through the contract it
+        is handed.
+
+        **It has no production caller today**, and saying so is the point. The
+        three this docstring used to name — the staleness monitor, the
+        dashboard's banner, `scripts/halt.py status` — either moved to
+        `halt_state().engaged` in the same change or had always used
+        `active_halts()`. What is left is a test convenience with fifty-odd
+        uses: a real constituency, but not a licence to claim constituents it
+        does not have. Anything in `apps/` or `scripts/` that wants it back has
+        to argue a boolean is enough for what it is deciding — the argument
+        ADR 0029 found the risk chain could not make.
 
         Fails closed, by deferring to `halt_state`.
         """
@@ -629,13 +637,15 @@ class RedisKillSwitch:
                 f"a halt is standing on {key} and this {reason.value} engage could not be "
                 f"merged into it after {_MAX_ENGAGE_ATTEMPTS} attempts"
                 + (lost or " — the reason in force is somebody else's")
-                + ". The store is reachable; retry, and confirm with `scripts/halt.py status`"
+                + ". The store is reachable; retry, and confirm with `scripts/halt.py status`",
+                halt_stands=True,
             )
         raise KillSwitchUnavailableError(
             f"could not record a {reason.value} halt for {key} after "
             f"{_MAX_ENGAGE_ATTEMPTS} attempts — the key kept being cleared under us, so "
             f"NO halt may be in force" + lost + ". Retry, and confirm with "
-            "`scripts/halt.py status` before assuming trading is stopped"
+            "`scripts/halt.py status` before assuming trading is stopped",
+            halt_stands=False,
         )
 
     def _announce_engaged(self, record: HaltRecord) -> None:

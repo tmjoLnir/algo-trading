@@ -284,7 +284,14 @@ class EquityCurveView(BaseModel):
 
 
 def _halt_view(record: HaltRecord) -> HaltView:
+    # `_merge` records an escalation whenever evidence first arrives, and the
+    # reason it records may be the one already in force — two manual halts, the
+    # second carrying `--unproven`, leave `from_reason` and `reason` both
+    # `manual`. Rendering that says "escalated from manual" on a halt whose
+    # reason never moved, which is a transition the operator did not see because
+    # it did not happen. Reported only when the two differ.
     escalation = record.escalation
+    rose = escalation is not None and escalation.from_reason is not record.reason
     return HaltView(
         scope=record.scope.value,
         reason=record.reason.value,
@@ -293,9 +300,9 @@ def _halt_view(record: HaltRecord) -> HaltView:
         detail=record.detail,
         target=record.target,
         unproven_symbols=sorted(record.unproven_symbols),
-        escalated_from=escalation.from_reason.value if escalation else None,
-        escalated_by=escalation.by if escalation else None,
-        escalated_at=escalation.at if escalation else None,
+        escalated_from=escalation.from_reason.value if rose and escalation else None,
+        escalated_by=escalation.by if rose and escalation else None,
+        escalated_at=escalation.at if rose and escalation else None,
     )
 
 
