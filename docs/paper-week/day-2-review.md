@@ -654,6 +654,13 @@ the repository that it was run.**
    across a four-day closure to fill a 50-period average. Until then day 3 measures plumbing,
    not strategy.
 
+**The roadmap needs no change.** Phase 4's *Verifiable:* line is *"a strategy trades the paper
+account for a week and reconciles clean"*. Day 2 did neither — the week is not complete and the
+reconciler diverged twice — so Phase 4 correctly stays `0 / 11`. The one ticked item day 2
+bears on, *"Alerting to a phone (feed loss, halt, reconciliation failure)"*, **holds**: all 17
+alerts were confirmed delivered. It does not claim to cover unprotected positions, and F3 is a
+gap in the platform rather than a lie in the roadmap.
+
 **Verify B1 with one query after the first fill of day 3:**
 ```sql
 select id, symbol, purpose, stop_price, status from orders
