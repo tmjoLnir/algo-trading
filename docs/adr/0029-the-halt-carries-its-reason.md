@@ -228,6 +228,19 @@ claimed a halt was standing when the last round had found the key gone. They are
 recorded rather than quietly restated, and that the review found them at all is
 the argument for running one — every gate was green over all three.
 
+**An operator can record one too** — `scripts/halt.py engage --unproven SPY`,
+and `status` renders every impugnment with its reason, actor and time. Both
+halves matter and neither was in the first draft. Without the flag the cron job
+could protect a symbol and a person could not, which is backwards in a platform
+whose whole asymmetry is that stopping is reflexive and resuming deliberate:
+someone who has just read the broker's UI and found it disagreeing with the
+dashboard is the best-informed party in the building. Without the rendering, the
+only surface naming the stuck symbols was a notification — and docs/SAFETY.md
+says plainly that alerting is not a layer. Deliberately **not** on
+`POST /risk/halt`: it only ever refuses more, so it is safe in the loosening
+direction, but what a browser can reach is a decision of its own (CLAUDE.md
+§1.8) and nobody has asked for this one there.
+
 **What this does not fix.** Nothing clears an impugnment except clearing the
 halt. A reconcile that finds SPY correct on its next pass does not retract the
 earlier finding, so the symbol stays unproven until a human resumes trading.

@@ -55,6 +55,15 @@ money.
 > until it stops, because until it lands those symbols are still flattenable
 > against a quantity nothing can prove.
 >
+> **If *you* are the one who found a bad quantity**, say so when you halt:
+> `scripts/halt.py engage --by "<you>" --unproven SPY` (repeatable). The platform
+> then refuses to close SPY — its protective stop included — until the halt is
+> cleared, exactly as it does when the reconciler finds the mismatch itself.
+> Everything else in the book still closes normally. Without it a halt leaves
+> the platform free to go on flattening the symbol you halted over, which is the
+> one thing you were trying to stop. `scripts/halt.py status` lists what each
+> halt says it cannot prove.
+>
 > `scripts/status.py` is the read-only companion — halts, quote freshness, the
 > latest stored bars, and the venue's account, positions and working orders.
 > Safe to run during an incident.

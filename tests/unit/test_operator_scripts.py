@@ -32,7 +32,13 @@ from atp_core.alerts import Severity
 from atp_core.audit.ports import Action
 from atp_core.config import Settings
 from atp_core.domain import Timeframe
-from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
+from atp_core.risk.killswitch import (
+    HaltEscalation,
+    HaltReason,
+    HaltRecord,
+    HaltScope,
+    Impugnment,
+)
 from atp_core.risk.limits import DEFAULT_RISK_LIMITS, RiskLimits
 from atp_core.worker import StoredWorkerConfig, WorkerConfig
 from atp_worker import preflight
@@ -680,13 +686,18 @@ class _RecordingSwitch:
 
     def engage(self, scope: HaltScope, reason: HaltReason, **kwargs: Any) -> HaltRecord:
         self.engaged_calls.append({"scope": scope, "reason": reason, **kwargs})
+        at = datetime(2024, 6, 3, 14, 30, tzinfo=UTC)
+        symbols = tuple(kwargs.get("unproven_symbols") or ())
         return HaltRecord(
             scope=scope,
             reason=reason,
-            engaged_at=datetime(2024, 6, 3, 14, 30, tzinfo=UTC),
+            engaged_at=at,
             engaged_by=kwargs.get("engaged_by", ""),
             detail=kwargs.get("detail", ""),
             target=kwargs.get("target"),
+            impugned=(
+                (Impugnment(symbols, reason, at, kwargs.get("engaged_by", "")),) if symbols else ()
+            ),
         )
 
     def clear(self, scope: HaltScope, cleared_by: str, target: str | None = None) -> Any:
@@ -883,3 +894,105 @@ class TestTheAuditTrail:
         halt.main(["engage", "--by", "jo"])
 
         assert switch.written[-1].detail["correlation_id"]
+
+
+class TestTheOperatorCanSayAQuantityIsBeyondProof:
+    """ADR 0029, and the asymmetry it closes.
+
+    The reconciler and the router can record which positions the platform must
+    not close. Until `--unproven`, a *person* could not — so someone who had
+    just read the broker's UI and found it disagreeing with the dashboard could
+    halt and then watch the platform go on flattening the very symbol they were
+    halting over. In a platform whose whole design is that stopping is reflexive
+    and resuming is deliberate, the human being less able to be conservative
+    than the cron job is backwards.
+    """
+
+    def test_the_symbol_reaches_the_switch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        switch = _gate(monkeypatch)
+
+        assert halt.main(["engage", "--by", "jo", "--unproven", "SPY"]) == 0
+
+        assert switch.engaged_calls[0]["unproven_symbols"] == ["SPY"]
+
+    def test_it_is_repeatable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        switch = _gate(monkeypatch)
+
+        halt.main(["engage", "--by", "jo", "--unproven", "SPY", "--unproven", "QQQ"])
+
+        assert switch.engaged_calls[0]["unproven_symbols"] == ["SPY", "QQQ"]
+
+    def test_an_ordinary_halt_impugns_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The majority case, and it must stay the majority case: a manual halt
+        says nothing about any position and every exit stays permitted."""
+        switch = _gate(monkeypatch)
+
+        halt.main(["engage", "--by", "jo"])
+
+        assert switch.engaged_calls[0]["unproven_symbols"] == []
+
+    def test_the_operator_is_told_what_they_just_did(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Refusing to close a position is a consequence someone should not have
+        to infer from the flag they typed."""
+        _gate(monkeypatch)
+
+        halt.main(["engage", "--by", "jo", "--unproven", "SPY"])
+
+        out = capsys.readouterr().out
+        assert "unproven SPY" in out
+        assert "will NOT close" in out
+        assert "broker's own UI" in out
+
+
+class TestTheStatusOutputCarriesTheEvidence:
+    """`scripts/halt.py status` is the surface an operator reaches for *after*
+    the phone buzzed, so it cannot be the one place that omits the symbols. An
+    alert already dismissed is not a record, and docs/SAFETY.md is explicit that
+    alerting is not a layer."""
+
+    def a_halt(self, **overrides: Any) -> HaltRecord:
+        at = datetime(2024, 6, 3, 14, 30, tzinfo=UTC)
+        fields: dict[str, Any] = {
+            "scope": HaltScope.GLOBAL,
+            "reason": HaltReason.RECONCILIATION_MISMATCH,
+            "engaged_at": at,
+            "engaged_by": "reconciler",
+            "impugned": (
+                Impugnment(("QQQ", "SPY"), HaltReason.RECONCILIATION_MISMATCH, at, "reconciler"),
+            ),
+        }
+        fields.update(overrides)
+        return HaltRecord(**fields)
+
+    def test_it_names_the_symbols_and_the_way_out(self) -> None:
+        rendered = halt._render(self.a_halt())
+
+        assert "unproven QQQ, SPY" in rendered
+        assert "reconciler" in rendered
+        assert "broker's own UI" in rendered
+
+    def test_it_says_when_the_reason_in_force_is_not_the_original(self) -> None:
+        """`since` and `by` still describe the original — that is the latch. So
+        a reader told "manual" an hour ago and now seeing
+        `reconciliation_mismatch` needs to be told it is the same incident."""
+        rendered = halt._render(
+            self.a_halt(
+                engaged_by="jo",
+                escalation=HaltEscalation(
+                    from_reason=HaltReason.MANUAL,
+                    at=datetime(2024, 6, 3, 15, 0, tzinfo=UTC),
+                    by="reconciler",
+                ),
+            )
+        )
+
+        assert "escalated from manual" in rendered
+        assert "by       jo" in rendered, "the original engager is not overwritten"
+
+    def test_a_halt_that_impugns_nothing_says_nothing_extra(self) -> None:
+        rendered = halt._render(self.a_halt(reason=HaltReason.MANUAL, impugned=()))
+
+        assert "unproven" not in rendered
+        assert "escalated" not in rendered
