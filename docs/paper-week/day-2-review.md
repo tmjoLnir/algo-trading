@@ -54,8 +54,8 @@ in the entire day.
 Three consequences follow:
 
 1. **Every position the platform opened ran with no broker-side protection** — 38 positions,
-   **86,470 position-seconds (24.0 position-hours)**, median 1,031 s each, longest 7,866 s
-   (INTC). An engine-side stop did fire 19 times and did close positions — but it only exists
+   **86,437 position-seconds (24.0 position-hours)**, median 17.2 min each, longest 131.1 min
+   (INTC) — FIFO-matched at the order level, same method as §5. An engine-side stop did fire 19 times and did close positions — but it only exists
    while the worker process is alive, and it acts on a completed bar at a median 60.2 s
    cadence. The GTC broker stop is the one that survives a crash, a restart, or the overnight
    gap, and `router.py:869-882` says so in its own docstring. None existed.
