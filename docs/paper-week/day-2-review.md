@@ -508,7 +508,7 @@ config revision was loaded. Day 1 could confirm all three. Start the capture bef
   `stream_subscribed` lands 2m17s after `stream_connected`. No trading impact, but a stall that
   long during RTH would be a staleness halt.
 
-### F13 — A reconciliation halt clears in 49 seconds with no evidence trail `medium`
+### F13 — Clearing a reconciliation halt proves who, never what `medium`
 
 The operator's entire final visit was 21:38:03 → 21:38:52. One `POST /api/v1/risk/resume` at
 21:38:31 cleared a global halt naming three unproven symbols, 1h38m after the close — **28
@@ -523,10 +523,16 @@ The order of requests is the finding:
 21:38:47  GET  /api/v1/orders
 ```
 
-`docs/RUNBOOK.md` "Reconciliation mismatch" step 1 is *compare `GET /api/v1/positions` with the
-broker's own UI*; step 3 is `adopt_broker_state()`. The positions read happened after the
-clear, and `execution.reconcile.adopted_broker_state` appears **0 times** all day. The runbook
-was not followed, and nothing required it to be.
+**Authentication was not the gap — day 1's F9 is properly fixed.** `POST /api/v1/risk/resume`
+calls `require_step_up(payload.password, ...)` (`api/routers/risk.py:831`) and writes an audit
+row, and `scripts/halt.py` now demands the same. The operator entered their password.
+
+What nothing demanded was **evidence**. `docs/RUNBOOK.md` "Reconciliation mismatch" step 1 is
+*compare `GET /api/v1/positions` with the broker's own UI*; step 3 is `adopt_broker_state()`.
+The positions read happened **after** the clear, and
+`execution.reconcile.adopted_broker_state` appears **0 times** all day. Clearing a
+reconciliation halt is an assertion that the two books now agree, and the platform accepted
+that assertion without checking it — or asking the operator whether they had.
 
 Human-shaped API navigation stops at **14:29:19** and does not resume until **21:38:03** — a
 **7h09m gap** that swallows the entire incident.
@@ -537,8 +543,13 @@ clearing a **reconciliation** halt is not a kill — it is an assertion that the
 and nothing in the log shows that assertion was checked. Day 1 raised the same shape of issue
 as F9 (`scripts/halt.py` clears with no password and no audit row).
 
+CLAUDE.md §1.8's asymmetry — arming costs a password, disarming asks nothing — is right for
+the *kill* direction. But a reconciliation halt is not a kill switch an operator is turning
+off; it is a claim about the state of the book. Those need different gates, and today they
+share one.
+
 **Fix.** Require a fresh clean reconcile before a reconciliation halt can be cleared, and
-record who cleared it against what evidence.
+record the halt against the evidence that cleared it, not only the person.
 
 ### F14 — The daily report's halt count is a stale row, and this day's halt counts zero `medium`
 
@@ -625,7 +636,7 @@ Worth stating plainly, because day 2 fixed real things:
 | **F6** crashes self-inflicted | **Fixed** — zero crashes |
 | **F7** crash-looping worker cannot halt itself | **Fixed** — no crash loop |
 | **F8** nothing repeated the halt | **Fixed** — 11 reminders, all alerting |
-| **F9** halt cleared with no password/audit | **Not fixed** — cleared in a 49s visit (F13) |
+| **F9** halt cleared with no password/audit | **Fixed** — `scripts/halt.py` and `POST /risk/resume` both demand the password (`risk.py:831`) and write an audit row |
 | **F10** three scheduled jobs are dormant stubs | **Partly fixed** — `generate_daily_report` and `rollover_daily_counters` now run; `apply_corporate_actions` runs and **crashes** (F7) |
 | **F11** sizing not survivable on the intended timeframe | **Open, and worse than thought** — see F8: the slow average also straddles a market closure |
 | **F12** full-stack restart during RTH | **Fixed** — zero restarts |
