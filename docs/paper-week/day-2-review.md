@@ -527,7 +527,16 @@ config revision was loaded. Day 1 could confirm all three. Start the capture bef
   `upsert_bars([bar])`, so it is one database round trip and one log line per bar. Batch the
   writes; log the batch. The line also carries **no `symbol`** (`bars.py:118`), so ADR 0026's
   own per-symbol coverage baseline cannot be reproduced from the log at all.
-- **A 129.6-second whole-host stall at 11:43:47**, mid-backfill and pre-market. It explains why
+- **A 129.6-second whole-host stall at 11:43:47**, mid-backfill and pre-market. Both container
+  healthchecks missed five consecutive beats at the same moment — the only availability blip of
+  the day.
+- **The arq queue worker produced no log output at all.** Day 1's capture had a `queue`
+  container; day 2's has five, and `queue` is not among them. It may simply have been idle, but
+  a container that logs nothing for ten hours cannot be distinguished from one that is not
+  running.
+- **Every WebSocket upgrade logs an nginx warning** — the API sends both `Date` and `date`.
+- **A 22-minute burst of 401s** ending when the operator logged back in at 14:23: the session
+  expired while the dashboard kept refetching, and nothing told the operator until they looked. It explains why
   `stream_subscribed` lands 2m17s after `stream_connected`. No trading impact, but a stall that
   long during RTH would be a staleness halt.
 
@@ -557,8 +566,21 @@ The positions read happened **after** the clear, and
 reconciliation halt is an assertion that the two books now agree, and the platform accepted
 that assertion without checking it — or asking the operator whether they had.
 
-Human-shaped API navigation stops at **14:29:19** and does not resume until **21:38:03** — a
-**7h09m gap** that swallows the entire incident.
+**And they were watching when it broke.** ADR 0022 removed timer polling, so the dashboard
+refetches only on window focus — which turns the access log into a presence trace. There are
+**65 such bursts**, dense every one to six minutes from 14:23 onward, and one of them is:
+
+```
+17:00:52 → 17:00:54     ← risk.killswitch.engaged fired at 17:00:52.799
+```
+
+Then four thinning glances — 17:10:55, 17:28:00, 17:32:03, 17:58:09 — and nothing for
+**3h40m** until 21:38:03.
+
+So the operator did not miss the halt. They saw it land, looked four more times over the next
+hour, **left at 17:58 with two hours of the session still to run**, and came back only to clear
+it. The 11 reminders that fired between 17:15 and 19:45 reached a phone nobody acted on, and
+the reminder went silent at 19:45 anyway (F4c).
 
 CLAUDE.md §1.8 is deliberate that arming `allow_live_orders` costs a password and is audited,
 while turning it *off* asks for nothing. That asymmetry is right for the kill direction. But
@@ -573,6 +595,28 @@ share one.
 
 **Fix.** Require a fresh clean reconcile before a reconciliation halt can be cleared, and
 record the halt against the evidence that cleared it, not only the person.
+
+### F15 — Nothing scrapes the metrics, and nothing ever did `high`
+
+Day 1's F1 blamed an unset `METRICS_TOKEN` for `atp_strategy_evaluations_total` never
+exporting. Day 2 shows the token was never the binding constraint.
+
+The log cannot say whether it was set: `metrics_server.py:141-163` emits
+`worker.metrics_disabled` on the disabled path **and** `worker.metrics_serving` on the enabled
+one, both at boot, and neither appears — because the boot is not in this capture (F11).
+
+It can answer the question behind it. Across all 14,989 records there are **zero `/metrics`
+requests**, and **no prometheus, grafana or scrape service exists in any compose file**. The 19
+metric names in `metrics/registry.py` are declared, incremented, and collected by nobody.
+
+So day 1's outcome recurs whether or not the token was set, and every operational question this
+review had to answer — how many evaluations, how complete the tape, how long a position ran
+unprotected — was answerable only by parsing container logs. That is the shape of every finding
+in §4 that begins "nothing says so".
+
+**Fix.** Either stand up a scraper and make the metrics real, or stop declaring metrics and
+invest the same effort in the durable rows F2 and F3 need. A metrics endpoint nobody reads is
+indistinguishable from no metrics, and it is worse, because it looks like coverage.
 
 ### F14 — The daily report's halt count is a stale row, and this day's halt counts zero `medium`
 
@@ -667,8 +711,13 @@ Worth stating plainly, because day 2 fixed real things:
   `ok:true` (`alerts/sinks.py:311-335`), and there were **0** `alert.send_failed` all day. Day
   1's F8 — *"nothing repeated the halt for 2h37m"* — is closed. The alerting worked; the
   attention did not (F4c, F13).
-- **Stability.** One warmup, zero crashes, zero restarts, zero config changes, no full-stack
-  bounce during RTH. Day 1's F6, F7 and F12 are closed.
+- **Stability.** **Zero restarts of any container inside the window**, zero crashes, zero
+  config changes, no full-stack bounce during RTH. Day 1's F6, F7 and F12 are closed.
+  *(The proof is not the single `runner.warmed_up` — `runner.py:492` re-runs warmup at each
+  open, so one warmup proves one session, not one process. It is `runner.evaluated
+  evaluations=` running 1 → 386 with no gap or regression, `halt_reminder reminder=1..11`,
+  postgres holding checkpointer PID `[27]` across all 101 checkpoints, redis keeping its `1:M`
+  prefix and monotonic fork PIDs, and `worker.starting` appearing nowhere.)*
 - **The engine-side stop fallback is reachable and fired 19 times.** Day 1's F2 is closed. It
   is now the *only* protection, which is B1's point — but it works.
 - **No secrets anywhere in 14,989 records.** CLAUDE.md §1.6 clean.
@@ -687,7 +736,7 @@ Worth stating plainly, because day 2 fixed real things:
 |---|---|
 | **B1** runner reads a series nothing writes | **Partly fixed** — reader and writer agree on `1m`; the *strategy* still declares `1d` (F8) |
 | **B2** market entry into a flat symbol cannot be priced | **Fixed** — 76 entries priced and filled |
-| **F1** strategy loop unobservable | **Fixed** — 386 `runner.evaluated` |
+| **F1** strategy loop unobservable | **Fixed in logs, not in metrics** — 386 `runner.evaluated`, but nothing scrapes `/metrics` (F15) |
 | **F2** engine-side stop fallback unreachable | **Fixed** — 19 `runner.stop_triggered` |
 | **F3** kill switch has no exit carve-out | **Fixed** — 5 exits allowed, 40 entries refused |
 | **F4** worker never reads halt state at boot | **Untestable** — no boot in this capture (F11) |
