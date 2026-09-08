@@ -86,6 +86,10 @@ covered the last 2h59m of RTH. The reconciler compares two book snapshots taken 
 apart while orders are in flight. It is not a real divergence — the very next run, five
 minutes later, was clean, with no intervention.
 
+And the day's only profit came from that discontinuity: INTC, entered at 14:18 while the slow
+average was still anchored to the previous Friday, returned 113% of the day's gross P&L. The
+other 36 trades lost money (§5, F8).
+
 **Recommendation: hold day 3.** Fix B1 (one line, plus a test), fix the alerting gap in F3,
 and put a quiescence guard on the reconciler (F4). Day 2's trades are not evidence about the
 strategy; they are evidence about the plumbing.
@@ -425,9 +429,16 @@ of the open while the slow average stayed half-stale — and the first order of 
 **14:01**, thirty-one minutes in. *(That the stale slow average manufactured that particular
 crossover is an inference, not established; the discontinuity itself is arithmetic.)*
 
+**And it is where the day's entire profit came from.** The stale bars aged out at about
+14:25:33. The five entries taken before that — KO, PEP, PFE, INTC, JNJ — are the only ones
+priced against a Friday-anchored slow average, and INTC alone returned **+$106.03, or 113% of
+the day's gross P&L**. The other 36 trades, on contiguous data, lost **$66.30** between them
+(§5).
+
 **This is the survivorship/lookahead family of error** that CLAUDE.md §5 exists to catch: a
 number that looks plausible and is meaningless. A moving average is only defined over a
-contiguous series.
+contiguous series — and here the one trade that made the day was taken on the part of the
+series that was not.
 
 **Fix.** Three things, and the third matters most:
 1. Require an explicit `timeframe` in the strategy config that must equal the worker's; refuse
@@ -585,23 +596,59 @@ names rather than a rolling 24 hours.
 
 ---
 
-## 5. The day's result
-
-Stated for completeness, and **not** as evidence about the strategy — see F8 and B1.
+## 5. The day's result, and why it is not one
 
 FIFO-matched from the 174 fill events using per-order VWAP: **38 completed round trips**, zero
-residual, **gross realised +$94.20** on $185,177.17 bought against $185,271.37 sold.
-**15 winners, 23 losers**; best INTC +$121.05, worst −$15.02. Corroborated independently by
-`runner.evaluated ... open_positions=0` at 19:59:36.
+residual, **gross realised +$94.20** on $185,177 of entry notional. **15 winners, 23 losers.**
+Median hold 17.1 minutes. Corroborated by `runner.evaluated ... open_positions=0` at 19:59:36.
 
-Costs are not modelled here and no benchmark is attached, so this is a bookkeeping figure, not
-a performance claim. On a day when 40 entry signals were refused for three hours and every
-position ran unprotected, +$94.20 on $100,000 of equity is noise.
+Then look at where the $94.20 came from:
 
-The 19 engine-side stop exits filled at a **net +$2.58** against their armed levels — a wash.
-The software fallback did not cost money on this tape. What it cannot do is survive the worker.
+| Symbol | Realised |
+|---|---:|
+| **INTC** | **+106.03** |
+| GOOGL | +54.47 |
+| QQQ | +18.82 |
+| BAC | +18.41 |
+| *…14 others…* | *…* |
+| PFE | −30.30 |
+| **Total** | **+94.20** |
 
----
+**INTC alone is 113% of the day's gross profit.** Strip INTC and GOOGL and the remaining 36
+trades lose **−$66.30**.
+
+Now put that against F8. The stale Friday bars aged out of the SMA(50) window at about
+**14:25:33**. The day's first five entries are:
+
+```
+14:01:24  KO     14:08:26  PEP    14:13:28  PFE
+14:18:30  INTC   14:19:31  JNJ
+        ── slow window flushes ~14:25 ──
+14:25:33  CSCO   … and the rest of the day
+```
+
+Every entry taken while the slow average was still anchored to the previous Friday is in that
+list of five — and **INTC, the fourth of them, produced more than the entire day's profit.**
+
+So the honest reading is not "the strategy made $94.20 on a quiet tape". It is: **the only
+profit of the day came from a crossover manufactured by a moving average that spanned a
+four-day market closure, and the 36 trades taken on contiguous data lost money.**
+
+*(The concentration is measured; that the discontinuity caused INTC's entry specifically is
+inference. The arithmetic and the timing are reproducible from the log — see the method note
+below. Costs are not modelled and no benchmark is attached, so none of this is a performance
+claim either way.)*
+
+Two further splits worth recording:
+
+- **Exits by kind.** 19 exits came from the engine-side stop, 19 from a crossover signal. The
+  19 stop exits lost **−$144.10**; the 19 signal exits made **+$238.30**.
+- **Stop slippage.** Those 19 engine-side stops filled at a net **+$2.58** against their armed
+  levels — a wash. The software fallback did not cost money on this tape. What it cannot do is
+  survive the worker.
+
+*Method: per-order VWAP over all 174 fill events, FIFO-matched per symbol, buy/sell taken from
+`order.submitted`. Reproducible from `events_all.log` alone.*
 
 ## 6. What worked
 
