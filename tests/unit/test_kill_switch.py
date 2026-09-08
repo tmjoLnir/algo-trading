@@ -1235,3 +1235,130 @@ class TestClearingReportsWhatItActuallyRemoved:
 
         assert ks.is_engaged() is False
         assert ks.is_engaged("any", "SPY") is True
+
+
+class TestTheDashboardIsToldAboutAnEscalation:
+    """Nothing polls (ADR 0022), so the pubsub announcement is the whole of what
+    puts a halt in front of a reader who has not asked.
+
+    That was tested for `engaged` and `cleared` and not for `escalated` — and
+    the escalation is the transition where the *screen* would otherwise keep
+    rendering the pre-escalation halt: the wrong reason, and no unproven
+    symbols, while the platform is refusing to close them and the operator has
+    no on-screen explanation. Dropping `_announce("escalated", …)` left the
+    whole suite green.
+    """
+
+    def test_an_escalation_is_published(self) -> None:
+        ks, redis = switch()
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+        before = len(redis.published)
+
+        ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY",),
+        )
+
+        assert len(redis.published) == before + 1
+        channel, raw = redis.published[-1]
+        assert channel == CHANNEL_HALTS
+        message = json.loads(raw)
+        assert message["type"] == "halt"
+        assert message["transition"] == "escalated"
+
+    def test_the_published_escalation_carries_the_new_reason(self) -> None:
+        """A message saying only "something changed" would leave the client
+        rendering `manual` until it re-read — and re-reading is the client's
+        job, but only because this told it to."""
+        ks, redis = switch()
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY",),
+        )
+
+        message = json.loads(redis.published[-1][1])
+        assert message["reason"] == "reconciliation_mismatch"
+
+    def test_a_halt_born_with_evidence_publishes_once_as_engaged(self) -> None:
+        """The creation path is one transition, not two. A second message would
+        make the client re-read twice for one event."""
+        ks, redis = switch()
+
+        ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY",),
+        )
+
+        assert len(redis.published) == 1
+        assert json.loads(redis.published[0][1])["transition"] == "engaged"
+
+
+class TestTheContendedRaiseCarriesWhichFailureItWas:
+    """`halt_stands` is the field `POST /risk/halt` branches on, and until this
+    nothing asserted the *real* switch sets it.
+
+    The API tests construct the exception by hand, and the switch tests asserted
+    the message text — so inverting `halt_stands` at either raise site left the
+    entire suite green while the endpoint answered 409 "trading IS halted" for
+    the shape where nothing was written. That is the error that tells someone to
+    walk away from a live account.
+    """
+
+    def test_an_occupied_key_says_a_halt_stands(self) -> None:
+        ks, redis = switch()
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+        rival = 0
+
+        def always_lose(client: FakeRedis) -> None:
+            nonlocal rival
+            rival += 1
+            client.store[client.scan_iter("*")[0]] = json.dumps(
+                {
+                    "scope": "global",
+                    "reason": "manual",
+                    "engaged_at": f"2024-06-03T14:30:{rival:02d}+00:00",
+                    "engaged_by": "ops",
+                    "detail": "",
+                    "target": None,
+                }
+            )
+
+        redis.before_cas = always_lose
+
+        with pytest.raises(KillSwitchUnavailableError) as raised:
+            ks.engage(
+                HaltScope.GLOBAL,
+                HaltReason.RECONCILIATION_MISMATCH,
+                "reconciler",
+                unproven_symbols=("SPY",),
+            )
+
+        assert raised.value.halt_stands is True
+        assert "a halt is standing" in str(raised.value), "the field and the prose must agree"
+
+    def test_a_key_cleared_under_us_says_no_halt_may_be_in_force(self) -> None:
+        ks, redis = switch()
+        real_set = redis.set
+
+        def always_taken(key: str, value: str, nx: bool = False) -> bool | None:
+            return None if nx else real_set(key, value)
+
+        def always_gone(key: str) -> str | None:
+            return None
+
+        redis.set = always_taken  # type: ignore[method-assign]
+        redis.get = always_gone  # type: ignore[method-assign]
+
+        with pytest.raises(KillSwitchUnavailableError) as raised:
+            ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        assert raised.value.halt_stands is False
+        assert "NO halt may be in force" in str(raised.value)
