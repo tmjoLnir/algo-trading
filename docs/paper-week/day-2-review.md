@@ -65,6 +65,10 @@ Three consequences follow:
 3. **The end-of-day report counts the failures as successes.** `orders_submitted=201` is
    76 real orders + 85 rejected stops + 40 risk refusals, added together as one number.
 
+And the operator could not have caught it by looking: the dashboard showed a stop price and a
+healthy gauge for every one of those positions, because it reads the level the engine armed
+rather than the order the venue holds (F2a).
+
 **This is the one condition the paper week exists to test.** `docs/SAFETY.md:125` lists as a
 go-live gate: *"Every strategy has a stop loss configured; there are no unprotected
 positions."* And `analytics/paper_run.py:261` carries a clause written for exactly this:
@@ -246,6 +250,42 @@ make a non-zero value the headline rather than a footnote. Populate `realised_pn
 fills, or say `NOT MEASURED` the way the feed-incidents section already honestly does — the
 machinery for admitting a gap is right there and unused.
 
+### F2a — The dashboard showed a stop on every position that did not have one `critical`
+
+The operator read `/api/v1/positions` **six times between 14:23 and 14:29**, by which point
+16 `order.position_unprotected` CRITICALs had already fired for KO, PEP, PFE, INTC, JNJ and
+CSCO.
+
+The screen told them those positions were protected.
+
+`router.py:510` arms `position.stop_loss_price` **before** submitting the child order — good
+design, and the reason the engine-side fallback works at all. But
+`dashboard/snapshot.py:310` then reads that same field:
+
+```python
+stop_loss_price=position.stop_loss_price,      # armed, not working
+...
+stop = position.stop_loss_price                # snapshot.py:328 — drives the gauge
+```
+
+and `apps/web/src/components/PositionsTable.tsx:49` renders `StopGauge({fraction, hasStop})`
+from it. Grep `dashboard/snapshot.py` for `broker_side_protected`, `unprotected` or
+`protective`: **zero hits**. The dashboard has no concept of venue-side protection at all.
+
+`OrderRouter.broker_side_protected_qty()` exists — `router.py:585` — and its docstring explains
+precisely why a boolean is not good enough ("A boolean says 'protected' for a partially covered
+position and suppresses the engine-side fallback over the uncovered remainder"). The runner
+calls it. The dashboard never does.
+
+So the one artifact the operator actually looked at, on the one day it mattered, reported the
+opposite of the truth. This is why F3's alerting gap was not survivable: an operator who
+mistrusted the silence and went to check would have been reassured.
+
+**Fix.** Feed `broker_side_protected_qty` into the position snapshot and render armed-only
+protection differently from working protection — a gauge that cannot tell them apart should not
+be drawn. This is the fourth guard in this review that exists in the codebase and is not called
+at the one place it was needed.
+
 ### F3 — 85 CRITICAL lines produced zero alerts `high`
 
 Every alert sent on 2026-09-08:
@@ -263,8 +303,19 @@ machinery alerts well; the protection machinery does not alert at all. Note the 
 the platform woke a human 11 times for a **false-positive halt**, and zero times for a **real
 loss of protection**.
 
+Two structural reasons this was possible, both worth fixing on their own:
+
+- **Log level and notification are entirely decoupled.** There are 47 `log.critical` call sites
+  and 11 `Alert(...)` sites, and nothing reconciles them. `position_unprotected` simply has no
+  `Alert` behind it — there is no throttle that suppressed it, because there was never anything
+  to throttle.
+- **`Alert.key` is never sent to either transport.** Three modules reason carefully about
+  deduplication by key, and the field does not reach the wire.
+
 **Fix.** Route `order.position_unprotected` to the alert port, deduplicated by symbol with a
-session-level "N symbols unprotected" rollup so 85 events become one actionable page. Add
+session-level "N symbols unprotected" rollup so 85 events become one actionable page. Then make
+the coupling explicit: a `log.critical` with no alert route should be a lint failure, not a
+judgement call at each call site. Add
 `atp_positions_unprotected` to `metrics/registry.py` — there is no metric for it today — and
 persist it, so SAFETY.md's go-live gate can be evaluated from the database rather than from
 `docker compose logs`.
@@ -374,9 +425,15 @@ render it `unchanged`.
 order.position_unprotected  detail= entry_order_id=... qty=56 rule= symbol=KO
 ```
 
-`router.py:550-551` populates these from `outcome.decision.rule` and `.reason` — fields set on
-a **risk denial**. This order was not risk-denied; it was **broker-rejected**, and the decision
-object is empty. The surrounding comment reasons entirely about risk rules ("a transient rule
+`router.py:547` populates these from `outcome.decision.rule` and `.reason` — fields set on a
+**risk denial**. This order was not risk-denied; it was **broker-rejected**, and `router.py:977`
+hands back the *approving* `RiskDecision`, whose `rule` and `reason` default to `""`
+(`risk/engine.py:36-42`).
+
+`docs/RUNBOOK.md:889` opens its procedure with *"Read `rule` in the log line."* **That
+instruction was unexecutable 85 times.** The reason did exist — on the paired WARNING one
+millisecond earlier — so the day's diagnostic sat at WARNING while the alarm sat at CRITICAL
+with its payload stripped. The surrounding comment reasons entirely about risk rules ("a transient rule
 declined", "`kill_switch` *can* reach here now") — the broker-rejection path was never
 considered. The single most important alert of the day says nothing about why.
 
@@ -566,21 +623,27 @@ The positions read happened **after** the clear, and
 reconciliation halt is an assertion that the two books now agree, and the platform accepted
 that assertion without checking it — or asking the operator whether they had.
 
-**And they were watching when it broke.** ADR 0022 removed timer polling, so the dashboard
-refetches only on window focus — which turns the access log into a presence trace. There are
-**65 such bursts**, dense every one to six minutes from 14:23 onward, and one of them is:
+**Nobody was watching when it broke**, and the request profile is how we know. ADR 0022 lists
+three automatic refetch triggers, and only two need a human: `refetchOnWindowFocus`, and
+`staleTime: 0` on in-app navigation. **The third — *"a fill or a halt on the WebSocket re-reads
+the dashboard"* — fires into an empty room by design**, because "a screen whose job is to
+interrupt somebody cannot require them to consult it first."
 
-```
-17:00:52 → 17:00:54     ← risk.killswitch.engaged fired at 17:00:52.799
-```
+Separating them by what they request:
 
-Then four thinning glances — 17:10:55, 17:28:00, 17:32:03, 17:58:09 — and nothing for
-**3h40m** until 21:38:03.
+| Window | Requests | Distinct paths |
+|---|---|---|
+| 14:23:54 → 14:29:19 | 66 | **13** — `/strategies`, `/orders`, `/positions`, `/worker/config`, `/backtests`, `/risk/rejections`, `/risk/status`, `/auth/me`… |
+| 17:00:52 → 17:00:54 (halt) | 5 | **2** — `/dashboard/live` ×4, `/ws` |
+| 17:28 → 17:32 | 10 | **2** — same |
 
-So the operator did not miss the halt. They saw it land, looked four more times over the next
-hour, **left at 17:58 with two hours of the session still to run**, and came back only to clear
-it. The 11 reminders that fired between 17:15 and 19:45 reached a phone nobody acted on, and
-the reminder went silent at 19:45 anyway (F4c).
+Thirteen distinct endpoints is a person clicking through the app. Two is the push refetch. So
+the banner **did** fire at 17:00:54, exactly as ADR 0022 intends — and there is nothing in the
+log to distinguish that from an open, unattended tab. **The last human-shaped navigation ends
+at 14:29:19**, and the next human action is 21:38:03.
+
+The 11 reminders between 17:15 and 19:45 reached a phone nobody acted on, and the reminder went
+silent at 19:45 anyway (F4c).
 
 CLAUDE.md §1.8 is deliberate that arming `allow_live_orders` costs a password and is audited,
 while turning it *off* asks for nothing. That asymmetry is right for the kill direction. But
@@ -793,7 +856,8 @@ book ended flat. What it lacks is the last inch of wiring on three guards that w
 written: `round_price`, `RESERVED_TEST_SYMBOLS`, and an alert route for the one condition that
 most needed one.
 
-The pattern is worth naming, because it is the same pattern three times. This codebase reasons
-carefully — the docstrings on `round_price`, on `Decimal(str(...))`, on the GTC stop, on the
-exit carve-out are all correct, and several of them predict the exact failure that then
-occurred. What is missing is not judgement. It is the call site.
+The pattern is worth naming, because it is the same pattern four times: `round_price`
+(`market.py:43`), `RESERVED_TEST_SYMBOLS` (`seed.py:59`), `broker_side_protected_qty`
+(`router.py:585`), and an alert route for the one condition that most needed one. This codebase
+reasons carefully — the docstrings on all of them are correct, and several predict the exact
+failure that then occurred. What is missing is not judgement. **It is the call site.**
