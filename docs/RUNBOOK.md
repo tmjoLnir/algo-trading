@@ -179,8 +179,16 @@ exit sized off a disputed quantity is how a flatten opens a short. Get flat in
 them through the broker if you need to before step 3.
 
 A cash drift or an orphaned order also halts here and impugns **nothing** —
-every position stays closeable. If the alert named no symbols, that is the case
-you are in.
+every position stays closeable.
+
+**Do not judge which case you are in from the alert body.** The halt alert
+carries the reconcile's own summary, and that summary names a symbol for *every*
+kind of finding — including the orphaned order, which impugns nothing. A halt
+over a protective stop left resting by a restart reads `orphan_order: SPY` while
+SPY is perfectly closeable. `scripts/halt.py status` is the authority: it lists
+each impugnment explicitly, or lists none. The second, separate alert titled
+**"Halt escalated: cannot prove …"** is the other reliable signal — if it never
+arrived, nothing is impugned.
 
 Clearing the halt is the only thing that lifts an impugnment. A later reconcile
 finding the symbol correct does not retract the earlier one; a human decides

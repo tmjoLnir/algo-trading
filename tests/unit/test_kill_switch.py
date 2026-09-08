@@ -624,6 +624,38 @@ class TestEscalation:
         assert len(latest.impugned) == 1
         assert redis.evals == 0, "a repeated finding is not a write"
 
+    def test_a_partially_overlapping_finding_brings_its_new_symbol_in(self) -> None:
+        """The boundary the subset test is actually for, and the shape the
+        reconciler produces every five minutes.
+
+        Each pass re-reports the **whole** disputed set, so the second one is
+        `{SPY, QQQ}` against a standing `{SPY}` — overlapping, not disjoint and
+        not a repeat. `not set(...) <= existing` says fresh, and QQQ becomes
+        unproven. Written as the obvious wrong thing —
+        `not (set(...) & existing)`, "have I seen any of these before" — the
+        same call answers "already covered" and QQQ is silently closeable while
+        the reconciler goes on reporting it. Every other test in this class
+        passes under that mutation: the exact repeat, the strict subset and the
+        disjoint case all agree with it. Only this one disagrees.
+        """
+        ks, _ = switch()
+        ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY",),
+        )
+
+        after = ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY", "QQQ"),
+        )
+
+        assert after.unproven_symbols == frozenset({"SPY", "QQQ"})
+        assert ks.halt_state(symbol="QQQ").position_is_unproven("QQQ")
+
     def test_a_subset_of_a_standing_impugnment_is_not_appended(self) -> None:
         """The reconciler's finding shrinks as positions are fixed one at a
         time. `{SPY}` arriving against a standing `{SPY, QQQ}` is not news."""

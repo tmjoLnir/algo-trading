@@ -10,15 +10,19 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from atp_core.alerts.ports import Alert
 
 from atp_core.clock import SimulatedClock
 from atp_core.domain import Order, OrderType, Portfolio, Position, Side
 from atp_core.errors import BrokerConnectionError
 from atp_core.execution.reconciliation import DiscrepancyKind, Reconciler
-from atp_core.risk.killswitch import HaltReason
-from tests.fakes import FakeBroker, FakeKillSwitch
+from atp_core.risk.killswitch import HaltReason, RedisKillSwitch
+from tests.fakes import FakeBroker, FakeKillSwitch, FakeRedis
 
 NOW = datetime(2024, 6, 3, 14, 30, tzinfo=UTC)
 
@@ -469,3 +473,57 @@ class TestTheClassificationIsTotal:
             DiscrepancyKind.MISSING_POSITION,
             DiscrepancyKind.UNKNOWN_POSITION,
         }
+
+
+class TestTheAlertBodyIsNotAnImpugnmentTest:
+    """An operator cannot tell what is impugned by reading the halt alert, and
+    docs/RUNBOOK.md says so because this test says so.
+
+    `_alert_engaged` carries `report.summary()`, and the summary names a symbol
+    for *every* kind of finding — `orphan_order` included, whose symbol is the
+    resting order's. So the alert for a protective stop left behind by a restart
+    reads `orphan_order: SPY` while SPY is perfectly closeable. An earlier draft
+    of the runbook told the operator "if the alert named no symbols, nothing is
+    impugned", which gives the opposite answer in exactly this case. The signal
+    that works is the *second* alert, or `scripts/halt.py status`.
+    """
+
+    class Sink:
+        def __init__(self) -> None:
+            self.sent: list[Alert] = []
+
+        def send(self, alert: Alert) -> None:
+            self.sent.append(alert)
+
+    @pytest.mark.asyncio
+    async def test_an_orphan_names_a_symbol_it_does_not_impugn(self) -> None:
+        broker, redis, sink = FakeBroker(), FakeRedis(), self.Sink()
+        switch = RedisKillSwitch(redis, alerts=sink)  # type: ignore[arg-type]
+        reconciler = Reconciler(broker, switch, SimulatedClock(NOW))
+        portfolio = Portfolio(cash=Decimal("100000"), starting_equity=Decimal("100000"))
+        broker.hold("SPY", Decimal("100"), Decimal("500"))
+        hold(portfolio, "SPY", "100")
+        await broker.submit_order(an_order("a-stop-from-before-the-restart"))
+
+        await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert "SPY" in sink.sent[0].body, "the summary names it — that is the trap"
+        assert not switch.halt_state(symbol="SPY").position_is_unproven("SPY")
+        assert len(sink.sent) == 1, "and no second alert, which is the signal that works"
+
+    @pytest.mark.asyncio
+    async def test_a_real_mismatch_does_send_the_second_alert(self) -> None:
+        """The other half. The signal has to fire when it should, or "no second
+        alert" means nothing."""
+        broker, redis, sink = FakeBroker(), FakeRedis(), self.Sink()
+        switch = RedisKillSwitch(redis, alerts=sink)  # type: ignore[arg-type]
+        reconciler = Reconciler(broker, switch, SimulatedClock(NOW))
+        portfolio = Portfolio(cash=Decimal("100000"), starting_equity=Decimal("100000"))
+        broker.hold("SPY", Decimal("1000"), Decimal("500"))
+        hold(portfolio, "SPY", "100")
+
+        await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert len(sink.sent) == 2
+        assert "cannot prove SPY" in sink.sent[1].title
+        assert switch.halt_state(symbol="SPY").position_is_unproven("SPY")
