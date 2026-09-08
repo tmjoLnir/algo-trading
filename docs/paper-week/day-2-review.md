@@ -234,36 +234,104 @@ loss of protection**.
 **Fix.** Route `order.position_unprotected` to the alert port, deduplicated by symbol with a
 session-level "N symbols unprotected" rollup so 85 events become one actionable page.
 
-### F4 — The reconciler races in-flight orders and halts on the result `high`
+### F4 — The reconciler reads its two books at different times, and halts on the difference `critical`
+
+Not a book divergence. A **read-ordering race inside the reconciler**, and the asymmetry is
+visible in one line:
+
+```python
+# apps/worker/src/atp_worker/scheduler.py:289-290
+report = await session.reconciler.reconcile(
+    session.portfolio, known_orders=session.open_orders()
+)
+```
+
+`session.open_orders()` is a **call**, evaluated as an argument expression *before* the
+coroutine runs. `session.portfolio` is a **live object reference**, whose state is read inside
+at `reconciliation.py:200`. Between them sit three sequential broker awaits
+(`get_positions`, `get_open_orders`, `get_account`, `reconciliation.py:182-184`).
+
+So the local order set is read **too early**, the local portfolio **too late**, and the
+broker's three snapshots are scattered in between — about 1.4 seconds end to end. For any
+order in flight, both errors point the same way.
 
 ```
-17:00:51.429  job_starting reconcile_with_broker        ← broker snapshot taken
-17:00:51.681  QQQ stop_triggered → exit submitted
-17:00:51.967  INTC stop_triggered → exit submitted
-17:00:52.219  QQQ partial fill (1 of 6)
-17:00:52.451  INTC fills 47 → position closes
-17:00:52.799  reconcile.mismatch → killswitch.engaged (global)
+17:00:51.429  job_starting                       ← known_orders snapshotted here
+17:00:51.681  QQQ exit submitted                 ← 252 ms after that snapshot
+17:00:51.967  INTC exit submitted
+17:00:52.219  QQQ fills 1 of 6
+17:00:52.451  INTC fills 47 → booked locally
+17:00:52.799  mismatch → killswitch.engaged      ← portfolio read here
 ```
 
-`missing_position: INTC` — closed on the platform after the broker snapshot.
-`orphan_order: QQQ` + `position_qty: QQQ` — a live partial exit inside the comparison window.
-Three "discrepancies", all of them the same 1.4-second window.
+Every field decodes to a read artifact:
 
-**Proof it is a false positive:** the next scheduled run at 17:05:55 was `execution.reconcile.clean
-open_orders=0 positions=5`, with no operator action in between. The 17:10:56 escalation is the
-same race against PEP's exit, submitted at 17:10:55.135, 0.5s before that run started.
+- `orphan_order: QQQ`, `orphan orders: atp-8c1a369c511562feff193f54` — **the platform's own QQQ
+  exit**, submitted 1.12 s after the `known_orders` snapshot that could not contain it.
+- `missing_position: INTC` — `MISSING_POSITION` means "the broker holds a position we do not"
+  (`reconciliation.py:281`). Ours = 0 because the fill was booked at 52.451; theirs = 47 from a
+  `get_positions()` call made before it.
+- `position_qty: QQQ` — ours 5, theirs 6, mid-exit.
+
+**The proof is statistical and total.** Of the 78 scheduled reconcile runs, **exactly 2 had any
+`order.submitted` or `execution.trade_update.filled` inside their job window — and those are
+exactly the 2 that halted.** All 76 quiet windows were clean. Perfect precision and
+specificity. The 17:05:55 run, five minutes later and quiet, was `clean positions=5` with no
+intervention.
+
+**Correction to a tempting story:** this is only *partly* downstream of B1. Run 1's exits were
+`runner.stop_triggered` — engine-side stops that exist only because the broker stops were
+rejected. Run 2's PEP exit carries no `stop_triggered`; it was an ordinary signal exit. So the
+rejections supplied the order flow for one of the two halts, and the mechanism for neither. F4
+would fire on a fully protected platform too.
 
 Cost: **2h59m07s of RTH** with entries refused, and a halt that outlived the close by 1h38m.
 
-**Fix.** Take both books at one instant, or require quiescence — no fills and no working
-orders for N seconds — before declaring a divergence. Failing that, re-check once before
-halting: a divergence that clears on immediate re-read is a race, not a break.
+**Fix.** Read both books at one instant — snapshot the portfolio at the same point as
+`open_orders()`, inside the reconciler — or require quiescence (no fills, no working orders for
+N seconds) before declaring a divergence. Failing either, re-read once before halting: a
+divergence that clears on immediate re-read is a race.
 
-### F5 — `from_reason=None` on an escalation that had a reason `medium`
+### F4a — The exit carve-out held by about two seconds `high`
 
-`risk.killswitch.escalated ... from_reason=None reason=reconciliation_mismatch`. The halt
-being escalated was engaged 10 minutes earlier with `reason=reconciliation_mismatch`, not
-`None`. The field that exists to show what changed reports the previous state as absent.
+The halt's impugnment named **INTC, QQQ and PEP** — and an impugned symbol is the *void* in the
+exit carve-out (ADR 0029): the halt says it cannot prove those positions, so it will not let
+them out.
+
+It cost nothing only because all three were going flat at the exact moments they were
+impugned. INTC's 47 filled at 17:00:52.451, 0.35 s before the halt named it. QQQ finished at
+17:00:54.329. PEP's exit was already submitted when the escalation named it.
+
+Had any of the three still held size, the platform would have refused to close it for **4h37m,
+through the close, with no broker-side stop anywhere** — the exact trap the carve-out exists to
+prevent, produced by a halt that was a false positive to begin with.
+
+**Fix.** An impugnment raised by a *transient* reconciliation artifact must not void the exit
+carve-out. Re-read before impugning (F4), and let a symbol out on a confirmed flat.
+
+### F4b — The reconciler's halt writes no audit row `medium`
+
+The 4h37m global halt exists only as a log line and a Redis key. `HALT_ENGAGED` is written at
+four sites — `api/routers/risk.py:762,872` and `scripts/halt.py:312,352` — and
+`risk/killswitch.py` imports no audit sink. See F14 for what that does to the daily report.
+
+### F4c — The halt reminder goes silent exactly when it is needed most `high`
+
+`remind_about_halts` is RTH-gated: 26 firings from 13:30 to 19:45, then nothing. The halt ran
+until 21:38. The reminder was silent for the final **1h53m** — the longest unattended stretch
+of the incident, and the only part of it after the operator might plausibly have finished their
+day.
+
+**Fix.** An engaged halt is a state, not a market-hours event. Remind until it clears.
+
+### F5 — `from_reason=None` reads as a bug and is not one `low`
+
+`risk.killswitch.escalated ... from_reason=None reason=reconciliation_mismatch` looks like a
+lost field: the halt being escalated was engaged 10 minutes earlier *with* that reason. It is
+in fact intended — `from_reason` is emitted only when the reason **changes**, and here it did
+not. But a field that renders `None` for "unchanged" is indistinguishable from one that lost
+its value, on the single most-read line of the worst incident of the day. Omit the key, or
+render it `unchanged`.
 
 ### F6 — The unprotected alert carries an empty reason `medium`
 
@@ -354,7 +422,25 @@ config revision was loaded. Day 1 could confirm all three. Start the capture bef
 ### F13 — A reconciliation halt clears in 49 seconds with no evidence trail `medium`
 
 The operator's entire final visit was 21:38:03 → 21:38:52. One `POST /api/v1/risk/resume` at
-21:38:31 cleared a global halt naming three unproven symbols, 1h38m after the close.
+21:38:31 cleared a global halt naming three unproven symbols, 1h38m after the close — **28
+seconds after loading the dashboard**.
+
+The order of requests is the finding:
+
+```
+21:38:03  dashboard loaded
+21:38:31  POST /api/v1/risk/resume     ← halt cleared
+21:38:43  GET  /api/v1/positions       ← the book read 12s AFTER clearing
+21:38:47  GET  /api/v1/orders
+```
+
+`docs/RUNBOOK.md` "Reconciliation mismatch" step 1 is *compare `GET /api/v1/positions` with the
+broker's own UI*; step 3 is `adopt_broker_state()`. The positions read happened after the
+clear, and `execution.reconcile.adopted_broker_state` appears **0 times** all day. The runbook
+was not followed, and nothing required it to be.
+
+Human-shaped API navigation stops at **14:29:19** and does not resume until **21:38:03** — a
+**7h09m gap** that swallows the entire incident.
 
 CLAUDE.md §1.8 is deliberate that arming `allow_live_orders` costs a password and is audited,
 while turning it *off* asks for nothing. That asymmetry is right for the kill direction. But
@@ -417,8 +503,11 @@ Worth stating plainly, because day 2 fixed real things:
 - **The halt does what it claims.** All 40 denials are `side=buy`; all 5 post-halt submissions
   are `side=sell`. The exit carve-out (commit `8154201`) let the book flatten completely while
   refusing every new entry. **The platform ended the day flat.**
-- **The halt reminder works.** 11 reminders, every 15 minutes, each one alerting. Day 1's F8 —
-  *"nothing repeated the halt for 2h37m"* — is closed.
+- **The halt reminder works, and the alerts really were delivered.** 11 reminders, every 15
+  minutes, each one alerting. `alert.sent` is emitted only after Telegram returns HTTP 200 with
+  `ok:true` (`alerts/sinks.py:311-335`), and there were **0** `alert.send_failed` all day. Day
+  1's F8 — *"nothing repeated the halt for 2h37m"* — is closed. The alerting worked; the
+  attention did not (F4c, F13).
 - **Stability.** One warmup, zero crashes, zero restarts, zero config changes, no full-stack
   bounce during RTH. Day 1's F6, F7 and F12 are closed.
 - **The engine-side stop fallback is reachable and fired 19 times.** Day 1's F2 is closed. It
