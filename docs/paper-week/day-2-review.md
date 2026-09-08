@@ -224,12 +224,23 @@ unprotected count, which it currently cannot see at all.
 ### F2 — The daily report cannot see that every position was unprotected `high`
 
 `worker.daily_report` names symbols, trades, risk rejections, halts, and honestly declares
-`feed incidents NOT MEASURED`. It says nothing about protection, because it has no field for
-it. On the one day when every position in the book ran naked, the operator's end-of-day
-artifact reads as a normal day.
+`feed incidents NOT MEASURED`. It says nothing about protection, because `DailyReport`
+(`analytics/daily.py:72-86`) has **no field for it** — the dataclass carries
+`orders_submitted`, `orders_filled`, `orders_refused`, `refusals_by_rule`, `symbols`,
+`realised_pnl`, `starting_equity` and `ending_equity`, and nothing about stops. On the one day
+when every position in the book ran naked, the operator's end-of-day artifact reads as a
+normal day.
 
-**Fix.** Add `positions_unprotected` and `protective_orders_rejected` to the report, and make
-a non-zero value the headline rather than a footnote.
+It also has `realised_pnl`, `starting_equity` and `ending_equity` — and **printed none of
+them**, so all three were `None`. The day's realised P&L was computable from the fill stream
+this whole time (§5: +$94.20 over 38 round trips). A report with a P&L field that silently
+renders nothing is worse than one without: the operator cannot tell "flat" from "not
+measured".
+
+**Fix.** Add `positions_unprotected` and `protective_orders_rejected` to `DailyReport`, and
+make a non-zero value the headline rather than a footnote. Populate `realised_pnl` from the
+fills, or say `NOT MEASURED` the way the feed-incidents section already honestly does — the
+machinery for admitting a gap is right there and unused.
 
 ### F3 — 85 CRITICAL lines produced zero alerts `high`
 
