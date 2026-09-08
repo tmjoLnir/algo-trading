@@ -144,7 +144,7 @@ cannot lower projected exposure), and that call is correctly about the settled
 book because that is the book being projected. It is the one place the predicate
 reads the same book it always did.
 
-The *predicate* there is a known hole, and it is left open deliberately.
+**Closed by ADR 0028**, and not the way this section expected. The *predicate* there is a known hole, and it is left open deliberately.
 `reduces_position` is quantity-blind, so a working reversal — `SELL 300` against
 a settled long of 100 — is dropped from the projection entirely, and the
 committed book still shows a long of 100 when that fill would leave it short

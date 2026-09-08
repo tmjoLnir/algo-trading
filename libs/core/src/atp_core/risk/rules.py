@@ -216,6 +216,88 @@ def project_pending(portfolio: Portfolio, pending: Iterable[Order]) -> Portfolio
     return replace(portfolio, cash=cash, positions=positions)
 
 
+def in_flight_by_symbol(pending: Iterable[Order]) -> dict[str, tuple[Decimal, Decimal]]:
+    """Per symbol, how much is still working on each side.
+
+    The summary `RiskBooks.in_flight` carries, built here beside the projection
+    because the two read the same list and must agree about `remaining_qty`.
+    """
+    totals: dict[str, list[Decimal]] = {}
+    for order in pending:
+        remaining = order.remaining_qty
+        if remaining <= 0:
+            continue
+        side = totals.setdefault(order.symbol, [Decimal(0), Decimal(0)])
+        side[0 if order.side is Side.BUY else 1] += remaining
+    return {symbol: (buys, sells) for symbol, (buys, sells) in totals.items()}
+
+
+def _producible_quantities(symbol: str, books: RiskBooks) -> list[Decimal]:
+    """The resting quantities `symbol` can end up at, given what is working.
+
+    Three candidates rather than one per subset of the orders in flight: the
+    reachable quantities are the interval ``[held - sells, held + buys]``,
+    ``|x + q|`` is convex, and the maximum of a convex function over an interval
+    is at an endpoint. `held` itself is the third because it is the outcome
+    where *nothing* fills — a cancel, a reject, an expiry, a DAY limit dying at
+    the close — which is the one outcome always available, and the one the
+    magnitude filter below can otherwise leave uncovered.
+
+    That filter is ADR 0020's asymmetry, unchanged and stated as a property of
+    the *outcome* rather than of a predicate: an outcome showing less of the
+    symbol than the account holds is not considered, because assuming a resting
+    reduction filled would lower a ceiling on the strength of an exit that has
+    not happened. `held` always survives it, so the list is never empty.
+
+    The committed quantity is appended unfiltered. For any `RiskBooks` the
+    engine builds it already lies inside the interval and adds nothing — but
+    including it is what makes "no ceiling measures less than it did before
+    ADR 0028" true of *every* `RiskBooks`, including one assembled by hand.
+    """
+    settled = books.settled.positions.get(symbol)
+    held = settled.qty if settled is not None else Decimal(0)
+    buys, sells = books.in_flight.get(symbol, (Decimal(0), Decimal(0)))
+    outcomes = [q for q in (held, held + buys, held - sells) if abs(q) >= abs(held)]
+    committed = books.committed.positions.get(symbol)
+    outcomes.append(committed.qty if committed is not None else Decimal(0))
+    return outcomes
+
+
+def worst_resulting_qty(order: Order, books: RiskBooks) -> Decimal:
+    """The largest position this order can leave in its symbol.
+
+    Over every outcome the orders in flight can produce — including the one
+    where none of them do. A ceiling caps what an order *leaves behind*, and
+    what it leaves behind depends on orders whose fate is not yet decided, so
+    the cap has to hold for all of them.
+
+    This is where a working reversal becomes visible. A `SELL 300` against a
+    settled long of 100 leaves a short of 200; the projection drops it, because
+    ADR 0020's predicate there is quantity-blind, and the committed book goes on
+    saying long 100. The bound says 200, and both ceilings ask for the bound.
+
+    **Deliberately not solved by projecting the reversal into `committed`**, and
+    the reason is arithmetic rather than taste. `Portfolio` carries one cash
+    balance and one mark per symbol, so a projected reversal moves quantity,
+    market value, cash and equity together. On a book holding +100 at a mark of
+    100, showing the short of 200 moves market value by -30,000, and the only
+    way to hold equity where it was is to credit 30,000 of cash the account has
+    not been paid — which is exactly the number `BuyingPowerRule` reads. Every
+    candidate cash value either loosens buying power or manufactures a drawdown
+    that `StrategyRunner._escalate` turns into a global halt; there is no safe
+    one. One book cannot be conservative about exposure and about cash at once,
+    so the exposure bound is a bound rather than a book, and the projection's
+    cash is left exactly as ADR 0020 wrote it.
+    """
+    signed = order.qty * order.side.sign
+    return max(abs(q + signed) for q in _producible_quantities(order.symbol, books))
+
+
+def worst_magnitude(symbol: str, books: RiskBooks) -> Decimal:
+    """`worst_resulting_qty` for a symbol no order under test touches."""
+    return max(abs(q) for q in _producible_quantities(symbol, books))
+
+
 def _unpriced_book(rule: str, portfolio: Portfolio) -> RiskDecision | None:
     """Refuse while any open position lacks a mark.
 
@@ -356,10 +438,12 @@ class MaxPositionSizeRule:
         if equity <= 0:
             return RiskDecision.deny(self.name, f"equity is {equity}")
 
-        held = portfolio.position(order.symbol).qty
         # The position this order *leaves behind*, not the order on its own —
-        # three orders of 4% each are a 12% position.
-        resulting = abs(held + order.qty * order.side.sign) * price
+        # three orders of 4% each are a 12% position — and over every outcome
+        # the orders in flight can produce rather than only the projected one
+        # (ADR 0028). `worst_resulting_qty` is never below the committed book's
+        # own answer, so this rule cannot come out looser than it was.
+        resulting = worst_resulting_qty(order, books) * price
         ceiling = limits.max_position_pct * equity
         if resulting > ceiling:
             return RiskDecision.deny(
@@ -405,6 +489,34 @@ class MaxExposureRule:
         # ceiling exactly as a long growing more long does.
         without = portfolio.gross_exposure - abs(held) * price
         resulting = without + abs(held + order.qty * order.side.sign) * price
+
+        # The committed book's number, plus what the orders in flight can add to
+        # it (ADR 0028). Written as an *increment* rather than as a replacement
+        # so both corrections are visibly non-negative: this rule measures at
+        # least what it measured before the change, whatever the book. HEAD's
+        # own price-mixing in `without` is preserved rather than quietly
+        # "fixed", which would have been a change in the loosening direction.
+        signed = order.qty * order.side.sign
+        resulting += (worst_resulting_qty(order, books) - abs(held + signed)) * price
+        for symbol in books.in_flight:
+            if symbol == order.symbol:
+                continue
+            position = portfolio.positions.get(symbol)
+            projected = position.qty if position is not None else Decimal(0)
+            extra = worst_magnitude(symbol, books) - abs(projected)
+            if extra <= 0:
+                continue
+            mark = position.last_price if position is not None else None
+            if mark is None:
+                # Default-closed, for the reason `_unpriced_book` gives: a
+                # working quantity nobody can value is the same problem as a
+                # held one, and it does not reach `unmarked_symbols` while the
+                # projected position happens to net to flat.
+                return RiskDecision.deny(
+                    self.name, f"cannot value the working quantity in {symbol}: no mark"
+                )
+            resulting += extra * mark
+
         ceiling = limits.max_gross_exposure_pct * equity
         if resulting > ceiling:
             return RiskDecision.deny(

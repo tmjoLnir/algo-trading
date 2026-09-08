@@ -10,14 +10,14 @@ allows. An unpriced position is exactly when you least want to be trading.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 from atp_core import metrics
 from atp_core.errors import ConfigError, RiskLimitBreachedError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Mapping
     from datetime import datetime
     from decimal import Decimal
 
@@ -95,6 +95,19 @@ class RiskBooks:
     #: What the account holds right now, moved only by fills. What a
     #: **permission** measures: whether there is a position here to reduce.
     settled: Portfolio
+    #: symbol -> (working BUY quantity, working SELL quantity), summed over the
+    #: orders in flight (ADR 0028).
+    #:
+    #: The third thing a ceiling needs, and the one neither `Portfolio` can
+    #: carry. `committed` is *one* outcome; a symbol with orders working on both
+    #: sides has several, and which is conservative differs per order. A
+    #: `Portfolio` welds quantity, mark and cash into a single equity, and the
+    #: conservative direction is not the same on all three axes — so the bound a
+    #: ceiling needs cannot be a book. It is this, and `rules.worst_resulting_qty`
+    #: turns it into a number.
+    #:
+    #: Empty in `of()` and by default, which is exactly "nothing is in flight".
+    in_flight: Mapping[str, tuple[Decimal, Decimal]] = field(default_factory=dict)
 
     @classmethod
     def of(cls, portfolio: Portfolio) -> RiskBooks:
@@ -205,9 +218,16 @@ class RiskEngine:
         # `default_rules` gives: `rules` needs `RiskDecision` from this module
         # at runtime, and a top-level import in both directions would not
         # resolve.
-        from atp_core.risk.rules import project_pending
+        from atp_core.risk.rules import in_flight_by_symbol, project_pending
 
-        books = RiskBooks(committed=project_pending(portfolio, pending), settled=portfolio)
+        # Materialised because it is read twice, and `pending` is an iterable a
+        # caller may hand over as a generator.
+        working = list(pending)
+        books = RiskBooks(
+            committed=project_pending(portfolio, working),
+            settled=portfolio,
+            in_flight=in_flight_by_symbol(working),
+        )
 
         adjusted: Decimal | None = None
         for rule in self.rules:

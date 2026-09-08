@@ -37,9 +37,11 @@ from atp_core.risk.rules import (
     StaleDataRule,
     TradingHoursRule,
     closes_without_reversing,
+    in_flight_by_symbol,
     position_size,
     project_pending,
     reduces_position,
+    worst_resulting_qty,
 )
 from atp_core.strategy.rules import PositionSizeSpec
 from tests.fakes import FakeKillSwitch
@@ -1381,3 +1383,122 @@ class TestTheExemptionIsAnExitQuestionToo:
 
         assert closes_without_reversing(sell, books.settled) is False
         assert MaxExposureRule().check(sell, books, limits()).approved  # judged, and fine
+
+
+class TestAWorkingReversalIsVisibleToTheCeilings:
+    """ADR 0028. `project_pending` drops a working reversal — its predicate is
+    quantity-blind — so the committed book says long 100 while a `SELL 300`
+    works and the fill would leave a short of 200.
+
+    The reversal is *not* fixed by projecting it into the committed book, and
+    the reason is arithmetic. `Portfolio` welds quantity, mark and cash into one
+    equity, so showing the short moves market value and the only way to hold
+    equity still is to credit cash the account has not been paid — which is the
+    number `BuyingPowerRule` reads. Every candidate value either loosens buying
+    power or manufactures a drawdown. So the bound is a bound, not a book.
+    """
+
+    @staticmethod
+    def _books(settled: Portfolio, *pending: Order) -> RiskBooks:
+        return RiskBooks(
+            committed=project_pending(settled, pending),
+            settled=settled,
+            in_flight=in_flight_by_symbol(pending),
+        )
+
+    def test_the_committed_book_still_hides_the_reversal(self) -> None:
+        """Pinning the premise, so this class fails loudly if the projection is
+        ever changed to carry reversals after all."""
+        settled = portfolio(SPY=(100.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", side=Side.SELL, qty=300, limit=100))
+
+        assert books.committed.position("SPY").qty == Decimal(100)
+
+    def test_the_bound_sees_it(self) -> None:
+        settled = portfolio(SPY=(100.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", side=Side.SELL, qty=300, limit=100))
+
+        # A further SELL 1 lands on a book that may be short 200, not long 100.
+        assert worst_resulting_qty(
+            order(symbol="SPY", side=Side.SELL, qty=1, limit=100), books
+        ) == Decimal(201)
+
+    def test_the_position_cap_refuses_what_the_reversal_makes_too_big(self) -> None:
+        # Equity 100,000, so the 10% cap is 10,000.
+        #
+        # The order under test must not itself be an exit, or ADR 0027's
+        # exemption allows it before the cap measures anything — `SELL 50`
+        # against a settled long of 100 closes into the position and is exempt,
+        # correctly. `SELL 150` carries it through flat, so the cap gets to look:
+        # 5,000 against the committed book (long 100 -> short 50) and 35,000
+        # against the book the working reversal can produce (short 200 -> 350).
+        # The cap sits between the two, which is the whole point of the case.
+        settled = portfolio(cash=90_000, SPY=(100.0, 100.0))
+        working = order(symbol="SPY", side=Side.SELL, qty=300, limit=100)
+
+        entry = order(symbol="SPY", side=Side.SELL, qty=150, limit=100)
+        assert MaxPositionSizeRule().check(entry, RiskBooks.of(settled), limits()).approved
+        assert (
+            not MaxPositionSizeRule().check(entry, self._books(settled, working), limits()).approved
+        )
+
+    def test_the_exposure_cap_counts_a_reversal_in_another_symbol(self) -> None:
+        """The per-symbol correction: a reversal working in IWM raises the gross
+        exposure an order in SPY is measured against."""
+        # Equity 100,000, ceiling 15,000. HEAD measures 12,000; the reversal
+        # IWM can produce adds 100 shares at its mark, taking it to 22,000.
+        settled = portfolio(cash=89_000, SPY=(10.0, 100.0), IWM=(100.0, 100.0))
+        working = order(symbol="IWM", side=Side.SELL, qty=300, limit=100)
+        tight = limits(max_gross_exposure_pct=Decimal("0.15"), max_position_pct=Decimal("0.15"))
+        entry = order(symbol="SPY", qty=10, limit=100)
+
+        assert MaxExposureRule().check(entry, RiskBooks.of(settled), tight).approved
+        assert not MaxExposureRule().check(entry, self._books(settled, working), tight).approved
+
+    def test_nothing_in_flight_is_exactly_head(self) -> None:
+        """`RiskBooks.of` carries no in-flight summary, so every number the two
+        ceilings compute is the one they computed before ADR 0028."""
+        settled = portfolio(SPY=(100.0, 100.0))
+        entry = order(symbol="SPY", qty=40, limit=100)
+
+        assert worst_resulting_qty(entry, RiskBooks.of(settled)) == Decimal(140)
+
+    def test_the_outcome_where_nothing_fills_is_always_covered(self) -> None:
+        """A cancel, a reject, an expiry, a DAY limit dying at the close. The
+        settled holding is a candidate outcome in its own right, so the bound
+        never assumes a working order fills."""
+        settled = portfolio(SPY=(100.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", side=Side.SELL, qty=300, limit=100))
+
+        # 100 held + a BUY 40 that lands after the reversal is cancelled.
+        assert worst_resulting_qty(order(symbol="SPY", qty=40, limit=100), books) >= Decimal(140)
+
+    def test_a_resting_reduction_still_does_not_lower_a_ceiling(self) -> None:
+        """ADR 0020's asymmetry, restated as a property of the outcome: an
+        outcome showing less of the symbol than is held is not considered, so a
+        resting protective stop cannot license a position the cap would refuse."""
+        settled = portfolio(SPY=(100.0, 100.0))
+        stop = order(symbol="SPY", side=Side.SELL, qty=100, limit=95)
+        books = self._books(settled, stop)
+
+        assert worst_resulting_qty(order(symbol="SPY", qty=40, limit=100), books) == Decimal(140)
+
+    def test_an_unvaluable_working_quantity_elsewhere_is_refused(self) -> None:
+        """Default-closed, for `_unpriced_book`'s reason: a working quantity
+        nobody can value is the same problem as a held one, and it does not
+        reach `unmarked_symbols` while the projected position nets to flat."""
+        # IWM flat and unmarked, with a BUY 100 and a SELL 100 working. Neither
+        # reduces a flat position, so the projection carries both and they net
+        # to flat — the symbol never reaches `unmarked_symbols`, so
+        # `_unpriced_book` does not fire and this branch is the only guard left.
+        settled = portfolio(cash=0, SPY=(100.0, 100.0))
+        books = self._books(
+            settled,
+            order(symbol="IWM", qty=100, limit=None),
+            order(symbol="IWM", side=Side.SELL, qty=100, limit=None),
+        )
+
+        decision = MaxExposureRule().check(order(symbol="SPY", qty=10, limit=100), books, limits())
+
+        assert not decision.approved
+        assert "cannot value the working quantity in IWM" in decision.reason
