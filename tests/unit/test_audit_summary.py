@@ -99,9 +99,7 @@ GLANCE_ROW = re.compile(r"^\| +(\d+) \| (.+?) \| `([^`]+)` \| (\S+) \|$")
 STATE_EMOJI = {"Closed": "🟢", "Half-closed": "🟡", "Open": "🔴"}
 
 #: `Of the 74 still open, **51 have never been re-checked by anyone**`
-NEVER_RECHECKED = re.compile(
-    r"Of the (\d+) still open, \*\*(\d+) have never been re-checked by anyone\*\*"
-)
+NEVER_RECHECKED = re.compile(r"Of the (\d+) still open, \*\*(\d+) are still marked ⚠️ Reported\*\*")
 
 #: §8.1: `57 of the 82 findings are marked ⚠️ … I verified 25 myself, including
 #: 8 of the 14 high-severity findings.` The sentence that tells a reader how
@@ -313,10 +311,17 @@ class TestTheStateTable:
         ]
 
     def test_the_never_rechecked_count_matches(self, text: str, findings: list[Finding]) -> None:
-        """ "51 have never been re-checked by anyone" is the sentence that says
-        how much of the open set is a lead rather than a defect. It moves when
-        a finding is verified *or* when one is closed, so it has two ways to go
-        stale and no obvious moment for either."""
+        """ "40 are still marked ⚠️ Reported" is the sentence that says how much
+        of the open set is a lead rather than a defect. It moves when a finding
+        is verified *or* when one is closed, so it has two ways to go stale and
+        no obvious moment for either.
+
+        It read "have never been re-checked by anyone" until §12, which
+        re-checked all seventy unresolved findings and made that phrasing false
+        while leaving the quantity it pins unchanged. The regex moved with the
+        sentence. That is the intended direction: this file guards a claim, so
+        when the claim stops being true the claim is corrected and the guard
+        follows it — not the other way round."""
         claim = NEVER_RECHECKED.search(text)
         assert claim is not None, "§3 has no 'Of the N still open, **M have never…**' sentence"
 

@@ -4,10 +4,13 @@
 **Commit:** `a71ae8f` (branch `claude/repo-audit-fu1irg`)  
 **Findings:** 82 (14 high, 40 medium, 28 low)
 
-**State reviewed:** 2026-09-03 against `f9eef10`, under the record conventions
-`docs/ROADMAP.md` sets for a file of this kind. 12 closed, 1 half-closed, 69
-open; 15 citations were re-anchored in this pass. The first review, and why
-this file needed one at all, is §10; the second is §11.
+**State reviewed:** 2026-09-07 against `c0886b6`, under the record conventions
+`docs/ROADMAP.md` sets for a file of this kind. 15 closed, 7 half-closed, 60
+open; every unresolved finding was re-checked against the tree. The first review, and why this file needed one at all, is §10; the second
+is §11; the third — the one that re-checked every open finding against the tree
+rather than the file against itself — is §12. §13 is the first section whose
+diff *fixes* what it marks closed, rather than recording work that had already
+merged.
 
 ---
 
@@ -72,7 +75,7 @@ claims turned out to be false (see §7), so expect some of the ⚠️ set not to
 | 🟡 Low | 4 | 12 | 12 | **28** |
 | **Total** | **32** | **36** | **14** | **82** |
 
-### By state, as at 2026-09-03 (`f9eef10`)
+### By state, as at 2026-09-07 (`c0886b6`)
 
 Derived from the state marks on the findings below and worth nothing if it
 disagrees with them, which `tests/unit/test_audit_summary.py` fails the build
@@ -81,13 +84,20 @@ roadmap's summary. §10.6 said this was missing; it is not any more (#129).
 
 | | 🟢 Closed | 🟡 Half-closed | 🔴 Open | Total |
 |---|---:|---:|---:|---:|
-| 🔴 High | 1 | 0 | 13 | **14** |
-| 🟠 Medium | 8 | 1 | 31 | **40** |
+| 🔴 High | 2 | 2 | 10 | **14** |
+| 🟠 Medium | 10 | 5 | 25 | **40** |
 | 🟡 Low | 3 | 0 | 25 | **28** |
-| **Total** | **12** | **1** | **69** | **82** |
+| **Total** | **15** | **7** | **60** | **82** |
 
-Of the 69 still open, **47 have never been re-checked by anyone** — they were
-⚠️ Reported on 2026-08-27 and are ⚠️ Reported now.
+Of the 60 still open, **39 are still marked ⚠️ Reported**.
+
+That sentence used to read "47 have never been re-checked by anyone", and §12
+made it false: all seventy unresolved findings were re-checked against the tree,
+so none is unexamined now. The number it pins has not changed and neither has
+its purpose — what ⚠️ records is how well a finding was established **when it
+was written**, which is what §2 says it means. `test_audit_summary.py` moved
+with the sentence rather than the sentence being bent to keep the old check
+green.
 
 ### By area
 
@@ -117,15 +127,15 @@ Of the 69 still open, **47 have never been re-checked by anyone** — they were
 | 1 | The dashboard's "close position" never cancels the broker-side stop, despite the module docstring saying it does | `apps/api/src/atp_api/execution.py:87` | 🔴 |
 | 2 | The run list and run detail label spec.qty "shares per entry" for every run, including runs the engine never sized by share count | `apps/web/src/components/BacktestRunList.tsx:241` | 🔴 |
 | 3 | The queue's interrupted-run sweep is startup-only with a 2-hour threshold, so a normal container restart never sweeps and the row stays `running` forever | `apps/worker/src/atp_worker/queue.py:161` | 🔴 |
-| 4 | The live runner marks only open positions, so every entry into a symbol the book does not already hold is refused at sizing | `apps/worker/src/atp_worker/runner.py:712` | 🔴 |
+| 4 | The live runner marks only open positions, so every entry into a symbol the book does not already hold is refused at sizing | `apps/worker/src/atp_worker/runner.py:712` | 🟢 |
 | 5 | Trailing-stop ratchets are computed and then discarded: `_exit_reason` short-circuits on `broker_side`, which is always True in the worker | `apps/worker/src/atp_worker/runner.py:820` | 🔴 |
-| 6 | The live runner is pinned to daily bars while the only live writer stores minute bars, so `strategy.on_bar` never fires | `apps/worker/src/atp_worker/trading.py:205` | 🔴 |
+| 6 | The live runner is pinned to daily bars while the only live writer stores minute bars, so `strategy.on_bar` never fires | `apps/worker/src/atp_worker/trading.py:205` | 🟡 |
 | 7 | DASHBOARD.md says every order/position write handler is still a stub; three of them are fully implemented, as DASHBOARD_STATUS.md states | `docs/DASHBOARD.md:860` | 🔴 |
 | 8 | DASHBOARD.md states login rate limiting is not built and "nothing slowing down guesses but bcrypt"; the limiter is implemented and wired | `docs/DASHBOARD.md:818` | 🟢 |
 | 9 | RISK.md names `flatten_at_close` as one of only two defences against overnight gap risk, but the rule compiler refuses any spec that sets it | `docs/RISK.md:167` | 🔴 |
 | 10 | STRATEGY_AUTHORING.md claims the draft→backtesting→paper→live ratchet is "enforced by the API"; every promotion handler is a NotImplementedError stub | `docs/STRATEGY_AUTHORING.md:226` | 🔴 |
 | 11 | A stop/target firing on the same bar as a resting exit order leaves the backtest holding a phantom reversed position | `libs/core/src/atp_core/backtest/engine.py:983` | 🔴 |
-| 12 | The nightly sweep never re-fetches reconnect-backfilled bars, so "nothing is permanently raw-only" is false and those windows become un-backtestable | `libs/core/src/atp_core/data/stream.py:271` | 🔴 |
+| 12 | The nightly sweep never re-fetches reconnect-backfilled bars, so "nothing is permanently raw-only" is false and those windows become un-backtestable | `libs/core/src/atp_core/data/stream.py:271` | 🟡 |
 | 13 | tests/integration/test_kill_switch.py has no `pytest.mark.integration`, so its 5 tests are deselected by CI and by `make test-integration` | `tests/integration/test_kill_switch.py:28` | 🔴 |
 | 14 | `test_money_fields_serialise_as_strings` cannot fail for `unrealized_pnl` or `market_value` — the only test guarding CLAUDE.md §1.1 on the wire is vacuous for nullable fields | `tests/unit/test_api_contract.py:89` | 🔴 |
 
@@ -206,7 +216,9 @@ The row is stranded at `running` permanently — the exact outcome the module's 
 
 #### 4. The live runner marks only open positions, so every entry into a symbol the book does not already hold is refused at sizing
 
-`apps/worker/src/atp_worker/runner.py:712` · Broken · 🔴 High · ✅ Verified · 🔴 **Open**
+`apps/worker/src/atp_worker/runner.py:712` · Broken · 🔴 High · ✅ Verified · 🟢 **Closed** — @claude (#135)
+
+*Record note (§12, 2026-09-07): `_mark` prices the whole watchlist as of `4caf6cf`, so a flat symbol yields a price to sizing; regression at `tests/unit/test_strategy_runner.py`. The citation above is where the defect was, not where the fix is — `runner.py:712` now lands in unrelated code.*
 
 **Evidence**
 
@@ -277,7 +289,9 @@ Confirmed, and worse than stated. `update_trailing` (runner.py:754) moves the le
 
 #### 6. The live runner is pinned to daily bars while the only live writer stores minute bars, so `strategy.on_bar` never fires
 
-`apps/worker/src/atp_worker/trading.py:205` · Broken · 🔴 High · ✅ Verified · 🔴 **Open**
+`apps/worker/src/atp_worker/trading.py:205` · Broken · 🔴 High · ✅ Verified · 🟡 **Half-closed** — @claude (#135)
+
+*Record note (§12, 2026-09-07): The reader half is closed: the runner reads `config.bar_timeframe` and `on_bar` fires. The writer half survives — `data/providers/alpaca.py` still stamps every streamed bar `Timeframe.M1` regardless of the configured timeframe, tracked as day-1 fix audit §4.1.*
 
 *Record note (§11, 2026-09-03): Re-pointed from `:203` to `:205`; #132 added two lines above it.*
 *Record note (§10, 2026-09-02): Cited `:185` on 2026-08-27; the code is at `:203` today.*
@@ -419,7 +433,9 @@ Any run that arms stops (`--stop atr`, or a strategy that emits `stop_loss_price
 
 #### 12. The nightly sweep never re-fetches reconnect-backfilled bars, so "nothing is permanently raw-only" is false and those windows become un-backtestable
 
-`libs/core/src/atp_core/data/stream.py:271` · Broken · 🔴 High · ✅ Verified · 🔴 **Open**
+`libs/core/src/atp_core/data/stream.py:271` · Broken · 🔴 High · ✅ Verified · 🟡 **Half-closed** — @claude (#139)
+
+*Record note (§12, 2026-09-07): A repair now exists — `apply_corporate_actions`, pre-open, last 7 days — but it is not the nightly sweep, and three defects survive: `data/stream.py` and `docs/DATA.md` still credit the sweep, `docs/DATA.md` contradicts itself on whether raw-only windows are repaired, and `1h`/`4h` are outside `SUPPORTED_TIMEFRAMES` so are never refreshed at all. Half-closed rather than closed because the finding's own remedy — the sweep re-fetches, or the two claims are withdrawn — happened neither way.*
 
 **Evidence**
 
@@ -486,7 +502,7 @@ Confirmed by collection. `pytest tests/integration --collect-only` gathers 196 t
 
 #### 14. `test_money_fields_serialise_as_strings` cannot fail for `unrealized_pnl` or `market_value` — the only test guarding CLAUDE.md §1.1 on the wire is vacuous for nullable fields
 
-`tests/unit/test_api_contract.py:89` · Broken · 🔴 High · ⚠️ Reported · 🔴 **Open**
+`tests/unit/test_api_contract.py:89` · Broken · 🔴 High · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -742,7 +758,7 @@ Both files claim to pin the behaviour of the emergency-stop and resume controls 
 
 #### 24. Preflight's remedy for missing bar history is a command that cannot run — `--start` is required
 
-`apps/worker/src/atp_worker/preflight.py:320` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
+`apps/worker/src/atp_worker/preflight.py:320` · Broken · 🟠 Medium · ✅ Verified · 🔴 **Open**
 
 *Record note (§11, 2026-09-03): Re-pointed from `:319` to `:320`; #132 added a line above it.*
 *Record note (§10, 2026-09-02): Cited `:311` on 2026-08-27; the code is at `:319` today.*
@@ -1161,7 +1177,9 @@ An operator who buys the SIP subscription and sets `ALPACA_DATA_FEED=sip` gets S
 
 #### 44. StalenessMonitor re-arms itself at the closing bell and logs "market data is flowing again" while the feed is still dead
 
-`libs/core/src/atp_core/data/stream.py:533` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
+`libs/core/src/atp_core/data/stream.py:533` · Broken · 🟠 Medium · ⚠️ Reported · 🟡 **Half-closed** — @claude (#140)
+
+*Record note (§12, 2026-09-07): The false all-clear is fixed: recovery gates on `data_is_current`, and the closing bell re-arms silently. The wording survives — `data/stream.py` and `docs/DATA.md` still promise "halts once per outage" while the deliberate session-boundary re-arm makes a multi-day outage halt once per session.*
 
 *Record note (§10, 2026-09-02): Cited `:528` on 2026-08-27; the code is at `:533` today.*
 
@@ -1193,6 +1211,8 @@ A feed that dies at 15:00 Tuesday and stays dead produces, at 16:00 that day, a 
 
 `libs/core/src/atp_core/execution/router.py:397` · Redundancy · 🟠 Medium · ✅ Verified · 🔴 **Open**
 
+*Record note (§12, 2026-09-07): Still open, and one clause of the evidence below is now false: `broker_side_protected_qty` does have a production caller, added by `4caf6cf` (#135). `has_broker_side_protection` remains uncalled, and the load-bearing half is untouched — no production path closes only the quantity the venue's stop does not cover.*
+
 *Record note (§10, 2026-09-02): Cited `:387` on 2026-08-27; the code is at `:397` today.*
 
 **Evidence**
@@ -1217,7 +1237,9 @@ Confirmed. `broker_side_protected_qty` and `has_broker_side_protection` have no 
 
 #### 46. `OrderRouter.flatten` says four risk rules can refuse an exit; ADR 0005, the API and the runner all say six — and six is correct
 
-`libs/core/src/atp_core/execution/router.py:700` · Inconsistency · 🟠 Medium · ✅ Verified · 🔴 **Open**
+`libs/core/src/atp_core/execution/router.py:700` · Inconsistency · 🟠 Medium · ✅ Verified · 🟡 **Half-closed** — @claude (#136)
+
+*Record note (§12, 2026-09-07): The "four rules" claim was deleted from `flatten`. The entry's own premise did not survive with it: six was never right either, and after ADR 0027 the number is three (`rules.EXIT_BLIND_RULES`). The successor — the remaining over-counts in ADR 0005, `positions.py`, `runner.py`, `RUNBOOK.md` and the generated `schema.d.ts` — was corrected in #142 and #143 rather than tracked as a new finding here.*
 
 *Record note (§10, 2026-09-02): Cited `:683` on 2026-08-27; the code is at `:700` today.*
 
@@ -1271,7 +1293,9 @@ Dead declarations that read as a supported access path. A maintainer who writes 
 
 #### 48. `RedisKillSwitch.engage` is GET-then-SET, so its documented idempotence and alert deduplication break under concurrent halts
 
-`libs/core/src/atp_core/risk/killswitch.py:214` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
+`libs/core/src/atp_core/risk/killswitch.py:214` · Broken · 🟠 Medium · ✅ Verified · 🟢 **Closed** — @claude (#144)
+
+*Record note (§13, 2026-09-08): Verified before it was fixed — the finding was ⚠️ Reported and the lost update is real. `engage` is now `SET NX` for the uncontended case, and on contention re-reads, merges through a one-way latch and writes through a compare-and-set script, bounded at three rounds. Both halves the finding names are restored: only the winning `SET NX` announces, so one incident is one alert and one `halts_engaged`, and `already_halted_by_another` is derived from a record whose `engaged_by` never moves. It was fixed as ADR 0029's prerequisite rather than on its own merits — the cost used to be an audit field and would now be the impugnment the exit carve-out reads. Exhausting the retry raises `KillSwitchUnavailableError`; `POST /risk/halt` reports it as 409, apart from the 503 an unreachable store gets, because the two say opposite things about whether trading is stopped.*
 
 **Evidence**
 
@@ -1295,7 +1319,9 @@ The realistic trigger is the ordinary incident shape: the feed drops and `Stalen
 
 #### 49. RedisKillSwitch stamps the halt record from the wall clock inside libs/core, where every sibling adapter takes an injected Clock for exactly this reason
 
-`libs/core/src/atp_core/risk/killswitch.py:221` · Inconsistency · 🟠 Medium · ✅ Verified · 🔴 **Open**
+`libs/core/src/atp_core/risk/killswitch.py:221` · Inconsistency · 🟠 Medium · ✅ Verified · 🟢 **Closed** — @claude (#144)
+
+*Record note (§13, 2026-09-08): `RedisKillSwitch.__init__` takes a `Clock` and `engage` stamps `engaged_at` — and every `Impugnment` and `HaltEscalation` alongside it — from `self._clock.now()`. Defaulted to `SystemClock()` rather than made required, unlike `Reconciler`'s: the nine existing construction sites are all real processes for which the system clock is the right answer, and a required argument would have been nine call-site edits to say so. `libs/core` now holds no `datetime.now()` outside `SystemClock` and the two live venue adapters.*
 
 **Evidence**
 
@@ -1365,7 +1391,9 @@ Confirmed. This is the only `datetime.now()` in `libs/core` outside `SystemClock
 
 #### 51. `scripts/halt.py` tells an operator that `/risk/resume` is a stub and that flattening has no operator path; both are implemented
 
-`scripts/halt.py:15` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
+`scripts/halt.py:15` · Inconsistency · 🟠 Medium · ⚠️ Reported · 🟡 **Half-closed** — @claude (#136)
+
+*Record note (§12, 2026-09-07): The `/risk/resume` half is closed — the endpoint is implemented. The flatten half survives: `scripts/halt.py` still tells the operator flattening has no operator path when `POST /api/v1/risk/flatten-all` exists.*
 
 **Evidence**
 
@@ -1386,7 +1414,7 @@ This file is what an operator reads during an incident — its own header calls 
 
 #### 52. `halt.py status` accepts and validates `--scope`/`--target` and then ignores them
 
-`scripts/halt.py:78` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
+`scripts/halt.py:78` · Broken · 🟠 Medium · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -1398,7 +1426,9 @@ This file is what an operator reads during an incident — its own header calls 
 
 #### 53. `scripts/halt.py clear` discards the record `KillSwitch.clear` returns and reports success when nothing was halted
 
-`scripts/halt.py:132` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
+`scripts/halt.py:132` · Broken · 🟠 Medium · ⚠️ Reported · 🟡 **Half-closed** — @claude (#136)
+
+*Record note (§12, 2026-09-07): The discarded record now reaches the audit row as `was_halted`. The unconditional success message survives: `halt.py` still reports success when `KillSwitch.clear` returned None and nothing was halted.*
 
 **Evidence**
 
@@ -1416,7 +1446,7 @@ An operator running `halt.py clear --by jo` against the wrong scope or target �
 
 #### 54. `test_reconstructed_pnl_equals_the_pnl_of_the_fills` checks equality in ~1% of generated examples; the other 99% hit a bound so loose it cannot fail
 
-`tests/unit/test_analytics_performance.py:874` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
+`tests/unit/test_analytics_performance.py:874` · Broken · 🟠 Medium · ✅ Verified · 🔴 **Open**
 
 **Evidence**
 
@@ -2057,11 +2087,14 @@ design. Recording them stops the next audit re-deriving them.
 Stated plainly, because an audit that overstates its coverage is worse than a
 shorter one.
 
-1. **The adversarial verification pass did not run.** 54 of the 82 findings are
-   marked ⚠️ and have not been independently re-checked. I verified 28 myself,
-   including 8 of the 14 high-severity findings — 25 in the original pass, #42
-   later by reproduction in the change that closed it (#132), and findings 66
-   and 67 re-read against the source in §11. Verify before acting, and
+1. **The adversarial verification pass did not run.** 49 of the 82 findings are
+   marked ⚠️ and were not independently re-checked *when written*. I verified 33 myself,
+   including 9 of the 14 high-severity findings — 25 in the original pass, #42
+   later by reproduction in the change that closed it (#132), findings 66
+   and 67 re-read against the source in §11, findings 14, 24, 52 and 54
+   reproduced by execution in §12, and finding 48 in §13 — re-read and confirmed
+   before the change that closed it, rather than taken on the reviewer's word
+   while rewriting the method it names. Verify before acting, and
    especially before changing risk or execution code.
 2. **One of thirteen reviewers did not finish** — the repository-wide dead-code
    and duplication sweep over `libs/core`. Partial coverage of that dimension came
@@ -2635,3 +2668,137 @@ own diff. What that review found is §11.7 — including a fabricated number in 
 paragraph directly above this one, which had reported `2,161 pytest tests`. That
 figure is §3's, measured on 2026-08-27; it was copied here and presented as a
 fresh result. Nothing measured it until the review asked.*
+
+---
+## 12. The reconciliation against the tree — 2026-09-07
+
+§10 checked this file against its own conventions. §11 checked `docs/` against
+the tree. This section checks **the findings themselves** against the tree,
+which is the half neither of the first two did and the half the two standing
+tests cannot: `test_audit_citations.py` asks whether a citation still resolves,
+`test_audit_summary.py` asks whether the tables agree with the marks, and both
+say in their own docstrings that whether a finding is still *true* needs a
+human. Reviewed at `c0886b6`, eight merged pull requests (#134–#143) after the
+commit §11 reviewed.
+
+All seventy unresolved findings were re-checked — sixty-nine open plus the one
+half-closed. The method was one agent per batch against the source, then a
+second agent asked to **refute** every claimed state change, defaulting to
+refuted where it could not independently confirm. That second pass was not
+ceremony: it downgraded five `now fixed` verdicts to `partially fixed`,
+including findings 6, 44 and 46, each of which would otherwise have been closed
+here on a half-truth.
+
+### 12.1 Six marks were wrong, and the file could not have known
+
+| # | Was | Now | Earned by |
+|---|---|---|---|
+| 4 | 🔴 Open | 🟢 Closed | #135 |
+| 6 | 🔴 Open | 🟡 Half-closed | #135 |
+| 12 | 🔴 Open | 🟡 Half-closed | #139 |
+| 44 | 🔴 Open | 🟡 Half-closed | #140 |
+| 46 | 🔴 Open | 🟡 Half-closed | #136 |
+| 51 | 🔴 Open | 🟡 Half-closed | #136 |
+| 53 | 🔴 Open | 🟡 Half-closed | #136 |
+
+Seven rows, six of them closed by work that landed **before** §11 reviewed this
+file and was not noticed then. That is the same failure §10.2 recorded — "seven
+findings were fixed and nothing said so" — recurring one review later, and it
+is worth being blunt about why: §11 read `docs/` against the tree and this file
+against `docs/`, but never read a *finding* against the code it accuses. A
+record that is internally consistent and externally stale passes every check
+this repository had.
+
+Only one finding is fully closed. The other six are half-closed because in each
+the fix addressed the mechanism and left the *claim* standing somewhere — a
+docstring still crediting the nightly sweep (12), a document still promising
+"halts once per outage" (44), a script still telling an operator there is no
+flatten path (51). Half-closed is the honest mark for that and the reason §10
+invented it.
+
+### 12.2 One finding's evidence was false, and it stayed open anyway
+
+Finding 45 keeps 🔴 Open, but one clause of its evidence does not survive:
+`broker_side_protected_qty` is no longer uncalled — `4caf6cf` (#135) gave it a
+production caller. The load-bearing half is untouched, so the finding stands and
+the evidence beneath it is corrected in place. A finding can be right for a
+reason that has stopped being true, and that is worth catching separately from
+whether it is still a defect.
+
+### 12.3 What this pass did not do
+
+- **It changed no code.** Every state mark here reflects work that had already
+  merged. The one finding this pass would have closed by fixing it — the halt
+  carve-out reading the wrong book — was a *new* defect found alongside, not one
+  of the 82, and it is ADR 0027 rather than a line in this table.
+- **Four findings moved from ⚠️ to ✅** — 14, 24, 52 and 54 — because they were
+  reproduced by execution here. The other 46 ⚠️ entries were re-checked but not
+  reproduced, and they keep the mark, because §2 defines ✅ as source read and
+  confirmed rather than "somebody looked".
+- **Finding 12 is the one judgement call.** Its own stated remedy was "the sweep
+  re-fetches, or the two claims are withdrawn", and neither happened; a
+  different repair exists instead. Open is defensible. Half-closed is recorded,
+  with the three surviving defects named in the note, because a reader who is
+  told nothing was done would go and build the repair twice.
+
+---
+
+## 13. Two findings, closed by fixing them — 2026-09-08
+
+Every previous section in this file changed marks to match work that had already
+merged. This one is the first where the diff that moves the mark is the diff
+that fixes the defect, which is what `§2` and `CLAUDE.md` §6 both ask for: a
+state annotated with the PR that earned it, in the same diff.
+
+Reviewed and fixed at `d5765bf`, on the branch that became #144.
+
+### 13.1 What closed, and why it closed here rather than on its own merits
+
+**Finding 48** — `engage` was GET-then-SET, so two processes reacting to one
+incident both wrote and the loser's record was silently overwritten.
+
+It was not fixed for its own sake. ADR 0029 makes the halt record carry an
+`Impugnment` — the symbols the platform cannot prove — and `KillSwitchRule`
+reads that to decide whether a flatten may go through. A lost update used to
+cost an audit field; it would now cost the evidence a risk rule consults, and a
+standing halt swallowing a later `broker_unreachable` outright is the exact case
+ADR 0029 exists to catch. The finding was a **prerequisite**, and naming it that
+way is the honest account: it had sat open through three prior review passes and
+what moved it was a different piece of work needing it.
+
+`engage` is now `SET NX` for the uncontended case — one round trip, which is
+what the finding asks for — and on contention re-reads, merges through a pure
+one-way latch, and writes through a compare-and-set script, bounded at three
+rounds. Both halves the finding names are restored: only the winning `SET NX`
+announces, so one incident is one CRITICAL alert and one `halts_engaged`; and
+`already_halted_by_another` is derived from a record whose `engaged_by` never
+moves.
+
+**Finding 49** — the halt record was stamped from the process wall clock inside
+`libs/core`. `RedisKillSwitch.__init__` now takes a `Clock`, and `engage` stamps
+`engaged_at` — plus every `Impugnment` and `HaltEscalation` beside it — from it.
+`libs/core` now holds no `datetime.now()` outside `SystemClock` itself and the
+two live venue adapters.
+
+### 13.2 One evidence mark moved, and it moved before the fix
+
+Finding 48 was ⚠️ Reported and is now ✅ Verified. The order matters: it was
+re-read and confirmed against the source *before* the method it names was
+rewritten, not marked verified afterwards because the replacement works. §2
+defines ✅ as "I re-read the source myself and confirmed it", and a mark awarded
+by having replaced the code would mean something else entirely.
+
+Finding 49 was already ✅ (§10 recorded a verification note beneath it) and its
+mark is unchanged.
+
+### 13.3 What this pass did not do
+
+- **It re-checked nothing else.** §12 re-checked all seventy unresolved findings
+  eight days ago and that work is not repeated here. The other 60 open findings
+  carry §12's marks untouched, and a reader should treat this section as two
+  entries changing state, not as a fourth review.
+- **It closes no half-closed finding.** The seven at 🟡 are where §12 left them.
+- **The defect fixed alongside these two is not in this table.** The exit
+  carve-out reading a halt's reason instead of its evidence was found in
+  `docs/paper-week/day-1-fix-audit.md` §3.1a, not in the 82, and it is recorded
+  as ADR 0029. Findings 48 and 49 are the only entries here that move.

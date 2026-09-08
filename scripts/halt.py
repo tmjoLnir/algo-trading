@@ -201,6 +201,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=[r.value for r in HaltReason],
         help="defaults to manual; the automated reasons are for the code that detects them",
     )
+    engage.add_argument(
+        "--unproven",
+        action="append",
+        default=[],
+        metavar="SYMBOL",
+        help=(
+            "a symbol whose held quantity you cannot vouch for. The platform will "
+            "refuse to close it — including its protective stop — until the halt is "
+            "cleared. Repeatable. Everything else still closes normally"
+        ),
+    )
     _add_scope(engage)
 
     clear = sub.add_parser("clear", help="resume trading — deliberately not the reflex")
@@ -230,6 +241,14 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"--scope {scope.value} needs --target (a strategy id or a symbol)")
     if scope is HaltScope.GLOBAL and args.target:
         raise SystemExit("--target is meaningless with --scope global")
+    # Checked here, before the switch is touched. `_clean_symbols` refuses a
+    # blank symbol inside `engage`, and rightly — a blank would be an
+    # impugnment no order can match and nothing can clear. But it refuses by
+    # raising *before the halt is written*, so `--unproven ""` on the platform's
+    # stop button would record nothing at all and stop nothing. An argument typo
+    # must not be able to do that.
+    if getattr(args, "unproven", None) and any(not s.strip() for s in args.unproven):
+        raise SystemExit("--unproven needs a symbol. Trading was NOT halted.")
 
     settings = get_settings()
     # No `try` around this. A kill switch that cannot reach Redis must fail
@@ -259,6 +278,22 @@ def main(argv: list[str] | None = None) -> int:
                 engaged_by=args.by,
                 detail=args.detail,
                 target=args.target,
+                # An operator can say a quantity is beyond proof, because
+                # otherwise the cron job can protect a symbol and the person
+                # cannot — which is backwards in a platform whose whole
+                # asymmetry is that stopping is reflexive and resuming is
+                # deliberate (ADR 0029, docs/RISK.md). Somebody who has just
+                # read the broker's UI and found it disagreeing with the
+                # dashboard is the best-informed party in the building, and
+                # until this flag existed their only move was to halt and then
+                # watch the platform go on flattening the very symbol they were
+                # halting over.
+                #
+                # Deliberately not on `POST /risk/halt`. It only ever refuses
+                # more, so it is safe in the loosening direction — but the flags
+                # a browser can reach are a decision of their own (CLAUDE.md
+                # §1.8), and nobody has asked for this one there.
+                unproven_symbols=args.unproven,
             )
             already_halted = record.engaged_by != args.by or record.detail != args.detail
             if already_halted:
@@ -352,6 +387,20 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _render(record: HaltRecord) -> str:
+    """One halt, as an operator mid-incident needs to read it.
+
+    `unproven` is here rather than only in the alert because this is the surface
+    someone reaches for *after* the phone buzzed, and an alert they have already
+    dismissed is not a record. Without it the only place naming the symbols the
+    platform will refuse to close is a notification, and docs/SAFETY.md is
+    explicit that alerting is not a layer (ADR 0029).
+
+    `escalated` says the reason in force is not the reason this halt started
+    with, so a reader who was told "manual" an hour ago and now sees
+    `reconciliation_mismatch` is not left wondering whether it is the same
+    incident. `since` and `by` still describe the original, which is the whole
+    point of the latch.
+    """
     lines = [
         f"  scope    {_describe(record.scope, record.target)}",
         f"  reason   {record.reason.value}",
@@ -360,6 +409,29 @@ def _render(record: HaltRecord) -> str:
     ]
     if record.detail:
         lines.append(f"  detail   {record.detail}")
+    escalation = record.escalation
+    if escalation is not None and escalation.from_reason is not record.reason:
+        # Only when the reason actually moved. `_merge` records an escalation
+        # whenever evidence *first* arrives, and both of docs/RUNBOOK.md's
+        # operator halts default to `manual` — so a manual halt met by
+        # `--unproven` carries `from_reason=manual` on a record whose reason is
+        # still manual. "escalated from manual" there describes a transition
+        # nobody saw, because it did not happen.
+        lines.append(
+            f"  escalated from {escalation.from_reason.value} "
+            f"by {escalation.by} at {escalation.at.isoformat()}"
+        )
+    for item in record.impugned:
+        lines.append(
+            f"  unproven {', '.join(item.symbols)}"
+            f"  ({item.reason.value}, {item.by}, {item.at.isoformat()})"
+        )
+    if record.impugned:
+        lines.append(
+            "           ^ these will NOT close through the platform, protective stops "
+            "included.\n             Use the broker's own UI. Everything else closes "
+            "normally. docs/RUNBOOK.md"
+        )
     return "\n".join(lines)
 
 

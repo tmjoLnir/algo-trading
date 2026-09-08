@@ -27,6 +27,7 @@ from atp_api.main import create_app
 from atp_core.audit.ports import Action
 from atp_core.clock import SimulatedClock
 from atp_core.config import Settings, get_settings
+from atp_core.errors import KillSwitchUnavailableError
 from atp_core.risk.killswitch import HaltReason, HaltScope
 from tests.fakes import FakeKillSwitch, RecordingAuditSink
 
@@ -80,6 +81,43 @@ class UnclearableKillSwitch(FakeKillSwitch):
 
     def clear(self, *args: Any, **kwargs: Any) -> Any:
         raise ConnectionError("Error 111 connecting to redis:6379. Connection refused.")
+
+
+class ContendedKillSwitch(FakeKillSwitch):
+    """A kill switch whose write kept losing to another process.
+
+    The opposite state from `UnreachableKillSwitch` and the reason the two are
+    handled apart: here the store answered every time and a halt is standing —
+    what did not land is this request's reason and the symbols it named. An
+    operator told "nothing was written, trading resumes when the store recovers"
+    would re-halt an already halted platform and walk away believing the
+    unproven symbol is closeable.
+    """
+
+    def engage(self, *args: Any, **kwargs: Any) -> Any:
+        raise KillSwitchUnavailableError(
+            "a halt is standing on atp:halt:global and this manual engage could not be "
+            "merged into it after 3 attempts — the reason in force is somebody else's. "
+            "The store is reachable; retry, and confirm with `scripts/halt.py status`",
+            halt_stands=True,
+        )
+
+
+class ClearedUnderUsKillSwitch(FakeKillSwitch):
+    """The *other* contended shape, and the dangerous one to get wrong.
+
+    Every round's `SET NX` lost and the last `GET` then found the key cleared,
+    so nothing was written and nothing may be halted. The store is answering,
+    which means this is not the fail-closed case either — telling an operator
+    "trading IS halted" here is how someone walks away from a live account.
+    """
+
+    def engage(self, *args: Any, **kwargs: Any) -> Any:
+        raise KillSwitchUnavailableError(
+            "could not record a manual halt for atp:halt:global after 3 attempts — the "
+            "key kept being cleared under us, so NO halt may be in force",
+            halt_stands=False,
+        )
 
 
 class UnreachableKillSwitch(FakeKillSwitch):
@@ -349,6 +387,77 @@ class TestWhenTheStoreIsGone:
         detail = (await client.post(HALT, json={})).json()["detail"]
 
         assert "Connection refused" in detail
+
+
+class TestWhenAnotherWriterWon:
+    """The other failure path, which misleads in the opposite direction."""
+
+    @pytest.fixture
+    def app(self, app: FastAPI) -> FastAPI:
+        app.dependency_overrides[get_kill_switch] = ContendedKillSwitch
+        return app
+
+    async def test_it_is_a_409_not_a_503(self, client: httpx.AsyncClient) -> None:
+        """A conflict with another writer, not an unavailable dependency. A
+        client retrying on 503 semantics would be retrying the wrong thing."""
+        response = await client.post(HALT, json={})
+
+        assert response.status_code == 409
+
+    async def test_it_says_trading_is_halted(self, client: httpx.AsyncClient) -> None:
+        """The single most important word, and the one the 503 message denies.
+
+        Every contended round found the key occupied, so a halt is standing. The
+        store's own message is carried through because it names what was lost —
+        which symbols are not recorded as unproven is the only thing here an
+        operator can act on.
+        """
+        detail = (await client.post(HALT, json={})).json()["detail"]
+
+        assert "trading IS halted" in detail
+        assert "The store is reachable" in detail
+        assert "NOT recorded" not in detail, "that is the outage message, and this is not one"
+        assert "resumes on its own" not in detail
+
+    async def test_the_audit_row_is_not_written(self, audit: RecordingAuditSink) -> None:
+        """A row claiming a halt this request did not record is read as "we
+        stopped" by whoever reviews the incident."""
+        # The engage raises, so the handler never reaches the audit write.
+        assert audit.entries == []
+
+
+class TestWhenTheKeyWasClearedUnderUs:
+    """The contended shape where nothing was written. Same exception type as the
+    409 above, opposite meaning — so the handler branches on `halt_stands`, and
+    these tests exist to make sure it keeps doing so."""
+
+    @pytest.fixture
+    def app(self, app: FastAPI) -> FastAPI:
+        app.dependency_overrides[get_kill_switch] = ClearedUnderUsKillSwitch
+        return app
+
+    async def test_it_is_not_a_409(self, client: httpx.AsyncClient) -> None:
+        response = await client.post(HALT, json={})
+
+        assert response.status_code == 503
+
+    async def test_it_does_not_claim_trading_is_halted(self, client: httpx.AsyncClient) -> None:
+        detail = (await client.post(HALT, json={})).json()["detail"]
+
+        assert "NOT recorded" in detail
+        assert "NO halt may be in force" in detail
+        assert "trading IS halted" not in detail
+
+    async def test_it_does_not_promise_the_fail_closed_behaviour_either(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """The unreachable-store 503 says "orders are being refused for as long
+        as the store is unreachable". Here the store is answering, so that
+        sentence would be a second false comfort on top of the first."""
+        detail = (await client.post(HALT, json={})).json()["detail"]
+
+        assert "fails closed" not in detail
+        assert "do NOT assume anything is stopped" in detail
 
 
 class TestRefusals:

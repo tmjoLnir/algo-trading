@@ -45,6 +45,12 @@ apps/web/openapi.json
 node_modules/
 apps/web/dist/
 apps/web/.vite/
+# …and again at the root, because `make test` runs vitest as
+# `npm --prefix apps/web run test`, so its cache directory resolves against the
+# *invoking* directory rather than the package. Every contributor who runs
+# `make test` from the repo root gets one; the `apps/web/` entry above only
+# covers running it from inside the package.
+/.vite/
 *.tsbuildinfo
 npm-debug.log*
 

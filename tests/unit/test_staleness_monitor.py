@@ -19,9 +19,17 @@ import pytest
 from atp_core.alerts.ports import Alert, Severity
 from atp_core.clock import TradingCalendar
 from atp_core.data.stream import STALENESS_ACTOR, IngestorStats, StalenessMonitor
-from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
+from atp_core.risk.killswitch import (
+    HaltReason,
+    HaltRecord,
+    HaltScope,
+    HaltState,
+    Impugnment,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from atp_core.data.stream import StreamIngestor
 
 #: Monday 3 June 2024, 14:30 UTC — 10:30 in New York, an hour into a regular
@@ -40,8 +48,15 @@ class FakeKillSwitch:
     def __init__(self) -> None:
         self.engaged: list[HaltRecord] = []
 
-    def is_engaged(self, strategy_id: str | None = None, symbol: str | None = None) -> bool:
-        return bool(self.engaged)
+    def halt_state(self, strategy_id: str | None = None, symbol: str | None = None) -> HaltState:
+        """The whole state, not a boolean — the monitor reads `.engaged` off it.
+
+        The records are handed back rather than synthesised, so a test that
+        engages with `unproven_symbols` sees them here. The watchdog does not
+        read impugnment today; a double that dropped it would let the day it
+        starts to pass silently.
+        """
+        return HaltState(halts=tuple(self.engaged))
 
     def engage(
         self,
@@ -50,6 +65,8 @@ class FakeKillSwitch:
         engaged_by: str,
         detail: str = "",
         target: str | None = None,
+        *,
+        unproven_symbols: Collection[str] = (),
     ) -> HaltRecord:
         record = HaltRecord(
             scope=scope,
@@ -58,6 +75,11 @@ class FakeKillSwitch:
             engaged_by=engaged_by,
             detail=detail,
             target=target,
+            impugned=(
+                (Impugnment(tuple(unproven_symbols), reason, MIDSESSION, engaged_by, detail),)
+                if unproven_symbols
+                else ()
+            ),
         )
         self.engaged.append(record)
         return record

@@ -106,9 +106,15 @@ ATR(14).
   cancel can lose the race outright.
 - **A protective stop can be refused.** Three of the nine rules judge the order
   rather than whether it reduces a position, so trading hours, the rate limit and
-  stale data can each block one. The other six can never refuse one; the list is
-  `rules.EXIT_BLIND_RULES`, and a unit test derives it from the real chain
-  because the count has been wrong in every document that quoted it.
+  stale data can each block one. The list is `rules.EXIT_BLIND_RULES`, and a
+  unit test derives it from the real chain because the count has been wrong in
+  every document that quoted it.
+
+  **The kill switch is a fourth, on evidence rather than on being an exit**
+  (ADR 0029): a halt that says it cannot prove this symbol's quantity refuses
+  the stop, because the stop is sized off that quantity. Unlike the other three
+  it does not clear by waiting, and the position is uncovered until a human
+  closes it through the broker. The remaining five can never refuse a stop.
   Two rules left that list at ADR 0027 and one left it earlier. The kill switch
   went when it was given its exit carve-out — a halt refusing the protective
   child of an entry that had just filled was SAFETY.md's layers 6 and 5 failing
@@ -269,6 +275,21 @@ that refused them stopped the platform reducing risk as well as taking it — se
 An order that would reverse a position rather than close it is not a reduction
 and is still refused.
 
+**Unless the halt says it cannot prove the size.** "Reduce" is computed from
+`Position.qty`, and two halt reasons exist precisely because that number is in
+doubt — a submit that failed in transport with its outcome unknown, and a
+reconcile that disagrees with the venue. So a halt carries the symbols it cannot
+prove, and the carve-out is void for exactly those: the denial names the symbol
+and sends the operator to the broker's own UI, while every other position in the
+book still closes normally (ADR 0029). This is keyed on the *evidence*, not on
+the `HaltReason` — the same reason means different things depending on where it
+came from, and `reconciliation_mismatch` is also what a dollar of late-settling
+fees engages.
+
+The uncomfortable half: a protective stop in an impugned symbol is refused too,
+because it is sized off the same disputed quantity. The escalation alert names
+those symbols for that reason.
+
 Auto-engages on: daily loss limit breach, reconciliation mismatch, data feed
 loss, broker unreachable, a rate-limit storm, repeated unhandled exceptions.
 Every one of those is wired to a caller; the last two to arrive were the daily
@@ -284,6 +305,16 @@ what the asymmetry above exists to prevent. `rollover_daily_counters` releases
 it narrowly: that reason only, engaged by the risk chain and not by a person who
 picked the same reason, and only when it was engaged before today's session.
 Nothing else halted is touched, so a feed halt standing beside it survives.
+**A fourth condition trumps the other three: the halt must impugn nothing.** If
+it carries an `Impugnment` — a symbol whose quantity the platform cannot prove
+(ADR 0029) — the rollover refuses to release it whatever its reason says, and
+logs `worker.rollover.halt_unproven_not_released` naming the symbols rather than
+skipping it silently. The guard is on the *evidence*, not on the reason and not
+on who supplied it: `scripts/halt.py` offers `--unproven` alongside `--reason`,
+so an operator can add evidence to yesterday's daily-loss halt without changing
+either its reason or its original engager, and all three conditions above would
+otherwise still pass. Nothing automated may decide a disputed position is proven
+again.
 
 **Fails closed.** The switch lives in Redis so that the API can trip it while
 the worker is mid-loop, and so that it survives a restart — a switch that

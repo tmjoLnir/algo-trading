@@ -105,6 +105,30 @@ class InsufficientFundsError(BrokerError): ...
 class RiskError(ATPError): ...
 
 
+class KillSwitchUnavailableError(RiskError):
+    """The halt could not be recorded.
+
+    Raised rather than returned, and never swallowed. `engage` is the platform's
+    stop button: a caller that believes it halted trading and did not is the one
+    outcome worse than an exception, because every later decision is taken on
+    the assumption that the book is frozen.
+
+    **`halt_stands` is the field a handler must branch on**, because two opposite
+    states raise this and an operator acts differently on each. True means every
+    contended round found the key occupied: the store answered, a halt is
+    standing, and what failed to land is this call's reason and its impugnment.
+    False means the last round found the key cleared under us: nothing was
+    written and no halt may be in force. Reporting the second as the first tells
+    someone to walk away from a live account, which is the more dangerous of the
+    two errors — so it is carried as a field rather than left for a caller to
+    parse out of the message.
+    """
+
+    def __init__(self, message: str, *, halt_stands: bool) -> None:
+        self.halt_stands = halt_stands
+        super().__init__(message)
+
+
 class RiskLimitBreachedError(RiskError):
     """A pre-trade check failed. Expected in normal operation, not a bug."""
 

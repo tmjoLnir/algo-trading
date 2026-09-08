@@ -5,11 +5,11 @@
 that claims to fix them, across PRs #134–#139.
 
 > **Status.** Items **1 and 2** of §8's order of work are fixed — §3.4 with §3.4a, and
-> §3.3. Items 3 and 4 are now **partly closed**: §3.2 and the projected-book half of §3.1
-> landed in #142 with ADR 0027, corrected by #143. §3.1a is still open, and is now known to
-> have a prerequisite — `RedisKillSwitch.engage` is first-writer-wins, so a standing halt
-> swallows a later `broker_unreachable` and a reason-aware carve-out would read the wrong
-> reason. Everything in §4 onward is open except §4.4b. The
+> §3.3. Items 3 and 4 are now **closed**: §3.2 and the projected-book half of §3.1 landed
+> in #142 with ADR 0027, corrected by #143; §3.1a is closed by ADR 0029, together with its
+> prerequisite — `RedisKillSwitch.engage` was first-writer-wins, so a standing halt
+> swallowed a later `broker_unreachable` and a reason-aware carve-out would have read the
+> wrong reason. Everything in §4 onward is open except §4.4b. The
 > sections below are left as they were written; where a fix corrected the audit, the
 > correction is recorded at the section rather than by editing the finding.
 >
@@ -83,7 +83,7 @@ interval. Pre-existing (PR #89), unrelated to the day-1 fixes.
 | **B2** | Market entry into a flat symbol cannot be priced | fixed | **fixed** |
 | **F1** | Strategy loop is unobservable | fixed | **fixed** (code half; token is a host action) |
 | **F2** | Engine-side stop fallback unreachable | fixed | **partial** — a second entry drops the gap flag |
-| **F3** | Kill switch has no exit carve-out | fixed | **partial** — projected book fixed (ADR 0027, §3.1/§3.2); §3.1a's halt-reason blindness open |
+| **F3** | Kill switch has no exit carve-out | fixed | **fixed** — projected book (ADR 0027, §3.1/§3.2); the carve-out now reads the halt's evidence (ADR 0029, §3.1a) |
 | **F4** | Worker never reads halt state at boot | fixed | **fixed** |
 | **F5** | Six minutes of data lost, reported as recovered | fixed | **partial** — a quote can still shrink a gap |
 | **F6** | Crashes were self-inflicted | fixed | **partial** — REST half untouched; flap loop unthrottled |
@@ -235,9 +235,11 @@ the dashboard form — and not through the status blob.
 > it. Pinned by `test_risk_engine.py::TestTheTwoBooks`, which fails on every mutation that
 > puts a permission back on the committed book.
 >
-> **§3.1a below is NOT fixed and is not closed by this.** It is a different question — which
-> *halt reasons* should void the carve-out at all — and answering it reverses a rationale
-> `KillSwitchRule` documents deliberately. It needs its own ADR and its own diff.
+> **§3.1a below is not closed by this** and got its own ADR, as this note said it would
+> need. The answer is not the one the question presumes: which *halt reasons* void the
+> carve-out is the wrong axis, because the same reason can mean opposite things. A halt
+> carries the symbols it cannot prove and the carve-out is void for those (ADR 0029), so
+> `KillSwitchRule`'s "deliberately blind to `HaltReason`" rationale survives intact.
 
 
 `KillSwitchRule` (`libs/core/src/atp_core/risk/rules.py:227-246`) permits an order that reduces
@@ -273,6 +275,30 @@ to be the single decisive boolean; measuring it against a hypothetical is the on
 cannot afford.
 
 #### 3.1a The carve-out removed a documented guard the platform implements *as* a halt
+
+> **Fixed** (ADR 0029), and not with the fix this section prescribes. Keying the carve-out
+> on `HaltReason` is a worse bug than the one it closes: `ReconciliationReport.is_clean` is
+> false for a cash drift past a **$1.00** tolerance and for an orphaned order — which this
+> module's own comment calls "most often a protective stop we placed before a restart" —
+> so a dollar of late-settling fees engages `reconciliation_mismatch` and, keyed on the
+> reason, refuses every exit and every protective stop across the whole book, unattended,
+> every five minutes. That is F3 reintroduced with layers 5 and 6 failing together.
+>
+> `broker_unreachable` is worse still, because the *same reason* warrants opposite verdicts
+> depending on where it came from: from the router it names one order whose outcome is
+> unknown; from the reconciler it means only that we could not read the venue — an
+> unverified book, not a disproven one.
+>
+> So the halt carries **evidence** instead. `HaltRecord.impugned` records which symbols a
+> finding put beyond proof, the reconciler supplies only the discrepancy kinds that impugn
+> a *position*, the router supplies the one symbol it could not resolve, and the carve-out
+> is void for exactly those symbols and no others. The section's diagnosis was right; its
+> prescription would have shipped the outage it was trying to prevent.
+>
+> It also had a prerequisite, named in the status block above and fixed in the same change:
+> `engage` was first-writer-wins, so a standing halt swallowed a later `broker_unreachable`
+> outright. It is now `SET NX` plus a compare-and-set merge — AUDIT.md finding 48, whose
+> cost used to be an audit field and would now be the impugnment the rule reads.
 
 Worse than the projection bug, and independent of it. `OrderRouter._resolve_indeterminate`
 (`execution/router.py:1078-1080`) engages a global `broker_unreachable` halt when an order's
@@ -1025,8 +1051,10 @@ Then:
    **Done** (#142, corrected in #143) — as `closes_without_reversing`, not `reduces_position`,
    which is quantity-blind and would have let a reversal skip the cap.
 4. ~~`KillSwitchRule` reads the settled book (§3.1)~~ **Done** (#142) — and so do the daily
-   loss limit and buying power, which shared the defect. §3.1a is **not** done: see the
-   status block for the prerequisite that has to be decided first.
+   loss limit and buying power, which shared the defect. ~~§3.1a~~ **Done** (ADR 0029) —
+   as evidence carried on the halt, not as a list of reasons, which would have refused
+   every exit in the book on a dollar of late-settling fees. Its prerequisite, the
+   first-writer-wins `engage`, is fixed in the same change.
 5. ~~Throttle the flap path in both stream adapters (§3.5)~~ **Done** — on both, and the
    discriminator is not the one this section proposed. Gating on *whether the connection
    delivered* halts the platform on a legitimately silent stream: the account stream

@@ -36,7 +36,13 @@ from atp_core.config import Settings, get_settings
 from atp_core.dashboard import build_snapshot
 from atp_core.domain import Order, OrderStatus, OrderType, Portfolio, Position, RunMode, Side
 from atp_core.execution.ports import EquityPoint
-from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
+from atp_core.risk.killswitch import (
+    HaltEscalation,
+    HaltReason,
+    HaltRecord,
+    HaltScope,
+    Impugnment,
+)
 from tests.fakes import (
     FakeKillSwitch,
     FakePortfolioRepository,
@@ -222,6 +228,73 @@ class TestWithNoPublishedBook:
         _, body = await get_live(client)
 
         assert [h["reason"] for h in body["active_halts"]] == ["data_feed_lost"]
+
+    async def test_a_halt_carries_what_it_cannot_prove(
+        self, client: httpx.AsyncClient, kill_switch: FakeKillSwitch
+    ) -> None:
+        """ADR 0029. The platform refuses to close these — protective stops
+        included — so the screen docs/SAFETY.md calls the place you halt from
+        cannot be the one surface that omits them."""
+        kill_switch.halts = [
+            HaltRecord(
+                scope=HaltScope.GLOBAL,
+                reason=HaltReason.RECONCILIATION_MISMATCH,
+                engaged_at=NOW,
+                engaged_by="reconciler",
+                impugned=(
+                    Impugnment(
+                        ("QQQ", "SPY"), HaltReason.RECONCILIATION_MISMATCH, NOW, "reconciler"
+                    ),
+                ),
+            )
+        ]
+
+        _, body = await get_live(client)
+
+        assert body["active_halts"][0]["unproven_symbols"] == ["QQQ", "SPY"]
+
+    async def test_an_escalated_halt_says_where_its_reason_came_from(
+        self, client: httpx.AsyncClient, kill_switch: FakeKillSwitch
+    ) -> None:
+        """`reason` is the reason in force; `engaged_by` and `detail` describe
+        the origin. Those stop being one incident once a halt escalates, and
+        four true fields then compose a false sentence on the banner —
+        `reconciliation_mismatch`, by `ops`, "pausing for lunch"."""
+        kill_switch.halts = [
+            HaltRecord(
+                scope=HaltScope.GLOBAL,
+                reason=HaltReason.RECONCILIATION_MISMATCH,
+                engaged_at=NOW,
+                engaged_by="ops",
+                detail="pausing for lunch",
+                escalation=HaltEscalation(from_reason=HaltReason.MANUAL, at=NOW, by="reconciler"),
+            )
+        ]
+
+        _, body = await get_live(client)
+
+        halt = body["active_halts"][0]
+        assert halt["escalated_from"] == "manual"
+        assert halt["escalated_by"] == "reconciler"
+        assert halt["engaged_by"] == "ops", "the origin is not overwritten — that is the latch"
+
+    async def test_an_ordinary_halt_carries_neither(
+        self, client: httpx.AsyncClient, kill_switch: FakeKillSwitch
+    ) -> None:
+        kill_switch.halts = [
+            HaltRecord(
+                scope=HaltScope.GLOBAL,
+                reason=HaltReason.MANUAL,
+                engaged_at=NOW,
+                engaged_by="ops",
+            )
+        ]
+
+        _, body = await get_live(client)
+
+        halt = body["active_halts"][0]
+        assert halt["unproven_symbols"] == []
+        assert halt["escalated_from"] is None
 
     async def test_feed_health_is_unknown_not_healthy(self, client: httpx.AsyncClient) -> None:
         _, body = await get_live(client)

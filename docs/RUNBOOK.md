@@ -47,12 +47,49 @@ money.
 > the store recovers. Halt again once it is back, or stop the worker meanwhile,
 > and confirm with `scripts/halt.py status`.
 >
+> **A different message says trading IS halted and this request is not what
+> recorded it.** That is a `409`, not a `503`, and it means the opposite: the
+> store answered, a halt is standing, and only your reason — plus any symbols it
+> named as unproven — failed to merge into the record that already stands. Do
+> **not** stop the worker for it. Retry; if the message named symbols, retry
+> until it stops, because until it lands those symbols are still flattenable
+> against a quantity nothing can prove.
+>
+> **If *you* are the one who found a bad quantity**, say so when you halt:
+> `scripts/halt.py engage --by "<you>" --unproven SPY` (repeatable). The platform
+> then refuses to close SPY — its protective stop included — until the halt is
+> cleared, exactly as it does when the reconciler finds the mismatch itself.
+> Everything else in the book still closes normally. Without it a halt leaves
+> the platform free to go on flattening the symbol you halted over, which is the
+> one thing you were trying to stop. `scripts/halt.py status` lists what each
+> halt says it cannot prove.
+>
 > `scripts/status.py` is the read-only companion — halts, quote freshness, the
 > latest stored bars, and the venue's account, positions and working orders.
 > Safe to run during an incident.
 
 Halting is *not* flattening. Halting stops new risk. Flattening realises
 existing P&L and is a separate decision.
+
+> **"Halt escalated: cannot prove ..."** is a different alert from the halt
+> itself, and it changes what you can do. Trading was already stopped; what has
+> changed is that the platform will no longer *close* the symbols it names,
+> because something said their quantity cannot be relied on — a reconcile that
+> disagrees with the venue, or a submit that failed in transport with its
+> outcome unknown (ADR 0029).
+>
+> Everything else in the book still closes normally. **To get flat in the named
+> symbols, use the broker's own UI** — the platform cannot size an exit against
+> a position it cannot confirm, and that includes the protective stop, so those
+> positions are uncovered until you act. Then work the mismatch below.
+>
+> `scripts/halt.py status` shows the halt and every symbol it names. In the logs
+> the field to grep is `unproven`, not an event name: a halt **born** carrying
+> evidence — the usual case, since the five-minute reconcile normally finds its
+> mismatch on a platform that was trading happily — logs
+> `risk.killswitch.engaged ... unproven=[...]`, while evidence arriving at a
+> halt that already stood logs `risk.killswitch.escalated`. Both alerts read the
+> same; only the log event differs.
 
 ## Reading the numbers
 
@@ -139,6 +176,27 @@ Our book disagrees with the broker's. **Do not resume until it is understood.**
    adopting silently hides the bug, and if the cause is duplicate submission you
    will do it again tomorrow.
 4. Clear the halt.
+
+**While it stands, the mismatched symbols cannot be closed by the platform** —
+not by a flatten, not by a protective stop (ADR 0029). That is the point: an
+exit sized off a disputed quantity is how a flatten opens a short. Get flat in
+them through the broker if you need to before step 3.
+
+A cash drift or an orphaned order also halts here and impugns **nothing** —
+every position stays closeable.
+
+**Do not judge which case you are in from the alert body.** The halt alert
+carries the reconcile's own summary, and that summary names a symbol for *every*
+kind of finding — including the orphaned order, which impugns nothing. A halt
+over a protective stop left resting by a restart reads `orphan_order: SPY` while
+SPY is perfectly closeable. `scripts/halt.py status` is the authority: it lists
+each impugnment explicitly, or lists none. The second, separate alert titled
+**"Halt escalated: cannot prove …"** is the other reliable signal — if it never
+arrived, nothing is impugned.
+
+Clearing the halt is the only thing that lifts an impugnment. A later reconcile
+finding the symbol correct does not retract the earlier one; a human decides
+that a position is proven again.
 
 ## Duplicate positions
 
@@ -832,18 +890,26 @@ place. The position is live and the venue holds nothing against it. An
 engine-side level may be armed, which protects you only while the worker is up —
 that is not the guarantee a broker-side stop gives.
 
-1. Read `rule` in the log line. It will name one of exactly three rules
+1. Read `rule` in the log line. Usually it names one of three
    (`rules.EXIT_BLIND_RULES`): `stale_data`, `trading_hours` or `rate_limit`.
    All three are transient and clear on their own, and the runner's next
    attempt places the stop.
 
-   **`kill_switch` cannot appear here**, and has not been able to since it was
-   given its exit carve-out — a halt does not refuse a protective stop, because
-   a halt that left a position naked was SAFETY.md's layers 6 and 5 failing
-   together. Neither can `max_position_size` or `max_gross_exposure` since
-   ADR 0027. If you see any of the three, the carve-outs have regressed and
-   that is the incident, not the stop.
-2. If it will not clear promptly, place the stop through the broker's own UI.
+   **`kill_switch` is the fourth, and it is the one that does not clear by
+   waiting** (ADR 0029). It means the standing halt says it cannot prove this
+   symbol's quantity — a reconcile that disagrees with the venue, or a submit
+   whose outcome is unknown — and a stop is sized off exactly that disputed
+   number, so placing one is how a stop becomes a short. The refusal is the
+   right answer and the position genuinely is uncovered: **go to the broker's
+   own UI now**, then work the mismatch (see "Reconciliation mismatch"). The
+   reason text names the symbol; `scripts/halt.py status` lists every symbol in
+   the same state.
+
+   `max_position_size` and `max_gross_exposure` still cannot appear here, and
+   have not been able to since ADR 0027. If you see either, a carve-out has
+   regressed and that is the incident, not the stop.
+2. If a transient rule will not clear promptly, place the stop through the
+   broker's own UI.
 3. `no stop level was requested and no stop_config was supplied` is a strategy
    configuration bug, not an incident: the strategy is trading without a stop.
    docs/SAFETY.md makes that a go-live blocker.

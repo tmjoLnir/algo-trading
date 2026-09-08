@@ -23,7 +23,7 @@ per file is one the next file forgets.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 from pydantic_settings import BaseSettings
@@ -31,9 +31,6 @@ from pydantic_settings import BaseSettings
 from atp_core import config
 from atp_core.alerts import LoggingAlertSink, build_alert_sink
 from atp_core.config import _ENV_MODELS, Settings
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 #: A `.env` shaped like an operator's: alerting wired up, and two ordinary
 #: values so the assertions below are not all about alerting.
@@ -118,4 +115,43 @@ def test_every_settings_model_is_registered() -> None:
     assert defined == set(_ENV_MODELS), (
         "a settings model is missing from atp_core.config._ENV_MODELS — "
         "add it there, or the env doctor and the test harness both skip it"
+    )
+
+
+def test_no_test_hides_inside_a_class_pytest_does_not_collect() -> None:
+    """A `test_*` method on a class whose name pytest ignores is a test that
+    silently does not run.
+
+    This file exists because a defence that has to be remembered per file is one
+    the next file forgets, and this is the second instance of that shape. It has
+    happened here: a test double inserted into the middle of `TestRiskRules`
+    adopted the twenty-two methods below it, `pytest` collected 111 where it had
+    collected 126, and **every gate stayed green** — `ruff`, `mypy` and the
+    suite itself all pass over tests that are no longer being run. Nothing in
+    `make check` reads the collected count, so nothing else can catch it.
+
+    Walked with `ast` rather than by importing, so a module with a collection-
+    time side effect cannot hide from it and a syntax error is a loud failure
+    rather than a skip. Names, not `pytest`'s own collection: the point is to
+    catch the file where the two disagree.
+    """
+    import ast
+
+    tests_root = Path(__file__).resolve().parent.parent
+    orphans: list[str] = []
+    for path in sorted(tests_root.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef) or node.name.startswith("Test"):
+                continue
+            orphans += [
+                f"{path.relative_to(tests_root)}::{node.name}::{item.name}"
+                for item in node.body
+                if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef)
+                and item.name.startswith("test_")
+            ]
+
+    assert orphans == [], (
+        "these test methods live on a class pytest will not collect, so they "
+        "never run — rename the class to Test* or move the method out:\n  " + "\n  ".join(orphans)
     )

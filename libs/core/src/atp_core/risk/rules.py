@@ -40,9 +40,11 @@ if TYPE_CHECKING:
 DAILY_LOSS_RULE = "daily_loss_limit"
 RATE_LIMIT_RULE = "rate_limit"
 
-#: The rules that can refuse an order which only *reduces* a position, and so
-#: the complete list of ways a flatten or a protective stop can come back
-#: refused (ADR 0005, `ProtectionResult`, docs/RISK.md).
+#: The rules that refuse an order which only *reduces* a position **on the order
+#: alone** — no book and no evidence can excuse them (ADR 0005,
+#: `ProtectionResult`, docs/RISK.md). See below for why that is narrower than
+#: "the complete list of ways a flatten can come back refused", which it used to
+#: claim and no longer is.
 #:
 #: All three judge the order rather than the book, which is why no carve-out
 #: reaches them and why that is correct: "do not trade outside the session", "do
@@ -51,15 +53,28 @@ RATE_LIMIT_RULE = "rate_limit"
 #: blind to `HaltReason` — a data-feed halt still cannot dump the book into a
 #: market nobody can see, because the rule whose job that is refuses first.
 #:
-#: The other six can never refuse a reduction: the kill switch, the daily loss
-#: limit and buying power each carve exits out explicitly, the two ceilings
-#: exempt an order that closes into the position without reversing through it
-#: (`closes_without_reversing`), and the open-position cap cannot be reached by
-#: an order in a symbol already held.
+#: The other six do not refuse a reduction *for being a reduction*: the kill
+#: switch, the daily loss limit and buying power each carve exits out
+#: explicitly, the two ceilings exempt an order that closes into the position
+#: without reversing through it (`closes_without_reversing`), and the
+#: open-position cap cannot be reached by an order in a symbol already held.
 #:
-#: Declared once because five documents and three docstrings quote the number,
-#: and it has been wrong in all of them at least once. `test_risk_engine.py`
-#: derives it from `default_rules()` rather than trusting it.
+#: **This is not the same as "only three rules can ever refuse a flatten", and
+#: that stronger claim is false as of ADR 0029.** `KillSwitchRule` refuses a
+#: reduction in a symbol the standing halt says it cannot prove — a genuine exit,
+#: correctly refused, because it would be sized against a disputed quantity. So
+#: a flatten or a protective stop can come back naming `kill_switch`, and
+#: `ProtectionResult`, `POST /positions/{symbol}/close` and docs/RUNBOOK.md all
+#: have to allow for it.
+#:
+#: What this tuple still is, exactly: the rules that refuse a reduction on the
+#: order alone, with no book and no evidence able to excuse it. Those three, and
+#: only those three, are what a caller can be sure of before it looks at
+#: anything. `test_risk_engine.py` derives *both* halves from `default_rules()`
+#: — this tuple under a halt that impugns nothing, and this tuple plus
+#: `kill_switch` under one that does — because five documents and three
+#: docstrings quote the number and it has been wrong in all of them at least
+#: once.
 EXIT_BLIND_RULES: tuple[str, ...] = ("trading_hours", RATE_LIMIT_RULE, "stale_data")
 
 
@@ -216,6 +231,98 @@ def project_pending(portfolio: Portfolio, pending: Iterable[Order]) -> Portfolio
     return replace(portfolio, cash=cash, positions=positions)
 
 
+def in_flight_by_symbol(pending: Iterable[Order]) -> dict[str, tuple[Decimal, Decimal]]:
+    """Per symbol, how much is still working on each side.
+
+    The summary `RiskBooks.in_flight` carries, built here beside the projection
+    because the two read the same list and must agree about `remaining_qty`.
+    """
+    totals: dict[str, list[Decimal]] = {}
+    for order in pending:
+        remaining = order.remaining_qty
+        if remaining <= 0:
+            continue
+        side = totals.setdefault(order.symbol, [Decimal(0), Decimal(0)])
+        side[0 if order.side is Side.BUY else 1] += remaining
+    return {symbol: (buys, sells) for symbol, (buys, sells) in totals.items()}
+
+
+def _producible_quantities(symbol: str, books: RiskBooks) -> list[Decimal]:
+    """The resting quantities `symbol` can end up at, given what is working.
+
+    Three candidates rather than one per subset of the orders in flight: the
+    reachable quantities are the interval ``[held - sells, held + buys]``,
+    ``|x + q|`` is convex, and the maximum of a convex function over an interval
+    is at an endpoint. `held` itself is the third because it is the outcome
+    where *nothing* fills — a cancel, a reject, an expiry, a DAY limit dying at
+    the close — which is the one outcome always available, and the one the
+    magnitude filter below can otherwise leave uncovered.
+
+    **Every endpoint is kept, unfiltered.** ADR 0020's asymmetry — that a
+    resting reduction must not lower a ceiling on the strength of an exit that
+    has not happened — is a property of the *bound*, and a bound taken as a
+    maximum already has it: adding an outcome to a `max` can only raise it.
+
+    > **Corrected before merge.** This first shipped with a magnitude filter,
+    > `abs(q) >= abs(held)`, written as if that asymmetry needed enforcing here.
+    > It does not, and the filter actively broke the bound: the callers maximise
+    > `|q + signed|`, not `|q|`, and a *small* `q` produces the *largest*
+    > result when the order opposes it. Held 100 with a resting `SELL 150`
+    > reaches −50; a new `SELL 300` from there leaves −350, and the filter
+    > dropped −50 for being smaller than 100, so the bound reported 200.
+    > Reproduced by execution. Removing it is strictly conservative in every
+    > case and a no-op for `worst_magnitude`, where `signed` is zero and the
+    > dropped candidates could never have been the maximum anyway.
+
+    The committed quantity is appended too. For any `RiskBooks` the engine
+    builds it already lies inside the interval and adds nothing — but including
+    it is what makes "no ceiling measures less than it did before ADR 0028" true
+    of *every* `RiskBooks`, including one assembled by hand.
+    """
+    settled = books.settled.positions.get(symbol)
+    held = settled.qty if settled is not None else Decimal(0)
+    buys, sells = books.in_flight.get(symbol, (Decimal(0), Decimal(0)))
+    outcomes = [held, held + buys, held - sells]
+    committed = books.committed.positions.get(symbol)
+    outcomes.append(committed.qty if committed is not None else Decimal(0))
+    return outcomes
+
+
+def worst_resulting_qty(order: Order, books: RiskBooks) -> Decimal:
+    """The largest position this order can leave in its symbol.
+
+    Over every outcome the orders in flight can produce — including the one
+    where none of them do. A ceiling caps what an order *leaves behind*, and
+    what it leaves behind depends on orders whose fate is not yet decided, so
+    the cap has to hold for all of them.
+
+    This is where a working reversal becomes visible. A `SELL 300` against a
+    settled long of 100 leaves a short of 200; the projection drops it, because
+    ADR 0020's predicate there is quantity-blind, and the committed book goes on
+    saying long 100. The bound says 200, and both ceilings ask for the bound.
+
+    **Deliberately not solved by projecting the reversal into `committed`**, and
+    the reason is arithmetic rather than taste. `Portfolio` carries one cash
+    balance and one mark per symbol, so a projected reversal moves quantity,
+    market value, cash and equity together. On a book holding +100 at a mark of
+    100, showing the short of 200 moves market value by -30,000, and the only
+    way to hold equity where it was is to credit 30,000 of cash the account has
+    not been paid — which is exactly the number `BuyingPowerRule` reads. Every
+    candidate cash value either loosens buying power or manufactures a drawdown
+    that `StrategyRunner._escalate` turns into a global halt; there is no safe
+    one. One book cannot be conservative about exposure and about cash at once,
+    so the exposure bound is a bound rather than a book, and the projection's
+    cash is left exactly as ADR 0020 wrote it.
+    """
+    signed = order.qty * order.side.sign
+    return max(abs(q + signed) for q in _producible_quantities(order.symbol, books))
+
+
+def worst_magnitude(symbol: str, books: RiskBooks) -> Decimal:
+    """`worst_resulting_qty` for a symbol no order under test touches."""
+    return max(abs(q) for q in _producible_quantities(symbol, books))
+
+
 def _unpriced_book(rule: str, portfolio: Portfolio) -> RiskDecision | None:
     """Refuse while any open position lacks a mark.
 
@@ -275,6 +382,13 @@ class KillSwitchRule:
     not trade on stale prices" is already enforced by the rule whose job it is,
     so a data-feed halt still cannot dump the book into a market nobody can see.
 
+    **But not blind to evidence.** ADR 0029: the carve-out rests on there being
+    a position here to close, and a halt that carries an `Impugnment` naming
+    this symbol is the platform saying it cannot prove that quantity. The
+    exemption is void for those symbols and for no others. That is a different
+    question from `HaltReason` — see `check` for why keying it on the reason
+    would refuse every exit in the book on a dollar of late-settling fees.
+
     **Not a second door.** `OrderRouter.flatten` still goes through `submit()`
     and still meets the whole chain (ADR 0005). This widens one rule; it does
     not add a bypass. An exit refused for stale data, trading hours or a rate
@@ -285,9 +399,27 @@ class KillSwitchRule:
     name: str = "kill_switch"
 
     def check(self, order: Order, books: RiskBooks, limits: RiskLimits) -> RiskDecision:
-        if not self.switch.is_engaged(order.strategy_id, order.symbol):
+        state = self.switch.halt_state(order.strategy_id, order.symbol)
+        if not state.engaged:
             return RiskDecision.allow()
 
+        # **The carve-out is void where the quantity cannot be proven**
+        # (ADR 0029). It rests on there being a position here to close, and two
+        # halts exist precisely because that claim has failed: the router's
+        # `broker_unreachable` when an order's outcome is unknown, and a
+        # reconcile that found our quantity and the venue's disagreeing. Under
+        # either, sizing an exit off `Position.qty` is sizing off the number in
+        # doubt — `OrderRouter._resolve_indeterminate` says it plainly: "we may
+        # be holding a position nobody knows about", and "flattening against a
+        # position that may not exist opens a short".
+        #
+        # Asked of the *evidence*, never of `HaltReason`. The same reason
+        # warrants opposite verdicts depending on where it came from — the
+        # reconciler's `broker_unreachable` means only that we could not read
+        # the venue, which is an unverified book rather than a disproven one —
+        # and a reconcile finding a dollar of late-settling fees would, keyed on
+        # the reason, refuse every exit and every protective stop across the
+        # whole book, unattended, every five minutes.
         # The **settled** book, not the committed one (`RiskBooks`, ADR 0027).
         # This is a permission, and the permission is "there is a position here
         # to close". A projected book answers that with a position that has not
@@ -297,7 +429,20 @@ class KillSwitchRule:
         # exposure to be let out of; cancelling it is how you undo it.
         settled = books.settled
         if not reduces_position(order, settled):
+            # An entry, refused for the ordinary reason — including in a symbol
+            # the halt cannot prove. The verdict is identical either way, but
+            # the *sentence* is persisted on the rejection and read off the
+            # dashboard, and telling the author of a `BUY` that "the platform
+            # cannot size an exit" describes an order they did not place.
             return RiskDecision.deny(self.name, "trading is halted")
+
+        if state.position_is_unproven(order.symbol):
+            return RiskDecision.deny(
+                self.name,
+                f"trading is halted and {order.symbol}'s quantity is unproven — the "
+                f"platform cannot size an exit against a position it cannot confirm. "
+                f"Close it through the broker's own UI",
+            )
 
         # `closes_without_reversing` asks exactly this rule's second question,
         # and the two ceilings now exempt on it — so the "a reversal is not an
@@ -356,10 +501,12 @@ class MaxPositionSizeRule:
         if equity <= 0:
             return RiskDecision.deny(self.name, f"equity is {equity}")
 
-        held = portfolio.position(order.symbol).qty
         # The position this order *leaves behind*, not the order on its own —
-        # three orders of 4% each are a 12% position.
-        resulting = abs(held + order.qty * order.side.sign) * price
+        # three orders of 4% each are a 12% position — and over every outcome
+        # the orders in flight can produce rather than only the projected one
+        # (ADR 0028). `worst_resulting_qty` is never below the committed book's
+        # own answer, so this rule cannot come out looser than it was.
+        resulting = worst_resulting_qty(order, books) * price
         ceiling = limits.max_position_pct * equity
         if resulting > ceiling:
             return RiskDecision.deny(
@@ -405,6 +552,34 @@ class MaxExposureRule:
         # ceiling exactly as a long growing more long does.
         without = portfolio.gross_exposure - abs(held) * price
         resulting = without + abs(held + order.qty * order.side.sign) * price
+
+        # The committed book's number, plus what the orders in flight can add to
+        # it (ADR 0028). Written as an *increment* rather than as a replacement
+        # so both corrections are visibly non-negative: this rule measures at
+        # least what it measured before the change, whatever the book. HEAD's
+        # own price-mixing in `without` is preserved rather than quietly
+        # "fixed", which would have been a change in the loosening direction.
+        signed = order.qty * order.side.sign
+        resulting += (worst_resulting_qty(order, books) - abs(held + signed)) * price
+        for symbol in books.in_flight:
+            if symbol == order.symbol:
+                continue
+            position = portfolio.positions.get(symbol)
+            projected = position.qty if position is not None else Decimal(0)
+            extra = worst_magnitude(symbol, books) - abs(projected)
+            if extra <= 0:
+                continue
+            mark = position.last_price if position is not None else None
+            if mark is None:
+                # Default-closed, for the reason `_unpriced_book` gives: a
+                # working quantity nobody can value is the same problem as a
+                # held one, and it does not reach `unmarked_symbols` while the
+                # projected position happens to net to flat.
+                return RiskDecision.deny(
+                    self.name, f"cannot value the working quantity in {symbol}: no mark"
+                )
+            resulting += extra * mark
+
         ceiling = limits.max_gross_exposure_pct * equity
         if resulting > ceiling:
             return RiskDecision.deny(

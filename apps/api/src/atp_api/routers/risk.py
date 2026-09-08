@@ -36,7 +36,7 @@ from atp_core.config import Settings, get_settings
 from atp_core.dashboard import LiveSnapshot, SnapshotStore
 from atp_core.dashboard.snapshot import RATIO_PLACES
 from atp_core.domain import RunMode
-from atp_core.errors import ATPError
+from atp_core.errors import ATPError, KillSwitchUnavailableError
 from atp_core.execution.ports import PortfolioRepository
 from atp_core.logging import current_correlation_id, get_logger
 from atp_core.risk.killswitch import HaltReason, HaltScope, KillSwitch
@@ -654,11 +654,19 @@ async def engage_kill_switch(
     the opposite of what an operator would assume from a red error on a halt
     button. `RedisKillSwitch.engage` deliberately does not swallow its
     exceptions, and the reason the message has to be explicit is the interaction
-    with `is_engaged`, which fails *closed*: while Redis is unreachable nothing
+    with `halt_state`, which fails *closed*: while Redis is unreachable nothing
     trades, so the moment of the failure is genuinely safe. But nothing was
     written, so trading resumes the instant Redis comes back. Reporting only
     "could not halt" would leave a reader to guess which of those two states
     they are in.
+
+    **A 409 says the opposite of that 503 and is not a retry of it.** `engage`
+    also fails when another writer keeps winning the compare-and-set (ADR 0029):
+    the store answered every round and found the key occupied, so a halt *is*
+    standing and only this request's reason — and any symbols it impugned —
+    failed to merge. Reporting that as the 503 above would tell an operator
+    nothing is recorded and trading is about to resume, when the truth is that
+    trading is stopped and a symbol they were told about is not.
     """
     try:
         record = await asyncio.to_thread(
@@ -669,6 +677,49 @@ async def engage_kill_switch(
             payload.detail,
             payload.target,
         )
+    except KillSwitchUnavailableError as exc:
+        # A *contended* write, and it raises in two opposite states. Branch on
+        # `halt_stands`, never on the message: reporting one as the other is
+        # what that split exists to prevent.
+        #
+        # `halt_stands` — every round found the key occupied, so the store is
+        # answering and a halt is standing; what failed is merging this
+        # request's reason, and any impugnment it carried, into the record that
+        # already stands. 409 rather than 503, because this is a conflict with
+        # another writer and not an unavailable dependency; a client retrying on
+        # 503 semantics would be retrying the wrong thing. Telling an operator
+        # "nothing was written, trading resumes when the store recovers" here
+        # would send them to re-halt an already halted platform.
+        #
+        # Not `halt_stands` — the last round found the key cleared under us, so
+        # nothing was written and nothing may be halted. Claiming "trading IS
+        # halted" there is the more dangerous of the two errors, because it
+        # tells someone to walk away from a live account.
+        log.critical(
+            "risk.halt_contended",
+            error=str(exc),
+            actor=actor,
+            scope=payload.scope.value,
+            halt_stands=exc.halt_stands,
+            effect=(
+                "a halt stands; this request's reason was not merged into it"
+                if exc.halt_stands
+                else "the key was cleared under us — nothing was written and nothing may be halted"
+            ),
+        )
+        if exc.halt_stands:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"trading IS halted, but this request was not what recorded it: {exc}",
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"the halt was NOT recorded: {exc}. The store is answering, so this is "
+                "not the fail-closed case — do NOT assume anything is stopped. Retry, and "
+                "confirm with `scripts/halt.py status`."
+            ),
+        ) from exc
     except Exception as exc:
         log.critical(
             "risk.halt_failed",
@@ -916,7 +967,7 @@ async def flatten_all(
     # re-enter within a tick. Refusing would be the wrong cure: the one moment
     # this endpoint exists for is the one where an extra step is most expensive.
     # So it is reported, loudly, and returned to the caller.
-    halted = await asyncio.to_thread(kill_switch.is_engaged)
+    halted = (await asyncio.to_thread(kill_switch.halt_state)).engaged
     if not halted:
         log.critical(
             "risk.flatten_all_while_trading",

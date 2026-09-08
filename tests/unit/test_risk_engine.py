@@ -24,6 +24,7 @@ from atp_core.clock import SimulatedClock, TradingCalendar
 from atp_core.domain import Order, OrderType, Portfolio, Side
 from atp_core.errors import ConfigError, RiskLimitBreachedError
 from atp_core.risk.engine import RiskBooks, RiskDecision, RiskEngine, RiskRule, default_rules
+from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope, HaltState
 from atp_core.risk.limits import MAX_GROSS_CEILING, RiskLimits
 from atp_core.risk.rules import (
     EXIT_BLIND_RULES,
@@ -37,9 +38,11 @@ from atp_core.risk.rules import (
     StaleDataRule,
     TradingHoursRule,
     closes_without_reversing,
+    in_flight_by_symbol,
     position_size,
     project_pending,
     reduces_position,
+    worst_resulting_qty,
 )
 from atp_core.strategy.rules import PositionSizeSpec
 from tests.fakes import FakeKillSwitch
@@ -84,6 +87,36 @@ def order(
         limit_price=Decimal(str(limit)) if limit is not None else None,
         strategy_id="test",
     )
+
+
+def halted(reason: HaltReason = HaltReason.MANUAL, **unproven: tuple[str, ...]) -> FakeKillSwitch:
+    """A halted switch, optionally carrying evidence.
+
+    `unproven` is target → symbols, where the target is a symbol-scoped halt's
+    target or `GLOBAL` for the global one, so a test can put the impugnment on
+    whichever halt it means to.
+    """
+    switch = FakeKillSwitch()
+    switch.engage(HaltScope.GLOBAL, reason, "test", unproven_symbols=unproven.pop("GLOBAL", ()))
+    for target, symbols in unproven.items():
+        switch.engage(HaltScope.SYMBOL, reason, "test", target=target, unproven_symbols=symbols)
+    return switch
+
+
+class UnreadableKillSwitch:
+    """Redis is down: engaged, and knows nothing about any position."""
+
+    def halt_state(self, strategy_id: str | None = None, symbol: str | None = None) -> HaltState:
+        return HaltState(unreadable=True)
+
+    def engage(self, *args: object, **kwargs: object) -> HaltRecord:  # pragma: no cover
+        raise AssertionError("a rule never engages")
+
+    def clear(self, *args: object, **kwargs: object) -> HaltRecord | None:  # pragma: no cover
+        raise AssertionError("a rule never clears")
+
+    def active_halts(self) -> list[HaltRecord]:  # pragma: no cover
+        return []
 
 
 class TestRiskRules:
@@ -1162,14 +1195,32 @@ class TestWhatCanRefuseAnExit:
     chain rather than trusted, exactly as `REPLAY_BLIND_RULES` is."""
 
     @staticmethod
-    def _chain() -> list[RiskRule]:
+    def _chain(switch: FakeKillSwitch | None = None) -> list[RiskRule]:
         """Every default rule, each configured to refuse whatever it can."""
         return default_rules(
-            kill_switch=FakeKillSwitch(engaged=True),
+            kill_switch=switch or FakeKillSwitch(engaged=True),
             clock=SimulatedClock(CLOSED),  # outside the session
             calendar=TradingCalendar(),
             last_tick_at=lambda _symbol: None,  # never ticked: maximally stale
         )
+
+    @staticmethod
+    def _refused_by(chain: list[RiskRule], exit_order: Order, book: Portfolio) -> set[str]:
+        """Run twice, taking the union, because `RateLimitRule` refuses only
+        once its window is full — the first pass consumes its single slot. A
+        one-pass version silently reported two rules and passed for the wrong
+        reason."""
+        tight = limits(
+            max_position_pct=Decimal("0.01"),
+            max_gross_exposure_pct=Decimal("0.01"),
+            max_orders_per_minute=1,
+        )
+        return {
+            rule.name
+            for _pass in range(2)
+            for rule in chain
+            if not rule.check(exit_order, RiskBooks.of(book), tight).approved
+        }
 
     def test_exactly_three_rules_can_refuse_a_reduction(self) -> None:
         """A pure exit — 100 held, 100 sold — put to every rule with each one
@@ -1187,21 +1238,57 @@ class TestWhatCanRefuseAnExit:
         """
         settled = portfolio(cash=0, SPY=(100.0, 100.0), IWM=(50.0, 0.0))
         exit_order = order(symbol="SPY", side=Side.SELL, qty=100, limit=100)
-        tight = limits(
-            max_position_pct=Decimal("0.01"),
-            max_gross_exposure_pct=Decimal("0.01"),
-            max_orders_per_minute=1,
+
+        assert self._refused_by(self._chain(), exit_order, settled) == set(EXIT_BLIND_RULES)
+
+    def test_a_halt_that_cannot_prove_the_symbol_makes_it_four(self) -> None:
+        """The half this test did not have, and the reason the tuple's own
+        comment had to be corrected.
+
+        `EXIT_BLIND_RULES` used to claim to be "the complete list of ways a
+        flatten or a protective stop can come back refused". ADR 0029 made that
+        false: a halt carrying an `Impugnment` for this symbol refuses the
+        reduction, because sizing it off `Position.qty` is sizing it off the
+        quantity in dispute. The test above did not notice, because
+        `FakeKillSwitch(engaged=True)` synthesises a bare MANUAL halt that
+        impugns nothing — so the one new way the kill switch can refuse an exit
+        was the one shape never exercised.
+
+        Both halves are pinned now. Three when the halt proves nothing about the
+        book, four when it names this symbol, and `kill_switch` is the only
+        difference between them.
+        """
+        settled = portfolio(cash=0, SPY=(100.0, 100.0), IWM=(50.0, 0.0))
+        exit_order = order(symbol="SPY", side=Side.SELL, qty=100, limit=100)
+        impugning = FakeKillSwitch()
+        impugning.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY",),
         )
 
-        chain = self._chain()
-        refused = {
-            rule.name
-            for _pass in range(2)
-            for rule in chain
-            if not rule.check(exit_order, RiskBooks.of(settled), tight).approved
-        }
+        refused = self._refused_by(self._chain(impugning), exit_order, settled)
 
-        assert refused == set(EXIT_BLIND_RULES)
+        assert refused == {*EXIT_BLIND_RULES, "kill_switch"}
+
+    def test_a_symbol_the_halt_does_not_impugn_is_back_to_three(self) -> None:
+        """The property that keeps the fourth rule an exception rather than a
+        reversal of the carve-out. One unproven symbol must not close the book.
+        """
+        settled = portfolio(cash=0, SPY=(100.0, 100.0), IWM=(50.0, 0.0))
+        exit_order = order(symbol="SPY", side=Side.SELL, qty=100, limit=100)
+        elsewhere = FakeKillSwitch()
+        elsewhere.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("QQQ",),
+        )
+
+        assert self._refused_by(self._chain(elsewhere), exit_order, settled) == set(
+            EXIT_BLIND_RULES
+        )
 
     def test_the_list_names_rules_the_chain_actually_has(self) -> None:
         """A typo here would silently shrink the set the test above compares
@@ -1381,3 +1468,336 @@ class TestTheExemptionIsAnExitQuestionToo:
 
         assert closes_without_reversing(sell, books.settled) is False
         assert MaxExposureRule().check(sell, books, limits()).approved  # judged, and fine
+
+
+class TestAWorkingReversalIsVisibleToTheCeilings:
+    """ADR 0028. `project_pending` drops a working reversal — its predicate is
+    quantity-blind — so the committed book says long 100 while a `SELL 300`
+    works and the fill would leave a short of 200.
+
+    The reversal is *not* fixed by projecting it into the committed book, and
+    the reason is arithmetic. `Portfolio` welds quantity, mark and cash into one
+    equity, so showing the short moves market value and the only way to hold
+    equity still is to credit cash the account has not been paid — which is the
+    number `BuyingPowerRule` reads. Every candidate value either loosens buying
+    power or manufactures a drawdown. So the bound is a bound, not a book.
+    """
+
+    @staticmethod
+    def _books(settled: Portfolio, *pending: Order) -> RiskBooks:
+        return RiskBooks(
+            committed=project_pending(settled, pending),
+            settled=settled,
+            in_flight=in_flight_by_symbol(pending),
+        )
+
+    def test_the_committed_book_still_hides_the_reversal(self) -> None:
+        """Pinning the premise, so this class fails loudly if the projection is
+        ever changed to carry reversals after all."""
+        settled = portfolio(SPY=(100.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", side=Side.SELL, qty=300, limit=100))
+
+        assert books.committed.position("SPY").qty == Decimal(100)
+
+    def test_the_bound_sees_it(self) -> None:
+        settled = portfolio(SPY=(100.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", side=Side.SELL, qty=300, limit=100))
+
+        # A further SELL 1 lands on a book that may be short 200, not long 100.
+        assert worst_resulting_qty(
+            order(symbol="SPY", side=Side.SELL, qty=1, limit=100), books
+        ) == Decimal(201)
+
+    def test_the_position_cap_refuses_what_the_reversal_makes_too_big(self) -> None:
+        # Equity 100,000, so the 10% cap is 10,000.
+        #
+        # The order under test must not itself be an exit, or ADR 0027's
+        # exemption allows it before the cap measures anything — `SELL 50`
+        # against a settled long of 100 closes into the position and is exempt,
+        # correctly. `SELL 150` carries it through flat, so the cap gets to look:
+        # 5,000 against the committed book (long 100 -> short 50) and 35,000
+        # against the book the working reversal can produce (short 200 -> 350).
+        # The cap sits between the two, which is the whole point of the case.
+        settled = portfolio(cash=90_000, SPY=(100.0, 100.0))
+        working = order(symbol="SPY", side=Side.SELL, qty=300, limit=100)
+
+        entry = order(symbol="SPY", side=Side.SELL, qty=150, limit=100)
+        assert MaxPositionSizeRule().check(entry, RiskBooks.of(settled), limits()).approved
+        assert (
+            not MaxPositionSizeRule().check(entry, self._books(settled, working), limits()).approved
+        )
+
+    def test_the_exposure_cap_counts_a_reversal_in_another_symbol(self) -> None:
+        """The per-symbol correction: a reversal working in IWM raises the gross
+        exposure an order in SPY is measured against."""
+        # Equity 100,000, ceiling 15,000. HEAD measures 12,000; the reversal
+        # IWM can produce adds 100 shares at its mark, taking it to 22,000.
+        settled = portfolio(cash=89_000, SPY=(10.0, 100.0), IWM=(100.0, 100.0))
+        working = order(symbol="IWM", side=Side.SELL, qty=300, limit=100)
+        tight = limits(max_gross_exposure_pct=Decimal("0.15"), max_position_pct=Decimal("0.15"))
+        entry = order(symbol="SPY", qty=10, limit=100)
+
+        assert MaxExposureRule().check(entry, RiskBooks.of(settled), tight).approved
+        assert not MaxExposureRule().check(entry, self._books(settled, working), tight).approved
+
+    def test_nothing_in_flight_is_exactly_head(self) -> None:
+        """`RiskBooks.of` carries no in-flight summary, so every number the two
+        ceilings compute is the one they computed before ADR 0028."""
+        settled = portfolio(SPY=(100.0, 100.0))
+        entry = order(symbol="SPY", qty=40, limit=100)
+
+        assert worst_resulting_qty(entry, RiskBooks.of(settled)) == Decimal(140)
+
+    def test_the_outcome_where_nothing_fills_is_always_covered(self) -> None:
+        """A cancel, a reject, an expiry, a DAY limit dying at the close. The
+        settled holding is a candidate outcome in its own right, so the bound
+        never assumes a working order fills."""
+        settled = portfolio(SPY=(100.0, 100.0))
+        books = self._books(settled, order(symbol="SPY", side=Side.SELL, qty=300, limit=100))
+
+        # 100 held + a BUY 40 that lands after the reversal is cancelled.
+        assert worst_resulting_qty(order(symbol="SPY", qty=40, limit=100), books) >= Decimal(140)
+
+    def test_a_resting_reduction_still_does_not_lower_a_ceiling(self) -> None:
+        """ADR 0020's asymmetry, restated as a property of the outcome: an
+        outcome showing less of the symbol than is held is not considered, so a
+        resting protective stop cannot license a position the cap would refuse."""
+        settled = portfolio(SPY=(100.0, 100.0))
+        stop = order(symbol="SPY", side=Side.SELL, qty=100, limit=95)
+        books = self._books(settled, stop)
+
+        assert worst_resulting_qty(order(symbol="SPY", qty=40, limit=100), books) == Decimal(140)
+
+    def test_an_unvaluable_working_quantity_elsewhere_is_refused(self) -> None:
+        """Default-closed, for `_unpriced_book`'s reason: a working quantity
+        nobody can value is the same problem as a held one, and it does not
+        reach `unmarked_symbols` while the projected position nets to flat."""
+        # IWM flat and unmarked, with a BUY 100 and a SELL 100 working. Neither
+        # reduces a flat position, so the projection carries both and they net
+        # to flat — the symbol never reaches `unmarked_symbols`, so
+        # `_unpriced_book` does not fire and this branch is the only guard left.
+        settled = portfolio(cash=0, SPY=(100.0, 100.0))
+        books = self._books(
+            settled,
+            order(symbol="IWM", qty=100, limit=None),
+            order(symbol="IWM", side=Side.SELL, qty=100, limit=None),
+        )
+
+        decision = MaxExposureRule().check(order(symbol="SPY", qty=10, limit=100), books, limits())
+
+        assert not decision.approved
+        assert "cannot value the working quantity in IWM" in decision.reason
+
+
+class TestTheCarveOutIsVoidWhereTheQuantityIsUnproven:
+    """ADR 0029. The exit carve-out rests on there being a position here to
+    close; a halt carrying an impugnment is the platform saying it cannot prove
+    that. These are the tests that keep the exception narrow — because the
+    tempting version of it, keyed on `HaltReason`, refuses every exit and every
+    protective stop in the book on a dollar of late-settling fees.
+    """
+
+    def test_an_exit_is_refused_in_an_unproven_symbol(self) -> None:
+        """The defect this closes. `flatten` sizes at `abs(position.qty)`, and
+        under a reconciliation mismatch that number is the one in doubt: sell
+        300 against a book that says 300 and a venue that says 100, and the
+        flatten opens a short of 200 while the platform is halted."""
+        rule = KillSwitchRule(switch=halted(HaltReason.RECONCILIATION_MISMATCH, GLOBAL=("SPY",)))
+
+        decision = rule.check(
+            order(side=Side.SELL, qty=100), RiskBooks.of(portfolio(SPY=(100, 100))), limits()
+        )
+
+        assert not decision.approved
+        assert decision.rule == "kill_switch"
+        assert "unproven" in decision.reason
+        assert "broker" in decision.reason, "an operator needs the way out, not just the refusal"
+
+    def test_an_exit_is_still_permitted_in_a_symbol_the_halt_does_not_impugn(self) -> None:
+        """The half that keeps this an exception rather than a reversal of the
+        carve-out. One unproven symbol must not close the book."""
+        rule = KillSwitchRule(switch=halted(HaltReason.RECONCILIATION_MISMATCH, GLOBAL=("QQQ",)))
+
+        decision = rule.check(
+            order(side=Side.SELL, qty=100), RiskBooks.of(portfolio(SPY=(100, 100))), limits()
+        )
+
+        assert decision.approved
+
+    def test_a_halt_that_impugns_nothing_still_lets_exits_out(self) -> None:
+        """The `RECONCILIATION_MISMATCH` trap, and the reason the carve-out is
+        keyed on evidence rather than on the reason.
+
+        `Reconciler.is_clean` covers cash and orphaned orders with a $1.00
+        tolerance, so a mismatch of late-settling fees engages this exact reason
+        while impugning no position at all. Keyed on `HaltReason`, that dollar
+        would refuse every exit and every protective stop platform-wide,
+        unattended, every five minutes.
+        """
+        rule = KillSwitchRule(switch=halted(HaltReason.RECONCILIATION_MISMATCH))
+
+        decision = rule.check(
+            order(side=Side.SELL, qty=100), RiskBooks.of(portfolio(SPY=(100, 100))), limits()
+        )
+
+        assert decision.approved
+
+    def test_an_entry_is_refused_the_same_way_it_always_was(self) -> None:
+        """The impugnment narrows the carve-out. It does not change the default,
+        and the denial an operator reads should still be the plain one."""
+        rule = KillSwitchRule(switch=halted(HaltReason.RECONCILIATION_MISMATCH, GLOBAL=("QQQ",)))
+
+        decision = rule.check(order(side=Side.BUY, qty=100), RiskBooks.of(portfolio()), limits())
+
+        assert not decision.approved
+        assert decision.reason == "trading is halted"
+
+    def test_an_entry_in_an_unproven_symbol_reads_as_an_entry(self) -> None:
+        """Same verdict, honest sentence.
+
+        The reason text is persisted on the rejection and read off the
+        dashboard, so it outlives the moment. Telling the author of a `BUY 100`
+        that "the platform cannot size an exit against a position it cannot
+        confirm" describes an order they did not place, and sends them looking
+        for a position that is not the problem. An entry is refused by the halt
+        whether or not the symbol is impugned, so the ordinary sentence is the
+        true one.
+        """
+        rule = KillSwitchRule(switch=halted(HaltReason.RECONCILIATION_MISMATCH, GLOBAL=("SPY",)))
+
+        decision = rule.check(
+            order(symbol="SPY", side=Side.BUY, qty=100), RiskBooks.of(portfolio()), limits()
+        )
+
+        assert not decision.approved
+        assert decision.reason == "trading is halted"
+
+    def test_adding_to_an_unproven_holding_is_still_an_entry(self) -> None:
+        """The boundary: a position exists, and the order grows it. Not an exit,
+        so not the exit sentence — and refused either way."""
+        rule = KillSwitchRule(switch=halted(HaltReason.RECONCILIATION_MISMATCH, GLOBAL=("SPY",)))
+
+        decision = rule.check(
+            order(symbol="SPY", side=Side.BUY, qty=50),
+            RiskBooks.of(portfolio(SPY=(100, 100))),
+            limits(),
+        )
+
+        assert not decision.approved
+        assert decision.reason == "trading is halted"
+
+    def test_a_protective_stop_in_an_unproven_symbol_is_refused_too(self) -> None:
+        """The uncomfortable case, stated rather than hidden.
+
+        A stop is exactly the order the carve-out was widened for, and this
+        refuses one. It is still the right answer: a stop is sized off the same
+        `Position.qty` the reconcile just disputed, so placing it against an
+        unproven quantity is how a stop becomes a short. The alert names the
+        symbol and sends the operator to the broker's UI precisely because this
+        path leaves a position uncovered and a human has to know.
+        """
+        rule = KillSwitchRule(switch=halted(HaltReason.BROKER_UNREACHABLE, GLOBAL=("SPY",)))
+        stop = Order(
+            symbol="SPY",
+            side=Side.SELL,
+            qty=Decimal(100),
+            order_type=OrderType.STOP,
+            stop_price=Decimal(95),
+            strategy_id="test",
+            parent_order_id="the-entry",
+            purpose="stop_loss",
+        )
+
+        assert not rule.check(stop, RiskBooks.of(portfolio(SPY=(100, 100))), limits()).approved
+
+    def test_evidence_on_a_symbol_scoped_halt_reaches_the_rule(self) -> None:
+        """`halt_state` composes every halt covering the order, so the
+        impugnment can be on any of them. A test that only ever put it on the
+        global halt would not notice a rule reading one record."""
+        rule = KillSwitchRule(switch=halted(HaltReason.RECONCILIATION_MISMATCH, SPY=("SPY",)))
+
+        decision = rule.check(
+            order(side=Side.SELL, qty=100), RiskBooks.of(portfolio(SPY=(100, 100))), limits()
+        )
+
+        assert not decision.approved
+        assert "unproven" in decision.reason
+
+    def test_an_unreachable_switch_still_lets_a_genuine_exit_out(self) -> None:
+        """docs/SAFETY.md layers 5 and 6, not failing together.
+
+        A Redis outage fails closed — every entry is refused — but it is not
+        evidence about any position. Treating "cannot read the halt record" as
+        "cannot prove the book" would refuse every protective stop on every
+        Redis blip, which is layer 5 taken down by a layer 6 fault that says
+        nothing about the book at all.
+        """
+        rule = KillSwitchRule(switch=UnreadableKillSwitch())
+
+        assert not rule.check(order(side=Side.BUY), RiskBooks.of(portfolio()), limits()).approved
+        assert rule.check(
+            order(side=Side.SELL, qty=100), RiskBooks.of(portfolio(SPY=(100, 100))), limits()
+        ).approved
+
+
+class TestTheBoundKeepsEveryReachableOutcome:
+    """ADR 0028's bound, and the filter that broke it.
+
+    `_producible_quantities` shipped with `abs(q) >= abs(held)`, written as if
+    ADR 0020's asymmetry needed enforcing there. It does not — a bound taken as
+    a maximum already has it, because adding an outcome to a `max` can only
+    raise it — and the filter actively discarded the worst case, because the
+    callers maximise `|q + signed|` and a *small* q produces the *largest*
+    result when the order opposes it.
+    """
+
+    @staticmethod
+    def _books(held: str, buys: str, sells: str) -> RiskBooks:
+        settled = portfolio(SPY=(float(held), 100.0))
+        # `project_pending` drops reducing orders, so the committed book still
+        # shows what is held. That is the state ADR 0028 works around.
+        committed = portfolio(SPY=(float(held), 100.0))
+        return RiskBooks(
+            committed=committed,
+            settled=settled,
+            in_flight={"SPY": (Decimal(buys), Decimal(sells))},
+        )
+
+    def test_a_resting_reduction_is_a_reachable_outcome(self) -> None:
+        """Long 100 with a working `SELL 150` reaches −50. A new `SELL 300` from
+        there leaves −350 — the largest position these orders can produce, and
+        the number `max_position_size` has to cap."""
+        books = self._books("100", "0", "150")
+
+        assert worst_resulting_qty(order(side=Side.SELL, qty=300), books) == Decimal(350)
+
+    def test_it_never_reports_less_than_the_committed_book_would(self) -> None:
+        """The invariant ADR 0028 rests on: no ceiling approves what it refused
+        before. Verified here at the boundary rather than only in the sweep."""
+        for held, buys, sells, side, qty in [
+            ("100", "0", "150", Side.SELL, 300),
+            ("100", "200", "0", Side.BUY, 50),
+            ("-100", "300", "0", Side.BUY, 200),
+            ("0", "0", "0", Side.SELL, 100),
+        ]:
+            books = self._books(held, buys, sells)
+            signed = Decimal(qty) if side is Side.BUY else -Decimal(qty)
+            committed = books.committed.positions["SPY"].qty
+            assert worst_resulting_qty(order(side=side, qty=qty), books) >= abs(
+                committed + signed
+            ), f"{held=} {buys=} {sells=} {side=} {qty=}"
+
+    def test_an_ordinary_protective_stop_does_not_tighten_anything(self) -> None:
+        """The reason removing the filter is not over-conservative in practice.
+
+        A protective child is capped at the exposure held (`submit_protective_orders`),
+        so `held - sells` never exceeds `held` in magnitude and the extra
+        endpoint cannot become the maximum. Only a working *reversal* — an order
+        larger than the position it opposes — moves the bound, which is exactly
+        what ADR 0028 exists to see.
+        """
+        with_stop = self._books("100", "0", "100")
+        without = self._books("100", "0", "0")
+        entry = order(side=Side.BUY, qty=50)
+
+        assert worst_resulting_qty(entry, with_stop) == worst_resulting_qty(entry, without)

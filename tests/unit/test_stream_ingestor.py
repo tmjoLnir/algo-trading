@@ -24,10 +24,10 @@ from atp_core.data.ports import FeedReconnected
 from atp_core.data.stream import StreamIngestor
 from atp_core.domain import Bar, Quote, Timeframe, Trade
 from atp_core.errors import DataError, DataGapError
-from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
+from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope, HaltState
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Collection, Sequence
 
     from atp_core.data.ports import StreamEvent
 
@@ -202,6 +202,9 @@ class FakeKillSwitch:
     def is_engaged(self, strategy_id: str | None = None, symbol: str | None = None) -> bool:
         return bool(self.engaged)
 
+    def halt_state(self, strategy_id: str | None = None, symbol: str | None = None) -> HaltState:
+        return HaltState(halts=tuple(self.engaged))
+
     def engage(
         self,
         scope: HaltScope,
@@ -209,6 +212,8 @@ class FakeKillSwitch:
         engaged_by: str,
         detail: str = "",
         target: str | None = None,
+        *,
+        unproven_symbols: Collection[str] = (),
     ) -> HaltRecord:
         record = HaltRecord(
             scope=scope,

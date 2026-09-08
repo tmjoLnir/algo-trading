@@ -126,6 +126,13 @@ hours, the rate limit and stale data. That set is
 `test_risk_engine.py` — five documents and three docstrings quote the number and
 it had been wrong in all of them at least once.
 
+> **ADR 0029 makes it four, conditionally.** The kill switch refuses a reduction
+> in a symbol the standing halt says it cannot prove. That is not a regression of
+> the carve-out this ADR defends — it is the carve-out's own premise failing, so
+> the exemption is void exactly there and nowhere else. `EXIT_BLIND_RULES` still
+> names the three that refuse a reduction on the *order alone*, which is the
+> thing a caller can be sure of without looking at anything.
+
 `StaleDataRule` staying in that list is what lets `KillSwitchRule` remain blind
 to `HaltReason`: a data-feed halt still cannot dump the book into a market
 nobody can see, because the rule whose job that is refuses first.
@@ -144,7 +151,7 @@ cannot lower projected exposure), and that call is correctly about the settled
 book because that is the book being projected. It is the one place the predicate
 reads the same book it always did.
 
-The *predicate* there is a known hole, and it is left open deliberately.
+**Closed by ADR 0028**, and not the way this section expected. The *predicate* there is a known hole, and it is left open deliberately.
 `reduces_position` is quantity-blind, so a working reversal — `SELL 300` against
 a settled long of 100 — is dropped from the projection entirely, and the
 committed book still shows a long of 100 when that fill would leave it short

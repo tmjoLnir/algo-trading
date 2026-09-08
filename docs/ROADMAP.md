@@ -736,6 +736,19 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   was resting on is exactly the sentence quoted above. It holds again, and
   `test_risk_engine.py::TestTheTwoBooks` is the assertion that says so.
 
+  **And it was narrower than the sentence implied until ADR 0029.** The
+  carve-out computed "is this an exit?" from `Position.qty` — the very number
+  that two of the halt reasons exist to dispute. Under a reconciliation
+  mismatch, a flatten sized off our own book was approved against a quantity the
+  platform had just declared it could not trust; against a position that turned
+  out not to exist, that flatten opens a short. The halt now carries the symbols
+  it cannot prove and the carve-out is void for exactly those, keyed on the
+  evidence rather than on the `HaltReason` — which would have refused every exit
+  in the book on a dollar of late-settling fees, every five minutes, unattended.
+  Fixing it also made `engage` atomic (`SET NX` plus a compare-and-set merge,
+  AUDIT.md finding 48): first-writer-wins used to cost an audit field and would
+  now cost the impugnment the rule reads.
+
   **It fails closed.** docs/SAFETY.md is explicit that layer 6 fails "Redis
   unreachable — fail closed", so an unreachable Redis reports engaged and
   trading stops. Shown against a genuinely dead port, not a fake that raises.

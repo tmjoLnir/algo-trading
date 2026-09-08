@@ -22,7 +22,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from enum import StrEnum
+from typing import TYPE_CHECKING, assert_never
 
 from atp_core.errors import BrokerError
 from atp_core.logging import get_logger
@@ -53,9 +54,54 @@ DEFAULT_CASH_TOLERANCE = Decimal("1.00")
 _NO_SYMBOL = ""
 
 
+class DiscrepancyKind(StrEnum):
+    """What kind of disagreement this is — and whether it impugns a *position*.
+
+    The union used to live in a trailing comment on `Discrepancy.kind`, which
+    is where the classification would have had to live too, and a comment
+    cannot fail a typecheck.
+
+    The distinction earns its place because `KillSwitchRule`'s exit carve-out
+    reads it (ADR 0029). A reconcile that finds a dollar of late-settling fees
+    or a protective stop we placed before a restart says nothing about any
+    quantity — and refusing every exit and every protective stop across the
+    book on that finding, unattended, every five minutes, is day 1's F3
+    reintroduced with docs/SAFETY.md's layers 5 and 6 failing together.
+    """
+
+    POSITION_QTY = "position_qty"
+    MISSING_POSITION = "missing_position"
+    UNKNOWN_POSITION = "unknown_position"
+    ORPHAN_ORDER = "orphan_order"
+    CASH = "cash"
+
+    @property
+    def impugns_position(self) -> bool:
+        """Whether this finding means our `Position.qty` for its symbol cannot
+        be relied on to size an exit.
+
+        `match` with `assert_never` rather than a set membership test, because
+        **both defaults are wrong**: a sixth kind defaulting to "impugns"
+        strands every stop on a benign finding, and defaulting to "does not"
+        lets a flatten through against a quantity nobody can vouch for. Neither
+        may happen silently, so a kind added later fails `make typecheck` until
+        somebody decides which it is.
+        """
+        match self:
+            case (
+                DiscrepancyKind.POSITION_QTY
+                | DiscrepancyKind.MISSING_POSITION
+                | DiscrepancyKind.UNKNOWN_POSITION
+            ):
+                return True
+            case DiscrepancyKind.ORPHAN_ORDER | DiscrepancyKind.CASH:
+                return False
+        assert_never(self)
+
+
 @dataclass(frozen=True, slots=True)
 class Discrepancy:
-    kind: str  # "position_qty" | "missing_position" | "unknown_position" | "orphan_order" | "cash"
+    kind: DiscrepancyKind
     symbol: str
     ours: Decimal | None
     theirs: Decimal | None
@@ -167,7 +213,7 @@ class Reconciler:
             report.orphan_order_ids.append(order.client_order_id)
             report.discrepancies.append(
                 Discrepancy(
-                    kind="orphan_order",
+                    kind=DiscrepancyKind.ORPHAN_ORDER,
                     symbol=order.symbol,
                     ours=None,
                     theirs=order.qty,
@@ -188,11 +234,21 @@ class Reconciler:
 
         log.error("execution.reconcile.mismatch", summary=report.summary())
         if halt_on_mismatch:
+            # Only the kinds that impugn a *position*. A cash drift past the
+            # tolerance and an orphan order — which this module's own comment
+            # calls "most often a protective stop we placed before a restart" —
+            # halt exactly as they do today, and name nothing: neither says
+            # anything about a quantity, and voiding the exit carve-out on them
+            # would refuse every protective stop across the whole book,
+            # unattended, every five minutes (ADR 0029).
             self.kill_switch.engage(
                 HaltScope.GLOBAL,
                 HaltReason.RECONCILIATION_MISMATCH,
                 engaged_by="reconciler",
                 detail=report.summary(),
+                unproven_symbols=sorted(
+                    {d.symbol for d in report.discrepancies if d.kind.impugns_position and d.symbol}
+                ),
             )
         return report
 
@@ -222,12 +278,16 @@ class Reconciler:
             if their_qty == our_qty:
                 continue
 
+            kind: DiscrepancyKind
             if our_qty == 0:
-                kind, detail = "missing_position", "the broker holds a position we do not"
+                kind = DiscrepancyKind.MISSING_POSITION
+                detail = "the broker holds a position we do not"
             elif their_qty == 0:
-                kind, detail = "unknown_position", "we hold a position the broker does not"
+                kind = DiscrepancyKind.UNKNOWN_POSITION
+                detail = "we hold a position the broker does not"
             else:
-                kind, detail = "position_qty", "the same symbol, a different quantity"
+                kind = DiscrepancyKind.POSITION_QTY
+                detail = "the same symbol, a different quantity"
 
             found.append(
                 Discrepancy(kind=kind, symbol=symbol, ours=our_qty, theirs=their_qty, detail=detail)
@@ -252,7 +312,7 @@ class Reconciler:
             return []
         return [
             Discrepancy(
-                kind="cash",
+                kind=DiscrepancyKind.CASH,
                 symbol=_NO_SYMBOL,
                 ours=portfolio.cash,
                 theirs=broker_cash,

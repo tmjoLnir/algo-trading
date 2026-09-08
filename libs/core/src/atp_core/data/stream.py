@@ -825,18 +825,18 @@ class StalenessMonitor:
         a human may have cleared it during the outage. Telling an operator a
         halt is standing when it is not is the same class of lie as telling them
         a dead feed recovered, and this message is now read on a phone rather
-        than in a log nobody was watching. `is_engaged` fails closed, so an
+        than in a log nobody was watching. `halt_state` fails closed, so an
         unreachable Redis says "still halted" and sends them to look.
 
         Swallowed like every other alert on this path (`killswitch._send_alert`):
         `AlertSink` says implementations must not raise, and being wrong about
         that must not take down the watchdog that is still watching. The
-        `is_engaged` call sits inside the same `try` for that reason.
+        `halt_state` call sits inside the same `try` for that reason.
         """
         if self._alerts is None:
             return
         try:
-            still_halted = self.kill_switch is not None and self.kill_switch.is_engaged()
+            still_halted = self.kill_switch is not None and self.kill_switch.halt_state().engaged
             self._alerts.send(
                 Alert(
                     severity=Severity.INFO,

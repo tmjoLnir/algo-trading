@@ -65,6 +65,32 @@ cancelling it is how you undo it. "Do not trade on stale prices" is not this
 layer's job and is not weakened by any of it — `stale_data` refuses every order
 including exits, on the same chain.
 
+**And it means one whose size the platform can prove.** The carve-out computes
+"smaller" from `Position.qty`, and two of the seven halt reasons are engaged
+*because that number is in doubt*: a submit that failed in transport and could
+not be resolved against the venue, and a reconcile that found our quantity and
+the broker's disagreeing. Under either, a flatten sized off our own book is
+sized off the number in dispute — against a position that turns out not to
+exist, it opens a short (ADR 0029).
+
+So a halt now **carries what it cannot prove**, and the carve-out is void for
+exactly those symbols and no others. An order in one of them comes back naming
+the symbol and pointing at the broker's own UI; every other position in the book
+still closes normally. This is deliberately keyed on the *evidence* a halt
+carries and never on its `HaltReason`: `reconciliation_mismatch` is also what a
+dollar of late-settling fees engages, and refusing every exit and every
+protective stop across the whole book on that finding — unattended, every five
+minutes — would be F3 all over again with layers 5 and 6 failing together.
+
+A Redis outage is not evidence about any position. It fails this layer closed on
+*new* risk, as ever, and impugns nothing: a blip that says nothing about the book
+must not strand every protective stop in it.
+
+The uncomfortable half, stated plainly: **a protective stop in an impugned
+symbol is refused too**, because it is sized off the same disputed quantity. The
+alert names those symbols rather than making you look them up, and getting flat
+in them goes through the broker directly — see docs/RUNBOOK.md.
+
 Layer 8 matters and is outside this codebase: **set position and loss limits in
 your broker's own controls too.** They are the only limits that still apply when
 this platform is the thing that is broken.
