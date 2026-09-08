@@ -981,3 +981,146 @@ class TestHaltStateFailsClosed:
         other = ks.halt_state("mean_reversion", "QQQ")
         assert len(other.halts) == 1
         assert not other.position_is_unproven("QQQ")
+
+
+class TestOneUnreadableRecordDoesNotErasTheOthers:
+    """Up to three halts cover one order and they are independent documents.
+
+    Decoding them as a single generator inside one `try` meant an unknown
+    `HaltReason` on *any* of them collapsed the whole answer to
+    `unreadable=True` — which by design impugns nothing. So a symbol halt that
+    had successfully recorded "we cannot prove SPY" was discarded because a
+    global halt beside it was written by a newer deploy, and the flatten against
+    SPY's disputed quantity was approved. Found by an adversarial review of this
+    branch's own diff and reproduced by execution before it was changed.
+    """
+
+    def a_mixed_read(self) -> tuple[RedisKillSwitch, FakeRedis]:
+        ks, redis = switch()
+        ks.engage(
+            HaltScope.SYMBOL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            target="SPY",
+            unproven_symbols=("SPY",),
+        )
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+        key = "atp:halt:global"
+        redis.store[key] = redis.store[key].replace('"manual"', '"a_reason_from_a_newer_deploy"')
+        return ks, redis
+
+    def test_the_evidence_on_a_readable_halt_survives(self) -> None:
+        ks, _ = self.a_mixed_read()
+
+        state = ks.halt_state("strat", "SPY")
+
+        assert state.position_is_unproven("SPY"), (
+            "the symbol halt decoded fine — discarding it reopens the exit carve-out"
+        )
+        assert len(state.halts) == 1
+
+    def test_it_still_fails_closed_on_the_one_it_could_not_read(self) -> None:
+        """The strictness is not traded away for the evidence. Both hold."""
+        ks, _ = self.a_mixed_read()
+
+        state = ks.halt_state("strat", "SPY")
+
+        assert state.unreadable is True
+        assert state.engaged is True
+
+    def test_an_undecodable_record_alone_is_still_unreadable_and_impugns_nothing(self) -> None:
+        """The case ADR 0029 reasons about — nothing was read, so there is no
+        evidence to keep and a store fault is not evidence about a position."""
+        ks, redis = switch()
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+        key = "atp:halt:global"
+        redis.store[key] = redis.store[key].replace('"manual"', '"from_the_future"')
+
+        state = ks.halt_state("strat", "SPY")
+
+        assert state.engaged is True
+        assert state.unreadable is True
+        assert state.position_is_unproven("SPY") is False
+
+
+class TestAFirstHaltCanArriveWithEvidence:
+    """And it is the common case, not the exotic one.
+
+    The scheduled reconcile finds a quantity it cannot prove on a platform that
+    was trading happily a second ago. Nothing was halted, so `SET NX` wins and
+    this is a *creation*. Routing only the escalation path through the
+    symbol-naming alert left exactly that path silent about which positions the
+    platform would no longer close.
+    """
+
+    def engaged_with_evidence(self) -> RecordingSink:
+        redis = FakeRedis()
+        sink = RecordingSink()
+        ks = RedisKillSwitch(redis, alerts=sink)  # type: ignore[arg-type]
+        ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            detail="SPY: broker 300, book 100",
+            unproven_symbols=("SPY",),
+        )
+        return sink
+
+    def test_the_operator_is_told_which_symbol_will_not_close(self) -> None:
+        sink = self.engaged_with_evidence()
+
+        assert len(sink.sent) == 2, "the halt, and what it means for exits"
+        bodies = " ".join(a.body for a in sink.sent)
+        assert "SPY" in bodies
+        assert any("cannot prove SPY" in a.title for a in sink.sent)
+        assert any("broker's own UI" in a.body for a in sink.sent)
+
+    def test_the_two_alerts_do_not_share_a_key(self) -> None:
+        """A deduping sink would otherwise deliver one of them (ADR 0012)."""
+        sink = self.engaged_with_evidence()
+
+        assert sink.sent[0].key != sink.sent[1].key
+
+    def test_a_halt_with_no_evidence_still_sends_exactly_one(self) -> None:
+        """The majority case is unchanged — a manual halt says nothing about any
+        position and must not manufacture a second page."""
+        redis = FakeRedis()
+        sink = RecordingSink()
+        ks = RedisKillSwitch(redis, alerts=sink)  # type: ignore[arg-type]
+
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        assert len(sink.sent) == 1
+
+
+class TestContentionSaysWhichFailureItWas:
+    """Two opposite states reach the same raise, and an operator acts
+    differently on each. Asserting either unconditionally is a lie half the
+    time — and the dangerous half is telling someone trading is stopped when
+    nothing is recorded."""
+
+    def test_a_key_cleared_on_the_final_round_does_not_claim_a_halt(self) -> None:
+        """Every round's `SET NX` loses, and every `GET` then finds the key
+        gone. Nothing was ever written by us and nothing may be in force."""
+        ks, redis = switch()
+        real_set = redis.set
+
+        def always_taken(key: str, value: str, nx: bool = False) -> bool | None:
+            if nx:
+                return None  # somebody else always holds it at SET time…
+            return real_set(key, value)
+
+        def always_gone(key: str) -> str | None:
+            return None  # …and it is gone by the time we read it
+
+        redis.set = always_taken  # type: ignore[method-assign]
+        redis.get = always_gone  # type: ignore[method-assign]
+
+        with pytest.raises(KillSwitchUnavailableError) as raised:
+            ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops", unproven_symbols=("SPY",))
+
+        message = str(raised.value)
+        assert "NO halt may be in force" in message
+        assert "trading is stopped" in message, "the operator must go and check"
+        assert "a halt is standing" not in message
+        assert "SPY is NOT recorded as unproven" in message

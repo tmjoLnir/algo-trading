@@ -433,11 +433,24 @@ class RedisKillSwitch:
         The decode is inside the `try` deliberately. A record we cannot read is
         exactly as unreadable as a Redis we cannot reach, and letting a
         `ValueError` out of the risk chain would be worse than either.
+
+        **But each record is decoded on its own.** Up to three halts cover one
+        order and they are independent documents; one of them being unreadable
+        is no reason to discard what the others said. Decoding them as a single
+        generator inside one `try` did exactly that, and it reopened the defect
+        this whole mechanism exists to close: a symbol halt impugning SPY beside
+        a global halt written by a newer deploy with an unknown `HaltReason`
+        collapsed to `unreadable=True`, which by design impugns nothing — so the
+        flatten against SPY's disputed quantity was approved. Reproduced by
+        execution before this was changed.
+
+        `unreadable` is still set, so the order is still refused unless it
+        reduces; what it no longer does is *erase* evidence already in hand. The
+        result is at least as strict on both axes as either alternative.
         """
         keys = self._covering_keys(strategy_id, symbol)
         try:
             raw = _sync(self._client.mget(keys))
-            return HaltState(halts=tuple(_decode(value) for value in raw if value is not None))
         except Exception as exc:
             log.critical(
                 "risk.killswitch.unreachable",
@@ -445,6 +458,26 @@ class RedisKillSwitch:
                 effect="failing closed — refusing the order",
             )
             return HaltState(unreadable=True)
+
+        halts: list[HaltRecord] = []
+        unreadable = False
+        for key, value in zip(keys, raw, strict=True):
+            if value is None:
+                continue
+            try:
+                halts.append(_decode(value))
+            except Exception as exc:
+                # A rolling deploy writing a `HaltReason` this process does not
+                # know. Loud, and fails closed via `unreadable` — but the halts
+                # beside it keep their impugnments.
+                unreadable = True
+                log.critical(
+                    "risk.killswitch.undecodable_record",
+                    key=key,
+                    error=str(exc),
+                    effect="failing closed on this record; the others still count",
+                )
+        return HaltState(halts=tuple(halts), unreadable=unreadable)
 
     def is_engaged(self, strategy_id: str | None = None, symbol: str | None = None) -> bool:
         """True if this order is covered by any active halt.
@@ -491,6 +524,10 @@ class RedisKillSwitch:
         """
         key = self._key(scope, target)
         symbols = _clean_symbols(unproven_symbols)
+        #: What the *last* round saw at the key. Only meaningful if the loop
+        #: falls through, where it is the difference between two opposite
+        #: messages — see the raise below.
+        last_saw_a_halt = False
 
         for _attempt in range(_MAX_ENGAGE_ATTEMPTS):
             now = self._clock.now()
@@ -518,7 +555,9 @@ class RedisKillSwitch:
                 # Cleared or expired between the SET and the GET. Round again
                 # rather than dereferencing None — which would raise out of the
                 # platform's stop button with no halt in force.
+                last_saw_a_halt = False
                 continue
+            last_saw_a_halt = True
 
             existing = _decode(raw)
             merged = _merge(existing, record)
@@ -529,33 +568,56 @@ class RedisKillSwitch:
                 return merged
             # Someone else wrote between our read and our write. Round again.
 
-        # What is known here is worth stating precisely, because the two
-        # failures a caller must tell apart look identical from the outside.
-        # Reaching this line means every round found the key **occupied** — the
-        # store answered, and a halt was standing at the last attempt. So
-        # trading is stopped; what did not land is *this* engage's reason and,
-        # far more importantly, its impugnment. A message that said "the halt
-        # may not be in force" would send an operator to re-halt an already
-        # halted platform while the symbol the reconciler could not prove goes
-        # on being flattenable.
+        # What is known here is worth stating precisely, because two opposite
+        # states reach this line and an operator mid-incident acts differently
+        # on each. `last_saw_a_halt` is the only thing that separates them, and
+        # asserting either one unconditionally is a lie half the time.
+        #
+        #   occupied  — every round found the key taken. The store answered and
+        #               a halt was standing at the last look, so trading IS
+        #               stopped; what did not land is this call's reason and,
+        #               far more importantly, its impugnment. Telling an
+        #               operator "the halt may not be in force" would send them
+        #               to re-halt an already halted platform while the symbol
+        #               nobody can prove goes on being flattenable.
+        #
+        #   gone      — the last round found the key cleared, so a `SET NX` was
+        #               about to be tried and never was. Nothing is recorded and
+        #               nothing may be halted. Claiming "trading IS halted" here
+        #               is the more dangerous error of the two: it tells someone
+        #               to walk away from a live account.
+        effect = (
+            "a halt stands, but this engage's evidence was not merged into it"
+            if last_saw_a_halt
+            else "the key was cleared under us and nothing was recorded — no halt may be in force"
+        )
         log.critical(
             "risk.killswitch.engage_contended",
             scope=scope.value,
             target=target,
             reason=reason.value,
             unproven=list(symbols),
-            effect="a halt stands, but this engage's evidence was not merged into it",
+            halt_seen=last_saw_a_halt,
+            effect=effect,
         )
-        raise KillSwitchUnavailableError(
-            f"a halt is standing on {key} and this {reason.value} engage could not be "
-            f"merged into it after {_MAX_ENGAGE_ATTEMPTS} attempts"
-            + (
-                f" — {', '.join(symbols)} is NOT recorded as unproven, so the exit "
-                f"carve-out will still size a flatten against it"
-                if symbols
-                else " — the reason in force is somebody else's"
+        lost = (
+            f" — {', '.join(symbols)} is NOT recorded as unproven, so the exit "
+            f"carve-out will still size a flatten against it"
+            if symbols
+            else ""
+        )
+        if last_saw_a_halt:
+            raise KillSwitchUnavailableError(
+                f"a halt is standing on {key} and this {reason.value} engage could not be "
+                f"merged into it after {_MAX_ENGAGE_ATTEMPTS} attempts"
+                + (lost or " — the reason in force is somebody else's")
+                + ". The store is reachable; retry, and confirm with `scripts/halt.py status`"
             )
-            + ". The store is reachable; retry, and confirm with `scripts/halt.py status`"
+        raise KillSwitchUnavailableError(
+            f"could not record a {reason.value} halt for {key} after "
+            f"{_MAX_ENGAGE_ATTEMPTS} attempts — the key kept being cleared under us, so "
+            f"NO halt may be in force" + lost + ". Retry, and confirm with "
+            "`scripts/halt.py status` before assuming trading is stopped"
         )
 
     def _announce_engaged(self, record: HaltRecord) -> None:
@@ -574,6 +636,26 @@ class RedisKillSwitch:
         metrics.halt_engaged(record.scope, record.reason)
         self._announce("engaged", record)
         self._alert_engaged(record)
+        if record.impugned:
+            # **A first halt can arrive already carrying evidence, and that is
+            # the common case rather than the exotic one.** The scheduled
+            # reconcile finds a quantity it cannot prove on a platform that was
+            # trading perfectly happily a second ago; nothing was halted, so
+            # `SET NX` wins and this is a *creation*, not an escalation.
+            #
+            # `_alert_engaged` deliberately keeps the book out of its body, so
+            # on its own it tells the operator trading stopped and never which
+            # symbols the platform will now refuse to close. That is precisely
+            # the half `_alert_escalated` exists to deliver, and routing only
+            # the escalation path through it left the ordinary path silent about
+            # the thing that matters most.
+            #
+            # `halt_escalated` is counted here too: the counter marks "exits
+            # stopped for the symbols named", which is exactly what happened,
+            # and its docstring says so. `halt_engaged` above marks the separate
+            # fact that trading stopped. One incident, two different facts.
+            metrics.halt_escalated(record.scope, record.reason)
+            self._alert_escalated(record, sorted(record.unproven_symbols))
 
     def _announce_escalated(self, before: HaltRecord, after: HaltRecord) -> None:
         """A standing halt that has learned something it cannot prove.

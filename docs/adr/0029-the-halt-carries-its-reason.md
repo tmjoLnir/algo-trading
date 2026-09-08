@@ -211,12 +211,22 @@ Escalation can only move a halt **out** of the auto-clear set and never into it:
 `engaged_by` never moves, and the only caller that engages as `DAILY_LOSS_RULE`
 supplies no symbols.
 
-**Verified by mutation, not by argument.** Twenty mutants — the latch removed,
-the dedup removed, the carve-out keyed on `HaltReason`, the impugnment read
-book-wide, `unreadable` treated as evidence, the alert key stripped of its
+**Verified by mutation, not by argument.** Twenty-six mutants — the latch
+removed, the dedup removed, the carve-out keyed on `HaltReason`, the impugnment
+read book-wide, `unreadable` treated as evidence, the alert key stripped of its
 symbols, `SET NX` made unconditional, the reconciler's classification inverted in
 both directions, the router impugning nothing and impugning everything, the
-rollover's new log silenced and over-fired — each killed by a named test.
+rollover's new log silenced and over-fired, `halt_state` returned to decoding all
+three keys as one generator, an undecodable record no longer failing closed, the
+creation-path alert silenced and over-fired, and the contended raise asserting
+each of its two outcomes unconditionally — each killed by a named test.
+
+**Three of those mutants are this ADR's own defects**, found by an adversarial
+review of the branch that introduces it and fixed before merge: the collapsed
+decode above, the silent creation-path alert, and the contended raise that
+claimed a halt was standing when the last round had found the key gone. They are
+recorded rather than quietly restated, and that the review found them at all is
+the argument for running one — every gate was green over all three.
 
 **What this does not fix.** Nothing clears an impugnment except clearing the
 halt. A reconcile that finds SPY correct on its next pass does not retract the
