@@ -98,9 +98,10 @@ strategy; they are evidence about the plumbing.
 |---|---|
 | *(before 11:16)* | **Worker already running — the boot is not in this capture.** First worker line is a reconnect whose `gap_since` is 11:15:12 |
 | 11:16:47 | Log window opens |
-| 11:43:41 | Stream + trade-updates reconnect after a **28m27s** gap (`gap_seconds=1707.4`). Pre-market |
-| 11:43:41 | `data.stream.backfill_truncated` — *"the rest is left to the nightly gap sweep."* The gap is **not** fully backfilled |
-| 12:01:00 | First bar ingested |
+| 11:43:40 | Stream + trade-updates drop and reconnect. **Real downtime 1.13s**; the log calls it `gap_seconds=1707.4`, which is the ingestor's age, not a gap (F10) |
+| 11:43:41 | `data.stream.backfill_truncated` → a 6-hour window lying entirely before IEX opens, so all 20 symbols return empty. Correct, and unreadable |
+| 11:43:47 | A **129.6-second whole-host stall**, mid-backfill. Pre-market |
+| 12:00:00 | First bar-minute of the day — IEX publishes nothing earlier |
 | 12:30:01 | **`apply_corporate_actions` raises `DataGapError` on `ZWZZT`** and dies. Never re-runs |
 | 13:12:11 | Postgres: `the "timescaledb" extension is not up-to-date` (2.15.2 installed, 2.30.0 current) |
 | 13:30:00 | **Market open.** No bars this minute |
