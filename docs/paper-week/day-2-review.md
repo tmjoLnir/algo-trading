@@ -843,6 +843,22 @@ bears on, *"Alerting to a phone (feed loss, halt, reconciliation failure)"*, **h
 alerts were confirmed delivered. It does not claim to cover unprotected positions, and F3 is a
 gap in the platform rather than a lie in the roadmap.
 
+**A warning about fixing B1.** Day 2 exercised exactly one protection path: total refusal. Every
+symbol stayed in `runner._unprotected`, so `_stop_is_missing` (`runner.py:1067`) took its
+"known short" branch for every position, all day. The moment B1 is fixed, positions start
+taking the `is_fully_protected` branch (`runner.py:1477`) and the partial-cover arithmetic at
+`runner.py:1070` — **neither of which this session touched even once.** `runner.py:1409`
+already names an adjacent state as *"the worst one in the system"*. Day 2 is not evidence that
+those paths work; it is evidence that they were never asked.
+
+Two smaller things will also surface on day 3 and are cheap to pre-empt:
+
+- **`RunnerStats` is never zeroed**, and the worker did not restart. Day 3's cumulative
+  counters continue day 2's unless the process is bounced.
+- **The 60-second poll has zero margin against a 60-second bar.** Observed `newest_bar_age_seconds`
+  drifts 60.3 → 120.8 s and phase-wraps twice a session. It cost nothing here; it is the kind of
+  thing that costs something on the day a bar is late.
+
 **Verify B1 with one query after the first fill of day 3:**
 ```sql
 select id, symbol, purpose, stop_price, status from orders
