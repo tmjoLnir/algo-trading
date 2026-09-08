@@ -596,6 +596,26 @@ share one.
 **Fix.** Require a fresh clean reconcile before a reconciliation halt can be cleared, and
 record the halt against the evidence that cleared it, not only the person.
 
+### F14 — The daily report's halt count is a stale row, and this day's halt counts zero `medium`
+
+`worker.daily_report` says `halts 1 (1 recorded — operator halts only; the risk layer's own
+triggers write no audit row)`. The parenthetical is truthful: `HALT_ENGAGED` / `HALT_CLEARED`
+audit rows are written at exactly four sites — `api/routers/risk.py:762,872` and
+`scripts/halt.py:312,352` — and `risk/killswitch.py` imports no audit sink at all.
+
+But the consequence is worse than the caveat admits. The halt that engaged at 17:00:52 was
+`engaged_by=reconciler`, so it wrote **no** row. The operator's clear came at 21:38:31 — 68
+minutes *after* the 20:30 report was generated. The only mutating HTTP requests in the entire
+capture are the 14:23 login and that 21:38 resume. So the "1 recorded" halt is a row from
+**outside this session**, swept in by the report's rolling `now - timedelta(days=1)` window at
+`scheduler.py:418`.
+
+The halt that cost three hours of RTH, 40 refusals and 11 CRITICAL reminders contributes
+**zero** to the day's halt count, and a halt from a previous day is reported in its place.
+
+**Fix.** Give the risk layer an audit sink, and bound the report's window to the session it
+names rather than a rolling 24 hours.
+
 ### F15 — Nothing scrapes the metrics, and nothing ever did `high`
 
 Day 1's F1 blamed an unset `METRICS_TOKEN` for `atp_strategy_evaluations_total` never
@@ -617,26 +637,6 @@ in §4 that begins "nothing says so".
 **Fix.** Either stand up a scraper and make the metrics real, or stop declaring metrics and
 invest the same effort in the durable rows F2 and F3 need. A metrics endpoint nobody reads is
 indistinguishable from no metrics, and it is worse, because it looks like coverage.
-
-### F14 — The daily report's halt count is a stale row, and this day's halt counts zero `medium`
-
-`worker.daily_report` says `halts 1 (1 recorded — operator halts only; the risk layer's own
-triggers write no audit row)`. The parenthetical is truthful: `HALT_ENGAGED` / `HALT_CLEARED`
-audit rows are written at exactly four sites — `api/routers/risk.py:762,872` and
-`scripts/halt.py:312,352` — and `risk/killswitch.py` imports no audit sink at all.
-
-But the consequence is worse than the caveat admits. The halt that engaged at 17:00:52 was
-`engaged_by=reconciler`, so it wrote **no** row. The operator's clear came at 21:38:31 — 68
-minutes *after* the 20:30 report was generated. The only mutating HTTP requests in the entire
-capture are the 14:23 login and that 21:38 resume. So the "1 recorded" halt is a row from
-**outside this session**, swept in by the report's rolling `now - timedelta(days=1)` window at
-`scheduler.py:418`.
-
-The halt that cost three hours of RTH, 40 refusals and 11 CRITICAL reminders contributes
-**zero** to the day's halt count, and a halt from a previous day is reported in its place.
-
-**Fix.** Give the risk layer an audit sink, and bound the report's window to the session it
-names rather than a rolling 24 hours.
 
 ---
 
