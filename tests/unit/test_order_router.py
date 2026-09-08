@@ -509,6 +509,28 @@ class TestTransportFailure:
         assert "broker_unreachable" in reason
         assert by == "order_router"
 
+    async def test_an_unresolvable_submit_impugns_its_own_symbol_and_no_other(self) -> None:
+        """ADR 0029. The halt is global and the impugnment is one ticker, and
+        both are right for different reasons.
+
+        What stops trading is global: a transport we cannot trust says nothing
+        good about the next order either. What we cannot *prove* is this order's
+        symbol — its outcome is unknown, so `Position.qty` for SPY may be wrong
+        by exactly its quantity and an exit sized against it is sized against
+        the number in doubt. Every other symbol still closes normally, which is
+        what keeps a halt from being a book-wide freeze on exits.
+        """
+        broker = FakeBroker()
+        broker.timeout_next = True
+        switch = FakeKillSwitch()
+
+        with pytest.raises(BrokerConnectionError):
+            await router(broker, kill_switch=switch).submit(request(), book())
+
+        state = switch.halt_state()
+        assert state.position_is_unproven("SPY")
+        assert not state.position_is_unproven("QQQ")
+
     async def test_an_unresolvable_submit_leaves_the_order_where_it_really_is(self) -> None:
         """`PENDING_SUBMIT` — approved, not yet acknowledged — is literally the
         truth, and it carries the deterministic key reconciliation needs to

@@ -13,20 +13,25 @@ stopping should be reflexive, restarting should not be.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from atp_core import metrics
 from atp_core.alerts.ports import Alert, Severity
 from atp_core.channels import CHANNEL_HALTS
+from atp_core.clock import SystemClock
+from atp_core.errors import KillSwitchUnavailableError
 from atp_core.logging import get_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Collection, Sequence
+
     from redis import Redis
 
     from atp_core.alerts.ports import AlertSink
+    from atp_core.clock import Clock
 
 log = get_logger(__name__)
 
@@ -70,7 +75,7 @@ class Impugnment:
     `symbols` plural and not one symbol: a reconcile compares the whole book at
     a single instant, and its findings are one event rather than five.
 
-    This is what `KillSwitchRule`'s exit carve-out actually reads (ADR 0028) —
+    This is what `KillSwitchRule`'s exit carve-out actually reads (ADR 0029) —
     *not* `reason`. A halt's reason answers "what stopped trading"; an
     impugnment answers "which positions we cannot prove". They are different
     questions, and the same `HaltReason` warrants opposite verdicts depending
@@ -121,11 +126,98 @@ class HaltRecord:
         return bool(self.impugned)
 
 
-class KillSwitch(Protocol):
-    def is_engaged(self, strategy_id: str | None = None, symbol: str | None = None) -> bool:
-        """True if this order is covered by any active halt.
+def _merge(existing: HaltRecord, incoming: HaltRecord) -> HaltRecord:
+    """The record that should stand, given one already does.
 
-        Checked by `KillSwitchRule` before every single order.
+    A **one-way latch**. `engaged_at`, `engaged_by` and `detail` never move: a
+    halt that re-stamps itself erases the only evidence of when trading actually
+    stopped. What can move is `reason`, and only upward — from a halt that
+    proves nothing about the book to one that does — with the original kept in
+    `escalation`.
+
+    `impugned` is appended to, and only when the incoming engage names a symbol
+    no standing impugnment already covers. That clause is not a nicety: the
+    scheduled reconcile runs every five minutes and a mismatch stands until a
+    human fixes it, so without it a two-hour incident appends twenty-four
+    identical impugnments and fires twenty-four alerts. The Redis state is the
+    dedup, exactly as ADR 0012 already has it for the halt notification.
+
+    Pure and total, so the whole latch is one testable function rather than a
+    branch tangled into a Redis round trip.
+    """
+    fresh = [
+        item for item in incoming.impugned if not set(item.symbols) <= existing.unproven_symbols
+    ]
+    impugned = existing.impugned + tuple(fresh)
+
+    # The reason rises once, when evidence arrives at a halt that had none.
+    # Never falls, never moves sideways: an operator pressing HALT beside a
+    # standing `broker_unreachable` cannot loosen it, and `manual` then
+    # `data_feed_lost` is the no-change case it is today.
+    escalates = bool(fresh) and not existing.impugned
+    if not escalates:
+        return existing if not fresh else replace(existing, impugned=impugned)
+
+    return replace(
+        existing,
+        reason=incoming.reason,
+        impugned=impugned,
+        escalation=HaltEscalation(
+            from_reason=existing.reason,
+            at=incoming.engaged_at,
+            by=incoming.engaged_by,
+            detail=incoming.detail,
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class HaltState:
+    """Everything the switch knows about the halts covering **one** order.
+
+    `unreadable` is a third answer rather than an empty `halts`, because
+    "halted for no reason we could read" and "halted for reasons we read, none
+    of which impugn a position" are different states and a caller that
+    conflates them silently picks a policy nobody chose.
+    """
+
+    halts: tuple[HaltRecord, ...] = ()
+    unreadable: bool = False
+
+    @property
+    def engaged(self) -> bool:
+        return self.unreadable or bool(self.halts)
+
+    def position_is_unproven(self, symbol: str) -> bool:
+        """Whether any halt covering this order says *this symbol's* quantity
+        cannot be relied on.
+
+        `unreadable` deliberately does **not** count. A Redis outage is not
+        evidence about the book: it is evidence that we cannot read halt
+        metadata, and the two are unrelated. Treating it as impugnment would
+        refuse every exit and every protective stop on every Redis blip —
+        docs/SAFETY.md's layers 5 and 6 failing together, on an outage that
+        says nothing about any position. The halt itself still stands, because
+        `engaged` is true; only the carve-out is unaffected.
+        """
+        return any(symbol in halt.unproven_symbols for halt in self.halts)
+
+
+class KillSwitch(Protocol):
+    def halt_state(self, strategy_id: str | None = None, symbol: str | None = None) -> HaltState:
+        """Every halt covering this order, and what each says it cannot prove.
+
+        Read by `KillSwitchRule` before every single order. **The Protocol
+        deliberately offers no bare boolean**: a rule that asks only "am I
+        halted" gets the pre-ADR 0029 behaviour and lets a flatten through
+        against a quantity nobody can vouch for. `RedisKillSwitch.is_engaged`
+        still exists for callers that genuinely want the boolean and are not
+        risk rules — the staleness monitor, the dashboard, `scripts/halt.py` —
+        but it is not on the contract a rule is handed.
+
+        Fails closed exactly as `is_engaged` does, returning
+        `HaltState(unreadable=True)`, so there is one fail-closed policy for
+        this switch rather than two.
         """
         ...
 
@@ -136,6 +228,8 @@ class KillSwitch(Protocol):
         engaged_by: str,
         detail: str = "",
         target: str | None = None,
+        *,
+        unproven_symbols: Collection[str] = (),
     ) -> HaltRecord:
         """Halt immediately. Idempotent — re-engaging an active halt is fine."""
         ...
@@ -161,11 +255,40 @@ class KillSwitch(Protocol):
         ...
 
 
+#: How many times `engage` will retry a contended write before giving up. Three
+#: because the contention it is for is two processes reacting to one incident,
+#: not a hot loop — and because failing loudly beats spinning on the path that
+#: stops trading.
+_MAX_ENGAGE_ATTEMPTS = 3
+
+#: Compare-and-set, as one round trip. `WATCH`/`MULTI` would need a dedicated
+#: connection out of the pool and a transaction the sync client holds open; a
+#: two-line script is the same guarantee without either.
+_CAS = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[2]); return 1
+else return 0 end
+"""
+
+
+def _clean_symbols(symbols: Collection[str]) -> tuple[str, ...]:
+    """Sorted, unique, uppercase tickers — or a `ValueError`.
+
+    A reconcile's cash discrepancy carries `_NO_SYMBOL`, which is the empty
+    string, so a blank must never enter here as if it named an instrument: it
+    would be a symbol no order can match and an impugnment nothing can clear.
+    """
+    cleaned = {s.strip().upper() for s in symbols}
+    if any(not s for s in cleaned):
+        raise ValueError("an impugned symbol cannot be blank")
+    return tuple(sorted(cleaned))
+
+
 #: redis-py types its sync client's returns as `Awaitable[Any] | Any`, because
-#: one class serves both the sync and async APIs. Every call below is against
-#: the synchronous client, so the awaitable half is unreachable — narrowed here
-#: rather than with an ignore on each call site, which would suppress real
-#: errors alongside this one.
+#: one class serves both the sync and async APIs. Every call in this module is
+#: against the synchronous client, so the awaitable half is unreachable —
+#: narrowed here rather than with an ignore on each call site, which would
+#: suppress real errors alongside this one.
 def _sync(value: object) -> Any:
     return cast("Any", value)
 
@@ -179,7 +302,7 @@ def _encode(record: HaltRecord) -> str:
         "detail": record.detail,
         "target": record.target,
     }
-    # Written only when present, so a record from before ADR 0028 and one
+    # Written only when present, so a record from before ADR 0029 and one
     # engaged today with nothing impugned encode identically. A rolling deploy
     # then cannot tell them apart, which is the point.
     if record.escalation is not None:
@@ -206,7 +329,7 @@ def _encode(record: HaltRecord) -> str:
 def _decode(raw: str | bytes) -> HaltRecord:
     payload: dict[str, Any] = json.loads(raw)
     # `.get` on both new fields: a record written by a process from before
-    # ADR 0028 reads back as un-escalated and un-impugned, which is the
+    # ADR 0029 reads back as un-escalated and un-impugned, which is the
     # default-closed answer — nothing is claimed to be proven that was not.
     escalation_payload = payload.get("escalation")
     escalation = (
@@ -259,8 +382,15 @@ class RedisKillSwitch:
         key_prefix: str = "atp:halt",
         *,
         alerts: AlertSink | None = None,
+        clock: Clock | None = None,
     ) -> None:
         self._client = client
+        #: Injected, because `HaltRecord.engaged_at` is now evidence a risk rule
+        #: reads rather than only an audit field — and because every sibling
+        #: adapter in `libs/core` takes one (CLAUDE.md §1.2, AUDIT.md #49).
+        #: Defaults to the system clock so the nine existing construction sites
+        #: are untouched.
+        self._clock = clock or SystemClock()
         self.key_prefix = key_prefix
         #: Where a halt goes to reach a human who is not looking at a screen.
         #: Optional because the kill switch must work without one — an
@@ -275,30 +405,62 @@ class RedisKillSwitch:
             raise ValueError(f"a {scope.value}-scoped halt needs a target")
         return f"{self.key_prefix}:{scope.value}:{target}"
 
-    def is_engaged(self, strategy_id: str | None = None, symbol: str | None = None) -> bool:
-        """True if this order is covered by any active halt.
+    def _covering_keys(self, strategy_id: str | None, symbol: str | None) -> list[str]:
+        """The keys a halt covering this order could live under.
 
-        **Fails closed.** If Redis cannot be reached, this returns True and
-        trading stops. docs/SAFETY.md names that explicitly as how layer 6
-        fails, and the reasoning is one-sided: a false halt costs missed
-        opportunity, while a false clear trades an account through whatever
-        made Redis unreachable in the first place.
+        One place, so `halt_state` and `is_engaged` cannot come to disagree
+        about what "covering" means — which is the drift that would let an
+        order be refused by one and permitted by the other.
         """
         keys = [self._key(HaltScope.GLOBAL, None)]
         if strategy_id:
             keys.append(self._key(HaltScope.STRATEGY, strategy_id))
         if symbol:
             keys.append(self._key(HaltScope.SYMBOL, symbol))
+        return keys
 
+    def halt_state(self, strategy_id: str | None = None, symbol: str | None = None) -> HaltState:
+        """Every halt covering this order, decoded. One round trip.
+
+        **Fails closed.** If Redis cannot be reached — or a record will not
+        decode, which a newer process writing an unknown `HaltReason` during a
+        rolling deploy would cause — this reports `unreadable`, `engaged` is
+        true and trading stops. docs/SAFETY.md names that as how layer 6 fails,
+        and the reasoning is one-sided: a false halt costs missed opportunity,
+        while a false clear trades an account through whatever made Redis
+        unreachable in the first place.
+
+        The decode is inside the `try` deliberately. A record we cannot read is
+        exactly as unreadable as a Redis we cannot reach, and letting a
+        `ValueError` out of the risk chain would be worse than either.
+        """
+        keys = self._covering_keys(strategy_id, symbol)
         try:
-            return any(value is not None for value in _sync(self._client.mget(keys)))
+            raw = _sync(self._client.mget(keys))
+            return HaltState(halts=tuple(_decode(value) for value in raw if value is not None))
         except Exception as exc:
             log.critical(
                 "risk.killswitch.unreachable",
                 error=str(exc),
                 effect="failing closed — refusing the order",
             )
-            return True
+            return HaltState(unreadable=True)
+
+    def is_engaged(self, strategy_id: str | None = None, symbol: str | None = None) -> bool:
+        """True if this order is covered by any active halt.
+
+        **Not for a risk rule** — `KillSwitchRule` reads `halt_state`, because a
+        bare boolean cannot say which positions a halt puts beyond proof and a
+        rule that asks this question lets a flatten through against a quantity
+        nobody can vouch for (ADR 0029). This is for the callers that genuinely
+        want the boolean: the staleness monitor deciding whether to re-halt, the
+        dashboard's banner, `scripts/halt.py status`. It is deliberately absent
+        from the `KillSwitch` Protocol so a rule cannot reach it through the
+        contract it is handed.
+
+        Fails closed, by deferring to `halt_state`.
+        """
+        return self.halt_state(strategy_id, symbol).engaged
 
     def engage(
         self,
@@ -307,6 +469,8 @@ class RedisKillSwitch:
         engaged_by: str,
         detail: str = "",
         target: str | None = None,
+        *,
+        unproven_symbols: Collection[str] = (),
     ) -> HaltRecord:
         """Halt immediately. Idempotent — re-engaging an active halt is fine.
 
@@ -320,35 +484,102 @@ class RedisKillSwitch:
         already failing closed on the same outage.
         """
         key = self._key(scope, target)
-        existing = _sync(self._client.get(key))
-        if existing is not None:
-            return _decode(existing)
+        symbols = _clean_symbols(unproven_symbols)
 
-        record = HaltRecord(
-            scope=scope,
-            reason=reason,
-            engaged_at=datetime.now(UTC),
-            engaged_by=engaged_by,
-            detail=detail,
-            target=target,
+        for _attempt in range(_MAX_ENGAGE_ATTEMPTS):
+            now = self._clock.now()
+            record = HaltRecord(
+                scope=scope,
+                reason=reason,
+                engaged_at=now,
+                engaged_by=engaged_by,
+                detail=detail,
+                target=target,
+                impugned=(
+                    (Impugnment(symbols, reason, now, engaged_by, detail),) if symbols else ()
+                ),
+            )
+            # `SET NX` rather than GET-then-SET: one atomic round trip, which is
+            # what AUDIT.md finding 48 asks for. It matters more now than it did
+            # then — a lost update used to cost an audit field, and would now
+            # cost the impugnment the exit carve-out reads.
+            if _sync(self._client.set(key, _encode(record), nx=True)):
+                self._announce_engaged(record)
+                return record
+
+            raw = _sync(self._client.get(key))
+            if raw is None:
+                # Cleared or expired between the SET and the GET. Round again
+                # rather than dereferencing None — which would raise out of the
+                # platform's stop button with no halt in force.
+                continue
+
+            existing = _decode(raw)
+            merged = _merge(existing, record)
+            if merged == existing:
+                return existing  # already covered. No write, no second alert.
+            if _sync(self._client.eval(_CAS, 1, key, raw, _encode(merged))):
+                self._announce_escalated(existing, merged)
+                return merged
+            # Someone else wrote between our read and our write. Round again.
+
+        log.critical("risk.killswitch.engage_contended", scope=scope.value, target=target)
+        raise KillSwitchUnavailableError(
+            f"could not record a {reason.value} halt for {key} after "
+            f"{_MAX_ENGAGE_ATTEMPTS} attempts — the halt may not be in force"
         )
-        self._client.set(key, _encode(record))
+
+    def _announce_engaged(self, record: HaltRecord) -> None:
         log.critical(
             "risk.killswitch.engaged",
-            scope=scope.value,
-            reason=reason.value,
-            engaged_by=engaged_by,
-            target=target,
-            detail=detail,
+            scope=record.scope.value,
+            reason=record.reason.value,
+            engaged_by=record.engaged_by,
+            target=record.target,
+            detail=record.detail,
+            unproven=sorted(record.unproven_symbols),
         )
-        # Counted here rather than at the top of the method, so that the
-        # early return above — a halt that was already active — is not a second
-        # incident on the graph. The Redis state is the deduplication, exactly
-        # as it is for the notification (ADR 0012).
-        metrics.halt_engaged(scope, reason)
+        # Reached only when the `SET NX` won, so a halt that was already active
+        # is not a second incident on the graph. The Redis state is the
+        # deduplication, exactly as it is for the notification (ADR 0012).
+        metrics.halt_engaged(record.scope, record.reason)
         self._announce("engaged", record)
         self._alert_engaged(record)
-        return record
+
+    def _announce_escalated(self, before: HaltRecord, after: HaltRecord) -> None:
+        """A standing halt that has learned something it cannot prove.
+
+        Announced and alerted separately from the halt itself, with its own
+        key, because a deduping sink would otherwise swallow it behind the
+        original — and what changed is that **exits are now refused too**,
+        which is the half an operator most needs to hear.
+
+        Two shapes reach here and the message distinguishes them, because they
+        are not the same news. A **rise** is a halt that proved nothing about
+        the book learning that it does, and `from_reason` records where it came
+        from. An **append** is a second incident naming symbols the first did
+        not, on a halt whose reason has already risen as far as it goes; there
+        `from_reason` is absent rather than repeated, because a log line saying
+        `manual -> manual` reads as a transition that did not happen.
+
+        `newly_unproven` is what carries in both, and it is the field this
+        method exists for: an operator who already knows SPY is stuck needs to
+        be told the word QQQ, not handed the whole set again.
+        """
+        newly = sorted(after.unproven_symbols - before.unproven_symbols)
+        raised = after.reason is not before.reason
+        log.critical(
+            "risk.killswitch.escalated",
+            scope=after.scope.value,
+            from_reason=before.reason.value if raised else None,
+            reason=after.reason.value,
+            newly_unproven=newly,
+            unproven=sorted(after.unproven_symbols),
+            target=after.target,
+        )
+        metrics.halt_escalated(after.scope, after.reason)
+        self._announce("escalated", after)
+        self._alert_escalated(after, newly)
 
     def clear(
         self, scope: HaltScope, cleared_by: str, target: str | None = None
@@ -397,6 +628,63 @@ class RedisKillSwitch:
         # and in that window this call did not resume anything — returning the
         # record anyway would credit this operator with someone else's decision.
         return None
+
+    def _alert_escalated(self, record: HaltRecord, newly: Sequence[str]) -> None:
+        """Tell a human that the halt they already know about now refuses exits.
+
+        Its own alert with its own `key`, because a deduping sink would
+        otherwise swallow it behind the original halt's notification (ADR 0012)
+        — and the thing that changed is the half an operator most needs: the
+        ordinary close is now refused for these symbols, so getting flat in them
+        goes through the broker's own UI. Everything else stays closeable.
+
+        **The key is keyed on the symbols, not only the reason.** A second
+        incident naming QQQ beside a standing `reconciliation_mismatch` on SPY
+        produces the same scope, target and reason as the first, so a key built
+        from those three would be identical — and the deduping sink this method
+        exists to get past would swallow exactly the message it exists to
+        deliver. The set is what changed, so the set is in the key.
+
+        The symbols are named. That is a departure from `_alert_engaged`, which
+        deliberately keeps the book out of the body — but a list of tickers the
+        platform will not close is not a position size, and an operator who has
+        to open the dashboard to learn *which* symbols are stuck at 3am is being
+        told the wrong half of the message.
+        """
+        if self._alerts is None:
+            return
+        target = f" [{record.target}]" if record.target else ""
+        every = sorted(record.unproven_symbols)
+        symbols = ", ".join(every)
+        added = ", ".join(newly) or symbols
+        also = (
+            f"In total the platform will not close: {symbols}."
+            if newly and len(newly) != len(every)
+            else "Every other symbol still closes normally."
+        )
+        self._send_alert(
+            Alert(
+                severity=Severity.CRITICAL,
+                title=f"Halt escalated: cannot prove {added}",
+                body="\n".join(
+                    [
+                        f"{record.scope.value}{target} was halted; the platform now also "
+                        f"refuses to close: {added}.",
+                        f"Reason: {record.reason.value}. {also}",
+                        "To get flat in these, use the broker's own UI. Then docs/RUNBOOK.md.",
+                    ]
+                ),
+                key=(
+                    f"halt.{record.scope.value}.{record.target or 'all'}."
+                    f"escalated.{record.reason.value}.{'-'.join(every)}"
+                ),
+                context={
+                    "scope": record.scope.value,
+                    "reason": record.reason.value,
+                    "unproven": symbols,
+                },
+            )
+        )
 
     def _alert_engaged(self, record: HaltRecord) -> None:
         """Tell a human trading stopped. Reached only by a *new* halt.

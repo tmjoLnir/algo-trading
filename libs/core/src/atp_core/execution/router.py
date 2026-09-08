@@ -1132,8 +1132,14 @@ class OrderRouter:
             from atp_core.risk.killswitch import HaltReason, HaltScope
 
             self.kill_switch.engage(
-                # GLOBAL rather than SYMBOL: the doubt is about the book, not
-                # about one ticker.
+                # GLOBAL rather than SYMBOL, and one symbol impugned: the two
+                # answer different questions and both are right (ADR 0029).
+                # What stops trading is global — a transport we cannot trust
+                # says nothing good about the next order either. What we cannot
+                # *prove* is one ticker: this order's outcome is unknown, so
+                # `Position.qty` for its symbol may be wrong by exactly its
+                # quantity, and an exit sized against it is sized against the
+                # number in doubt. Every other symbol still closes normally.
                 HaltScope.GLOBAL,
                 HaltReason.BROKER_UNREACHABLE,
                 engaged_by="order_router",
@@ -1142,6 +1148,7 @@ class OrderRouter:
                     f"{order.side.value} {order.qty}) failed in transport and could "
                     f"not be resolved against the venue"
                 ),
+                unproven_symbols=(order.symbol,),
             )
         raise BrokerConnectionError(
             f"submit of {order.client_order_id} ({order.symbol} {order.side.value} "

@@ -105,6 +105,16 @@ class InsufficientFundsError(BrokerError): ...
 class RiskError(ATPError): ...
 
 
+class KillSwitchUnavailableError(RiskError):
+    """The halt could not be recorded, so it may not be in force.
+
+    Raised rather than returned, and never swallowed. `engage` is the platform's
+    stop button: a caller that believes it halted trading and did not is the one
+    outcome worse than an exception, because every later decision is taken on
+    the assumption that the book is frozen.
+    """
+
+
 class RiskLimitBreachedError(RiskError):
     """A pre-trade check failed. Expected in normal operation, not a bug."""
 

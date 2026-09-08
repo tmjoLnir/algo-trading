@@ -35,6 +35,7 @@ from atp_core.logging import (
 )
 from atp_core.metrics import get_registry
 from atp_core.risk.killswitch import HaltReason, HaltScope, RedisKillSwitch
+from tests.fakes import FakeRedis
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -83,31 +84,6 @@ def value(name: str, **labels: str) -> float:
     """
     sample = get_registry().get_sample_value(name, labels or None)
     return 0.0 if sample is None else sample
-
-
-class FakeRedis:
-    """Just enough Redis for the kill switch. Mirrors `test_kill_switch`."""
-
-    def __init__(self) -> None:
-        self.store: dict[str, str] = {}
-
-    def get(self, key: str) -> str | None:
-        return self.store.get(key)
-
-    def mget(self, keys: list[str]) -> list[str | None]:
-        return [self.store.get(k) for k in keys]
-
-    def set(self, key: str, value: str) -> None:
-        self.store[key] = value
-
-    def delete(self, key: str) -> int:
-        return 1 if self.store.pop(key, None) is not None else 0
-
-    def scan_iter(self, match: str) -> list[str]:
-        return [k for k in self.store if k.startswith(match.rstrip("*"))]
-
-    def publish(self, channel: str, message: str) -> int:
-        return 0
 
 
 class TestTheRegistryItself:

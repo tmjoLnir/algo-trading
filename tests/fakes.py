@@ -41,11 +41,19 @@ from atp_core.errors import (
     StrategyExistsError,
 )
 from atp_core.execution.ports import StoredBook
-from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
+from atp_core.risk.killswitch import (
+    _CAS,
+    HaltReason,
+    HaltRecord,
+    HaltScope,
+    HaltState,
+    Impugnment,
+)
 from atp_core.strategy.ports import StoredStrategy
 from atp_core.worker.config import StoredWorkerConfig, WorkerConfig
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Collection
     from typing import Any
 
     from atp_core.audit.ports import AuditEntry
@@ -309,6 +317,96 @@ class FakeBroker:
             raise BrokerConnectionError("broker unreachable")
 
 
+class FakeRedis:
+    """Just enough Redis, in a dict, for `RedisKillSwitch` to run against.
+
+    Shared rather than copied into each test module, because the surface it
+    stands in for is no longer three dict operations: `engage` now writes
+    through `SET NX` and a compare-and-set script, and a fake that quietly
+    treated either as an unconditional write would let a lost update pass the
+    very tests that exist to catch one.
+
+    Two of its choices are deliberate:
+
+    - **`set(nx=True)` returns `True` or `None`**, exactly as redis-py does.
+      A fake returning `None` unconditionally would send `engage` down the
+      merge path every time; one returning `True` unconditionally would hide
+      the merge path entirely. Both are green suites over a broken switch.
+    - **`eval` refuses a script it does not recognise.** It compares against
+      the module's own `_CAS` constant rather than interpreting Lua, so the
+      day that script changes the fake fails loudly instead of returning a
+      success it did not perform.
+
+    `broken` makes every call raise, which is how docs/SAFETY.md layer 6's
+    fail-closed behaviour is tested. `before_cas` is the seam for the contended
+    write: a callable invoked between the read and the compare-and-set, which
+    is where a second process lands in production and nowhere a test can reach
+    otherwise.
+    """
+
+    def __init__(
+        self,
+        broken: bool = False,
+        before_cas: Callable[[FakeRedis], None] | None = None,
+    ) -> None:
+        self.store: dict[str, str] = {}
+        self.published: list[tuple[str, str]] = []
+        self.broken = broken
+        self.before_cas = before_cas
+        self.evals = 0
+
+    def _guard(self) -> None:
+        if self.broken:
+            raise ConnectionError("redis is down")
+
+    def get(self, key: str) -> str | None:
+        self._guard()
+        return self.store.get(key)
+
+    def mget(self, keys: list[str]) -> list[str | None]:
+        self._guard()
+        return [self.store.get(k) for k in keys]
+
+    def set(self, key: str, value: str, nx: bool = False) -> bool | None:
+        self._guard()
+        if nx and key in self.store:
+            return None
+        self.store[key] = value
+        return True
+
+    def delete(self, key: str) -> int:
+        self._guard()
+        return 1 if self.store.pop(key, None) is not None else 0
+
+    def eval(self, script: str, numkeys: int, *args: str) -> int:
+        """The compare-and-set in `killswitch._CAS`, and nothing else."""
+        self._guard()
+        if script != _CAS:
+            raise NotImplementedError(
+                "FakeRedis emulates killswitch._CAS only; this script is not it"
+            )
+        if numkeys != 1:
+            raise ValueError(f"_CAS takes one key, got {numkeys}")
+        key, expected, new = args
+        self.evals += 1
+        if self.before_cas is not None:
+            self.before_cas(self)
+        if self.store.get(key) != expected:
+            return 0
+        self.store[key] = new
+        return 1
+
+    def scan_iter(self, match: str) -> list[str]:
+        self._guard()
+        prefix = match.rstrip("*")
+        return [k for k in self.store if k.startswith(prefix)]
+
+    def publish(self, channel: str, message: str) -> int:
+        self._guard()
+        self.published.append((channel, message))
+        return 0
+
+
 class FakeKillSwitch:
     """Records halts instead of reaching Redis.
 
@@ -346,6 +444,37 @@ class FakeKillSwitch:
     def is_engaged(self, strategy_id: str | None = None, symbol: str | None = None) -> bool:
         return self.engaged
 
+    def halt_state(self, strategy_id: str | None = None, symbol: str | None = None) -> HaltState:
+        """The halts covering this order, as the real switch reports them.
+
+        Built from `self._records` rather than from a second flag, so a test
+        that engages a halt with `unproven_symbols` gets the impugnment back
+        through the same path production uses. `engaged=True` set directly on
+        the fake — the shape most tests use — still reports engaged with no
+        records, which is exactly a halt that impugns nothing, and therefore
+        exactly the behaviour those tests already assert.
+        """
+        if not self.engaged:
+            return HaltState()
+        if self._records:
+            return HaltState(halts=tuple(self._records.values()))
+        # `FakeKillSwitch(engaged=True)` — the shape most tests use — means "a
+        # halt is in force" without saying which. Synthesised as a bare MANUAL
+        # record rather than reported as no halts at all, because `HaltState`
+        # derives `engaged` from the records it carries and an empty tuple would
+        # report *not halted*. A MANUAL halt impugns nothing, which is exactly
+        # what those tests assert: entries refused, exits permitted.
+        return HaltState(
+            halts=(
+                HaltRecord(
+                    scope=HaltScope.GLOBAL,
+                    reason=HaltReason.MANUAL,
+                    engaged_at=self._now,
+                    engaged_by="fake",
+                ),
+            )
+        )
+
     def engage(
         self,
         scope: object,
@@ -353,6 +482,8 @@ class FakeKillSwitch:
         engaged_by: str,
         detail: str = "",
         target: str | None = None,
+        *,
+        unproven_symbols: Collection[str] = (),
     ) -> HaltRecord:
         self.engaged = True
         self.engagements.append((str(scope), str(reason), engaged_by, detail))
@@ -362,6 +493,7 @@ class FakeKillSwitch:
         if existing is not None:
             return existing
 
+        symbols = tuple(sorted({s.strip().upper() for s in unproven_symbols}))
         record = HaltRecord(
             scope=HaltScope(str(scope)),
             reason=HaltReason(str(reason)),
@@ -369,6 +501,11 @@ class FakeKillSwitch:
             engaged_by=engaged_by,
             detail=detail,
             target=target,
+            impugned=(
+                (Impugnment(symbols, HaltReason(str(reason)), self._now, engaged_by, detail),)
+                if symbols
+                else ()
+            ),
         )
         self._now += timedelta(seconds=1)
         self._records[key] = record

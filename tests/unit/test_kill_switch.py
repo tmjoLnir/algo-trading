@@ -18,53 +18,17 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from atp_core.alerts import Alert, Severity
 from atp_core.channels import CHANNEL_HALTS
+from atp_core.errors import KillSwitchUnavailableError
 from atp_core.risk.killswitch import (
     HaltReason,
     HaltScope,
     RedisKillSwitch,
 )
-
-
-class FakeRedis:
-    """Just enough Redis, in a dict. `broken` makes every call raise."""
-
-    def __init__(self, broken: bool = False) -> None:
-        self.store: dict[str, str] = {}
-        self.published: list[tuple[str, str]] = []
-        self.broken = broken
-
-    def _guard(self) -> None:
-        if self.broken:
-            raise ConnectionError("redis is down")
-
-    def get(self, key: str) -> str | None:
-        self._guard()
-        return self.store.get(key)
-
-    def mget(self, keys: list[str]) -> list[str | None]:
-        self._guard()
-        return [self.store.get(k) for k in keys]
-
-    def set(self, key: str, value: str) -> None:
-        self._guard()
-        self.store[key] = value
-
-    def delete(self, key: str) -> int:
-        self._guard()
-        return 1 if self.store.pop(key, None) is not None else 0
-
-    def scan_iter(self, match: str) -> list[str]:
-        self._guard()
-        prefix = match.rstrip("*")
-        return [k for k in self.store if k.startswith(prefix)]
-
-    def publish(self, channel: str, message: str) -> int:
-        self._guard()
-        self.published.append((channel, message))
-        return 0
+from tests.fakes import FakeRedis
 
 
 def switch(**kwargs: Any) -> tuple[RedisKillSwitch, FakeRedis]:
@@ -466,3 +430,502 @@ class TestAlerting:
         ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
 
         assert ks.is_engaged() is True
+
+
+class TestTheHaltCarriesItsReason:
+    """ADR 0029. A halt's `reason` says what stopped trading; its `impugned`
+    says which positions the platform cannot prove. The exit carve-out reads the
+    second, and these are the tests that keep the two from collapsing into one.
+    """
+
+    def test_engaging_with_evidence_records_it(self) -> None:
+        ks, _ = switch()
+
+        record = ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            detail="broker says 300, we say 100",
+            unproven_symbols=("SPY", "QQQ"),
+        )
+
+        assert record.unproven_symbols == frozenset({"SPY", "QQQ"})
+        assert record.book_is_unproven
+        assert len(record.impugned) == 1
+        assert record.impugned[0].reason is HaltReason.RECONCILIATION_MISMATCH
+        assert record.impugned[0].by == "reconciler"
+
+    def test_engaging_without_evidence_impugns_nothing(self) -> None:
+        """The case that must stay the majority. A manual halt, a feed halt and
+        a rate-limit storm all stop trading without saying anything about any
+        position, and an exit out of each of them must still be permitted."""
+        ks, _ = switch()
+
+        record = ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        assert record.impugned == ()
+        assert record.unproven_symbols == frozenset()
+        assert not record.book_is_unproven
+
+    def test_evidence_survives_the_round_trip(self) -> None:
+        """The rule reads this back out of Redis, not off the object `engage`
+        returned. An impugnment that did not serialise would be a carve-out that
+        works in-process and is silently absent in production."""
+        ks, _ = switch()
+        ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.BROKER_UNREACHABLE,
+            "router",
+            unproven_symbols=("SPY",),
+        )
+
+        state = ks.halt_state("any_strategy", "SPY")
+
+        assert state.engaged
+        assert state.position_is_unproven("SPY")
+        assert not state.position_is_unproven("QQQ")
+
+    def test_symbols_are_normalised(self) -> None:
+        ks, _ = switch()
+
+        record = ks.engage(
+            HaltScope.GLOBAL, HaltReason.MANUAL, "ops", unproven_symbols=(" spy ", "SPY", "qqq")
+        )
+
+        assert record.impugned[0].symbols == ("QQQ", "SPY")
+
+    def test_a_blank_symbol_is_refused(self) -> None:
+        """The `_NO_SYMBOL` trap, and the reason `_clean_symbols` exists.
+
+        `Discrepancy` carries the empty string for a cash mismatch, which has no
+        symbol. Letting that through would store an impugnment naming `""` — a
+        symbol no order can ever match, so nothing could clear it, and an
+        operator reading the record would be told a position is unproven without
+        being told which. Loud is the only safe answer.
+        """
+        ks, _ = switch()
+
+        with pytest.raises(ValueError, match="cannot be blank"):
+            ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops", unproven_symbols=("SPY", ""))
+
+
+class TestEscalation:
+    """The one-way latch. A halt's reason may rise when evidence arrives and may
+    never fall, and nothing else about the record moves at all."""
+
+    def test_evidence_arriving_at_a_bare_halt_raises_its_reason(self) -> None:
+        ks, redis = switch()
+        first = ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops", detail="eyeballing it")
+
+        second = ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            detail="SPY: broker 300, book 100",
+            unproven_symbols=("SPY",),
+        )
+
+        assert second.reason is HaltReason.RECONCILIATION_MISMATCH
+        assert second.unproven_symbols == frozenset({"SPY"})
+        # …and the original is kept rather than overwritten.
+        assert second.escalation is not None
+        assert second.escalation.from_reason is HaltReason.MANUAL
+        assert second.escalation.by == "reconciler"
+        # The halt is still the one that started, to the second.
+        assert second.engaged_at == first.engaged_at
+        assert second.engaged_by == "ops"
+        assert second.detail == "eyeballing it"
+        assert redis.evals == 1, "the merge must land through the compare-and-set"
+
+    def test_a_bare_halt_cannot_lower_a_standing_one(self) -> None:
+        """The half that makes it a latch rather than a last-writer-wins field.
+
+        An operator pressing HALT beside a standing `reconciliation_mismatch`
+        must not turn it into a manual halt — that would drop the impugnment
+        the exit carve-out reads, and the flatten that was refused a second ago
+        would go through against a quantity nobody can vouch for.
+        """
+        ks, _ = switch()
+        ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY",),
+        )
+
+        after = ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        assert after.reason is HaltReason.RECONCILIATION_MISMATCH
+        assert after.unproven_symbols == frozenset({"SPY"})
+        assert after.escalation is None
+
+    def test_a_second_reason_without_evidence_changes_nothing(self) -> None:
+        """`manual` then `data_feed_lost` — the no-change case today, and it
+        stays the no-change case. Neither says anything about a position, so
+        there is nothing to escalate to."""
+        ks, redis = switch()
+        first = ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        after = ks.engage(HaltScope.GLOBAL, HaltReason.DATA_FEED_LOST, "monitor")
+
+        assert after == first
+        assert redis.evals == 0, "nothing changed, so nothing should have been written"
+
+    def test_new_symbols_are_appended_without_re_escalating(self) -> None:
+        """A second incident adds evidence. It does not restart the halt, and it
+        does not overwrite the escalation that recorded the first one."""
+        ks, _ = switch()
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+        ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY",),
+        )
+
+        third = ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.BROKER_UNREACHABLE,
+            "router",
+            unproven_symbols=("QQQ",),
+        )
+
+        assert third.unproven_symbols == frozenset({"SPY", "QQQ"})
+        assert len(third.impugned) == 2
+        # The reason and the escalation both still describe the *first* rise.
+        assert third.reason is HaltReason.RECONCILIATION_MISMATCH
+        assert third.escalation is not None
+        assert third.escalation.from_reason is HaltReason.MANUAL
+
+    def test_a_repeated_impugnment_is_not_appended_again(self) -> None:
+        """The property that keeps a two-hour incident from becoming 24 alerts.
+
+        `reconcile_positions` runs every five minutes and a mismatch stands
+        until a human fixes it, so the *same* finding arrives over and over.
+        Appending each one would grow the record without bound and re-alert on
+        every pass — the dedup ADR 0012 already applies to the halt itself.
+        """
+        ks, redis = switch()
+        ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY",),
+        )
+
+        for _ in range(24):
+            latest = ks.engage(
+                HaltScope.GLOBAL,
+                HaltReason.RECONCILIATION_MISMATCH,
+                "reconciler",
+                unproven_symbols=("SPY",),
+            )
+
+        assert len(latest.impugned) == 1
+        assert redis.evals == 0, "a repeated finding is not a write"
+
+    def test_a_subset_of_a_standing_impugnment_is_not_appended(self) -> None:
+        """The reconciler's finding shrinks as positions are fixed one at a
+        time. `{SPY}` arriving against a standing `{SPY, QQQ}` is not news."""
+        ks, _ = switch()
+        ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY", "QQQ"),
+        )
+
+        after = ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY",),
+        )
+
+        assert len(after.impugned) == 1
+        assert after.unproven_symbols == frozenset({"SPY", "QQQ"})
+
+    def test_escalating_alerts_and_counts(self) -> None:
+        """An escalation is a new fact about the incident, so it reaches a human
+        — but it is not a new halt, so it does not count as one. The two
+        counters are separate for exactly that reason."""
+        redis = FakeRedis()
+        sink = RecordingSink()
+        ks = RedisKillSwitch(redis, alerts=sink)  # type: ignore[arg-type]
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY",),
+        )
+
+        assert len(sink.sent) == 2
+        escalation = sink.sent[1]
+        assert escalation.severity is Severity.CRITICAL
+        assert "SPY" in escalation.body
+
+    def test_a_second_incident_is_not_swallowed_by_the_first(self) -> None:
+        """The dedup key is keyed on the symbols, and this is why.
+
+        A `reconciliation_mismatch` on SPY, then a second one naming QQQ: same
+        scope, same target, same reason. A key built from those three would be
+        byte-identical, so a deduping sink would swallow the second — which is
+        exactly the message `_alert_escalated` exists to get past, about a
+        symbol the operator has not yet been told about.
+        """
+        redis = FakeRedis()
+        sink = RecordingSink()
+        ks = RedisKillSwitch(redis, alerts=sink)  # type: ignore[arg-type]
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+        ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY",),
+        )
+
+        ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("QQQ",),
+        )
+
+        first, second = sink.sent[1], sink.sent[2]
+        assert first.key != second.key
+        # And the second names what is *new*, not the whole set again.
+        assert "cannot prove QQQ" in second.title
+        assert "QQQ, SPY" in second.body, "the total is still stated, just not as the headline"
+
+    def test_an_append_does_not_log_a_transition_that_did_not_happen(self) -> None:
+        """`from_reason` is absent when the reason did not move.
+
+        The append path merges evidence onto a halt whose reason has already
+        risen as far as it goes. Reporting `from_reason` there would print
+        `reconciliation_mismatch -> reconciliation_mismatch`, which reads as a
+        transition and is not one.
+        """
+        redis = FakeRedis()
+        ks = RedisKillSwitch(redis)  # type: ignore[arg-type]
+        ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY",),
+        )
+
+        with capture_logs() as logs:
+            ks.engage(
+                HaltScope.GLOBAL,
+                HaltReason.RECONCILIATION_MISMATCH,
+                "reconciler",
+                unproven_symbols=("QQQ",),
+            )
+
+        line = next(entry for entry in logs if entry["event"] == "risk.killswitch.escalated")
+        assert line["from_reason"] is None
+        assert line["newly_unproven"] == ["QQQ"]
+        assert line["unproven"] == ["QQQ", "SPY"]
+
+    def test_a_rise_logs_where_it_came_from(self) -> None:
+        redis = FakeRedis()
+        ks = RedisKillSwitch(redis)  # type: ignore[arg-type]
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        with capture_logs() as logs:
+            ks.engage(
+                HaltScope.GLOBAL,
+                HaltReason.RECONCILIATION_MISMATCH,
+                "reconciler",
+                unproven_symbols=("SPY",),
+            )
+
+        line = next(entry for entry in logs if entry["event"] == "risk.killswitch.escalated")
+        assert line["from_reason"] == "manual"
+        assert line["reason"] == "reconciliation_mismatch"
+        assert line["newly_unproven"] == ["SPY"]
+
+
+class TestContendedWrites:
+    """AUDIT.md finding 48. `engage` used to be GET-then-SET, so two processes
+    reacting to one incident could lose an update. It cost an audit field then;
+    it would now cost the impugnment the exit carve-out reads, so the write is
+    atomic and the retry is bounded and loud."""
+
+    def test_a_first_halt_lands_through_set_nx(self) -> None:
+        """The uncontended path takes one round trip and no script at all."""
+        ks, redis = switch()
+
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        assert redis.evals == 0
+
+    def test_a_writer_landing_mid_merge_is_retried_not_lost(self) -> None:
+        """The race the compare-and-set exists for.
+
+        Another process engages between our read and our write. The CAS sees a
+        value that is not the one we read, refuses, and we round again against
+        what is actually there — so *both* impugnments survive. A blind SET
+        would have kept ours and dropped theirs.
+        """
+        ks, redis = switch()
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        intruder = RedisKillSwitch(redis)  # type: ignore[arg-type]
+        landed = False
+
+        def other_process(_client: FakeRedis) -> None:
+            nonlocal landed
+            if landed:
+                return
+            landed = True
+            intruder.engage(
+                HaltScope.GLOBAL,
+                HaltReason.BROKER_UNREACHABLE,
+                "router",
+                unproven_symbols=("QQQ",),
+            )
+
+        redis.before_cas = other_process
+
+        final = ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY",),
+        )
+
+        assert final.unproven_symbols == frozenset({"SPY", "QQQ"})
+        # Three: the intruder's own merge, our refused CAS, and our retry.
+        assert redis.evals == 3, "the first CAS must have been refused"
+
+    def test_a_key_cleared_mid_engage_is_re_engaged_not_dereferenced(self) -> None:
+        """A human clears the halt in the window between our `SET NX` and our
+        `GET`. The record is gone, so there is nothing to merge with — and the
+        answer is to round again and engage cleanly, not to dereference `None`
+        out of the platform's stop button.
+        """
+        ks, redis = switch()
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        real_get = redis.get
+        cleared = False
+
+        def get_then_clear(key: str) -> str | None:
+            nonlocal cleared
+            value = real_get(key)
+            if not cleared:
+                cleared = True
+                redis.store.pop(key, None)
+            return value
+
+        # The clear lands *before* our read returns, so the CAS finds nothing.
+        redis.get = get_then_clear  # type: ignore[method-assign]
+
+        final = ks.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY",),
+        )
+
+        assert final.reason is HaltReason.RECONCILIATION_MISMATCH
+        assert final.unproven_symbols == frozenset({"SPY"})
+        assert ks.is_engaged() is True
+
+    def test_unresolvable_contention_raises_rather_than_returning(self) -> None:
+        """The bounded half. Three rounds and then a loud failure, because a
+        caller that believes it halted trading and did not is worse than an
+        exception: every decision after it is taken on the assumption that the
+        book is frozen.
+        """
+        ks, redis = switch()
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+
+        rival = 0
+
+        def always_lose(client: FakeRedis) -> None:
+            nonlocal rival
+            rival += 1
+            # Someone else always writes first. The CAS can never match.
+            client.store[client.scan_iter("*")[0]] = json.dumps(
+                {
+                    "scope": "global",
+                    "reason": "manual",
+                    "engaged_at": f"2024-06-03T14:30:{rival:02d}+00:00",
+                    "engaged_by": "ops",
+                    "detail": "",
+                    "target": None,
+                }
+            )
+
+        redis.before_cas = always_lose
+
+        with pytest.raises(KillSwitchUnavailableError, match="may not be in force"):
+            ks.engage(
+                HaltScope.GLOBAL,
+                HaltReason.RECONCILIATION_MISMATCH,
+                "reconciler",
+                unproven_symbols=("SPY",),
+            )
+
+        assert redis.evals == 3, "bounded at _MAX_ENGAGE_ATTEMPTS, not spinning"
+
+
+class TestHaltStateFailsClosed:
+    def test_an_unreachable_redis_is_engaged_and_impugns_nothing(self) -> None:
+        """docs/SAFETY.md layers 5 and 6, and the one place they must not fail
+        together.
+
+        A Redis outage is not evidence about the book — it is evidence that we
+        cannot read halt metadata. Treating it as impugnment would refuse every
+        exit and every protective stop on every blip, which is layer 5 taken
+        down by a layer 6 fault that says nothing about any position. The halt
+        itself still stands; only the carve-out is unaffected.
+        """
+        ks, _ = switch(broken=True)
+
+        state = ks.halt_state("strat", "SPY")
+
+        assert state.engaged is True
+        assert state.unreadable is True
+        assert state.position_is_unproven("SPY") is False
+
+    def test_an_undecodable_record_is_as_unreadable_as_an_outage(self) -> None:
+        """A newer process writing an unknown `HaltReason` during a rolling
+        deploy. Letting the `ValueError` out of the risk chain would be worse
+        than either failure it sits between."""
+        ks, redis = switch()
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+        key = redis.scan_iter("*")[0]
+        redis.store[key] = redis.store[key].replace('"manual"', '"a_reason_from_the_future"')
+
+        state = ks.halt_state()
+
+        assert state.engaged is True
+        assert state.unreadable is True
+
+    def test_halts_from_every_scope_are_composed(self) -> None:
+        """One order can be covered by three halts at once, and the evidence
+        that matters may be on any of them."""
+        ks, _ = switch()
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+        ks.engage(HaltScope.STRATEGY, HaltReason.UNHANDLED_EXCEPTION, "runner", target="sma")
+        ks.engage(
+            HaltScope.SYMBOL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            target="SPY",
+            unproven_symbols=("SPY",),
+        )
+
+        state = ks.halt_state("sma", "SPY")
+
+        assert len(state.halts) == 3
+        assert state.position_is_unproven("SPY")
+        # A different strategy on a different symbol sees only the global halt.
+        other = ks.halt_state("mean_reversion", "QQQ")
+        assert len(other.halts) == 1
+        assert not other.position_is_unproven("QQQ")

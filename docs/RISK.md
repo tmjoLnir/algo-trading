@@ -269,6 +269,21 @@ that refused them stopped the platform reducing risk as well as taking it — se
 An order that would reverse a position rather than close it is not a reduction
 and is still refused.
 
+**Unless the halt says it cannot prove the size.** "Reduce" is computed from
+`Position.qty`, and two halt reasons exist precisely because that number is in
+doubt — a submit that failed in transport with its outcome unknown, and a
+reconcile that disagrees with the venue. So a halt carries the symbols it cannot
+prove, and the carve-out is void for exactly those: the denial names the symbol
+and sends the operator to the broker's own UI, while every other position in the
+book still closes normally (ADR 0029). This is keyed on the *evidence*, not on
+the `HaltReason` — the same reason means different things depending on where it
+came from, and `reconciliation_mismatch` is also what a dollar of late-settling
+fees engages.
+
+The uncomfortable half: a protective stop in an impugned symbol is refused too,
+because it is sized off the same disputed quantity. The escalation alert names
+those symbols for that reason.
+
 Auto-engages on: daily loss limit breach, reconciliation mismatch, data feed
 loss, broker unreachable, a rate-limit storm, repeated unhandled exceptions.
 Every one of those is wired to a caller; the last two to arrive were the daily
@@ -284,6 +299,10 @@ what the asymmetry above exists to prevent. `rollover_daily_counters` releases
 it narrowly: that reason only, engaged by the risk chain and not by a person who
 picked the same reason, and only when it was engaged before today's session.
 Nothing else halted is touched, so a feed halt standing beside it survives.
+A daily-loss halt that has since escalated — evidence arrived and its reason
+rose — is no longer that reason and so is no longer this job's to release. It is
+kept, and the rollover says so in a log line naming the symbols rather than
+skipping it silently.
 
 **Fails closed.** The switch lives in Redis so that the API can trip it while
 the worker is mid-loop, and so that it survives a restart — a switch that

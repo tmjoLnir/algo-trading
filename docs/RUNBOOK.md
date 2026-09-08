@@ -54,6 +54,22 @@ money.
 Halting is *not* flattening. Halting stops new risk. Flattening realises
 existing P&L and is a separate decision.
 
+> **"Halt escalated: cannot prove ..."** is a different alert from the halt
+> itself, and it changes what you can do. Trading was already stopped; what has
+> changed is that the platform will no longer *close* the symbols it names,
+> because something said their quantity cannot be relied on — a reconcile that
+> disagrees with the venue, or a submit that failed in transport with its
+> outcome unknown (ADR 0029).
+>
+> Everything else in the book still closes normally. **To get flat in the named
+> symbols, use the broker's own UI** — the platform cannot size an exit against
+> a position it cannot confirm, and that includes the protective stop, so those
+> positions are uncovered until you act. Then work the mismatch below.
+>
+> `scripts/halt.py status` shows the halt; the alert body and the
+> `risk.killswitch.escalated` log line both name the symbols and where the
+> finding came from.
+
 ## Reading the numbers
 
 `scripts/status.py` first — it is the operator's view and it needs no token.
@@ -139,6 +155,19 @@ Our book disagrees with the broker's. **Do not resume until it is understood.**
    adopting silently hides the bug, and if the cause is duplicate submission you
    will do it again tomorrow.
 4. Clear the halt.
+
+**While it stands, the mismatched symbols cannot be closed by the platform** —
+not by a flatten, not by a protective stop (ADR 0029). That is the point: an
+exit sized off a disputed quantity is how a flatten opens a short. Get flat in
+them through the broker if you need to before step 3.
+
+A cash drift or an orphaned order also halts here and impugns **nothing** —
+every position stays closeable. If the alert named no symbols, that is the case
+you are in.
+
+Clearing the halt is the only thing that lifts an impugnment. A later reconcile
+finding the symbol correct does not retract the earlier one; a human decides
+that a position is proven again.
 
 ## Duplicate positions
 

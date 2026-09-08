@@ -24,6 +24,7 @@ from atp_core.clock import SimulatedClock, TradingCalendar
 from atp_core.domain import Order, OrderType, Portfolio, Side
 from atp_core.errors import ConfigError, RiskLimitBreachedError
 from atp_core.risk.engine import RiskBooks, RiskDecision, RiskEngine, RiskRule, default_rules
+from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope, HaltState
 from atp_core.risk.limits import MAX_GROSS_CEILING, RiskLimits
 from atp_core.risk.rules import (
     EXIT_BLIND_RULES,
@@ -86,6 +87,36 @@ def order(
         limit_price=Decimal(str(limit)) if limit is not None else None,
         strategy_id="test",
     )
+
+
+def halted(reason: HaltReason = HaltReason.MANUAL, **unproven: tuple[str, ...]) -> FakeKillSwitch:
+    """A halted switch, optionally carrying evidence.
+
+    `unproven` is target → symbols, where the target is a symbol-scoped halt's
+    target or `GLOBAL` for the global one, so a test can put the impugnment on
+    whichever halt it means to.
+    """
+    switch = FakeKillSwitch()
+    switch.engage(HaltScope.GLOBAL, reason, "test", unproven_symbols=unproven.pop("GLOBAL", ()))
+    for target, symbols in unproven.items():
+        switch.engage(HaltScope.SYMBOL, reason, "test", target=target, unproven_symbols=symbols)
+    return switch
+
+
+class UnreadableKillSwitch:
+    """Redis is down: engaged, and knows nothing about any position."""
+
+    def halt_state(self, strategy_id: str | None = None, symbol: str | None = None) -> HaltState:
+        return HaltState(unreadable=True)
+
+    def engage(self, *args: object, **kwargs: object) -> HaltRecord:  # pragma: no cover
+        raise AssertionError("a rule never engages")
+
+    def clear(self, *args: object, **kwargs: object) -> HaltRecord | None:  # pragma: no cover
+        raise AssertionError("a rule never clears")
+
+    def active_halts(self) -> list[HaltRecord]:  # pragma: no cover
+        return []
 
 
 class TestRiskRules:
@@ -1502,3 +1533,120 @@ class TestAWorkingReversalIsVisibleToTheCeilings:
 
         assert not decision.approved
         assert "cannot value the working quantity in IWM" in decision.reason
+
+
+class TestTheCarveOutIsVoidWhereTheQuantityIsUnproven:
+    """ADR 0029. The exit carve-out rests on there being a position here to
+    close; a halt carrying an impugnment is the platform saying it cannot prove
+    that. These are the tests that keep the exception narrow — because the
+    tempting version of it, keyed on `HaltReason`, refuses every exit and every
+    protective stop in the book on a dollar of late-settling fees.
+    """
+
+    def test_an_exit_is_refused_in_an_unproven_symbol(self) -> None:
+        """The defect this closes. `flatten` sizes at `abs(position.qty)`, and
+        under a reconciliation mismatch that number is the one in doubt: sell
+        300 against a book that says 300 and a venue that says 100, and the
+        flatten opens a short of 200 while the platform is halted."""
+        rule = KillSwitchRule(switch=halted(HaltReason.RECONCILIATION_MISMATCH, GLOBAL=("SPY",)))
+
+        decision = rule.check(
+            order(side=Side.SELL, qty=100), RiskBooks.of(portfolio(SPY=(100, 100))), limits()
+        )
+
+        assert not decision.approved
+        assert decision.rule == "kill_switch"
+        assert "unproven" in decision.reason
+        assert "broker" in decision.reason, "an operator needs the way out, not just the refusal"
+
+    def test_an_exit_is_still_permitted_in_a_symbol_the_halt_does_not_impugn(self) -> None:
+        """The half that keeps this an exception rather than a reversal of the
+        carve-out. One unproven symbol must not close the book."""
+        rule = KillSwitchRule(switch=halted(HaltReason.RECONCILIATION_MISMATCH, GLOBAL=("QQQ",)))
+
+        decision = rule.check(
+            order(side=Side.SELL, qty=100), RiskBooks.of(portfolio(SPY=(100, 100))), limits()
+        )
+
+        assert decision.approved
+
+    def test_a_halt_that_impugns_nothing_still_lets_exits_out(self) -> None:
+        """The `RECONCILIATION_MISMATCH` trap, and the reason the carve-out is
+        keyed on evidence rather than on the reason.
+
+        `Reconciler.is_clean` covers cash and orphaned orders with a $1.00
+        tolerance, so a mismatch of late-settling fees engages this exact reason
+        while impugning no position at all. Keyed on `HaltReason`, that dollar
+        would refuse every exit and every protective stop platform-wide,
+        unattended, every five minutes.
+        """
+        rule = KillSwitchRule(switch=halted(HaltReason.RECONCILIATION_MISMATCH))
+
+        decision = rule.check(
+            order(side=Side.SELL, qty=100), RiskBooks.of(portfolio(SPY=(100, 100))), limits()
+        )
+
+        assert decision.approved
+
+    def test_an_entry_is_refused_the_same_way_it_always_was(self) -> None:
+        """The impugnment narrows the carve-out. It does not change the default,
+        and the denial an operator reads should still be the plain one."""
+        rule = KillSwitchRule(switch=halted(HaltReason.RECONCILIATION_MISMATCH, GLOBAL=("QQQ",)))
+
+        decision = rule.check(order(side=Side.BUY, qty=100), RiskBooks.of(portfolio()), limits())
+
+        assert not decision.approved
+        assert decision.reason == "trading is halted"
+
+    def test_a_protective_stop_in_an_unproven_symbol_is_refused_too(self) -> None:
+        """The uncomfortable case, stated rather than hidden.
+
+        A stop is exactly the order the carve-out was widened for, and this
+        refuses one. It is still the right answer: a stop is sized off the same
+        `Position.qty` the reconcile just disputed, so placing it against an
+        unproven quantity is how a stop becomes a short. The alert names the
+        symbol and sends the operator to the broker's UI precisely because this
+        path leaves a position uncovered and a human has to know.
+        """
+        rule = KillSwitchRule(switch=halted(HaltReason.BROKER_UNREACHABLE, GLOBAL=("SPY",)))
+        stop = Order(
+            symbol="SPY",
+            side=Side.SELL,
+            qty=Decimal(100),
+            order_type=OrderType.STOP,
+            stop_price=Decimal(95),
+            strategy_id="test",
+            parent_order_id="the-entry",
+            purpose="stop_loss",
+        )
+
+        assert not rule.check(stop, RiskBooks.of(portfolio(SPY=(100, 100))), limits()).approved
+
+    def test_evidence_on_a_symbol_scoped_halt_reaches_the_rule(self) -> None:
+        """`halt_state` composes every halt covering the order, so the
+        impugnment can be on any of them. A test that only ever put it on the
+        global halt would not notice a rule reading one record."""
+        rule = KillSwitchRule(switch=halted(HaltReason.RECONCILIATION_MISMATCH, SPY=("SPY",)))
+
+        decision = rule.check(
+            order(side=Side.SELL, qty=100), RiskBooks.of(portfolio(SPY=(100, 100))), limits()
+        )
+
+        assert not decision.approved
+        assert "unproven" in decision.reason
+
+    def test_an_unreachable_switch_still_lets_a_genuine_exit_out(self) -> None:
+        """docs/SAFETY.md layers 5 and 6, not failing together.
+
+        A Redis outage fails closed — every entry is refused — but it is not
+        evidence about any position. Treating "cannot read the halt record" as
+        "cannot prove the book" would refuse every protective stop on every
+        Redis blip, which is layer 5 taken down by a layer 6 fault that says
+        nothing about the book at all.
+        """
+        rule = KillSwitchRule(switch=UnreadableKillSwitch())
+
+        assert not rule.check(order(side=Side.BUY), RiskBooks.of(portfolio()), limits()).approved
+        assert rule.check(
+            order(side=Side.SELL, qty=100), RiskBooks.of(portfolio(SPY=(100, 100))), limits()
+        ).approved

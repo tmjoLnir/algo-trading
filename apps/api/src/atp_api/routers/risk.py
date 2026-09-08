@@ -916,7 +916,7 @@ async def flatten_all(
     # re-enter within a tick. Refusing would be the wrong cure: the one moment
     # this endpoint exists for is the one where an extra step is most expensive.
     # So it is reported, loudly, and returned to the caller.
-    halted = await asyncio.to_thread(kill_switch.is_engaged)
+    halted = (await asyncio.to_thread(kill_switch.halt_state)).engaged
     if not halted:
         log.critical(
             "risk.flatten_all_while_trading",

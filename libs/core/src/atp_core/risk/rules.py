@@ -357,6 +357,13 @@ class KillSwitchRule:
     not trade on stale prices" is already enforced by the rule whose job it is,
     so a data-feed halt still cannot dump the book into a market nobody can see.
 
+    **But not blind to evidence.** ADR 0029: the carve-out rests on there being
+    a position here to close, and a halt that carries an `Impugnment` naming
+    this symbol is the platform saying it cannot prove that quantity. The
+    exemption is void for those symbols and for no others. That is a different
+    question from `HaltReason` — see `check` for why keying it on the reason
+    would refuse every exit in the book on a dollar of late-settling fees.
+
     **Not a second door.** `OrderRouter.flatten` still goes through `submit()`
     and still meets the whole chain (ADR 0005). This widens one rule; it does
     not add a bypass. An exit refused for stale data, trading hours or a rate
@@ -367,8 +374,34 @@ class KillSwitchRule:
     name: str = "kill_switch"
 
     def check(self, order: Order, books: RiskBooks, limits: RiskLimits) -> RiskDecision:
-        if not self.switch.is_engaged(order.strategy_id, order.symbol):
+        state = self.switch.halt_state(order.strategy_id, order.symbol)
+        if not state.engaged:
             return RiskDecision.allow()
+
+        # **The carve-out is void where the quantity cannot be proven**
+        # (ADR 0029). It rests on there being a position here to close, and two
+        # halts exist precisely because that claim has failed: the router's
+        # `broker_unreachable` when an order's outcome is unknown, and a
+        # reconcile that found our quantity and the venue's disagreeing. Under
+        # either, sizing an exit off `Position.qty` is sizing off the number in
+        # doubt — `OrderRouter._resolve_indeterminate` says it plainly: "we may
+        # be holding a position nobody knows about", and "flattening against a
+        # position that may not exist opens a short".
+        #
+        # Asked of the *evidence*, never of `HaltReason`. The same reason
+        # warrants opposite verdicts depending on where it came from — the
+        # reconciler's `broker_unreachable` means only that we could not read
+        # the venue, which is an unverified book rather than a disproven one —
+        # and a reconcile finding a dollar of late-settling fees would, keyed on
+        # the reason, refuse every exit and every protective stop across the
+        # whole book, unattended, every five minutes.
+        if state.position_is_unproven(order.symbol):
+            return RiskDecision.deny(
+                self.name,
+                f"trading is halted and {order.symbol}'s quantity is unproven — the "
+                f"platform cannot size an exit against a position it cannot confirm. "
+                f"Close it through the broker's own UI",
+            )
 
         # The **settled** book, not the committed one (`RiskBooks`, ADR 0027).
         # This is a permission, and the permission is "there is a position here

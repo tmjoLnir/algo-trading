@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from atp_core.clock import Clock
     from atp_core.domain import Order, Portfolio, Timeframe
     from atp_core.execution.reconciliation import Reconciler
-    from atp_core.risk.killswitch import KillSwitch
+    from atp_core.risk.killswitch import HaltRecord, KillSwitch
     from atp_worker.runner import RunnerStats
 
 log = get_logger(__name__)
@@ -623,6 +623,7 @@ async def rollover_daily_counters(watch: SessionWatch) -> None:
     now = SystemClock().now()
     for record in watch.kill_switch.active_halts():
         if record.reason is not HaltReason.DAILY_LOSS_LIMIT:
+            _log_escalated_out_of_reach(record)
             continue
         if record.engaged_by != DAILY_LOSS_RULE:
             continue
@@ -655,6 +656,44 @@ async def rollover_daily_counters(watch: SessionWatch) -> None:
                 context={"scope": record.scope.value},
             )
         )
+
+
+def _log_escalated_out_of_reach(record: HaltRecord) -> None:
+    """Say so when a halt this job *would* have released has escalated past it.
+
+    ADR 0029 lets a halt's reason rise when evidence arrives: a daily-loss halt
+    standing overnight, met by a reconciliation that cannot prove a position,
+    keeps its `engaged_at` and its `engaged_by` and takes the new reason. The
+    first test above then skips it — which is the right answer, because a halt
+    covering an unproven quantity must not be released by a cron job — but it
+    is skipped by a `continue` that says nothing.
+
+    An operator who came in expecting yesterday's loss halt to clear at the
+    rollover would otherwise find it still standing, with no line anywhere
+    saying why. That is the shape of every incident in docs/paper-week: not a
+    wrong decision, a correct decision taken silently.
+
+    Detected off `escalation.from_reason` rather than off the reason alone, so
+    this stays quiet for the halts that were never in this job's reach — a
+    manual halt, a feed halt, anything a human engaged for their own reasons.
+    """
+    escalation = record.escalation
+    if escalation is None or escalation.from_reason is not HaltReason.DAILY_LOSS_LIMIT:
+        return
+    log.warning(
+        "worker.rollover.halt_escalated_not_released",
+        scope=record.scope.value,
+        target=record.target,
+        engaged_at=record.engaged_at.isoformat(),
+        reason=record.reason.value,
+        escalated_at=escalation.at.isoformat(),
+        escalated_by=escalation.by,
+        unproven=sorted(record.unproven_symbols),
+        msg=(
+            "yesterday's daily-loss halt has escalated and is not the rollover's "
+            "to release — a human must read it"
+        ),
+    )
 
 
 #: What runs whether or not this worker is trading. Two of the three are still

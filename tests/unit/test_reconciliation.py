@@ -16,7 +16,7 @@ import pytest
 from atp_core.clock import SimulatedClock
 from atp_core.domain import Order, OrderType, Portfolio, Position, Side
 from atp_core.errors import BrokerConnectionError
-from atp_core.execution.reconciliation import Reconciler
+from atp_core.execution.reconciliation import DiscrepancyKind, Reconciler
 from atp_core.risk.killswitch import HaltReason
 from tests.fakes import FakeBroker, FakeKillSwitch
 
@@ -345,3 +345,127 @@ class TestAdoptingBrokerState:
         await reconciler.reconcile(portfolio, known_orders=[], halt_on_mismatch=False)
 
         assert portfolio.positions["SPY"].qty == Decimal("100")
+
+
+class TestWhatAMismatchImpugns:
+    """ADR 0029. The halt now carries *which positions* the reconcile could not
+    prove, and `KillSwitchRule` voids the exit carve-out for exactly those.
+
+    The narrowness is the whole point. `is_clean` is false for a cash drift past
+    a dollar and for an orphaned order, and a halt that impugned the book on
+    either would refuse every exit and every protective stop across the whole
+    account, unattended, every five minutes — day 1's F3 with docs/SAFETY.md's
+    layers 5 and 6 failing together.
+    """
+
+    def unproven(self, switch: FakeKillSwitch) -> frozenset[str]:
+        return switch.halt_state().halts[0].unproven_symbols
+
+    @pytest.mark.asyncio
+    async def test_a_quantity_mismatch_names_its_symbol(self) -> None:
+        reconciler, broker, switch, portfolio = build()
+        broker.hold("SPY", Decimal("1000"), Decimal("500"))
+        hold(portfolio, "SPY", "100")
+
+        await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert self.unproven(switch) == frozenset({"SPY"})
+
+    @pytest.mark.asyncio
+    async def test_a_position_only_the_broker_has_is_impugned(self) -> None:
+        """We believe we hold nothing. Sizing an exit off that belief is sizing
+        off zero, which is not a number to trade on when the venue disagrees."""
+        reconciler, broker, switch, portfolio = build()
+        broker.hold("SPY", Decimal("100"), Decimal("500"))
+
+        await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert self.unproven(switch) == frozenset({"SPY"})
+
+    @pytest.mark.asyncio
+    async def test_a_position_only_we_have_is_impugned(self) -> None:
+        reconciler, _broker, switch, portfolio = build()
+        hold(portfolio, "SPY", "100")
+
+        await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert self.unproven(switch) == frozenset({"SPY"})
+
+    @pytest.mark.asyncio
+    async def test_a_cash_drift_halts_and_impugns_nothing(self) -> None:
+        """The trap, in the module that would spring it. A dollar of
+        late-settling fees is a real discrepancy and a real halt, and it says
+        nothing whatever about any quantity."""
+        reconciler, broker, switch, portfolio = build(cash="95000")
+        broker.equity = Decimal("100000")
+
+        report = await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert not report.is_clean
+        assert switch.engaged is True
+        assert self.unproven(switch) == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_an_orphan_order_halts_and_impugns_nothing(self) -> None:
+        """This module's own comment calls an orphan "most often a protective
+        stop we placed before a restart". Refusing to close the book because a
+        stop we already own is working is the wrong way round."""
+        reconciler, broker, switch, portfolio = build()
+        broker.hold("SPY", Decimal("100"), Decimal("500"))
+        hold(portfolio, "SPY", "100")
+        await broker.submit_order(an_order("someone-elses-order"))
+
+        report = await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert not report.is_clean
+        assert switch.engaged is True
+        assert self.unproven(switch) == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_only_the_mismatched_symbol_is_impugned(self) -> None:
+        """A book of five positions with one bad quantity keeps four closeable.
+        This is the property that makes the exception survivable in production."""
+        reconciler, broker, switch, portfolio = build()
+        for symbol in ("SPY", "QQQ", "IWM"):
+            broker.hold(symbol, Decimal("100"), Decimal("500"))
+            hold(portfolio, symbol, "100")
+        broker.hold("SPY", Decimal("999"), Decimal("500"))
+
+        await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert self.unproven(switch) == frozenset({"SPY"})
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_broker_halts_without_impugning_the_book(self) -> None:
+        """The distinction `Impugnment` exists to make. `broker_unreachable`
+        from *here* means only that we could not read the venue — an unverified
+        book, not a disproven one — while the same reason from
+        `OrderRouter._resolve_indeterminate` names the one order whose outcome
+        is genuinely unknown. Same `HaltReason`, opposite verdicts, which is why
+        the carve-out reads the evidence instead.
+        """
+        reconciler, broker, switch, portfolio = build()
+        hold(portfolio, "SPY", "100")
+        broker.reads_fail = True
+
+        with pytest.raises(BrokerConnectionError):
+            await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert switch.engaged is True
+        assert self.unproven(switch) == frozenset()
+
+
+class TestTheClassificationIsTotal:
+    def test_every_kind_declares_whether_it_impugns_a_position(self) -> None:
+        """`assert_never` makes a sixth kind a typecheck failure rather than a
+        silent default — but only if something calls the property on all of
+        them. Both defaults are wrong: one strands every stop on a benign
+        finding, the other lets a flatten through against a quantity nobody can
+        vouch for."""
+        impugning = {kind for kind in DiscrepancyKind if kind.impugns_position}
+
+        assert impugning == {
+            DiscrepancyKind.POSITION_QTY,
+            DiscrepancyKind.MISSING_POSITION,
+            DiscrepancyKind.UNKNOWN_POSITION,
+        }

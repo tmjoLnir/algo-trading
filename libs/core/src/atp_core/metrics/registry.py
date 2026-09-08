@@ -88,6 +88,12 @@ class _Instruments:
             ["scope", "reason"],
             registry=registry,
         )
+        self.halts_escalated = Counter(
+            "atp_halts_escalated_total",
+            "Standing halts that learned a position they cannot prove (ADR 0029).",
+            ["scope", "reason"],
+            registry=registry,
+        )
         self.halts_cleared = Counter(
             "atp_halts_cleared_total",
             "Halts cleared by a human. Every one of these is somebody's decision.",
@@ -258,6 +264,23 @@ def halt_engaged(scope: HaltScope, reason: HaltReason) -> None:
     reasoning that stops it sending a second phone notification (ADR 0012).
     """
     _m.halts_engaged.labels(scope=scope.value, reason=reason.value).inc()
+
+
+def halt_escalated(scope: HaltScope, reason: HaltReason) -> None:
+    """A standing halt learned a position it cannot prove (ADR 0029).
+
+    Its own counter rather than a second `halt_engaged`, because one incident
+    must not read as two on the graph — the same reasoning `halt_engaged` gives
+    for not counting a re-engage. What it marks is different in kind: not that
+    trading stopped, but that **exits stopped too**, for the symbols named.
+
+    A counter and not a gauge of unproven symbols. `atp_halts_active` is
+    deliberately absent from this module — the API exports halt *state* from an
+    authoritative read at scrape time (docs/OBSERVABILITY.md) — and a second
+    source of truth for the same question is the drift this file exists to
+    prevent.
+    """
+    _m.halts_escalated.labels(scope=scope.value, reason=reason.value).inc()
 
 
 def halt_cleared(scope: HaltScope) -> None:

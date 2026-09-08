@@ -62,7 +62,7 @@ class DiscrepancyKind(StrEnum):
     cannot fail a typecheck.
 
     The distinction earns its place because `KillSwitchRule`'s exit carve-out
-    reads it (ADR 0028). A reconcile that finds a dollar of late-settling fees
+    reads it (ADR 0029). A reconcile that finds a dollar of late-settling fees
     or a protective stop we placed before a restart says nothing about any
     quantity — and refusing every exit and every protective stop across the
     book on that finding, unattended, every five minutes, is day 1's F3
@@ -234,11 +234,21 @@ class Reconciler:
 
         log.error("execution.reconcile.mismatch", summary=report.summary())
         if halt_on_mismatch:
+            # Only the kinds that impugn a *position*. A cash drift past the
+            # tolerance and an orphan order — which this module's own comment
+            # calls "most often a protective stop we placed before a restart" —
+            # halt exactly as they do today, and name nothing: neither says
+            # anything about a quantity, and voiding the exit carve-out on them
+            # would refuse every protective stop across the whole book,
+            # unattended, every five minutes (ADR 0029).
             self.kill_switch.engage(
                 HaltScope.GLOBAL,
                 HaltReason.RECONCILIATION_MISMATCH,
                 engaged_by="reconciler",
                 detail=report.summary(),
+                unproven_symbols=sorted(
+                    {d.symbol for d in report.discrepancies if d.kind.impugns_position and d.symbol}
+                ),
             )
         return report
 

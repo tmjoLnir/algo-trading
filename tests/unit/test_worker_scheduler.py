@@ -26,13 +26,20 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from atp_core.alerts.ports import Alert, Severity
 from atp_core.clock import SimulatedClock, TradingCalendar
 from atp_core.data.corporate_actions import Adjustment
 from atp_core.domain import Order, OrderType, Portfolio, Position, Side, Timeframe
 from atp_core.execution.reconciliation import Reconciler
-from atp_core.risk.killswitch import HaltReason, HaltRecord, HaltScope
+from atp_core.risk.killswitch import (
+    HaltEscalation,
+    HaltReason,
+    HaltRecord,
+    HaltScope,
+    Impugnment,
+)
 from atp_core.risk.rules import DAILY_LOSS_RULE
 from atp_worker.runner import RunnerStats
 from atp_worker.scheduler import (
@@ -682,6 +689,59 @@ class TestTheDailyLossRollover:
         await rollover_daily_counters(watch)
 
         assert len(switch.clears) == 1, "only the daily-loss halt is released"
+
+    async def test_an_escalated_loss_halt_is_kept_and_said_out_loud(self) -> None:
+        """ADR 0029's interaction with the only automated clear in the platform.
+
+        A daily-loss halt standing overnight, met by a reconcile that cannot
+        prove SPY, keeps its `engaged_at` and `engaged_by` and takes the new
+        reason. The first test in this loop then skips it — which is right, a
+        halt covering an unproven quantity is not a cron job's to release — but
+        it is skipped by a `continue` that would otherwise say nothing, and an
+        operator who came in expecting the release would find it standing with
+        no line anywhere explaining why.
+        """
+        switch = self._halt(
+            reason=HaltReason.RECONCILIATION_MISMATCH,
+            escalation=HaltEscalation(
+                from_reason=HaltReason.DAILY_LOSS_LIMIT,
+                at=datetime(2024, 6, 2, 20, 0, tzinfo=UTC),
+                by="reconciler",
+            ),
+            impugned=(
+                Impugnment(
+                    ("SPY",),
+                    HaltReason.RECONCILIATION_MISMATCH,
+                    datetime(2024, 6, 2, 20, 0, tzinfo=UTC),
+                    "reconciler",
+                ),
+            ),
+        )
+        watch, _ = _watch(switch)
+
+        with capture_logs() as logs:
+            await rollover_daily_counters(watch)
+
+        assert switch.clears == []
+        line = next(
+            entry
+            for entry in logs
+            if entry["event"] == "worker.rollover.halt_escalated_not_released"
+        )
+        assert line["reason"] == "reconciliation_mismatch"
+        assert line["unproven"] == ["SPY"]
+
+    async def test_a_halt_that_was_never_this_jobs_to_release_stays_quiet(self) -> None:
+        """The line above fires off `escalation.from_reason`, not off the reason
+        alone. A manual halt was never in this job's reach, so explaining why it
+        was not released is noise on every rollover for the rest of its life."""
+        switch = self._halt(reason=HaltReason.MANUAL, engaged_by="jo")
+        watch, _ = _watch(switch)
+
+        with capture_logs() as logs:
+            await rollover_daily_counters(watch)
+
+        assert not [e for e in logs if e["event"] == "worker.rollover.halt_escalated_not_released"]
 
     async def test_nothing_halted_is_a_no_op(self) -> None:
         watch, alerts = _watch()
