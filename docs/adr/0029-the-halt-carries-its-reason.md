@@ -243,23 +243,33 @@ reason rose, where it rose from. That guard subsumes a reason-based one, because
 `_merge` raises a reason only when fresh evidence arrives, so an escalated record
 always carries an impugnment.
 
-**Verified by mutation, not by argument.** Twenty-six mutants — the latch
-removed, the dedup removed, the carve-out keyed on `HaltReason`, the impugnment
-read book-wide, `unreadable` treated as evidence, the alert key stripped of its
-symbols, `SET NX` made unconditional, the reconciler's classification inverted in
-both directions, the router impugning nothing and impugning everything, the
-rollover's new log silenced and over-fired, `halt_state` returned to decoding all
-three keys as one generator, an undecodable record no longer failing closed, the
-creation-path alert silenced and over-fired, and the contended raise asserting
-each of its two outcomes unconditionally — each killed by a named test.
+**Verified by mutation, not by argument.** Forty-three mutants, each killed by a
+named test: the latch removed; the impugnment dedup removed and its subset
+predicate written the obvious wrong way; the carve-out keyed on `HaltReason`;
+the impugnment read book-wide; `unreadable` treated as evidence; the alert key
+stripped of its symbols; `SET NX` made unconditional; `clear` returned to
+read-then-delete; `halt_state` returned to decoding all three keys as one
+generator, and an undecodable record no longer failing closed; the creation-path
+alert silenced and over-fired; the contended raise asserting each of its two
+outcomes unconditionally, and the API branching on neither; the reconciler's
+classification inverted in both directions; the router impugning nothing and
+impugning everything; the rollover releasing an impugned halt, and doing it
+silently; `EXIT_BLIND_RULES` gaining the kill switch; the operator's `--unproven`
+dropped and forced; the banner's two new lines removed; and the bound's magnitude
+filter restored.
 
-**Several of those mutants are this ADR's own defects**, found by an adversarial
-review of the branch that introduces it and fixed before merge: the collapsed
-decode above, the silent creation-path alert, the contended raise that claimed a
-halt was standing when the last round had found the key gone, `clear`'s
-read-then-delete, the `EXIT_BLIND_RULES` claim, and the rollover hole below. They
-are recorded rather than quietly restated, and that the review found them at all
-is the argument for running one — every gate was green over all of them.
+**Nine of those are defects in this ADR's own first draft**, found by an
+adversarial review of the branch that introduces it and fixed before merge: the
+collapsed decode, the silent creation-path alert, the contended raise that
+claimed a halt was standing when the last round had found the key gone, `clear`'s
+read-then-delete, the false `EXIT_BLIND_RULES` claim and the derivation test that
+could not see it, the shared `FakeKillSwitch` no longer mirroring the object it
+stands in for, the rollover hole below, an entry refused with an exit's reason,
+and the API asserting the dangerous half of a two-state failure. They are
+recorded rather than quietly restated. **Every gate was green over all nine**,
+which is the argument for running the review: `ruff`, `mypy --strict`, 2,880
+unit tests and the vitest suite all passed on a branch that reopened the very
+defect this ADR exists to close.
 
 **The rollover argument in this ADR was wrong within the hour.** It claimed
 escalation can only move a halt *out* of the auto-clear set, because
