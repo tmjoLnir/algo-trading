@@ -192,12 +192,38 @@ class AccountView(BaseModel):
 
 
 class HaltView(BaseModel):
+    """One active halt, as the banner renders it.
+
+    `reason` is the reason **in force** and `engaged_by`/`engaged_at`/`detail`
+    describe the halt's *origin*, which are not the same incident once a halt
+    has escalated (ADR 0029). Rendering those four alone produced a banner that
+    read `reconciliation_mismatch` beside `ops` and "pausing for lunch" — three
+    true fields composing one false sentence. `escalated_from` and
+    `escalated_by` say a reason moved and who moved it; without them the
+    mismatch has no explanation on screen.
+
+    `unproven_symbols` is the field that changes what an operator can *do*. The
+    platform refuses to close these — protective stops included — so a banner
+    that omits them leaves the browser, which docs/SAFETY.md calls the place you
+    halt from, unable to say why a flatten was refused. Flattened to a symbol
+    list rather than the full `Impugnment` tuple: the banner needs the tickers,
+    and `scripts/halt.py status` is where the reason, actor and time of each
+    finding are read.
+    """
+
     scope: str
     reason: str
     engaged_at: datetime
     engaged_by: str
     detail: str
     target: str | None
+    #: Sorted. Empty for the overwhelming majority of halts, which say nothing
+    #: about any position.
+    unproven_symbols: list[str] = Field(default_factory=list)
+    #: The reason this halt started with, when that is not the one in force.
+    escalated_from: str | None = None
+    escalated_by: str | None = None
+    escalated_at: datetime | None = None
 
 
 class LiveDashboard(BaseModel):
@@ -258,6 +284,7 @@ class EquityCurveView(BaseModel):
 
 
 def _halt_view(record: HaltRecord) -> HaltView:
+    escalation = record.escalation
     return HaltView(
         scope=record.scope.value,
         reason=record.reason.value,
@@ -265,6 +292,10 @@ def _halt_view(record: HaltRecord) -> HaltView:
         engaged_by=record.engaged_by,
         detail=record.detail,
         target=record.target,
+        unproven_symbols=sorted(record.unproven_symbols),
+        escalated_from=escalation.from_reason.value if escalation else None,
+        escalated_by=escalation.by if escalation else None,
+        escalated_at=escalation.at if escalation else None,
     )
 
 

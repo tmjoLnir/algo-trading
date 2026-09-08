@@ -160,6 +160,16 @@ The key vanishing between the `SET NX` and the `GET` — a human clearing the ha
 in that window — rounds again rather than dereferencing `None` out of the
 platform's stop button.
 
+**And `clear` had to become one step too.** A standing halt's bytes used to be
+immutable — `engage` returned early without writing — so a GET-then-DELETE had
+nothing to lose between them. `engage` now rewrites the record in place while
+the *same* halt stands, so an escalation can land inside that gap and be deleted
+unseen: the operator is told they resumed the manual halt they engaged at
+lunchtime, the audit row records that halt, and what actually went away was a
+reconciliation halt naming a symbol nobody can prove — which is now closeable.
+A two-line script reads and removes atomically, so the record reported is the
+record removed.
+
 **Exhaustion is not an outage, and the two must not read alike.** Reaching the
 third failure means every round found the key *occupied*: the store answered,
 and a halt is standing. What did not land is this call's reason and — the part
@@ -227,6 +237,16 @@ decode above, the silent creation-path alert, and the contended raise that
 claimed a halt was standing when the last round had found the key gone. They are
 recorded rather than quietly restated, and that the review found them at all is
 the argument for running one — every gate was green over all three.
+
+**The dashboard carries it, because that is where docs/SAFETY.md says you halt
+from.** `HaltView` gained `unproven_symbols` and the escalation fields, and the
+banner renders both. Without the first, the browser could not say why a flatten
+came back refused; without the second it rendered `reconciliation_mismatch`
+beside `ops` and "pausing for lunch" — three true fields composing one false
+sentence, because `reason` is the reason in force while `engaged_by` and
+`detail` describe the origin. The symbols are a separate line rather than folded
+into `detail`, because `detail` carries the reconcile's summary and *that* names
+symbols for findings which impugn nothing.
 
 **An operator can record one too** — `scripts/halt.py engage --unproven SPY`,
 and `status` renders every impugnment with its reason, actor and time. Both

@@ -1014,11 +1014,19 @@ export interface paths {
          *     the opposite of what an operator would assume from a red error on a halt
          *     button. `RedisKillSwitch.engage` deliberately does not swallow its
          *     exceptions, and the reason the message has to be explicit is the interaction
-         *     with `is_engaged`, which fails *closed*: while Redis is unreachable nothing
+         *     with `halt_state`, which fails *closed*: while Redis is unreachable nothing
          *     trades, so the moment of the failure is genuinely safe. But nothing was
          *     written, so trading resumes the instant Redis comes back. Reporting only
          *     "could not halt" would leave a reader to guess which of those two states
          *     they are in.
+         *
+         *     **A 409 says the opposite of that 503 and is not a retry of it.** `engage`
+         *     also fails when another writer keeps winning the compare-and-set (ADR 0029):
+         *     the store answered every round and found the key occupied, so a halt *is*
+         *     standing and only this request's reason — and any symbols it impugned —
+         *     failed to merge. Reporting that as the 503 above would tell an operator
+         *     nothing is recorded and trading is about to resume, when the truth is that
+         *     trading is stopped and a symbol they were told about is not.
          */
         post: operations["engage_kill_switch_api_v1_risk_halt_post"];
         delete?: never;
@@ -2131,7 +2139,26 @@ export interface components {
          * @enum {string}
          */
         HaltScope: "global" | "strategy" | "symbol";
-        /** HaltView */
+        /**
+         * HaltView
+         * @description One active halt, as the banner renders it.
+         *
+         *     `reason` is the reason **in force** and `engaged_by`/`engaged_at`/`detail`
+         *     describe the halt's *origin*, which are not the same incident once a halt
+         *     has escalated (ADR 0029). Rendering those four alone produced a banner that
+         *     read `reconciliation_mismatch` beside `ops` and "pausing for lunch" — three
+         *     true fields composing one false sentence. `escalated_from` and
+         *     `escalated_by` say a reason moved and who moved it; without them the
+         *     mismatch has no explanation on screen.
+         *
+         *     `unproven_symbols` is the field that changes what an operator can *do*. The
+         *     platform refuses to close these — protective stops included — so a banner
+         *     that omits them leaves the browser, which docs/SAFETY.md calls the place you
+         *     halt from, unable to say why a flatten was refused. Flattened to a symbol
+         *     list rather than the full `Impugnment` tuple: the banner needs the tickers,
+         *     and `scripts/halt.py status` is where the reason, actor and time of each
+         *     finding are read.
+         */
         HaltView: {
             /** Detail */
             detail: string;
@@ -2142,12 +2169,20 @@ export interface components {
             engaged_at: string;
             /** Engaged By */
             engaged_by: string;
+            /** Escalated At */
+            escalated_at?: string | null;
+            /** Escalated By */
+            escalated_by?: string | null;
+            /** Escalated From */
+            escalated_from?: string | null;
             /** Reason */
             reason: string;
             /** Scope */
             scope: string;
             /** Target */
             target: string | null;
+            /** Unproven Symbols */
+            unproven_symbols?: string[];
         };
         /**
          * LimitFieldView

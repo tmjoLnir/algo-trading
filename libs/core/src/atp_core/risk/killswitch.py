@@ -270,6 +270,24 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
 else return 0 end
 """
 
+#: Read and remove in one step. `GETDEL` would do it in one command but needs
+#: Redis 6.2, and this module has no version floor of its own; the script is the
+#: same guarantee against anything that can run `_CAS`.
+#:
+#: It has to be atomic for a reason that did not exist before ADR 0029. A
+#: standing halt's bytes used to be immutable — `engage` returned early without
+#: writing — so a GET-then-DELETE had nothing to lose in the gap between them.
+#: `engage` now rewrites the record in place while the same halt stands, so an
+#: escalation can land inside that gap and be deleted unseen: the operator is
+#: told they resumed the halt they engaged at lunchtime, the audit row records
+#: that halt, and what actually went away was a reconciliation halt naming a
+#: symbol nobody can prove — which is now closeable.
+_GETDEL = """
+local v = redis.call('GET', KEYS[1])
+if v then redis.call('DEL', KEYS[1]) end
+return v
+"""
+
 
 def _clean_symbols(symbols: Collection[str]) -> tuple[str, ...]:
     """Sorted, unique, uppercase tickers — or a `ValueError`.
@@ -712,8 +730,11 @@ class RedisKillSwitch:
             )
 
         key = self._key(scope, target)
-        raw = _sync(self._client.get(key))
-        removed = bool(self._client.delete(key))
+        # One step, so the record reported is exactly the record removed. See
+        # `_GETDEL` for what a two-step read-then-delete loses now that a
+        # standing halt's bytes can change under it.
+        raw = _sync(self._client.eval(_GETDEL, 1, key))
+        removed = raw is not None
         record = _decode(raw) if raw is not None else None
         log.critical(
             "risk.killswitch.cleared",
@@ -734,10 +755,10 @@ class RedisKillSwitch:
             )
             self._alert_cleared(scope, target, cleared_by)
             return record
-        # `removed` is the authority, not `raw`. The two disagree when the key
-        # expired or another caller cleared it between the GET and the DELETE,
-        # and in that window this call did not resume anything — returning the
-        # record anyway would credit this operator with someone else's decision.
+        # Nothing was there. `_GETDEL` makes `removed` and `raw` one answer
+        # rather than two that can disagree, so this is now simply "the key was
+        # empty" — and returning a record here would credit this operator with a
+        # resume that did not happen.
         return None
 
     def _alert_escalated(self, record: HaltRecord, newly: Sequence[str]) -> None:

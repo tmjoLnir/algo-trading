@@ -43,6 +43,7 @@ from atp_core.errors import (
 from atp_core.execution.ports import StoredBook
 from atp_core.risk.killswitch import (
     _CAS,
+    _GETDEL,
     HaltReason,
     HaltRecord,
     HaltScope,
@@ -378,15 +379,18 @@ class FakeRedis:
         self._guard()
         return 1 if self.store.pop(key, None) is not None else 0
 
-    def eval(self, script: str, numkeys: int, *args: str) -> int:
-        """The compare-and-set in `killswitch._CAS`, and nothing else."""
+    def eval(self, script: str, numkeys: int, *args: str) -> int | str | None:
+        """The two scripts in `killswitch`, and nothing else."""
         self._guard()
+        if numkeys != 1:
+            raise ValueError(f"both scripts take one key, got {numkeys}")
+        if script == _GETDEL:
+            (key,) = args
+            return self.store.pop(key, None)
         if script != _CAS:
             raise NotImplementedError(
-                "FakeRedis emulates killswitch._CAS only; this script is not it"
+                "FakeRedis emulates killswitch._CAS and _GETDEL only; this script is neither"
             )
-        if numkeys != 1:
-            raise ValueError(f"_CAS takes one key, got {numkeys}")
         key, expected, new = args
         self.evals += 1
         if self.before_cas is not None:

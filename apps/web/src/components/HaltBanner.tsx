@@ -18,6 +18,21 @@
  * dashboard. So this appears within a second of trading stopping. Had it been
  * left to the reader to ask, the screen that exists to interrupt somebody would
  * have waited to be consulted.
+ *
+ * **Two fields here are not decoration (ADR 0029).** `reason` is the reason *in
+ * force*, while `engaged_by`, `engaged_at` and `detail` describe the halt's
+ * origin — and those stop being the same incident once a halt escalates.
+ * Rendering the four alone produced a banner reading `reconciliation_mismatch`
+ * beside `ops` and "pausing for lunch": three true fields composing one false
+ * sentence. `escalated_from` explains the mismatch on screen.
+ *
+ * And `unproven_symbols` changes what the operator can *do*. The platform
+ * refuses to close those — protective stops included — so without them this
+ * screen, which docs/SAFETY.md calls the place you halt from, cannot say why a
+ * flatten came back refused. It is called out separately from `detail` rather
+ * than folded into it because the summary in `detail` names symbols for
+ * findings that impugn nothing, and conflating the two is exactly the mistake
+ * docs/RUNBOOK.md had to be corrected for.
  */
 
 import { formatDateTime } from '@/lib/money'
@@ -29,6 +44,12 @@ const SCOPE_LABEL: Record<string, string> = {
   global: 'ALL TRADING HALTED',
   strategy: 'STRATEGY HALTED',
   symbol: 'SYMBOL HALTED',
+}
+
+/** Optional on the wire because it has a server-side default, and empty for the
+ *  overwhelming majority of halts. Read once so the two uses cannot disagree. */
+function unproven(halt: HaltView): string[] {
+  return halt.unproven_symbols ?? []
 }
 
 function scopeLabel(halt: HaltView): string {
@@ -50,11 +71,24 @@ export default function HaltBanner() {
         >
           <span className="font-bold tracking-wide text-rose-200">⛔ {scopeLabel(halt)}</span>
           <span className="text-rose-300">{halt.reason.replace(/_/g, ' ')}</span>
+          {halt.escalated_from ? (
+            <span className="text-rose-300/80">
+              (escalated from {halt.escalated_from.replace(/_/g, ' ')}
+              {halt.escalated_by ? ` by ${halt.escalated_by}` : ''})
+            </span>
+          ) : null}
           {halt.detail ? <span className="text-rose-300/80">— {halt.detail}</span> : null}
           <span className="ml-auto text-xs text-rose-400/80">
             by {halt.engaged_by} at {formatDateTime(halt.engaged_at)}
           </span>
           <ResumeButton halt={halt} />
+          {unproven(halt).length > 0 ? (
+            <p className="w-full text-xs text-amber-300">
+              Cannot prove: <span className="font-bold">{unproven(halt).join(', ')}</span> — the
+              platform will not close these, protective stops included. Use the broker's own UI.
+              Every other position still closes normally.
+            </p>
+          ) : null}
         </div>
       ))}
       <p className="px-4 pb-2 text-xs text-rose-400/70">

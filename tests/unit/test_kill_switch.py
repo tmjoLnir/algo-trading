@@ -1156,3 +1156,82 @@ class TestContentionSaysWhichFailureItWas:
         assert "trading is stopped" in message, "the operator must go and check"
         assert "a halt is standing" not in message
         assert "SPY is NOT recorded as unproven" in message
+
+
+class TestClearingReportsWhatItActuallyRemoved:
+    """The gap ADR 0029 opened in `clear`, and the reason it is one step now.
+
+    A standing halt's bytes used to be immutable — `engage` returned early
+    without writing — so a GET-then-DELETE had nothing to lose between them.
+    `engage` now rewrites the record in place through the compare-and-set while
+    the *same* halt stands, so an escalation can land inside that gap and be
+    deleted unseen: the operator is told they resumed the halt they engaged at
+    lunchtime, the audit row records that halt, and what actually went away was
+    a reconciliation halt naming a symbol nobody can prove.
+    """
+
+    def test_an_escalation_landing_mid_clear_is_not_deleted_unseen(self) -> None:
+        ks, redis = switch()
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops", detail="pausing for lunch")
+
+        reconciler = RedisKillSwitch(redis)  # type: ignore[arg-type]
+        landed = False
+
+        def escalate_mid_clear(_script: str, _n: int, *_args: str) -> None:
+            # Stands in for the reconcile that fires inside the old GET/DELETE
+            # window. With one atomic step there is no such window, so what this
+            # asserts is that the record handed back is the one removed.
+            nonlocal landed
+            if landed:
+                return
+            landed = True
+            reconciler.engage(
+                HaltScope.GLOBAL,
+                HaltReason.RECONCILIATION_MISMATCH,
+                "reconciler",
+                unproven_symbols=("SPY",),
+            )
+
+        real_eval = redis.eval
+
+        def eval_after_escalation(script: str, numkeys: int, *args: str) -> int | str | None:
+            escalate_mid_clear(script, numkeys, *args)
+            return real_eval(script, numkeys, *args)
+
+        redis.eval = eval_after_escalation  # type: ignore[method-assign]
+
+        removed = ks.clear(HaltScope.GLOBAL, cleared_by="ops")
+
+        assert removed is not None
+        assert removed.reason is HaltReason.RECONCILIATION_MISMATCH, (
+            "the operator must be told what they actually resumed, not the halt they remember"
+        )
+        assert removed.unproven_symbols == frozenset({"SPY"})
+        assert ks.is_engaged() is False
+
+    def test_clearing_nothing_still_returns_none(self) -> None:
+        """`/risk/resume` reports "nothing was halted" from exactly this."""
+        ks, _ = switch()
+
+        assert ks.clear(HaltScope.GLOBAL, cleared_by="ops") is None
+
+    def test_an_ordinary_clear_returns_the_halt_it_removed(self) -> None:
+        ks, _ = switch()
+        ks.engage(HaltScope.GLOBAL, HaltReason.DATA_FEED_LOST, "monitor")
+
+        removed = ks.clear(HaltScope.GLOBAL, cleared_by="ops")
+
+        assert removed is not None
+        assert removed.reason is HaltReason.DATA_FEED_LOST
+        assert removed.engaged_by == "monitor"
+        assert ks.is_engaged() is False
+
+    def test_only_the_scope_asked_for_is_removed(self) -> None:
+        ks, _ = switch()
+        ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
+        ks.engage(HaltScope.SYMBOL, HaltReason.RECONCILIATION_MISMATCH, "reconciler", target="SPY")
+
+        ks.clear(HaltScope.GLOBAL, cleared_by="ops")
+
+        assert ks.is_engaged() is False
+        assert ks.is_engaged("any", "SPY") is True
