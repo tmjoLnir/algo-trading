@@ -184,6 +184,17 @@ def _print_halts(settings: Settings) -> None:
             f"           {record.scope.value}{target}  {record.reason.value}  "
             f"by {record.engaged_by}  since {record.engaged_at.isoformat()}"
         )
+        # The symbols the platform will refuse to close, on the read-only
+        # surface an operator runs during an incident. `scripts/halt.py status`
+        # carries the full evidence with each finding's reason and actor; this
+        # is the one-line version, and leaving it out would make this the only
+        # place layer 6 is reported without the half that changes what you can
+        # do about it.
+        if record.impugned:
+            print(
+                f"           ^ will NOT close: {', '.join(sorted(record.unproven_symbols))}"
+                f"  — use the broker's own UI"
+            )
 
 
 async def _print_local(settings: Settings, symbols: list[str], timeframe: Timeframe) -> None:

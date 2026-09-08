@@ -1195,14 +1195,32 @@ class TestWhatCanRefuseAnExit:
     chain rather than trusted, exactly as `REPLAY_BLIND_RULES` is."""
 
     @staticmethod
-    def _chain() -> list[RiskRule]:
+    def _chain(switch: FakeKillSwitch | None = None) -> list[RiskRule]:
         """Every default rule, each configured to refuse whatever it can."""
         return default_rules(
-            kill_switch=FakeKillSwitch(engaged=True),
+            kill_switch=switch or FakeKillSwitch(engaged=True),
             clock=SimulatedClock(CLOSED),  # outside the session
             calendar=TradingCalendar(),
             last_tick_at=lambda _symbol: None,  # never ticked: maximally stale
         )
+
+    @staticmethod
+    def _refused_by(chain: list[RiskRule], exit_order: Order, book: Portfolio) -> set[str]:
+        """Run twice, taking the union, because `RateLimitRule` refuses only
+        once its window is full — the first pass consumes its single slot. A
+        one-pass version silently reported two rules and passed for the wrong
+        reason."""
+        tight = limits(
+            max_position_pct=Decimal("0.01"),
+            max_gross_exposure_pct=Decimal("0.01"),
+            max_orders_per_minute=1,
+        )
+        return {
+            rule.name
+            for _pass in range(2)
+            for rule in chain
+            if not rule.check(exit_order, RiskBooks.of(book), tight).approved
+        }
 
     def test_exactly_three_rules_can_refuse_a_reduction(self) -> None:
         """A pure exit — 100 held, 100 sold — put to every rule with each one
@@ -1220,21 +1238,57 @@ class TestWhatCanRefuseAnExit:
         """
         settled = portfolio(cash=0, SPY=(100.0, 100.0), IWM=(50.0, 0.0))
         exit_order = order(symbol="SPY", side=Side.SELL, qty=100, limit=100)
-        tight = limits(
-            max_position_pct=Decimal("0.01"),
-            max_gross_exposure_pct=Decimal("0.01"),
-            max_orders_per_minute=1,
+
+        assert self._refused_by(self._chain(), exit_order, settled) == set(EXIT_BLIND_RULES)
+
+    def test_a_halt_that_cannot_prove_the_symbol_makes_it_four(self) -> None:
+        """The half this test did not have, and the reason the tuple's own
+        comment had to be corrected.
+
+        `EXIT_BLIND_RULES` used to claim to be "the complete list of ways a
+        flatten or a protective stop can come back refused". ADR 0029 made that
+        false: a halt carrying an `Impugnment` for this symbol refuses the
+        reduction, because sizing it off `Position.qty` is sizing it off the
+        quantity in dispute. The test above did not notice, because
+        `FakeKillSwitch(engaged=True)` synthesises a bare MANUAL halt that
+        impugns nothing — so the one new way the kill switch can refuse an exit
+        was the one shape never exercised.
+
+        Both halves are pinned now. Three when the halt proves nothing about the
+        book, four when it names this symbol, and `kill_switch` is the only
+        difference between them.
+        """
+        settled = portfolio(cash=0, SPY=(100.0, 100.0), IWM=(50.0, 0.0))
+        exit_order = order(symbol="SPY", side=Side.SELL, qty=100, limit=100)
+        impugning = FakeKillSwitch()
+        impugning.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("SPY",),
         )
 
-        chain = self._chain()
-        refused = {
-            rule.name
-            for _pass in range(2)
-            for rule in chain
-            if not rule.check(exit_order, RiskBooks.of(settled), tight).approved
-        }
+        refused = self._refused_by(self._chain(impugning), exit_order, settled)
 
-        assert refused == set(EXIT_BLIND_RULES)
+        assert refused == {*EXIT_BLIND_RULES, "kill_switch"}
+
+    def test_a_symbol_the_halt_does_not_impugn_is_back_to_three(self) -> None:
+        """The property that keeps the fourth rule an exception rather than a
+        reversal of the carve-out. One unproven symbol must not close the book.
+        """
+        settled = portfolio(cash=0, SPY=(100.0, 100.0), IWM=(50.0, 0.0))
+        exit_order = order(symbol="SPY", side=Side.SELL, qty=100, limit=100)
+        elsewhere = FakeKillSwitch()
+        elsewhere.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            "reconciler",
+            unproven_symbols=("QQQ",),
+        )
+
+        assert self._refused_by(self._chain(elsewhere), exit_order, settled) == set(
+            EXIT_BLIND_RULES
+        )
 
     def test_the_list_names_rules_the_chain_actually_has(self) -> None:
         """A typo here would silently shrink the set the test above compares
@@ -1594,6 +1648,40 @@ class TestTheCarveOutIsVoidWhereTheQuantityIsUnproven:
         rule = KillSwitchRule(switch=halted(HaltReason.RECONCILIATION_MISMATCH, GLOBAL=("QQQ",)))
 
         decision = rule.check(order(side=Side.BUY, qty=100), RiskBooks.of(portfolio()), limits())
+
+        assert not decision.approved
+        assert decision.reason == "trading is halted"
+
+    def test_an_entry_in_an_unproven_symbol_reads_as_an_entry(self) -> None:
+        """Same verdict, honest sentence.
+
+        The reason text is persisted on the rejection and read off the
+        dashboard, so it outlives the moment. Telling the author of a `BUY 100`
+        that "the platform cannot size an exit against a position it cannot
+        confirm" describes an order they did not place, and sends them looking
+        for a position that is not the problem. An entry is refused by the halt
+        whether or not the symbol is impugned, so the ordinary sentence is the
+        true one.
+        """
+        rule = KillSwitchRule(switch=halted(HaltReason.RECONCILIATION_MISMATCH, GLOBAL=("SPY",)))
+
+        decision = rule.check(
+            order(symbol="SPY", side=Side.BUY, qty=100), RiskBooks.of(portfolio()), limits()
+        )
+
+        assert not decision.approved
+        assert decision.reason == "trading is halted"
+
+    def test_adding_to_an_unproven_holding_is_still_an_entry(self) -> None:
+        """The boundary: a position exists, and the order grows it. Not an exit,
+        so not the exit sentence — and refused either way."""
+        rule = KillSwitchRule(switch=halted(HaltReason.RECONCILIATION_MISMATCH, GLOBAL=("SPY",)))
+
+        decision = rule.check(
+            order(symbol="SPY", side=Side.BUY, qty=50),
+            RiskBooks.of(portfolio(SPY=(100, 100))),
+            limits(),
+        )
 
         assert not decision.approved
         assert decision.reason == "trading is halted"

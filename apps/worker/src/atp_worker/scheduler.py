@@ -142,12 +142,13 @@ async def remind_about_halts(watch: SessionWatch) -> None:
 
     _HALT_REMINDERS["count"] += 1
     count = _HALT_REMINDERS["count"]
-    lines = [
-        f"{h.scope.value}{f' [{h.target}]' if h.target else ''} — {h.reason.value}, "
-        f"by {h.engaged_by}, since {h.engaged_at.isoformat()}"
-        for h in halts
-    ]
-    log.critical("worker.halt_reminder", halts=len(halts), reminder=count)
+    lines = [_halt_line(h) for h in halts]
+    log.critical(
+        "worker.halt_reminder",
+        halts=len(halts),
+        reminder=count,
+        unproven=sorted({s for h in halts for s in h.unproven_symbols}),
+    )
     watch.alerts.send(
         Alert(
             severity=Severity.CRITICAL,
@@ -157,6 +158,29 @@ async def remind_about_halts(watch: SessionWatch) -> None:
             context={"active": str(len(halts))},
         )
     )
+
+
+def _halt_line(halt: HaltRecord) -> str:
+    """One halt, for a repeating channel.
+
+    **The unproven symbols repeat with it**, and that is the whole reason this
+    is a function rather than an inline f-string in three places. `engage`
+    names them once, when the halt is engaged; `remind_about_halts` exists
+    because day 1's halt "produced exactly one alert, at the moment it engaged"
+    (F8) — and until this, the reminder repeated only the half the operator
+    already had, while the half that says which positions cannot be closed was
+    left in a notification they may have dismissed hours ago.
+    """
+    target = f" [{halt.target}]" if halt.target else ""
+    line = (
+        f"{halt.scope.value}{target} — {halt.reason.value}, "
+        f"by {halt.engaged_by}, since {halt.engaged_at.isoformat()}"
+    )
+    if halt.impugned:
+        line += (
+            f"; will NOT close {', '.join(sorted(halt.unproven_symbols))} (use the broker's own UI)"
+        )
+    return line
 
 
 async def summarise_the_session(watch: SessionWatch) -> None:
@@ -189,11 +213,10 @@ async def summarise_the_session(watch: SessionWatch) -> None:
     lines = [headline]
     if halts:
         lines.append(f"STILL HALTED at the close — {len(halts)} active:")
-        lines += [
-            f"  {h.scope.value}{f' [{h.target}]' if h.target else ''} since "
-            f"{h.engaged_at.isoformat()} ({h.reason.value})"
-            for h in halts
-        ]
+        # The unproven symbols go in the close-of-day summary too. A position
+        # the platform will not close is exactly the thing an operator must not
+        # discover tomorrow morning.
+        lines += [f"  {_halt_line(h)}" for h in halts]
     else:
         lines.append("Not halted.")
 
@@ -622,8 +645,25 @@ async def rollover_daily_counters(watch: SessionWatch) -> None:
     """
     now = SystemClock().now()
     for record in watch.kill_switch.active_halts():
+        if record.book_is_unproven:
+            # **A halt covering a quantity nobody can prove is never a cron
+            # job's to release**, whatever its reason says. ADR 0029 argued this
+            # branch was unreachable — escalation moves a halt *out* of the
+            # auto-clear set because `engaged_by` never moves and the only
+            # caller engaging as `DAILY_LOSS_RULE` names no symbols. Then
+            # `scripts/halt.py --unproven` arrived, and it takes `--reason` over
+            # every `HaltReason`: an operator adding evidence to yesterday's
+            # daily-loss halt merges into a record that still carries
+            # `engaged_by=daily_loss_limit` and yesterday's timestamp, so the
+            # reason test below passes and the rollover clears the impugnment
+            # nobody has acted on.
+            #
+            # Gated on the evidence rather than on who supplied it, because the
+            # argument does not depend on the source: nothing automated may
+            # decide a disputed position is proven again.
+            _log_unproven_out_of_reach(record)
+            continue
         if record.reason is not HaltReason.DAILY_LOSS_LIMIT:
-            _log_escalated_out_of_reach(record)
             continue
         if record.engaged_by != DAILY_LOSS_RULE:
             continue
@@ -658,40 +698,34 @@ async def rollover_daily_counters(watch: SessionWatch) -> None:
         )
 
 
-def _log_escalated_out_of_reach(record: HaltRecord) -> None:
-    """Say so when a halt this job *would* have released has escalated past it.
+def _log_unproven_out_of_reach(record: HaltRecord) -> None:
+    """Say so when a halt this job might otherwise have released is kept because
+    it impugns a position.
 
-    ADR 0029 lets a halt's reason rise when evidence arrives: a daily-loss halt
-    standing overnight, met by a reconciliation that cannot prove a position,
-    keeps its `engaged_at` and its `engaged_by` and takes the new reason. The
-    first test above then skips it — which is the right answer, because a halt
-    covering an unproven quantity must not be released by a cron job — but it
-    is skipped by a `continue` that says nothing.
+    The skip itself is a bare `continue`, and an operator who came in expecting
+    yesterday's loss halt to clear would otherwise find it standing with no line
+    anywhere saying why. That is the shape of every incident in docs/paper-week:
+    not a wrong decision, a correct decision taken silently.
 
-    An operator who came in expecting yesterday's loss halt to clear at the
-    rollover would otherwise find it still standing, with no line anywhere
-    saying why. That is the shape of every incident in docs/paper-week: not a
-    wrong decision, a correct decision taken silently.
-
-    Detected off `escalation.from_reason` rather than off the reason alone, so
-    this stays quiet for the halts that were never in this job's reach — a
-    manual halt, a feed halt, anything a human engaged for their own reasons.
+    This subsumes the escalation case rather than sitting beside it. `_merge`
+    raises a halt's reason *only* when fresh evidence arrives, so an escalated
+    record always carries an impugnment and would never have reached a separate
+    reason-based check. `escalated_from` carries that half of the story here.
     """
     escalation = record.escalation
-    if escalation is None or escalation.from_reason is not HaltReason.DAILY_LOSS_LIMIT:
-        return
     log.warning(
-        "worker.rollover.halt_escalated_not_released",
+        "worker.rollover.halt_unproven_not_released",
         scope=record.scope.value,
         target=record.target,
-        engaged_at=record.engaged_at.isoformat(),
         reason=record.reason.value,
-        escalated_at=escalation.at.isoformat(),
-        escalated_by=escalation.by,
+        engaged_at=record.engaged_at.isoformat(),
         unproven=sorted(record.unproven_symbols),
+        # Set when this started as some other halt and rose — most relevantly a
+        # daily-loss halt this job *would* have released yesterday's version of.
+        escalated_from=escalation.from_reason.value if escalation else None,
         msg=(
-            "yesterday's daily-loss halt has escalated and is not the rollover's "
-            "to release — a human must read it"
+            "this halt says a position's quantity cannot be proven — releasing it "
+            "is a human's decision, not the rollover's"
         ),
     )
 

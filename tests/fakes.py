@@ -49,6 +49,7 @@ from atp_core.risk.killswitch import (
     HaltScope,
     HaltState,
     Impugnment,
+    _merge,
 )
 from atp_core.strategy.ports import StoredStrategy
 from atp_core.worker.config import StoredWorkerConfig, WorkerConfig
@@ -457,11 +458,24 @@ class FakeKillSwitch:
         the fake — the shape most tests use — still reports engaged with no
         records, which is exactly a halt that impugns nothing, and therefore
         exactly the behaviour those tests already assert.
+
+        **Scoped, like the real one.** `RedisKillSwitch` reads only the three
+        keys that can cover this order, so a fake returning everything it holds
+        reports a QQQ symbol halt as covering SPY — refusing an order the real
+        switch permits, and, worse in the other direction, reporting another
+        strategy's impugnment as this order's. Both are green tests over
+        behaviour production does not have.
         """
         if not self.engaged:
             return HaltState()
+        covering = [r for r in self._records.values() if self._covers(r, strategy_id, symbol)]
+        if covering:
+            return HaltState(halts=tuple(covering))
         if self._records:
-            return HaltState(halts=tuple(self._records.values()))
+            # Records exist but none covers this order. `engaged` is still set
+            # because a test may have forced it; a bare MANUAL halt below is the
+            # honest reading of "halted, impugning nothing".
+            pass
         # `FakeKillSwitch(engaged=True)` — the shape most tests use — means "a
         # halt is in force" without saying which. Synthesised as a bare MANUAL
         # record rather than reported as no halts at all, because `HaltState`
@@ -493,10 +507,6 @@ class FakeKillSwitch:
         self.engagements.append((str(scope), str(reason), engaged_by, detail))
 
         key = (str(scope), target)
-        existing = self._records.get(key)
-        if existing is not None:
-            return existing
-
         symbols = tuple(sorted({s.strip().upper() for s in unproven_symbols}))
         record = HaltRecord(
             scope=HaltScope(str(scope)),
@@ -511,9 +521,33 @@ class FakeKillSwitch:
                 else ()
             ),
         )
+        existing = self._records.get(key)
+        if existing is not None:
+            # **Merged, not discarded.** This class's docstring calls its
+            # idempotence load-bearing, and until ADR 0029 "return the original
+            # untouched" was the whole of it. `RedisKillSwitch.engage` now
+            # `_merge`s new evidence into a standing halt, so a fake that
+            # returned the original would swallow exactly the impugnment the
+            # exit carve-out reads — and every test built on it would be green
+            # over a flatten production refuses. The real `_merge` is called
+            # rather than reimplemented, because a second copy of a one-way
+            # latch is a second thing to get wrong.
+            merged = _merge(existing, record)
+            self._records[key] = merged
+            return merged
+
         self._now += timedelta(seconds=1)
         self._records[key] = record
         return record
+
+    @staticmethod
+    def _covers(record: HaltRecord, strategy_id: str | None, symbol: str | None) -> bool:
+        """`RedisKillSwitch._covering_keys`, as a predicate over records."""
+        if record.scope is HaltScope.GLOBAL:
+            return True
+        if record.scope is HaltScope.STRATEGY:
+            return strategy_id is not None and record.target == strategy_id
+        return symbol is not None and record.target == symbol
 
     def clear(self, scope: object, cleared_by: str, target: str | None = None) -> HaltRecord | None:
         """Removes and returns the halt in force, mirroring `RedisKillSwitch`.

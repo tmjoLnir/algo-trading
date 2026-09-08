@@ -106,9 +106,15 @@ ATR(14).
   cancel can lose the race outright.
 - **A protective stop can be refused.** Three of the nine rules judge the order
   rather than whether it reduces a position, so trading hours, the rate limit and
-  stale data can each block one. The other six can never refuse one; the list is
-  `rules.EXIT_BLIND_RULES`, and a unit test derives it from the real chain
-  because the count has been wrong in every document that quoted it.
+  stale data can each block one. The list is `rules.EXIT_BLIND_RULES`, and a
+  unit test derives it from the real chain because the count has been wrong in
+  every document that quoted it.
+
+  **The kill switch is a fourth, on evidence rather than on being an exit**
+  (ADR 0029): a halt that says it cannot prove this symbol's quantity refuses
+  the stop, because the stop is sized off that quantity. Unlike the other three
+  it does not clear by waiting, and the position is uncovered until a human
+  closes it through the broker. The remaining five can never refuse a stop.
   Two rules left that list at ADR 0027 and one left it earlier. The kill switch
   went when it was given its exit carve-out — a halt refusing the protective
   child of an entry that had just filled was SAFETY.md's layers 6 and 5 failing

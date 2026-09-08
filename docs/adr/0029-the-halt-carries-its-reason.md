@@ -182,9 +182,25 @@ believing a symbol is closeable that the reconciler could not prove.
 
 ## Consequences
 
-**Three rules can still refuse an order that only reduces a position** —
-`rules.EXIT_BLIND_RULES`, unchanged by this ADR. What changed is that the kill
-switch now refuses reductions in *named symbols*, for stated evidence.
+**`EXIT_BLIND_RULES` stays three, and its meaning had to be narrowed to stay
+true.** It used to call itself "the complete list of ways a flatten or a
+protective stop can come back refused". This ADR makes that false — the kill
+switch is a fourth — so the tuple now means what it always measured: the rules
+that refuse a reduction on the *order alone*, with no book and no evidence able
+to excuse them. That is what a caller can be sure of before it looks at
+anything.
+
+The distinction was found late and by review, not by the guard meant to catch
+it. `test_risk_engine.py::TestWhatCanRefuseAnExit` derives the set from the real
+chain precisely so this cannot drift — but it built its chain with
+`FakeKillSwitch(engaged=True)`, which synthesises a bare `MANUAL` halt, so the
+one new way the kill switch can refuse an exit was the single shape it never
+exercised. It now derives both: three under a halt that impugns nothing, four
+under one that names the symbol. Six other places asserted the old claim —
+`ProtectionResult`, the `position_unprotected` comment beside it,
+`POST /positions/{symbol}/close` (whose docstring is the OpenAPI description, so
+the claim was checked into `schema.d.ts` too), docs/RUNBOOK.md's naked-position
+procedure, docs/RISK.md and ADR 0027 — and all six are corrected here.
 
 **A protective stop in an unproven symbol is refused.** This is the
 uncomfortable case and it is stated rather than hidden: a stop is sized off the
@@ -231,12 +247,33 @@ three keys as one generator, an undecodable record no longer failing closed, the
 creation-path alert silenced and over-fired, and the contended raise asserting
 each of its two outcomes unconditionally — each killed by a named test.
 
-**Three of those mutants are this ADR's own defects**, found by an adversarial
+**Several of those mutants are this ADR's own defects**, found by an adversarial
 review of the branch that introduces it and fixed before merge: the collapsed
-decode above, the silent creation-path alert, and the contended raise that
-claimed a halt was standing when the last round had found the key gone. They are
-recorded rather than quietly restated, and that the review found them at all is
-the argument for running one — every gate was green over all three.
+decode above, the silent creation-path alert, the contended raise that claimed a
+halt was standing when the last round had found the key gone, `clear`'s
+read-then-delete, the `EXIT_BLIND_RULES` claim, and the rollover hole below. They
+are recorded rather than quietly restated, and that the review found them at all
+is the argument for running one — every gate was green over all of them.
+
+**The rollover argument in this ADR was wrong within the hour.** It claimed
+escalation can only move a halt *out* of the auto-clear set, because
+`engaged_by` never moves and the only caller engaging as `DAILY_LOSS_RULE`
+names no symbols. Then `scripts/halt.py --unproven` was added — and it takes
+`--reason` over every `HaltReason`. An operator adding evidence to yesterday's
+daily-loss halt merges into a record that keeps `engaged_by=daily_loss_limit`
+and yesterday's timestamp, so all three of the rollover's conditions pass and
+the cron job releases an impugnment nobody has acted on. `rollover_daily_counters`
+now refuses to clear **any** halt that impugns a position, gated on the evidence
+rather than on who supplied it: the argument does not depend on the source, and
+nothing automated may decide a disputed position is proven again. That guard
+subsumes the reason-based one, since `_merge` raises a reason only when fresh
+evidence arrives — so an escalated record always carries an impugnment.
+
+**Every repeating operator channel carries the symbols now**, not just the alert
+at the moment of engagement: the 15-minute halt reminder, the close-of-day
+summary, `scripts/status.py` and `scripts/halt.py status`. `remind_about_halts`
+exists because day 1's halt "produced exactly one alert, at the moment it
+engaged" (F8), and it was repeating only the half the operator already had.
 
 **The dashboard carries it, because that is where docs/SAFETY.md says you halt
 from.** `HaltView` gained `unproven_symbols` and the escalation fields, and the

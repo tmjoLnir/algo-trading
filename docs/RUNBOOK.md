@@ -886,18 +886,26 @@ place. The position is live and the venue holds nothing against it. An
 engine-side level may be armed, which protects you only while the worker is up —
 that is not the guarantee a broker-side stop gives.
 
-1. Read `rule` in the log line. It will name one of exactly three rules
+1. Read `rule` in the log line. Usually it names one of three
    (`rules.EXIT_BLIND_RULES`): `stale_data`, `trading_hours` or `rate_limit`.
    All three are transient and clear on their own, and the runner's next
    attempt places the stop.
 
-   **`kill_switch` cannot appear here**, and has not been able to since it was
-   given its exit carve-out — a halt does not refuse a protective stop, because
-   a halt that left a position naked was SAFETY.md's layers 6 and 5 failing
-   together. Neither can `max_position_size` or `max_gross_exposure` since
-   ADR 0027. If you see any of the three, the carve-outs have regressed and
-   that is the incident, not the stop.
-2. If it will not clear promptly, place the stop through the broker's own UI.
+   **`kill_switch` is the fourth, and it is the one that does not clear by
+   waiting** (ADR 0029). It means the standing halt says it cannot prove this
+   symbol's quantity — a reconcile that disagrees with the venue, or a submit
+   whose outcome is unknown — and a stop is sized off exactly that disputed
+   number, so placing one is how a stop becomes a short. The refusal is the
+   right answer and the position genuinely is uncovered: **go to the broker's
+   own UI now**, then work the mismatch (see "Reconciliation mismatch"). The
+   reason text names the symbol; `scripts/halt.py status` lists every symbol in
+   the same state.
+
+   `max_position_size` and `max_gross_exposure` still cannot appear here, and
+   have not been able to since ADR 0027. If you see either, a carve-out has
+   regressed and that is the incident, not the stop.
+2. If a transient rule will not clear promptly, place the stop through the
+   broker's own UI.
 3. `no stop level was requested and no stop_config was supplied` is a strategy
    configuration bug, not an incident: the strategy is trading without a stop.
    docs/SAFETY.md makes that a go-live blocker.

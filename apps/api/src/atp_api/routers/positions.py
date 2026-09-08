@@ -183,9 +183,12 @@ async def close_position(
     different act with a different door on it.
 
     **A refusal is a 200, not an error**, and the distinction is the point.
-    Three of the nine rules can refuse an exit — trading hours, the rate limit
-    and stale data (`rules.EXIT_BLIND_RULES`) — and the response says which one
-    did. HTTP-erroring would collapse "the platform
+    Three of the nine rules refuse an exit on the order alone — trading hours,
+    the rate limit and stale data (`rules.EXIT_BLIND_RULES`) — and `kill_switch`
+    is a fourth when a standing halt says it cannot prove this symbol's quantity
+    (ADR 0029). The response says which one did. The first three clear on their
+    own; the fourth does not, and its reason tells the operator to close through
+    the broker directly. HTTP-erroring would collapse "the platform
     considered this and said no, because trading is halted" into the same shape
     as "the symbol was misspelt", when the first is a decision the operator must
     read and the second is a typo. `submitted` is the field to branch on; the

@@ -136,10 +136,19 @@ class ProtectionResult:
 
     A bare `list[Order]` cannot distinguish "this position needed no protection"
     from "this position is naked because the stop was refused" — both are the
-    empty list. Three of the nine default rules can refuse a protective stop —
-    trading hours, the rate limit and stale data, which all judge the order
-    rather than the book (`rules.EXIT_BLIND_RULES`) — so a denial here is
-    ordinary rather than exotic. The other six can never refuse one.
+    empty list. Three of the nine default rules refuse a protective stop on the
+    order alone — trading hours, the rate limit and stale data, which all judge
+    the order rather than the book (`rules.EXIT_BLIND_RULES`) — so a denial here
+    is ordinary rather than exotic. Those three are transient and clear on their
+    own; the runner's next attempt places the stop.
+
+    **`kill_switch` is a fourth, and it is not transient (ADR 0029).** A halt
+    saying it cannot prove this symbol's quantity refuses the stop, because a
+    stop is sized off the very `Position.qty` the reconcile disputed. That is
+    the deliberate answer, and it leaves the position uncovered until a human
+    acts — so it is the one denial here that does not clear by waiting. The
+    halt's own alert names the symbol and sends the operator to the broker's UI
+    (docs/RUNBOOK.md). The remaining five still cannot refuse a stop.
 
     Two of those six only stopped being able to at ADR 0027. `max_position_size`
     and `max_gross_exposure` refused a stop whenever any *other* holding was
@@ -524,11 +533,16 @@ class OrderRouter:
             # sentence that used to be here ("`KillSwitchRule` refuses
             # everything with no exit carve-out"), which stopped being true when
             # the carve-out was added. Halting here would still be wrong: it
-            # cannot refuse this stop, but it would refuse every *entry* on the
-            # strategy over one child that a transient rule declined. Loud,
-            # surfaced, and left retryable instead — the denial clears, and the
-            # deterministic key makes the retry the same order to the venue
-            # rather than a second stop.
+            # would refuse every *entry* on the strategy over one child that a
+            # transient rule declined. Loud, surfaced, and left retryable
+            # instead — the denial clears, and the deterministic key makes the
+            # retry the same order to the venue rather than a second stop.
+            #
+            # `kill_switch` *can* reach here now, when a halt says it cannot
+            # prove this symbol (ADR 0029) — and escalating would be doubly
+            # pointless there, since trading is already stopped. That one does
+            # not clear by waiting either, which is why the halt's own alert
+            # names the symbol and points at the broker's UI.
             log.critical(
                 "order.position_unprotected",
                 symbol=symbol,

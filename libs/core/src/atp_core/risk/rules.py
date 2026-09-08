@@ -40,9 +40,11 @@ if TYPE_CHECKING:
 DAILY_LOSS_RULE = "daily_loss_limit"
 RATE_LIMIT_RULE = "rate_limit"
 
-#: The rules that can refuse an order which only *reduces* a position, and so
-#: the complete list of ways a flatten or a protective stop can come back
-#: refused (ADR 0005, `ProtectionResult`, docs/RISK.md).
+#: The rules that refuse an order which only *reduces* a position **on the order
+#: alone** — no book and no evidence can excuse them (ADR 0005,
+#: `ProtectionResult`, docs/RISK.md). See below for why that is narrower than
+#: "the complete list of ways a flatten can come back refused", which it used to
+#: claim and no longer is.
 #:
 #: All three judge the order rather than the book, which is why no carve-out
 #: reaches them and why that is correct: "do not trade outside the session", "do
@@ -51,15 +53,28 @@ RATE_LIMIT_RULE = "rate_limit"
 #: blind to `HaltReason` — a data-feed halt still cannot dump the book into a
 #: market nobody can see, because the rule whose job that is refuses first.
 #:
-#: The other six can never refuse a reduction: the kill switch, the daily loss
-#: limit and buying power each carve exits out explicitly, the two ceilings
-#: exempt an order that closes into the position without reversing through it
-#: (`closes_without_reversing`), and the open-position cap cannot be reached by
-#: an order in a symbol already held.
+#: The other six do not refuse a reduction *for being a reduction*: the kill
+#: switch, the daily loss limit and buying power each carve exits out
+#: explicitly, the two ceilings exempt an order that closes into the position
+#: without reversing through it (`closes_without_reversing`), and the
+#: open-position cap cannot be reached by an order in a symbol already held.
 #:
-#: Declared once because five documents and three docstrings quote the number,
-#: and it has been wrong in all of them at least once. `test_risk_engine.py`
-#: derives it from `default_rules()` rather than trusting it.
+#: **This is not the same as "only three rules can ever refuse a flatten", and
+#: that stronger claim is false as of ADR 0029.** `KillSwitchRule` refuses a
+#: reduction in a symbol the standing halt says it cannot prove — a genuine exit,
+#: correctly refused, because it would be sized against a disputed quantity. So
+#: a flatten or a protective stop can come back naming `kill_switch`, and
+#: `ProtectionResult`, `POST /positions/{symbol}/close` and docs/RUNBOOK.md all
+#: have to allow for it.
+#:
+#: What this tuple still is, exactly: the rules that refuse a reduction on the
+#: order alone, with no book and no evidence able to excuse it. Those three, and
+#: only those three, are what a caller can be sure of before it looks at
+#: anything. `test_risk_engine.py` derives *both* halves from `default_rules()`
+#: — this tuple under a halt that impugns nothing, and this tuple plus
+#: `kill_switch` under one that does — because five documents and three
+#: docstrings quote the number and it has been wrong in all of them at least
+#: once.
 EXIT_BLIND_RULES: tuple[str, ...] = ("trading_hours", RATE_LIMIT_RULE, "stale_data")
 
 
@@ -395,14 +410,6 @@ class KillSwitchRule:
         # and a reconcile finding a dollar of late-settling fees would, keyed on
         # the reason, refuse every exit and every protective stop across the
         # whole book, unattended, every five minutes.
-        if state.position_is_unproven(order.symbol):
-            return RiskDecision.deny(
-                self.name,
-                f"trading is halted and {order.symbol}'s quantity is unproven — the "
-                f"platform cannot size an exit against a position it cannot confirm. "
-                f"Close it through the broker's own UI",
-            )
-
         # The **settled** book, not the committed one (`RiskBooks`, ADR 0027).
         # This is a permission, and the permission is "there is a position here
         # to close". A projected book answers that with a position that has not
@@ -412,7 +419,20 @@ class KillSwitchRule:
         # exposure to be let out of; cancelling it is how you undo it.
         settled = books.settled
         if not reduces_position(order, settled):
+            # An entry, refused for the ordinary reason — including in a symbol
+            # the halt cannot prove. The verdict is identical either way, but
+            # the *sentence* is persisted on the rejection and read off the
+            # dashboard, and telling the author of a `BUY` that "the platform
+            # cannot size an exit" describes an order they did not place.
             return RiskDecision.deny(self.name, "trading is halted")
+
+        if state.position_is_unproven(order.symbol):
+            return RiskDecision.deny(
+                self.name,
+                f"trading is halted and {order.symbol}'s quantity is unproven — the "
+                f"platform cannot size an exit against a position it cannot confirm. "
+                f"Close it through the broker's own UI",
+            )
 
         # `closes_without_reversing` asks exactly this rule's second question,
         # and the two ceilings now exempt on it — so the "a reversal is not an
