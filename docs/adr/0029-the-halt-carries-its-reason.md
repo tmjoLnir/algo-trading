@@ -160,6 +160,16 @@ The key vanishing between the `SET NX` and the `GET` — a human clearing the ha
 in that window — rounds again rather than dereferencing `None` out of the
 platform's stop button.
 
+**Exhaustion is not an outage, and the two must not read alike.** Reaching the
+third failure means every round found the key *occupied*: the store answered,
+and a halt is standing. What did not land is this call's reason and — the part
+that matters — its impugnment. So the error names the symbols that are *not*
+recorded as unproven, and `POST /risk/halt` answers **409** rather than the
+**503** it gives an unreachable store. The 503's message is "nothing was
+written, trading resumes on its own when the store recovers"; saying that here
+would send an operator to re-halt an already halted platform and leave them
+believing a symbol is closeable that the reconciler could not prove.
+
 ## Consequences
 
 **Three rules can still refuse an order that only reduces a position** —

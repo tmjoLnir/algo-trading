@@ -480,8 +480,14 @@ class RedisKillSwitch:
         would erase the only audit trail of the original.
 
         Deliberately no error handling: engaging must never fail quietly. If
-        Redis is unreachable the exception propagates, and `is_engaged` is
+        Redis is unreachable the exception propagates, and `halt_state` is
         already failing closed on the same outage.
+
+        Raises `KillSwitchUnavailableError` when the record could not be written
+        after `_MAX_ENGAGE_ATTEMPTS` contended rounds. That is a *different*
+        failure from an unreachable store and callers must not conflate them:
+        there, nothing is written and nothing is halted; here, a halt is
+        standing and only this call's evidence is missing. The message says so.
         """
         key = self._key(scope, target)
         symbols = _clean_symbols(unproven_symbols)
@@ -523,10 +529,33 @@ class RedisKillSwitch:
                 return merged
             # Someone else wrote between our read and our write. Round again.
 
-        log.critical("risk.killswitch.engage_contended", scope=scope.value, target=target)
+        # What is known here is worth stating precisely, because the two
+        # failures a caller must tell apart look identical from the outside.
+        # Reaching this line means every round found the key **occupied** — the
+        # store answered, and a halt was standing at the last attempt. So
+        # trading is stopped; what did not land is *this* engage's reason and,
+        # far more importantly, its impugnment. A message that said "the halt
+        # may not be in force" would send an operator to re-halt an already
+        # halted platform while the symbol the reconciler could not prove goes
+        # on being flattenable.
+        log.critical(
+            "risk.killswitch.engage_contended",
+            scope=scope.value,
+            target=target,
+            reason=reason.value,
+            unproven=list(symbols),
+            effect="a halt stands, but this engage's evidence was not merged into it",
+        )
         raise KillSwitchUnavailableError(
-            f"could not record a {reason.value} halt for {key} after "
-            f"{_MAX_ENGAGE_ATTEMPTS} attempts — the halt may not be in force"
+            f"a halt is standing on {key} and this {reason.value} engage could not be "
+            f"merged into it after {_MAX_ENGAGE_ATTEMPTS} attempts"
+            + (
+                f" — {', '.join(symbols)} is NOT recorded as unproven, so the exit "
+                f"carve-out will still size a flatten against it"
+                if symbols
+                else " — the reason in force is somebody else's"
+            )
+            + ". The store is reachable; retry, and confirm with `scripts/halt.py status`"
         )
 
     def _announce_engaged(self, record: HaltRecord) -> None:

@@ -837,9 +837,17 @@ class TestContendedWrites:
 
     def test_unresolvable_contention_raises_rather_than_returning(self) -> None:
         """The bounded half. Three rounds and then a loud failure, because a
-        caller that believes it halted trading and did not is worse than an
-        exception: every decision after it is taken on the assumption that the
-        book is frozen.
+        caller that believes it recorded evidence and did not is worse than an
+        exception: the exit carve-out goes on sizing a flatten against the very
+        quantity the reconciler could not prove.
+
+        **The message must not read like a store outage.** Reaching here means
+        every round found the key occupied, so a halt *is* standing and the
+        store *is* answering — the opposite of the unreachable-Redis case, which
+        writes nothing and halts nothing. `POST /risk/halt` tells an operator
+        "nothing was written, trading resumes when the store recovers", and
+        saying that here would send them to re-halt an already halted platform
+        while the unproven symbol stays flattenable.
         """
         ks, redis = switch()
         ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops")
@@ -863,7 +871,7 @@ class TestContendedWrites:
 
         redis.before_cas = always_lose
 
-        with pytest.raises(KillSwitchUnavailableError, match="may not be in force"):
+        with pytest.raises(KillSwitchUnavailableError) as raised:
             ks.engage(
                 HaltScope.GLOBAL,
                 HaltReason.RECONCILIATION_MISMATCH,
@@ -871,7 +879,51 @@ class TestContendedWrites:
                 unproven_symbols=("SPY",),
             )
 
+        message = str(raised.value)
+        assert "a halt is standing" in message
+        assert "The store is reachable" in message
+        assert "SPY is NOT recorded as unproven" in message, (
+            "the symbol whose evidence was lost is the one thing an operator has to act on"
+        )
         assert redis.evals == 3, "bounded at _MAX_ENGAGE_ATTEMPTS, not spinning"
+
+    def test_contention_without_evidence_says_what_is_missing_instead(self) -> None:
+        """A contended engage that named no symbols lost only its reason, and
+        the message says that rather than naming an empty set."""
+        ks, redis = switch()
+        ks.engage(HaltScope.GLOBAL, HaltReason.DATA_FEED_LOST, "monitor")
+
+        rival = 0
+
+        def always_lose(client: FakeRedis) -> None:
+            nonlocal rival
+            rival += 1
+            client.store[client.scan_iter("*")[0]] = json.dumps(
+                {
+                    "scope": "global",
+                    "reason": "data_feed_lost",
+                    "engaged_at": f"2024-06-03T14:30:{rival:02d}+00:00",
+                    "engaged_by": "monitor",
+                    "detail": "",
+                    "target": None,
+                    "impugned": [
+                        {
+                            "symbols": ["QQQ"],
+                            "reason": "data_feed_lost",
+                            "at": "2024-06-03T14:30:00+00:00",
+                            "by": "monitor",
+                            "detail": "",
+                        }
+                    ],
+                }
+            )
+
+        redis.before_cas = always_lose
+
+        with pytest.raises(KillSwitchUnavailableError) as raised:
+            ks.engage(HaltScope.GLOBAL, HaltReason.MANUAL, "ops", unproven_symbols=("SPY",))
+
+        assert "SPY is NOT recorded as unproven" in str(raised.value)
 
 
 class TestHaltStateFailsClosed:

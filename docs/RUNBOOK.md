@@ -47,6 +47,14 @@ money.
 > the store recovers. Halt again once it is back, or stop the worker meanwhile,
 > and confirm with `scripts/halt.py status`.
 >
+> **A different message says trading IS halted and this request is not what
+> recorded it.** That is a `409`, not a `503`, and it means the opposite: the
+> store answered, a halt is standing, and only your reason — plus any symbols it
+> named as unproven — failed to merge into the record that already stands. Do
+> **not** stop the worker for it. Retry; if the message named symbols, retry
+> until it stops, because until it lands those symbols are still flattenable
+> against a quantity nothing can prove.
+>
 > `scripts/status.py` is the read-only companion — halts, quote freshness, the
 > latest stored bars, and the venue's account, positions and working orders.
 > Safe to run during an incident.
