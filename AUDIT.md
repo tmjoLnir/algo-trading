@@ -5,10 +5,12 @@
 **Findings:** 82 (14 high, 40 medium, 28 low)
 
 **State reviewed:** 2026-09-07 against `c0886b6`, under the record conventions
-`docs/ROADMAP.md` sets for a file of this kind. 13 closed, 7 half-closed, 62
+`docs/ROADMAP.md` sets for a file of this kind. 15 closed, 7 half-closed, 60
 open; every unresolved finding was re-checked against the tree. The first review, and why this file needed one at all, is §10; the second
 is §11; the third — the one that re-checked every open finding against the tree
-rather than the file against itself — is §12.
+rather than the file against itself — is §12. §13 is the first section whose
+diff *fixes* what it marks closed, rather than recording work that had already
+merged.
 
 ---
 
@@ -83,11 +85,11 @@ roadmap's summary. §10.6 said this was missing; it is not any more (#129).
 | | 🟢 Closed | 🟡 Half-closed | 🔴 Open | Total |
 |---|---:|---:|---:|---:|
 | 🔴 High | 2 | 2 | 10 | **14** |
-| 🟠 Medium | 8 | 5 | 27 | **40** |
+| 🟠 Medium | 10 | 5 | 25 | **40** |
 | 🟡 Low | 3 | 0 | 25 | **28** |
-| **Total** | **13** | **7** | **62** | **82** |
+| **Total** | **15** | **7** | **60** | **82** |
 
-Of the 62 still open, **40 are still marked ⚠️ Reported**.
+Of the 60 still open, **39 are still marked ⚠️ Reported**.
 
 That sentence used to read "47 have never been re-checked by anyone", and §12
 made it false: all seventy unresolved findings were re-checked against the tree,
@@ -1291,7 +1293,9 @@ Dead declarations that read as a supported access path. A maintainer who writes 
 
 #### 48. `RedisKillSwitch.engage` is GET-then-SET, so its documented idempotence and alert deduplication break under concurrent halts
 
-`libs/core/src/atp_core/risk/killswitch.py:214` · Broken · 🟠 Medium · ⚠️ Reported · 🔴 **Open**
+`libs/core/src/atp_core/risk/killswitch.py:214` · Broken · 🟠 Medium · ✅ Verified · 🟢 **Closed** — @claude (#144)
+
+*Record note (§13, 2026-09-08): Verified before it was fixed — the finding was ⚠️ Reported and the lost update is real. `engage` is now `SET NX` for the uncontended case, and on contention re-reads, merges through a one-way latch and writes through a compare-and-set script, bounded at three rounds. Both halves the finding names are restored: only the winning `SET NX` announces, so one incident is one alert and one `halts_engaged`, and `already_halted_by_another` is derived from a record whose `engaged_by` never moves. It was fixed as ADR 0029's prerequisite rather than on its own merits — the cost used to be an audit field and would now be the impugnment the exit carve-out reads. Exhausting the retry raises `KillSwitchUnavailableError`; `POST /risk/halt` reports it as 409, apart from the 503 an unreachable store gets, because the two say opposite things about whether trading is stopped.*
 
 **Evidence**
 
@@ -1315,7 +1319,9 @@ The realistic trigger is the ordinary incident shape: the feed drops and `Stalen
 
 #### 49. RedisKillSwitch stamps the halt record from the wall clock inside libs/core, where every sibling adapter takes an injected Clock for exactly this reason
 
-`libs/core/src/atp_core/risk/killswitch.py:221` · Inconsistency · 🟠 Medium · ✅ Verified · 🔴 **Open**
+`libs/core/src/atp_core/risk/killswitch.py:221` · Inconsistency · 🟠 Medium · ✅ Verified · 🟢 **Closed** — @claude (#144)
+
+*Record note (§13, 2026-09-08): `RedisKillSwitch.__init__` takes a `Clock` and `engage` stamps `engaged_at` — and every `Impugnment` and `HaltEscalation` alongside it — from `self._clock.now()`. Defaulted to `SystemClock()` rather than made required, unlike `Reconciler`'s: the nine existing construction sites are all real processes for which the system clock is the right answer, and a required argument would have been nine call-site edits to say so. `libs/core` now holds no `datetime.now()` outside `SystemClock` and the two live venue adapters.*
 
 **Evidence**
 
@@ -2081,12 +2087,14 @@ design. Recording them stops the next audit re-deriving them.
 Stated plainly, because an audit that overstates its coverage is worse than a
 shorter one.
 
-1. **The adversarial verification pass did not run.** 50 of the 82 findings are
-   marked ⚠️ and were not independently re-checked *when written*. I verified 32 myself,
+1. **The adversarial verification pass did not run.** 49 of the 82 findings are
+   marked ⚠️ and were not independently re-checked *when written*. I verified 33 myself,
    including 9 of the 14 high-severity findings — 25 in the original pass, #42
    later by reproduction in the change that closed it (#132), findings 66
-   and 67 re-read against the source in §11, and findings 14, 24, 52 and 54
-   reproduced by execution in §12. Verify before acting, and
+   and 67 re-read against the source in §11, findings 14, 24, 52 and 54
+   reproduced by execution in §12, and finding 48 in §13 — re-read and confirmed
+   before the change that closed it, rather than taken on the reviewer's word
+   while rewriting the method it names. Verify before acting, and
    especially before changing risk or execution code.
 2. **One of thirteen reviewers did not finish** — the repository-wide dead-code
    and duplication sweep over `libs/core`. Partial coverage of that dimension came
@@ -2732,3 +2740,65 @@ whether it is still a defect.
   different repair exists instead. Open is defensible. Half-closed is recorded,
   with the three surviving defects named in the note, because a reader who is
   told nothing was done would go and build the repair twice.
+
+---
+
+## 13. Two findings, closed by fixing them — 2026-09-08
+
+Every previous section in this file changed marks to match work that had already
+merged. This one is the first where the diff that moves the mark is the diff
+that fixes the defect, which is what `§2` and `CLAUDE.md` §6 both ask for: a
+state annotated with the PR that earned it, in the same diff.
+
+Reviewed and fixed at `d5765bf`, on the branch that became #144.
+
+### 13.1 What closed, and why it closed here rather than on its own merits
+
+**Finding 48** — `engage` was GET-then-SET, so two processes reacting to one
+incident both wrote and the loser's record was silently overwritten.
+
+It was not fixed for its own sake. ADR 0029 makes the halt record carry an
+`Impugnment` — the symbols the platform cannot prove — and `KillSwitchRule`
+reads that to decide whether a flatten may go through. A lost update used to
+cost an audit field; it would now cost the evidence a risk rule consults, and a
+standing halt swallowing a later `broker_unreachable` outright is the exact case
+ADR 0029 exists to catch. The finding was a **prerequisite**, and naming it that
+way is the honest account: it had sat open through three prior review passes and
+what moved it was a different piece of work needing it.
+
+`engage` is now `SET NX` for the uncontended case — one round trip, which is
+what the finding asks for — and on contention re-reads, merges through a pure
+one-way latch, and writes through a compare-and-set script, bounded at three
+rounds. Both halves the finding names are restored: only the winning `SET NX`
+announces, so one incident is one CRITICAL alert and one `halts_engaged`; and
+`already_halted_by_another` is derived from a record whose `engaged_by` never
+moves.
+
+**Finding 49** — the halt record was stamped from the process wall clock inside
+`libs/core`. `RedisKillSwitch.__init__` now takes a `Clock`, and `engage` stamps
+`engaged_at` — plus every `Impugnment` and `HaltEscalation` beside it — from it.
+`libs/core` now holds no `datetime.now()` outside `SystemClock` itself and the
+two live venue adapters.
+
+### 13.2 One evidence mark moved, and it moved before the fix
+
+Finding 48 was ⚠️ Reported and is now ✅ Verified. The order matters: it was
+re-read and confirmed against the source *before* the method it names was
+rewritten, not marked verified afterwards because the replacement works. §2
+defines ✅ as "I re-read the source myself and confirmed it", and a mark awarded
+by having replaced the code would mean something else entirely.
+
+Finding 49 was already ✅ (§10 recorded a verification note beneath it) and its
+mark is unchanged.
+
+### 13.3 What this pass did not do
+
+- **It re-checked nothing else.** §12 re-checked all seventy unresolved findings
+  eight days ago and that work is not repeated here. The other 60 open findings
+  carry §12's marks untouched, and a reader should treat this section as two
+  entries changing state, not as a fourth review.
+- **It closes no half-closed finding.** The seven at 🟡 are where §12 left them.
+- **The defect fixed alongside these two is not in this table.** The exit
+  carve-out reading a halt's reason instead of its evidence was found in
+  `docs/paper-week/day-1-fix-audit.md` §3.1a, not in the 82, and it is recorded
+  as ADR 0029. Findings 48 and 49 are the only entries here that move.
