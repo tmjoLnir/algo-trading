@@ -381,24 +381,50 @@ unapplied splits corrupt the price history a backtest is later judged on.
 **Fix.** Exclude `RESERVED_TEST_SYMBOLS` from the work list, and make one symbol's gap skip
 that symbol rather than abort the job.
 
-### F8 — The strategy is running parameters it was not configured for `medium`
+### F8 — The slow average at the open straddles a four-day weekend `high`
 
-`runner.timeframe_mismatch asked_for=1d serving=1m`. `sma_crossover` defaults to
-`fast_period=20`, `slow_period=50` (`examples/sma_crossover.py:37-38`). Declared against daily
-bars, that is a 20-day/50-day trend system. Served 1-minute bars, it is a 20-minute/50-minute
-scalper — which is what actually traded, 38 round trips in one session.
+Two defects, and the second is the serious one.
 
-Day 1's fix made the reader agree with the writer, which was right. It did not make the
-*strategy* agree with either: the platform silently substitutes a series the strategy did not
-ask for, warns **once** at 13:33, and runs 385 more evaluations in silence.
+**First, the declared timeframe is still wrong.** `runner.timeframe_mismatch asked_for=1d
+serving=1m`. `sma_crossover` defaults to `fast_period=20`, `slow_period=50`
+(`examples/sma_crossover.py:37-38`). Declared against daily bars that is a 20-day/50-day trend
+system; served 1-minute bars it is a 20-minute/50-minute scalper — which is what actually
+traded, 38 round trips in one session. The platform silently substitutes a series the strategy
+did not ask for, warns **once** at 13:33, and runs 385 more evaluations in silence.
 
-`runner.warmed_up bars=1020` = 20 × 51 = 20 × (`slow_period` + 1). At 13:32 the 50-bar slow
-average therefore spans the 50 minutes *before* the open — thin pre-market IEX prints.
+**Second, the warmup is stitched across a market closure.** `runner.warmed_up bars=1020
+symbols=20` is 51 bars per symbol — `slow_period + 1`. `runner.py:449` gets them from
+`bar_repo.get_last_n_bars(symbol, self.timeframe, needed)`, and `get_last_n_bars`
+(`persistence/bars.py:150`) takes the newest `n` rows **with no recency bound at all**.
 
-**Fix.** Refuse to boot on a mismatch, or require an explicit `timeframe` in the strategy
-config that must equal the worker's. Warning-and-continuing on a disagreement about *what data
-the strategy trades* is the class of silent substitution CLAUDE.md §5 exists to prevent.
-Whatever day 3 measures, it is not the configured strategy until this is closed.
+Count what was actually available. This session had ingested **118 bars in total** before the
+13:32:16 warmup — 5.9 per symbol — of which only 58 were pre-market (2.9 per symbol; IEX
+pre-market is nearly dead). Yet every symbol received its full 51, and
+`runner.warmup_short_history` fired **zero** times.
+
+So at least **45 of each symbol's 51 bars came from storage that predates this session** — and
+`data.stream.gap_widened_from_storage storage_says_from=2026-09-04T20:57` names the newest
+stored bar as **Friday 4 September, post-market**. Monday 7 September was Labor Day.
+
+The SMA(50) that priced the open was therefore computed over roughly 45 one-minute bars from
+the previous Friday, concatenated directly onto Tuesday's first few, with a **four-day closure
+treated as though no time had passed**. The fast SMA(20) refreshed within about twenty minutes
+of the open while the slow average stayed half-stale — and the first order of the day landed at
+**14:01**, thirty-one minutes in. *(That the stale slow average manufactured that particular
+crossover is an inference, not established; the discontinuity itself is arithmetic.)*
+
+**This is the survivorship/lookahead family of error** that CLAUDE.md §5 exists to catch: a
+number that looks plausible and is meaningless. A moving average is only defined over a
+contiguous series.
+
+**Fix.** Three things, and the third matters most:
+1. Require an explicit `timeframe` in the strategy config that must equal the worker's; refuse
+   to boot on a mismatch rather than substituting.
+2. Give `get_last_n_bars` a recency bound, or have warmup refuse bars older than a session
+   boundary — and make `warmup_short_history` the loud path rather than silently reaching back
+   across a holiday.
+3. Re-tune the periods for whatever timeframe is chosen. Until then day 3 measures plumbing,
+   not strategy.
 
 ### F9 — The tape is 91.67% complete and nothing says so `medium`
 
@@ -601,7 +627,7 @@ Worth stating plainly, because day 2 fixed real things:
 | **F8** nothing repeated the halt | **Fixed** — 11 reminders, all alerting |
 | **F9** halt cleared with no password/audit | **Not fixed** — cleared in a 49s visit (F13) |
 | **F10** three scheduled jobs are dormant stubs | **Partly fixed** — `generate_daily_report` and `rollover_daily_counters` now run; `apply_corporate_actions` runs and **crashes** (F7) |
-| **F11** sizing not survivable on the intended timeframe | **Open** — folded into F8 |
+| **F11** sizing not survivable on the intended timeframe | **Open, and worse than thought** — see F8: the slow average also straddles a market closure |
 | **F12** full-stack restart during RTH | **Fixed** — zero restarts |
 | **F13** the feed is structurally thin | **Confirmed, quantified, improving** — 91.67%, up from 87.6% (F9) |
 | **F14** `no_action` inflates the rejection counter | **Superseded** — the counter is now wrong in a bigger way (F1) |
@@ -623,8 +649,10 @@ the repository that it was run.**
 4. **F2/F1 — make the daily report say what happened.** Add protection counts; label the
    denominators.
 5. **F7 — exclude `RESERVED_TEST_SYMBOLS`** and make corporate actions survive one bad symbol.
-6. **F8 — decide the timeframe question.** Either configure the strategy for `1m` and re-tune
-   its periods, or serve it `1d`. Until then day 3 measures plumbing, not strategy.
+6. **F8 — decide the timeframe question, and bound the warmup.** Configure the strategy for
+   `1m` and re-tune its periods, or serve it `1d` — and stop `get_last_n_bars` reaching back
+   across a four-day closure to fill a 50-period average. Until then day 3 measures plumbing,
+   not strategy.
 
 **Verify B1 with one query after the first fill of day 3:**
 ```sql
