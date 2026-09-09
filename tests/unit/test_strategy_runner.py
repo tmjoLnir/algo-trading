@@ -12,7 +12,8 @@ repositories and the clock are all fakes (CLAUDE.md §1.7).
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as dt_time
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -22,7 +23,7 @@ from structlog.testing import capture_logs
 from atp_core.alerts.ports import Alert, Severity
 from atp_core.brokers.ports import TradeUpdate
 from atp_core.channels import CHANNEL_ORDERS, CHANNEL_SIGNALS
-from atp_core.clock import SimulatedClock
+from atp_core.clock import Session, SimulatedClock
 from atp_core.dashboard.snapshot import DEFAULT_SIGNAL_LIMIT
 from atp_core.domain import (
     Bar,
@@ -161,8 +162,25 @@ class FakeBarRepo:
     async def get_bars(self, symbol: str, timeframe: Any, start: Any, end: Any) -> list[Bar]:
         return self._series(symbol, timeframe)
 
-    async def get_last_n_bars(self, symbol: str, timeframe: Any, n: int) -> list[Bar]:
-        return self._series(symbol, timeframe)[-n:]
+    async def get_last_n_bars(
+        self,
+        symbol: str,
+        timeframe: Any,
+        n: int,
+        *,
+        not_before: datetime | None = None,
+    ) -> list[Bar]:
+        """**Honours `not_before`, like the real one.**
+
+        A fake that ignored it could not express the bug the bound exists for —
+        a warmup silently assembling a full window from bars belonging to a
+        previous session — which is the same lesson this class's own docstring
+        already carries about `timeframe`.
+        """
+        series = self._series(symbol, timeframe)
+        if not_before is not None:
+            series = [b for b in series if b.ts >= not_before]
+        return series[-n:]
 
     async def find_gaps(self, symbol: str, timeframe: Any, start: Any, end: Any) -> list[Any]:
         return []
@@ -376,14 +394,38 @@ class FakeReconciler:
 
 
 class FakeCalendar:
-    def __init__(self, open_: bool = True) -> None:
+    """One session a day, 13:30-20:00 UTC, on whatever days it is given.
+
+    `sessions` is real enough for `_warmup_floor` to find the session covering
+    an instant, because that is the question the floor asks. `days` is the set
+    of exchange-local dates that trade; anything else is a closure, which is
+    what makes a four-day weekend expressible here at all.
+    """
+
+    def __init__(self, open_: bool = True, *, days: set[date] | None = None) -> None:
         self.open = open_
+        self.days = days
 
     def is_open(self, ts: datetime) -> bool:
         return self.open
 
     def next_open(self, after: datetime) -> datetime:
         return after + timedelta(hours=1)
+
+    def sessions(self, first: date, last: date) -> list[Session]:
+        out: list[Session] = []
+        day = first
+        while day <= last:
+            if self.days is None or day in self.days:
+                out.append(
+                    Session(
+                        day=day,
+                        open_at=datetime.combine(day, dt_time(13, 30), tzinfo=UTC),
+                        close_at=datetime.combine(day, dt_time(20, 0), tzinfo=UTC),
+                    )
+                )
+            day += timedelta(days=1)
+        return out
 
 
 class RecordingAlertSink:
@@ -2314,3 +2356,125 @@ class TestAPositionWithNoVenueStopReachesAHuman:
 
         assert portfolio.position("KO").unprotected_qty == Decimal(10)
         assert portfolio.position("KO").broker_protected_qty == Decimal(0)
+
+
+class TestWarmupCannotReachAcrossAClosure:
+    """Day 2's SMA(50) spanned a four-day weekend and nothing said so.
+
+    `runner.warmed_up bars=1020 symbols=20` is exactly 51 bars each — a full
+    window — and `runner.warmup_short_history` fired **zero** times. But this
+    session had ingested 118 bars in total before that line, 5.9 per symbol, so
+    at least 45 of each symbol's 51 came from storage predating the session.
+    The newest stored bar was Friday 4 September post-market; Monday 7 September
+    was Labor Day. `get_last_n_bars` had no recency bound, and 51 rows is 51
+    rows (docs/paper-week/day-2-review.md, F8).
+
+    A moving average is only defined over a contiguous series, and the one trade
+    that made the day's P&L was taken on the part of the series that was not.
+    """
+
+    #: Tuesday 2026-09-08 — the session day 2 traded, after Labor Day.
+    TUESDAY = date(2026, 9, 8)
+    FRIDAY = date(2026, 9, 4)
+
+    def _minute_bar(self, ts: datetime, close: float = 100.0) -> Bar:
+        price = Decimal(str(close))
+        return Bar(
+            symbol=SYMBOL,
+            ts=ts,
+            timeframe=Timeframe.M1,
+            open=price,
+            high=price + Decimal("1"),
+            low=price - Decimal("1"),
+            close=price,
+            volume=Decimal("1000"),
+        )
+
+    #: `slow_period + 1`, which is what day 2's warmup asked for per symbol.
+    NEEDED = 51
+
+    def _runner_at(self, now: datetime, bars: list[Bar]) -> StrategyRunner:
+        """A minute-timeframe runner whose calendar knows about Labor Day."""
+        runner, _router, _switch, _rec, _portfolio, _slept = build(
+            strategy=ScriptedStrategy(warmup=self.NEEDED), bars=bars, clean=True
+        )
+        runner.timeframe = Timeframe.M1
+        runner.bar_repo = FakeBarRepo({SYMBOL: bars}, timeframe=Timeframe.M1)
+        runner.calendar = FakeCalendar(days={self.FRIDAY, self.TUESDAY})  # type: ignore[assignment]
+        runner.clock = SimulatedClock(now)
+        return runner
+
+    @pytest.mark.asyncio
+    async def test_fridays_bars_do_not_seed_tuesdays_average(self) -> None:
+        """The finding, reproduced. 45 bars from before Labor Day and 6 from
+        this session used to make a full 51-bar window; now they make six."""
+        friday = [
+            self._minute_bar(datetime(2026, 9, 4, 19, 30, tzinfo=UTC) + timedelta(minutes=i))
+            for i in range(45)
+        ]
+        tuesday_open = datetime(2026, 9, 8, 13, 30, tzinfo=UTC)
+        tuesday = [self._minute_bar(tuesday_open + timedelta(minutes=i)) for i in range(6)]
+        runner = self._runner_at(tuesday_open + timedelta(minutes=6), friday + tuesday)
+
+        await runner.warmup(runner._portfolio)
+
+        held = runner._bars[SYMBOL]
+        assert len(held) == 6, "Friday's 45 bars must not count towards this session"
+        assert all(b.ts >= tuesday_open for b in held)
+
+    @pytest.mark.asyncio
+    async def test_short_history_becomes_the_loud_path(self) -> None:
+        """The review's words. Reaching back across a holiday was silent;
+        refusing to is not."""
+        friday = [
+            self._minute_bar(datetime(2026, 9, 4, 19, 30, tzinfo=UTC) + timedelta(minutes=i))
+            for i in range(45)
+        ]
+        tuesday_open = datetime(2026, 9, 8, 13, 30, tzinfo=UTC)
+        runner = self._runner_at(tuesday_open + timedelta(minutes=2), friday)
+
+        with capture_logs() as logs:
+            await runner.warmup(runner._portfolio)
+
+        short = [line for line in logs if line["event"] == "runner.warmup_short_history"]
+        assert len(short) == 1
+        assert short[0]["have"] == 0
+        assert short[0]["not_before"] == tuesday_open.isoformat()
+
+    @pytest.mark.asyncio
+    async def test_this_session_s_own_bars_are_kept(self) -> None:
+        """The bound excludes a different trading day, not the current one."""
+        tuesday_open = datetime(2026, 9, 8, 13, 30, tzinfo=UTC)
+        bars = [self._minute_bar(tuesday_open + timedelta(minutes=i)) for i in range(60)]
+        runner = self._runner_at(tuesday_open + timedelta(minutes=60), bars)
+
+        await runner.warmup(runner._portfolio)
+
+        assert len(runner._bars[SYMBOL]) == self.NEEDED
+
+    def test_a_daily_series_is_never_bounded(self) -> None:
+        """The asymmetry is the point: a daily bar *is* a session, so a 50-day
+        average spanning weekends and holidays is what a 50-day average is.
+        Bounding it would be the same mistake in the other direction."""
+        runner, _r, _s, _rec, _p, _sl = build()
+        assert runner.timeframe is Timeframe.D1
+
+        assert runner._warmup_floor(datetime(2026, 9, 8, 14, 0, tzinfo=UTC)) is None
+
+    def test_an_intraday_floor_is_this_session_s_open(self) -> None:
+        runner = self._runner_at(datetime(2026, 9, 8, 17, 0, tzinfo=UTC), [])
+
+        floor = runner._warmup_floor(datetime(2026, 9, 8, 17, 0, tzinfo=UTC))
+
+        assert floor == datetime(2026, 9, 8, 13, 30, tzinfo=UTC)
+
+    def test_while_the_market_is_shut_nothing_from_a_past_session_qualifies(self) -> None:
+        """Whatever is warmed now will trade the *next* session, and last
+        Friday's bars are not that session's. `run` re-warms at each open, so
+        this corrects itself rather than needing a restart."""
+        runner = self._runner_at(datetime(2026, 9, 7, 12, 0, tzinfo=UTC), [])
+
+        floor = runner._warmup_floor(datetime(2026, 9, 7, 12, 0, tzinfo=UTC))
+
+        assert floor is not None
+        assert floor > datetime(2026, 9, 7, 12, 0, tzinfo=UTC)

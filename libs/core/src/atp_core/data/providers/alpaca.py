@@ -271,6 +271,8 @@ class AlpacaHistoricalProvider:
         start: datetime,
         end: datetime,
         adjusted: bool = True,
+        *,
+        skip_empty: bool = False,
     ) -> dict[str, list[Bar]]:
         """Bars per symbol, chronological, no duplicates.
 
@@ -286,6 +288,11 @@ class AlpacaHistoricalProvider:
         all. Interior gaps are deliberately not checked here: telling a real
         hole apart from a weekend needs the trading calendar, which lives in
         `BarRepository.find_gaps`.
+
+        `skip_empty=True` omits such a symbol instead, for a caller sweeping
+        over whatever the store holds rather than assembling a universe to
+        backtest. See `HistoricalDataProvider.get_bars` for why that is opt-in
+        and why the raise stays the default.
         """
         if not symbols:
             return {}
@@ -323,9 +330,13 @@ class AlpacaHistoricalProvider:
                     adj_close_by_key[(symbol, _parse_ts(raw["t"]))] = _as_decimal(raw["c"])
 
         result: dict[str, list[Bar]] = {}
+        empty: list[str] = []
         for symbol in symbols:
             raw_bars = raw_pages.get(symbol) or []
             if not raw_bars:
+                if skip_empty:
+                    empty.append(symbol)
+                    continue
                 raise DataGapError(
                     f"Alpaca returned no {timeframe} bars for {symbol} between "
                     f"{start.isoformat()} and {end.isoformat()}. Either the window "
@@ -334,12 +345,26 @@ class AlpacaHistoricalProvider:
                 )
             result[symbol] = self._to_bars(symbol, timeframe, raw_bars, adj_close_by_key)
 
+        if empty:
+            # Never silent, even though it was asked for. `skip_empty` says
+            # "do not abort the batch", not "do not tell me" — a sweep that
+            # quietly covered nineteen of twenty symbols reads exactly like one
+            # that covered twenty.
+            log.warning(
+                "data.alpaca.bars_missing",
+                symbols=sorted(empty),
+                count=len(empty),
+                timeframe=str(timeframe),
+                detail="no bars in the window; skipped rather than failing the batch",
+            )
+
         log.info(
             "data.alpaca.bars_fetched",
             symbols=len(result),
             bars=sum(len(v) for v in result.values()),
             timeframe=str(timeframe),
             adjusted=adjusted,
+            skipped=len(empty),
         )
         return result
 

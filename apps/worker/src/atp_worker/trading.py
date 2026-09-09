@@ -41,6 +41,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from atp_core.domain import Portfolio, RunMode, StopType
+from atp_core.errors import ConfigError
 from atp_core.execution.reconciliation import Reconciler
 from atp_core.execution.router import OrderRouter
 from atp_core.logging import get_logger
@@ -62,8 +63,10 @@ if TYPE_CHECKING:
     from atp_core.config import Settings
     from atp_core.dashboard.ports import SnapshotStore
     from atp_core.data.ports import BarRepository, EventPublisher, QuoteCache
+    from atp_core.domain import Timeframe
     from atp_core.execution.ports import OrderRepository, PortfolioRepository
     from atp_core.risk.killswitch import KillSwitch
+    from atp_core.strategy.base import Strategy
     from atp_core.strategy.ports import SignalRepository, StrategyRepository
 
 log = get_logger(__name__)
@@ -154,6 +157,44 @@ def decide(settings: Settings, config: WorkerConfig) -> TradingDecision:
     )
 
 
+def require_matching_timeframe(strategy: Strategy, serving: Timeframe) -> None:
+    """Refuse to start a strategy against a series it did not ask for.
+
+    The worker holds one series — `WorkerConfig.timeframe` — and it is both what
+    the ingestor writes and what the runner reads, so those two can no longer
+    disagree (day 1's blocker). What survived that fix is the *third* party:
+    the strategy, which declares its own timeframe and was simply handed
+    whatever the worker had.
+
+    Day 2 logged the substitution exactly once — `runner.timeframe_mismatch
+    asked_for=1d serving=1m` at 13:33 — and then ran 385 more evaluations in
+    silence. `sma_crossover`'s 20/50 pair, declared against daily bars, is a
+    20-day/50-day trend system; served minute bars it is a 20-minute/50-minute
+    scalper, and that is what took 38 round trips that session. Nobody chose
+    it (docs/paper-week/day-2-review.md, F8).
+
+    So this raises rather than warns, and it raises *here*, at assembly, before
+    a socket is opened or a bar is read. A warning was already the answer and
+    it was not enough — `LiveContext._check_timeframe` still emits one, and it
+    is right to, because a strategy may ask `history()` for any series it likes
+    mid-run. What it cannot do is tell an operator before the session that the
+    thing about to trade is not the thing they configured.
+
+    A strategy that declares no timeframe is indifferent, not mismatched: the
+    worker's series is then the only answer available and it is the right one.
+    """
+    declared = strategy.declared_timeframe
+    if declared is None or declared == serving:
+        return
+    raise ConfigError(
+        f"{strategy.name or type(strategy).__name__} is written for {declared.value} bars and "
+        f"this worker trades {serving.value}. Refusing to start: served the wrong series a "
+        f"strategy silently becomes a different one — the periods mean a different span of "
+        f"time. Set strategy_params.timeframe to {serving.value!r} if that is what you want "
+        f"(and re-tune its periods for it), or set the worker's timeframe to {declared.value!r}."
+    )
+
+
 def build_runner(
     settings: Settings,
     config: WorkerConfig,
@@ -181,6 +222,7 @@ def build_runner(
     """
     strategy_cls = registry.get(config.strategy)
     strategy = strategy_cls(dict(config.strategy_params) or None)
+    require_matching_timeframe(strategy, config.bar_timeframe)
 
     stop_manager = StopManager()
     # The ceilings come off the same row as everything else here, so what this

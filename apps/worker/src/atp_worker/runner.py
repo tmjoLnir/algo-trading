@@ -34,6 +34,7 @@ import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -84,6 +85,10 @@ log = get_logger(__name__)
 #: which is the state this counter exists to end. Three rather than one,
 #: because a single transient read failure should not stop a strategy.
 MAX_CONSECUTIVE_ERRORS = 3
+
+#: A bar at or above this is a session in itself, so its series is contiguous
+#: across closures by construction and `_warmup_floor` must not bound it.
+_ONE_DAY_SECONDS = 86_400
 
 #: Consecutive rate-limit refusals that count as a *storm* rather than as one
 #: busy minute. `RateLimitRule` is the runaway-loop guard and its cap is
@@ -437,6 +442,48 @@ class StrategyRunner:
         """What we believe is working at the venue. Handed to the reconciler."""
         return list(self._open_orders.values())
 
+    def _warmup_floor(self, now: datetime) -> datetime | None:
+        """The earliest bar this warmup may use, or `None` for no bound.
+
+        **A moving average is only defined over a contiguous series.** Day 2 of
+        the paper week warmed 20 symbols with 51 one-minute bars each, of which
+        at least 45 predated the session: the newest stored bar was Friday 4
+        September post-market, Monday was Labor Day, and the SMA(50) that
+        priced Tuesday's open was computed across a four-day closure as though
+        no time had passed. `warmup_short_history` fired **zero** times, because
+        `get_last_n_bars` had no recency bound and 51 rows is 51 rows
+        (docs/paper-week/day-2-review.md, F8).
+
+        So for an intraday series the floor is **this session's open**. Bars
+        from before it describe a different trading day, and stitching them on
+        does not produce a 50-minute average — it produces a number with no
+        span. The honest consequence is that a 50-period minute strategy has no
+        signal for the first 50 minutes of a session, which is not a limitation
+        this introduces: that average genuinely does not exist five minutes in.
+        Day 2's own numbers say the same thing from the other side — the stale
+        bars aged out at about 14:25, and every entry taken before that is one
+        the platform should not have been able to take.
+
+        Daily bars and coarser get **no** bound, and the asymmetry is the point:
+        a daily bar *is* a session, so a 50-day average spanning weekends and
+        holidays is what a 50-day average is. Bounding it would be the same
+        mistake in the opposite direction.
+
+        While the market is shut the floor is the *next* open — nothing yet
+        qualifies for the session about to be traded, which reads as short
+        history and is true. `run` re-warms at each open, so this corrects
+        itself rather than needing a restart.
+        """
+        if self.timeframe.seconds >= _ONE_DAY_SECONDS:
+            return None
+        # A day either side, because `now` is UTC and a session is named by its
+        # exchange-local date; the two disagree either side of midnight.
+        today = now.date()
+        for session in self.calendar.sessions(today - timedelta(days=1), today + timedelta(days=1)):
+            if session.open_at <= now < session.close_at:
+                return session.open_at
+        return self.calendar.next_open(now)
+
     async def warmup(self, portfolio: Portfolio) -> None:
         """Load history and rebuild state before the first evaluation.
 
@@ -467,19 +514,25 @@ class StrategyRunner:
         await self._ensure_strategy_row()
 
         needed = max(self.strategy.warmup_bars, 1)
+        floor = self._warmup_floor(self.clock.now())
 
+        short: list[str] = []
         for symbol in self.symbols:
-            bars = await self.bar_repo.get_last_n_bars(symbol, self.timeframe, needed)
+            bars = await self.bar_repo.get_last_n_bars(
+                symbol, self.timeframe, needed, not_before=floor
+            )
             self._bars[symbol] = list(bars)
             if len(bars) < needed:
                 # Loud, and not fatal on its own: `LiveContext.history` refuses
                 # for whoever actually needs the missing bars, while a strategy
                 # that checks its own lengths can still run.
+                short.append(symbol)
                 log.warning(
                     "runner.warmup_short_history",
                     symbol=symbol,
                     have=len(bars),
                     needed=needed,
+                    not_before=floor.isoformat() if floor is not None else None,
                 )
         self._context.invalidate()
 
@@ -530,6 +583,15 @@ class StrategyRunner:
             strategy=self.strategy.name,
             symbols=len(self.symbols),
             bars=sum(len(b) for b in self._bars.values()),
+            # The three fields that make this line auditable. Day 2's warmup
+            # said `bars=1020 symbols=20` — exactly 51 each — and that was the
+            # whole of it, so nothing distinguished 51 bars from this session
+            # from 45 belonging to the previous Friday. `short` and
+            # `not_before` are what let a reader tell the two apart, and
+            # `needed` is what makes `short` mean anything (F8).
+            needed=needed,
+            short=len(short),
+            not_before=floor.isoformat() if floor is not None else None,
         )
 
     def _escalate(self, decision: RiskDecision) -> None:

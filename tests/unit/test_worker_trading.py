@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import inspect
 from decimal import Decimal
+from typing import ClassVar
 
 import pytest
 from pydantic import SecretStr
@@ -29,6 +30,7 @@ from pydantic import SecretStr
 from atp_core.config import Settings
 from atp_core.domain import RunMode, StopType, Timeframe
 from atp_core.errors import ConfigError
+from atp_core.strategy.examples.sma_crossover import SmaCrossover
 from atp_core.worker import DEFAULT_WORKER_CONFIG, WorkerConfig
 from atp_core.worker.config import parse_strategy_params
 from atp_worker import main, trading
@@ -317,3 +319,56 @@ class TestTheSeriesBothEndsRead:
         default and the disagreement is expressible again."""
         source = inspect.getsource(main.run)
         assert "bar_timeframe=config.bar_timeframe" in source
+
+
+class TestTheStrategyGetsTheSeriesItAskedFor:
+    """Day 1 fixed the *ingestor* and the *runner* disagreeing. This is the
+    third party neither fix covered: the strategy.
+
+    `runner.timeframe_mismatch asked_for=1d serving=1m` was logged once, at
+    13:33, and 385 more evaluations ran in silence. `sma_crossover`'s 20/50
+    pair, declared against daily bars, is a 20-day/50-day trend system; served
+    minute bars it is a 20-minute/50-minute scalper. That is what took 38 round
+    trips that session, and nobody chose it
+    (docs/paper-week/day-2-review.md, F8).
+    """
+
+    def test_a_strategy_written_for_daily_bars_refuses_a_minute_worker(self) -> None:
+        with pytest.raises(ConfigError, match="written for 1d bars"):
+            trading.require_matching_timeframe(SmaCrossover(), Timeframe.M1)
+
+    def test_the_refusal_names_both_ways_out(self) -> None:
+        """An operator reading this at 08:00 needs to know which of the two
+        knobs to turn, and that changing the strategy's is not free."""
+        with pytest.raises(ConfigError) as caught:
+            trading.require_matching_timeframe(SmaCrossover(), Timeframe.M1)
+
+        message = str(caught.value)
+        assert "strategy_params.timeframe" in message
+        assert "re-tune its periods" in message
+
+    def test_an_agreeing_pair_starts(self) -> None:
+        trading.require_matching_timeframe(SmaCrossover({"timeframe": "1m"}), Timeframe.M1)
+        trading.require_matching_timeframe(SmaCrossover(), Timeframe.D1)
+
+    def test_a_strategy_that_declares_nothing_is_indifferent_not_mismatched(self) -> None:
+        """The worker's series is then the only answer available, and it is the
+        right one. Refusing here would block every strategy that has no opinion."""
+
+        class Silent(SmaCrossover):
+            params_schema: ClassVar[dict[str, object]] = {"type": "object", "properties": {}}
+
+        trading.require_matching_timeframe(Silent(), Timeframe.M1)
+
+    def test_it_is_checked_where_the_strategy_is_built(self) -> None:
+        """At assembly, before a socket is opened or a bar is read — a warning
+        was already the answer and it was not enough."""
+        source = inspect.getsource(trading.build_runner)
+        assert "require_matching_timeframe(strategy, config.bar_timeframe)" in source
+
+    def test_a_schema_default_counts_as_a_declaration(self) -> None:
+        """Reading only the operator's override would make an unconfigured
+        strategy look indifferent when it is not — which is the exact reading
+        that let day 2 happen."""
+        assert SmaCrossover().declared_timeframe is Timeframe.D1
+        assert SmaCrossover({"timeframe": "1m"}).declared_timeframe is Timeframe.M1
