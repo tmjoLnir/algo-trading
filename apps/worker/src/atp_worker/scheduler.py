@@ -22,6 +22,7 @@ from atp_core.data.backfill import GapBackfillResult, backfill_gaps
 from atp_core.data.corporate_actions import Adjustment, detect_adjustment
 from atp_core.data.gaps import SUPPORTED_TIMEFRAMES
 from atp_core.data.providers.alpaca import AlpacaHistoricalProvider
+from atp_core.data.seed import RESERVED_TEST_SYMBOLS
 from atp_core.logging import correlation_id, get_logger
 from atp_core.persistence.audit import PostgresAuditLog
 from atp_core.persistence.bars import PostgresBarRepository
@@ -31,7 +32,7 @@ from atp_core.risk.killswitch import HaltReason
 from atp_core.risk.rules import DAILY_LOSS_RULE
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Iterable
     from datetime import datetime
 
     from atp_core.alerts.ports import AlertSink
@@ -468,6 +469,49 @@ async def generate_daily_report(watch: SessionWatch) -> DailyReport:
     return report
 
 
+def sweepable_series(
+    stored: Iterable[tuple[str, Timeframe]],
+) -> tuple[dict[Timeframe, list[str]], list[str]]:
+    """Which of the stored series a corporate-actions sweep may ask a vendor for.
+
+    Pure, and separated from the job for the reason `atp_core.data.gaps` is
+    separated from the repository: the interesting logic here is a decision
+    about symbols, and a decision that needs a database, an HTTP client and an
+    engine to exercise is a decision nothing tests.
+
+    Two filters, and the second is the whole finding.
+
+    `SUPPORTED_TIMEFRAMES` was always here. What was not is
+    `RESERVED_TEST_SYMBOLS`: `stored_series()` returns *every* series the bar
+    store holds, and a seeded database holds NASDAQ's reserved test tickers
+    (`ZJZZT`, `ZVZZT`, `ZWZZT`, `ZXZZT` — `data/seed.py`). They exist, they carry
+    no value, and no vendor serves a price history for one, so asking is a
+    guaranteed `DataGapError`. On day 2 of the paper week `ZWZZT` raised it at
+    12:30:01 before a single real symbol had been processed; the job does not
+    retry, so twenty real symbols went the whole session with unapplied splits
+    (docs/paper-week/day-2-review.md, F7). Under CLAUDE.md §5 that is a price
+    history a backtest is later judged on.
+
+    The guard was written when the seed was. `RESERVED_TEST_SYMBOLS` has existed
+    since `seed.py` and nothing here consulted it — the same shape as
+    `round_price` in the day-2 review, and the same fix: a call site.
+
+    Returns the work list and the symbols it dropped, because a sweep that
+    silently covers less than the store holds is indistinguishable from one that
+    covers all of it.
+    """
+    by_timeframe: dict[Timeframe, list[str]] = {}
+    skipped: set[str] = set()
+    for symbol, timeframe in stored:
+        if timeframe not in SUPPORTED_TIMEFRAMES:
+            continue
+        if symbol in RESERVED_TEST_SYMBOLS:
+            skipped.add(symbol)
+            continue
+        by_timeframe.setdefault(timeframe, []).append(symbol)
+    return by_timeframe, sorted(skipped)
+
+
 async def apply_corporate_actions(watch: SessionWatch) -> list[Adjustment]:
     """Pre-open. Refresh adjusted history, and say what moved overnight.
 
@@ -515,13 +559,33 @@ async def apply_corporate_actions(watch: SessionWatch) -> list[Adjustment]:
     found: list[Adjustment] = []
 
     try:
-        by_timeframe: dict[Timeframe, list[str]] = {}
-        for symbol, timeframe in await repository.stored_series():
-            if timeframe in SUPPORTED_TIMEFRAMES:
-                by_timeframe.setdefault(timeframe, []).append(symbol)
+        by_timeframe, skipped = sweepable_series(await repository.stored_series())
+
+        if skipped:
+            log.info(
+                "worker.corporate_actions.skipped_seed_symbols",
+                symbols=skipped,
+                detail="reserved test tickers carry no corporate actions to apply",
+            )
 
         for timeframe, symbols in by_timeframe.items():
-            fresh = await provider.get_bars(symbols, timeframe, start, now, adjusted=True)
+            # `skip_empty`, so a symbol the vendor has nothing for costs that
+            # symbol rather than the whole batch and every symbol behind it.
+            # A newly listed ticker, one delisted last week, or a window with
+            # no sessions in it all land here, and none of them is a reason to
+            # leave twenty real symbols on last month's prices — which under
+            # CLAUDE.md §5 is a corrupted history a backtest is later judged on.
+            fresh = await provider.get_bars(
+                symbols, timeframe, start, now, adjusted=True, skip_empty=True
+            )
+            missing = sorted(set(symbols) - fresh.keys())
+            if missing:
+                log.warning(
+                    "worker.corporate_actions.no_vendor_data",
+                    symbols=missing,
+                    timeframe=timeframe.value,
+                    detail="skipped; the rest of the batch was still applied",
+                )
             for symbol in symbols:
                 incoming = fresh.get(symbol, [])
                 if not incoming:

@@ -254,6 +254,43 @@ class TestGetLastNBars:
         with pytest.raises(ValueError, match="at least 1"):
             await repo.get_last_n_bars("SPY", Timeframe.D1, 0)
 
+    async def test_not_before_bounds_how_far_back_the_rows_may_come_from(
+        self, repo: PostgresBarRepository
+    ) -> None:
+        """The bound that did not exist. Without it this returned the newest `n`
+        rows whatever their dates, so a 51-bar warmup was 51 bars even when 45
+        of them belonged to a session four days earlier
+        (docs/paper-week/day-2-review.md, F8)."""
+        await repo.upsert_bars([make_bar(i) for i in range(5)])
+
+        got = await repo.get_last_n_bars("SPY", Timeframe.D1, 10, not_before=T0 + timedelta(days=3))
+
+        assert [b.ts.day for b in got] == [5, 6]
+
+    async def test_fewer_than_n_is_the_honest_answer_under_a_bound(
+        self, repo: PostgresBarRepository
+    ) -> None:
+        """Not an error, and not padded from before the bound: it is the answer
+        that lets a caller notice its window is short and say so."""
+        await repo.upsert_bars([make_bar(i) for i in range(5)])
+
+        got = await repo.get_last_n_bars(
+            "SPY", Timeframe.D1, 10, not_before=T0 + timedelta(days=99)
+        )
+
+        assert got == []
+
+    async def test_a_naive_bound_is_rejected(self, repo: PostgresBarRepository) -> None:
+        """Rule §1.2 at the boundary — a naive bound would compare against
+        tz-aware timestamps and raise somewhere less legible."""
+        with pytest.raises(ValueError, match="not_before"):
+            await repo.get_last_n_bars(
+                "SPY",
+                Timeframe.D1,
+                5,
+                not_before=datetime(2024, 1, 1),  # noqa: DTZ001
+            )
+
 
 class TestBulkWrites:
     async def test_writes_more_rows_than_one_statement_can_bind(

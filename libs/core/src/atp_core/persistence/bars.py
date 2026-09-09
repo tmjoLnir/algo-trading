@@ -147,23 +147,38 @@ class PostgresBarRepository:
             result = await session.execute(stmt)
             return [self._to_bar(row) for row in result.scalars()]
 
-    async def get_last_n_bars(self, symbol: str, timeframe: Timeframe, n: int) -> list[Bar]:
+    async def get_last_n_bars(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        n: int,
+        *,
+        not_before: datetime | None = None,
+    ) -> list[Bar]:
         """The most recent `n` bars, returned chronological.
 
         Fetched newest-first so the database reads `n` rows rather than the
         symbol's whole history, then reversed — indicators are defined over a
         forward series and handing them a reversed one produces numbers that
         look plausible and are wrong.
+
+        `not_before` is a floor on `ts`, and its absence was a real defect
+        rather than a missing convenience: this returned the newest `n` rows
+        **with no recency bound at all**, so a warmup asking for 51 minute bars
+        got 51 whatever their dates, and a four-day closure between the sixth
+        and the seventh of them was invisible (F8). Fewer than `n` come back
+        when the bound excludes them, which is the answer that lets a caller
+        notice.
         """
         if n < 1:
             raise ValueError(f"n must be at least 1, got {n}")
+        if not_before is not None:
+            _require_utc(not_before, "not_before")
 
-        stmt = (
-            select(BarRow)
-            .where(BarRow.symbol == symbol, BarRow.timeframe == timeframe.value)
-            .order_by(BarRow.ts.desc())
-            .limit(n)
-        )
+        conditions = [BarRow.symbol == symbol, BarRow.timeframe == timeframe.value]
+        if not_before is not None:
+            conditions.append(BarRow.ts >= not_before)
+        stmt = select(BarRow).where(*conditions).order_by(BarRow.ts.desc()).limit(n)
         async with read_scope(self._session_factory) as session:
             result = await session.execute(stmt)
             return [self._to_bar(row) for row in reversed(list(result.scalars()))]

@@ -31,6 +31,7 @@ from structlog.testing import capture_logs
 from atp_core.alerts.ports import Alert, Severity
 from atp_core.clock import SimulatedClock, TradingCalendar
 from atp_core.data.corporate_actions import Adjustment
+from atp_core.data.gaps import SUPPORTED_TIMEFRAMES
 from atp_core.domain import Order, OrderType, Portfolio, Position, Side, Timeframe
 from atp_core.execution.reconciliation import Reconciler
 from atp_core.risk.killswitch import (
@@ -58,6 +59,7 @@ from atp_worker.scheduler import (
     rollover_daily_counters,
     run_scheduler,
     summarise_the_session,
+    sweepable_series,
 )
 from tests.fakes import FakeBroker, FakeKillSwitch
 
@@ -919,3 +921,65 @@ class TestTheCorporateActionsJob:
         assert alerts.sent[0].severity is Severity.CRITICAL
         assert "inconsistent" in alerts.sent[0].title
         assert "11 of 20" in alerts.sent[0].body
+
+
+class TestTheCorporateActionsSweepSurvivesOneDeadSymbol:
+    """Day 2 applied corporate actions to nothing, every session, silently.
+
+    `stored_series()` is every series the bar store holds, and a seeded database
+    holds NASDAQ's reserved test tickers. Alpaca has no price history for a
+    symbol that carries no value, so `get_bars` raised `DataGapError` on
+    `ZWZZT` at 12:30:01 — before a single real symbol had been processed. The
+    job does not retry, so twenty real symbols went the whole day with unapplied
+    splits (docs/paper-week/day-2-review.md, F7).
+
+    Under CLAUDE.md §5 that is not a cosmetic failure: an unapplied split
+    corrupts the price history a backtest is later judged on.
+    """
+
+    def test_reserved_test_tickers_are_never_asked_for(self) -> None:
+        """`RESERVED_TEST_SYMBOLS` has existed since `seed.py` was written and
+        nothing here consulted it — the same shape as `round_price` in the same
+        review, and the same fix: a call site."""
+        by_timeframe, skipped = sweepable_series(
+            [
+                ("SPY", Timeframe.D1),
+                ("ZWZZT", Timeframe.D1),
+                ("ZVZZT", Timeframe.D1),
+                ("AAPL", Timeframe.D1),
+            ]
+        )
+
+        assert by_timeframe == {Timeframe.D1: ["SPY", "AAPL"]}
+        assert skipped == ["ZVZZT", "ZWZZT"]
+
+    def test_the_real_symbols_survive_the_seeded_ones(self) -> None:
+        """The exact day-2 shape: one dead ticker sorted ahead of the real ones.
+
+        `ZWZZT` was not the only symbol in the store — it was the one that
+        happened to abort the batch before the other twenty were reached.
+        """
+        by_timeframe, _ = sweepable_series(
+            [("ZWZZT", Timeframe.D1), *((s, Timeframe.D1) for s in ("KO", "PEP", "INTC"))]
+        )
+
+        assert by_timeframe[Timeframe.D1] == ["KO", "PEP", "INTC"]
+
+    def test_a_timeframe_the_sweep_cannot_handle_is_still_dropped(self) -> None:
+        """The filter that was already here keeps working beside the new one."""
+        unsupported = next(tf for tf in Timeframe if tf not in SUPPORTED_TIMEFRAMES)
+
+        by_timeframe, skipped = sweepable_series([("SPY", unsupported)])
+
+        assert by_timeframe == {}
+        # Dropped for a different reason, and not reported as a seed symbol.
+        assert skipped == []
+
+    def test_the_dropped_symbols_are_reported_rather_than_silently_missing(self) -> None:
+        """A sweep that quietly covers less than the store holds reads exactly
+        like one that covers all of it, which is how this went unnoticed."""
+        _, skipped = sweepable_series([("ZJZZT", Timeframe.D1), ("ZJZZT", Timeframe.M1)])
+
+        # Deduplicated: one symbol stored at two timeframes is one symbol an
+        # operator needs told about, not two.
+        assert skipped == ["ZJZZT"]

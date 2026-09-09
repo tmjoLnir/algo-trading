@@ -206,7 +206,7 @@ Expect:
 | `worker.trading` | the opt-in took; the message names the venue |
 | `worker.adopted_broker_state` | **the boot adoption** — see the warning below |
 | `execution.reconcile.clean` | our book matches Alpaca's |
-| `runner.warmed_up` `bars=N` | history loaded; if `N` is small, check `runner.warmup_short_history` |
+| `runner.warmed_up` `bars=N short=S not_before=T` | history loaded. **`short=S` at the open is expected on an intraday series** — see "Warmup does not reach across a closure" below |
 | `broker.alpaca.trade_updates_connected` | the account stream authenticated |
 
 `broker.alpaca.trade_updates_connected` is the one to watch hardest. That
@@ -267,6 +267,45 @@ Ranked by how much of this has actually met a venue, which is none of it:
    history there is no ATR to derive from.
 4. **Warmup history.** `runner.warmup_short_history` warns per symbol;
    `LiveContext.history` raises for whoever actually needs the missing bars.
+   On an intraday series this is expected at the open — see below.
+
+---
+
+## Warmup does not reach across a closure
+
+**On an intraday series, warmup uses only bars from the session it is about to
+trade.** A 50-period one-minute average genuinely does not exist five minutes
+into a session, and the platform now says so rather than borrowing the previous
+session's tail to fill the window.
+
+So at the open you should expect `runner.warmup_short_history` for every symbol,
+and `runner.warmed_up` to carry `short=` equal to your watchlist size with
+`not_before=` set to this session's open. The strategy produces no signals until
+enough bars have printed *this session* — for a 50-period minute strategy, about
+fifty minutes in. That is not a fault to investigate; it is the window filling.
+
+Day 2 of the paper week did the opposite silently: `runner.warmed_up bars=1020
+symbols=20` was a full 51-bar window per symbol, of which at least 45 came from
+Friday 4 September, with Labor Day in between and `warmup_short_history` firing
+zero times. The one trade that made that day's P&L was taken on the stitched
+part of the series (docs/paper-week/day-2-review.md, F8).
+
+**Daily bars are not bounded**, and the asymmetry is deliberate: a daily bar *is*
+a session, so a 50-day average spanning weekends and holidays is exactly what a
+50-day average is.
+
+## The strategy's series must match the worker's
+
+The worker **refuses to start** when the configured strategy declares a
+timeframe different from `WorkerConfig.timeframe`. `scripts/preflight.py` reports
+the same mismatch as a `FAIL` before you get there.
+
+`sma_crossover` declares `1d` and the worker defaults to `1m`, so the shipped
+pairing is a mismatch: set `strategy_params` to `{"timeframe": "1m"}` on the
+Config tab if a minute series is what you want — **and re-tune the periods for
+it**. A 20/50 pair means twenty and fifty *days* on a daily series and twenty and
+fifty *minutes* on a minute one. Those are different strategies, and day 2 traded
+the second while its configuration described the first.
 
 ---
 

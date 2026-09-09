@@ -56,6 +56,8 @@ class HistoricalDataProvider(Protocol):
         start: datetime,
         end: datetime,
         adjusted: bool = True,
+        *,
+        skip_empty: bool = False,
     ) -> dict[str, list[Bar]]:
         """Bars per symbol, chronological, no duplicates.
 
@@ -65,6 +67,24 @@ class HistoricalDataProvider(Protocol):
         Raises `DataGapError` if a requested window is not fully covered.
         Returning a short series silently is the failure mode to avoid: the
         backtest then runs over a hole and reports a return that never existed.
+
+        `skip_empty=True` omits a symbol that returned nothing instead of
+        raising, and **must be asked for**. The default is the guarantee above
+        and stays the default: a backtest that quietly skipped a symbol would
+        report a portfolio result over a universe nobody chose.
+
+        It exists because the all-or-nothing contract is wrong for a *sweep*
+        over whatever the bar store happens to hold. One dead ticker there
+        aborts the batch and every symbol behind it — which is how a NASDAQ
+        test symbol stopped corporate actions being applied to twenty real ones
+        for a whole session (docs/paper-week/day-2-review.md, F7 and F10a). A
+        caller that wants "as many as the vendor has" asks for it, in one word,
+        at the call site where that is the right answer.
+
+        The caller is then responsible for noticing what is missing: the
+        returned mapping is keyed by the symbols that had data, so
+        `set(symbols) - result.keys()` is the gap, and a caller using this must
+        say something about it rather than silently proceeding.
         """
         ...
 
@@ -135,7 +155,31 @@ class BarRepository(Protocol):
         self, symbol: str, timeframe: Timeframe, start: datetime, end: datetime
     ) -> list[Bar]: ...
 
-    async def get_last_n_bars(self, symbol: str, timeframe: Timeframe, n: int) -> list[Bar]: ...
+    async def get_last_n_bars(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        n: int,
+        *,
+        not_before: datetime | None = None,
+    ) -> list[Bar]:
+        """The most recent `n` bars, chronological, newest last.
+
+        `not_before` bounds how far back they may come from, and a caller that
+        needs a *contiguous* series must pass one. Without it this returns the
+        newest `n` rows with no regard for when they were written, which is how
+        a 50-period intraday average came to be computed over 45 bars from the
+        previous Friday concatenated onto Tuesday's first few, with a four-day
+        market closure treated as though no time had passed
+        (docs/paper-week/day-2-review.md, F8).
+
+        Fewer than `n` bars is the honest answer when the bound excludes the
+        rest. It is the caller's job to notice and say so — a moving average is
+        only defined over a contiguous series, and one silently assembled from
+        two sides of a holiday is a number that looks plausible and means
+        nothing (CLAUDE.md §5).
+        """
+        ...
 
     async def find_gaps(
         self, symbol: str, timeframe: Timeframe, start: datetime, end: datetime

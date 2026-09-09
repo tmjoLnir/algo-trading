@@ -60,6 +60,8 @@ class FakeProvider:
         start: datetime,
         end: datetime,
         adjusted: bool = True,
+        *,
+        skip_empty: bool = False,
     ) -> dict[str, list[Bar]]:
         self.calls.append((tuple(symbols), start, end, adjusted))
         missing = [s for s in symbols if s in self.empty]
@@ -107,7 +109,14 @@ class FakeRepository:
     ) -> list[Bar]:
         return []
 
-    async def get_last_n_bars(self, symbol: str, timeframe: Timeframe, n: int) -> list[Bar]:
+    async def get_last_n_bars(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        n: int,
+        *,
+        not_before: datetime | None = None,
+    ) -> list[Bar]:
         return []
 
     async def find_gaps(

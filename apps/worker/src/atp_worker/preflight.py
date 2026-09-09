@@ -230,7 +230,33 @@ def check_strategy(config: WorkerConfig) -> Check:
             f"{name} rejected its parameters: {exc}",
             fix="fix the strategy parameters on the Config tab",
         )
-    return Check("strategy", Status.PASS, f"{name} constructs, warmup_bars={strategy.warmup_bars}")
+    declared = strategy.declared_timeframe
+    if declared is not None and declared != config.bar_timeframe:
+        # The same refusal `trading.require_matching_timeframe` makes at
+        # assembly, reported here instead — the whole point of a preflight is
+        # that an operator reads it *before* the worker will not start.
+        #
+        # Day 2 ran this mismatch for a full session on a warning nobody saw:
+        # a 20/50 pair declared against daily bars, served minute bars, is a
+        # different strategy with the same name and it took 38 round trips
+        # (docs/paper-week/day-2-review.md, F8).
+        return Check(
+            "strategy",
+            Status.FAIL,
+            f"{name} is written for {declared.value} bars and this worker trades "
+            f"{config.bar_timeframe.value} — served the wrong series it silently becomes a "
+            "different strategy, because its periods mean a different span of time",
+            fix=(
+                f'set strategy_params.timeframe to "{config.bar_timeframe.value}" and re-tune '
+                f'the periods for it, or set the worker\'s timeframe to "{declared.value}"'
+            ),
+        )
+    return Check(
+        "strategy",
+        Status.PASS,
+        f"{name} constructs on {config.bar_timeframe.value} bars, "
+        f"warmup_bars={strategy.warmup_bars}",
+    )
 
 
 def check_stop_config(config: WorkerConfig) -> Check:

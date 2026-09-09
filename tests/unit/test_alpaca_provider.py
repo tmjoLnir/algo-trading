@@ -239,6 +239,52 @@ class TestGaps:
             await provider().get_bars(["SPY", "QQQ"], Timeframe.D1, START, END, adjusted=False)
 
     @respx.mock
+    async def test_skip_empty_costs_the_symbol_and_not_the_batch(self) -> None:
+        """The all-or-nothing contract is right for a backtest universe and
+        wrong for a sweep over whatever the store holds.
+
+        On day 2 of the paper week one NASDAQ test ticker raised here and took
+        the whole corporate-actions batch with it — twenty real symbols left on
+        stale prices, every session, because the job does not retry
+        (docs/paper-week/day-2-review.md, F7 and F10a). Both paginated request
+        passes had already been paid for when it raised.
+        """
+        respx.get(BARS_URL).mock(return_value=httpx.Response(200, json=page({"SPY": [bar(2)]})))
+
+        result = await provider().get_bars(
+            ["SPY", "ZWZZT"], Timeframe.D1, START, END, adjusted=False, skip_empty=True
+        )
+
+        assert list(result) == ["SPY"]
+        assert len(result["SPY"]) == 1
+        # The caller can name what it did not get, which is what lets it say so.
+        assert {"SPY", "ZWZZT"} - result.keys() == {"ZWZZT"}
+
+    @respx.mock
+    async def test_the_raise_is_still_the_default(self) -> None:
+        """`skip_empty` must be asked for. A backtest that quietly dropped a
+        symbol would report a portfolio result over a universe nobody chose,
+        which is the failure the raise exists to prevent."""
+        respx.get(BARS_URL).mock(return_value=httpx.Response(200, json=page({"SPY": [bar(2)]})))
+
+        with pytest.raises(DataGapError, match="QQQ"):
+            await provider().get_bars(["SPY", "QQQ"], Timeframe.D1, START, END, adjusted=False)
+
+    @respx.mock
+    async def test_skipping_every_symbol_returns_empty_rather_than_raising(self) -> None:
+        """A window with no sessions in it — the reconnect backfill's 05:43-11:43
+        case — is a legitimate nothing, not a failure."""
+        respx.get(BARS_URL).mock(
+            return_value=httpx.Response(200, json={"bars": None, "next_page_token": None})
+        )
+
+        result = await provider().get_bars(
+            ["SPY", "QQQ"], Timeframe.D1, START, END, adjusted=False, skip_empty=True
+        )
+
+        assert result == {}
+
+    @respx.mock
     async def test_null_bars_payload_raises(self) -> None:
         """Alpaca sends `"bars": null`, not `{}`, for an empty window."""
         respx.get(BARS_URL).mock(

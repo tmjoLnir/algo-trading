@@ -61,7 +61,17 @@ def config(**overrides: object) -> WorkerConfig:
     the point rather than an inconvenience: `check_run_mode` cannot accidentally
     be influenced by a stop multiplier now, because it is not handed one.
     """
-    base: dict[str, object] = {"strategy": "sma_crossover", "symbols": ("SPY",)}
+    #: `strategy_params.timeframe` is part of "would trade" now, not decoration.
+    #: `sma_crossover` declares `1d` and `WorkerConfig` defaults to `1m`, so the
+    #: shipped pairing is itself the day-2 mismatch — a 20/50 pair written for
+    #: daily bars, served minute bars, is a different strategy with the same
+    #: name (docs/paper-week/day-2-review.md, F8). A fixture that left it out
+    #: would be asserting against a configuration the worker now refuses.
+    base: dict[str, object] = {
+        "strategy": "sma_crossover",
+        "symbols": ("SPY",),
+        "strategy_params": {"timeframe": "1m"},
+    }
     base.update(overrides)
     return WorkerConfig(**base)  # type: ignore[arg-type]
 
@@ -130,6 +140,22 @@ class TestTheConfigurationItself:
         check = preflight.check_strategy(config())
         assert check.status is Status.PASS
         assert "warmup_bars=" in check.detail
+        # And which series it will read them at, because that is now half of
+        # whether the number means anything.
+        assert "1m bars" in check.detail
+
+    def test_a_strategy_written_for_another_series_fails_before_the_open(self) -> None:
+        """`trading.require_matching_timeframe` refuses this at assembly. The
+        whole point of a preflight is that an operator reads it *before* the
+        worker will not start — day 2 ran the mismatch for a full session on a
+        warning nobody saw (docs/paper-week/day-2-review.md, F8)."""
+        check = preflight.check_strategy(config(strategy_params={}, timeframe="1m"))
+
+        assert check.status is Status.FAIL
+        assert "written for 1d bars" in check.detail
+        # Both knobs, and the fact that turning the strategy's is not free.
+        assert "strategy_params.timeframe" in check.fix
+        assert "re-tune" in check.fix
 
     def test_a_time_stop_warns_that_layer_5_is_not_exercised(self) -> None:
         """A real stop type that places no level. The run is valid and it does

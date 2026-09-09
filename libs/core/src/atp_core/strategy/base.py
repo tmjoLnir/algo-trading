@@ -11,6 +11,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from atp_core.domain import Timeframe
+from atp_core.errors import StrategyError
+
 if TYPE_CHECKING:
     from atp_core.domain import Bar, Fill, Order, Quote, Signal
     from atp_core.strategy.context import StrategyContext
@@ -47,6 +50,48 @@ class Strategy(ABC):
     def validate_params(self) -> None:
         """Reject a bad configuration at construction, not at bar 40,000."""
         return None
+
+    @property
+    def declared_timeframe(self) -> Timeframe | None:
+        """The bar series this strategy's signals are defined over, if it says.
+
+        `None` when the strategy names no series — it is then indifferent, and
+        whatever the worker is configured for is the right answer.
+
+        **A declared series is a claim about what the numbers mean, not a
+        preference.** `SmaCrossover` defaults to `1d`, so its 20/50 pair is a
+        20-day/50-day trend system. Served minute bars it is a 20-minute
+        /50-minute scalper — a different strategy with the same name, and the
+        one that actually traded 38 round trips on day 2 of the paper week
+        while the platform logged the substitution *once*, at 13:33, and ran
+        385 more evaluations in silence (docs/paper-week/day-2-review.md, F8).
+
+        Read from `params` so it works for both kinds of strategy: a
+        hand-written one takes it from its schema default or the operator's
+        override, and a `RuleSet` puts its own `timeframe` there when it
+        serialises the spec into `params`.
+
+        The schema default is consulted rather than only the supplied params,
+        because a strategy that ships a default has declared one — that is what
+        a default is — and reading only the override would make an unconfigured
+        strategy look indifferent when it is not. That is exactly the reading
+        that let day 2 happen.
+        """
+        raw = self.params.get("timeframe")
+        if raw is None:
+            properties = self.params_schema.get("properties", {})
+            raw = properties.get("timeframe", {}).get("default")
+        if raw is None:
+            return None
+        if isinstance(raw, Timeframe):
+            return raw
+        try:
+            return Timeframe(raw)
+        except ValueError as exc:
+            raise StrategyError(
+                f"{type(self).__name__} declares timeframe {raw!r}, which is not one this "
+                f"platform stores ({', '.join(sorted(t.value for t in Timeframe))})"
+            ) from exc
 
     @property
     @abstractmethod
