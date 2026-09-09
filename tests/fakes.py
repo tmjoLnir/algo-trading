@@ -18,11 +18,11 @@ The failures it can be told to produce are the ones that matter:
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from atp_core.brokers.ports import AccountSnapshot
+from atp_core.brokers.ports import AccountSnapshot, FeeActivity
 from atp_core.clock import SimulatedClock
 from atp_core.domain import (
     Fill,
@@ -55,13 +55,13 @@ from atp_core.strategy.ports import StoredStrategy
 from atp_core.worker.config import StoredWorkerConfig, WorkerConfig
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection
+    from collections.abc import Callable, Collection, Sequence
     from typing import Any
 
     from atp_core.audit.ports import AuditEntry
     from atp_core.backtest.ports import BacktestProgress, StoredBacktestRun
     from atp_core.dashboard.snapshot import LiveSnapshot
-    from atp_core.domain import Signal
+    from atp_core.domain import RunMode, Signal
     from atp_core.execution.ports import EquityPoint
     from atp_core.strategy.ports import NewStrategy, SignalOutcome, StrategyRecord
     from atp_core.worker.ports import RunningWorkerConfig
@@ -124,6 +124,13 @@ class FakeBroker:
         #: `reads_fail`: the lookup succeeds and the retraction does not,
         #: which is the case where an order is known to still be working.
         self.cancel_refuses: set[str] = set()
+        #: What the venue's fee feed returns. Empty by default, so every test
+        #: written before fees existed sees the behaviour it was written
+        #: against; a test about fees fills it.
+        self.fee_activities: list[FeeActivity] = []
+        #: Every `since` this was asked for, so a test can prove the window is
+        #: wide enough to catch a fee the venue booked late.
+        self.fee_queries: list[date] = []
 
         self._next_id = 0
 
@@ -192,6 +199,14 @@ class FakeBroker:
     async def get_positions(self) -> list[Position]:
         self._guard_reads()
         return [p for p in self.positions.values() if not p.is_flat]
+
+    async def get_fee_activities(self, since: date) -> list[FeeActivity]:
+        """The venue's fee feed. Subject to `reads_fail` like every other read —
+        a fee feed that will not answer is a case `settle_broker_fees` has to
+        survive without turning an outage into a halt."""
+        self._guard_reads()
+        self.fee_queries.append(since)
+        return [item for item in self.fee_activities if item.booked_on >= since]
 
     async def close_position(self, symbol: str) -> Order:
         """The venue closing a position on its own, around our book.
@@ -1114,3 +1129,26 @@ class FakeBacktestQueue:
 
     async def progress(self, run_id: str) -> BacktestProgress | None:
         return self.progress_by_run.get(run_id)
+
+
+class FakeFeeLedger:
+    """An in-memory `FeeLedger`, with the same exactly-once contract.
+
+    The real one gets that from a primary key; this gets it from a set, and the
+    point of both is that `record_unseen` may hand a charge back only once
+    however often the venue's feed offers it.
+    """
+
+    def __init__(self) -> None:
+        self.seen: set[str] = set()
+        #: Every batch this was offered, so a test can prove the reconciler's
+        #: re-read does not go looking for fees a second time in vain.
+        self.calls: list[int] = []
+
+    async def record_unseen(
+        self, activities: Sequence[FeeActivity], *, run_mode: RunMode
+    ) -> list[FeeActivity]:
+        self.calls.append(len(activities))
+        unseen = [item for item in activities if item.activity_id not in self.seen]
+        self.seen.update(item.activity_id for item in unseen)
+        return unseen

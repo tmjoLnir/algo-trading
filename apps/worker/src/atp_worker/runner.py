@@ -555,8 +555,12 @@ class StrategyRunner:
         # instant, and read them again if it has to re-check.
         report = await self.reconciler.reconcile(portfolio, known_orders=lambda: self.open_orders)
         if not report.is_clean:
+            # `explain()` rather than `summary()`: this message is the body of
+            # the CRITICAL alert `_announce_death` sends and the last line of
+            # the traceback, and `summary()` renders a cash drift as the bare
+            # string "cash: account" — a halt an operator cannot size.
             raise ExecutionError(
-                f"refusing to start: the book does not match the broker's — {report.summary()}. "
+                f"refusing to start: the book does not match the broker's — {report.explain()}. "
                 "See docs/RUNBOOK.md 'Reconciliation mismatch'."
             )
 

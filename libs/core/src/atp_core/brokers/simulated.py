@@ -40,14 +40,14 @@ from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from atp_core.brokers.ports import AccountSnapshot
+from atp_core.brokers.ports import AccountSnapshot, FeeActivity
 from atp_core.domain import Fill, Order, OrderStatus, OrderType, Position, Side, TimeInForce
 from atp_core.errors import BrokerError, ExecutionError
 from atp_core.execution.matching import intended_price
 from atp_core.logging import get_logger
 
 if TYPE_CHECKING:
-    from datetime import datetime
+    from datetime import date, datetime
 
     from atp_core.backtest.costs import CostModel
     from atp_core.clock import Clock
@@ -184,6 +184,17 @@ class SimulatedBroker:
 
     async def get_open_orders(self) -> list[Order]:
         return [replace(o, fills=list(o.fills)) for o in self._open_orders.values()]
+
+    async def get_fee_activities(self, since: date) -> list[FeeActivity]:
+        """None, ever — and that is an answer rather than a stub.
+
+        This venue's `cost_model` charges the fill (`_book` puts the commission
+        on `Fill.fee` and takes it out of cash in the same statement), so there
+        is no second channel for a fee to arrive on and nothing for the ledger
+        to settle. A backtest whose fees appeared both on the fill and again as
+        an activity would double-charge every trade.
+        """
+        return []
 
     async def get_positions(self) -> list[Position]:
         return [replace(p) for p in self._positions.values() if not p.is_flat]

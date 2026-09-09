@@ -64,7 +64,7 @@ if TYPE_CHECKING:
     from atp_core.dashboard.ports import SnapshotStore
     from atp_core.data.ports import BarRepository, EventPublisher, QuoteCache
     from atp_core.domain import Timeframe
-    from atp_core.execution.ports import OrderRepository, PortfolioRepository
+    from atp_core.execution.ports import FeeLedger, OrderRepository, PortfolioRepository
     from atp_core.risk.killswitch import KillSwitch
     from atp_core.strategy.base import Strategy
     from atp_core.strategy.ports import SignalRepository, StrategyRepository
@@ -213,6 +213,7 @@ def build_runner(
     snapshot_store: SnapshotStore | None = None,
     publisher: EventPublisher | None = None,
     alerts: AlertSink | None = None,
+    fee_ledger: FeeLedger | None = None,
 ) -> tuple[StrategyRunner, Reconciler]:
     """Assemble the live loop from settings.
 
@@ -231,7 +232,17 @@ def build_runner(
     # limits changed underneath a half-finished evaluation.
     risk_engine = RiskEngine(config.risk, default_rules(kill_switch, clock, calendar, last_tick_at))
     router = OrderRouter(broker, risk_engine, stop_manager, clock, kill_switch=kill_switch)
-    reconciler = Reconciler(broker, kill_switch, clock)
+    # The fee ledger, and the run mode that scopes it, go in together: without
+    # them the reconciler compares a fills-only cash total against a venue that
+    # also charges CAT, REG and TAF, and the gap only ever widens. See
+    # `atp_core.execution.fees`.
+    reconciler = Reconciler(
+        broker,
+        kill_switch,
+        clock,
+        fee_ledger=fee_ledger,
+        run_mode=settings.run_mode,
+    )
 
     runner = StrategyRunner(
         strategy=strategy,

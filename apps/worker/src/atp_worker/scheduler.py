@@ -306,6 +306,7 @@ async def reconcile_with_broker(session: SessionJobs) -> None:
     log.critical(
         "worker.reconcile.diverged",
         summary=report.summary(),
+        findings=report.findings(),
         discrepancies=len(report.discrepancies),
         orphan_orders=len(report.orphan_order_ids),
         msg="trading is halted — see docs/RUNBOOK.md 'Reconciliation mismatch'",

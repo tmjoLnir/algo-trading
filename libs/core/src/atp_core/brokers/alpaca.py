@@ -28,6 +28,16 @@ plausible, because the plausible default is `SUBMITTED` and an order silently
 reported as working when the venue has actually killed it is a position nobody
 is watching.
 
+**Fees.** Alpaca charges regulatory fees — the SEC fee and FINRA's TAF, both
+sell-side — and books them as *account activities*, never on the fill. Both
+places this adapter builds a `Fill` therefore set `fee` to zero, and say so.
+That left our cash a fills-only total against a venue cash that is not one, so
+the two ratcheted apart by the fee take of every session until the reconciler
+halted the worker (2026-09-09; $4.14 against a $1.00 tolerance). The gap those
+two comments call "a known gap the activities endpoint closes" is closed by
+`get_fee_activities` below, and `atp_core.execution.fees` applies what it
+returns.
+
 **Fills.** Alpaca reports `filled_qty` and `filled_avg_price` as running totals,
 not as a fill sequence — the individual prints only exist on the trade-updates
 stream. So `_from_alpaca_order` synthesises **one** `Fill` carrying the whole
@@ -42,14 +52,19 @@ import asyncio
 import contextlib
 import json
 import random
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from atp_core import ws
-from atp_core.brokers.ports import AccountSnapshot, TradeUpdate, TradeUpdatesReconnected
+from atp_core.brokers.ports import (
+    AccountSnapshot,
+    FeeActivity,
+    TradeUpdate,
+    TradeUpdatesReconnected,
+)
 from atp_core.clock import SystemClock
 from atp_core.domain import Fill, Order, OrderStatus, OrderType, Position, Side, TimeInForce
 from atp_core.domain.enums import RunMode
@@ -72,6 +87,39 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 _MAX_ATTEMPTS = 5
+
+#: The non-trade activity types that move cash as a *charge* against trading.
+#:
+#: **One type, not three.** The account feed for 2026-09-08 answered:
+#:
+#:     FEE / CAT  -0.01  "CAT fee for proceed of 174 trades"
+#:     FEE / REG  -3.82  "REG fee for proceed of $185271.37"
+#:     FEE / TAF  -0.31  "TAF fee for proceed of 1572 shares (89 trades)"
+#:
+#: — so `REG` and `TAF` are `activity_sub_type` values *under* `FEE`, and
+#: asking for them as activity types would have quietly returned nothing while
+#: looking like it worked. Those three sum to exactly the $4.14 that halted the
+#: worker the next morning, which is the whole of this path's evidence.
+#:
+#: Narrow on purpose. The rest of the feed is journals, dividends and
+#: transfers: money that moves for reasons the platform has no opinion about
+#: and must not silently fold into a trading ledger.
+#:
+#: **A type missing from this list fails safely.** It is not applied, so our
+#: cash stays above the venue's, so the reconciler reports the drift and halts
+#: — the same visible failure this list exists to remove, rather than a book
+#: quietly corrected by a number nobody chose.
+_FEE_ACTIVITY_TYPES = ("FEE",)
+
+#: The only `status` whose money has actually moved. A row in any other state
+#: is a fee the venue has not charged yet, and applying it would put our cash
+#: *below* the venue's — drift in the other direction, reported identically and
+#: harder to read.
+_EXECUTED = "executed"
+
+#: Alpaca caps `page_size` on the activities endpoint; ask for the cap so a
+#: quiet account is one request.
+_ACTIVITY_PAGE_SIZE = 100
 _BACKOFF_BASE_SECONDS = 1.0
 #: Retried. 429 is rate limiting and 5xx is the venue having a moment; both are
 #: transient and the request has not been acted on.
@@ -420,6 +468,105 @@ class AlpacaBroker:
             trading_blocked=bool(payload.get("trading_blocked", False))
             or bool(payload.get("account_blocked", False)),
             as_of=datetime.now(UTC),
+        )
+
+    async def get_fee_activities(self, since: date) -> list[FeeActivity]:
+        """GET /v2/account/activities — the fees, oldest first.
+
+        Alpaca books a regulatory fee as its own non-trade activity with a
+        `net_amount` and a `date`, and never attaches it to the fill it came
+        from. So this cannot populate `Fill.fee`, and does not pretend to: it
+        reports the charges, and `atp_core.execution.fees` settles them against
+        cash. Attributing an account-level debit back to one fill would be a
+        guess, and a guessed fee is a wrong number in the P&L ledger — the
+        reason both `Fill` sites here hold zero rather than an estimate.
+
+        **Sign is normalised on the way out.** Alpaca reports money leaving the
+        account as a negative `net_amount`; `FeeActivity.amount` is positive for
+        the same event, so a caller settles with `cash -= amount` for every
+        venue. A rebate keeps the arithmetic honest by arriving negative.
+
+        **Paginated to exhaustion.** `page_token` is the last id seen. A partial
+        read here would look exactly like a session that paid fewer fees, which
+        is the failure this whole path exists to stop.
+
+        A malformed entry is skipped and logged rather than raising. This runs
+        inside reconciliation, on the unattended path, and one unparseable row
+        must not be able to stop the fees around it from being applied — the
+        same argument `sweepable_series` makes for one dead ticker. What is
+        skipped stays unapplied and therefore stays visible as drift.
+        """
+        activities: list[FeeActivity] = []
+        page_token: str | None = None
+
+        while True:
+            params: dict[str, Any] = {
+                "activity_types": ",".join(_FEE_ACTIVITY_TYPES),
+                "after": since.isoformat(),
+                "page_size": _ACTIVITY_PAGE_SIZE,
+            }
+            if page_token:
+                params["page_token"] = page_token
+
+            payload = await self._request("GET", "/v2/account/activities", params=params)
+            if not payload:
+                break
+
+            for entry in payload:
+                activity = self._to_fee_activity(entry)
+                if activity is not None:
+                    activities.append(activity)
+
+            if len(payload) < _ACTIVITY_PAGE_SIZE:
+                break
+            page_token = str(payload[-1]["id"])
+
+        # By date only, and `sort` is stable — so the venue's own order within
+        # a day survives. The id's suffix is a UUID: ordering on it would put
+        # a day's CAT, REG and TAF fees in an order nothing chose, and a fee
+        # list an operator reads should look like the feed it came from.
+        activities.sort(key=lambda item: item.booked_on)
+        return activities
+
+    @staticmethod
+    def _to_fee_activity(entry: Any) -> FeeActivity | None:
+        """One activity row, or None if it is not one we can bank on.
+
+        `id` and `net_amount` are both required: an activity with no identifier
+        cannot be applied exactly once, and one with no amount has nothing to
+        apply. Neither is a case worth guessing through.
+        """
+        status = str(entry.get("status", _EXECUTED)) if isinstance(entry, dict) else ""
+        if status != _EXECUTED:
+            log.info(
+                "broker.alpaca.fee_activity_skipped",
+                status=status,
+                msg="fee is not executed; nothing has left the account yet",
+            )
+            return None
+        try:
+            activity_id = str(entry["id"])
+            net_amount = _as_decimal(entry["net_amount"])
+            booked_on = date.fromisoformat(str(entry["date"])[:10])
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning(
+                "broker.alpaca.fee_activity_unparseable",
+                error=str(exc),
+                msg="skipping one activity row; it stays unapplied and therefore "
+                "stays visible to reconciliation as cash drift",
+            )
+            return None
+
+        return FeeActivity(
+            activity_id=activity_id,
+            booked_on=booked_on,
+            # Negated: Alpaca signs money leaving the account negative, and
+            # `FeeActivity.amount` is positive for a charge at every venue.
+            amount=-net_amount,
+            # `activity_sub_type` is the fee's kind — CAT, REG, TAF — and it is
+            # what an operator reconciling a session actually reads.
+            sub_type=str(entry.get("activity_sub_type", "")),
+            description=str(entry.get("description", "")),
         )
 
     async def submit_order(self, order: Order) -> Order:
