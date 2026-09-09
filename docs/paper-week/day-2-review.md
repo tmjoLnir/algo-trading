@@ -5,6 +5,15 @@
 **Config:** `sma_crossover`, 20 symbols, Alpaca paper, IEX feed, `run_mode=paper`
 **Predecessor:** `day-1-review.md` (2026-09-03, void). 43 commits landed between the two sessions.
 
+**Method, and one hole in it.** Findings were produced by eight parallel investigations of the
+log and then put to independent adversarial verifiers, which corrected several of the numbers
+below — those corrections are in this file's git history rather than quietly folded in. **One
+lens did not run: the causal-chain critic died on a session limit.** Its silence is not
+agreement, and the chain it was meant to attack — B1 → engine-side exits → the reconciler race →
+the halt — is argued in F4 on evidence, with the part that does *not* hold called out there.
+`b8bdc94`, carried in this same change, exists because exactly this failure mode was mistaken
+for a clean result once before.
+
 ---
 
 ## 1. The verdict
@@ -41,7 +50,7 @@ Decimal('88.21881579149739452')      # byte-for-byte what Alpaca refused
 The function that would have fixed this already exists:
 
 ```python
-# libs/core/src/atp_core/domain/market.py:43
+# libs/core/src/atp_core/domain/market.py:41
 def round_price(self, price: Decimal) -> Decimal:
     """Snap to the venue tick. Sending an off-tick price is a rejection."""
     return (price / self.tick_size).quantize(Decimal("1")) * self.tick_size
@@ -151,7 +160,7 @@ six boots, three crashes and three revisions.
 | `libs/core/src/atp_core/risk/stops.py` | 141 | `level = entry_price + direction * multiplier * atr_value` — never quantised |
 | `libs/core/src/atp_core/execution/router.py` | 895 | `stop_price=level` — passed through untouched |
 | `libs/core/src/atp_core/brokers/alpaca.py` | 838 | `body["stop_price"] = str(order.stop_price)` — serialised raw |
-| `libs/core/src/atp_core/domain/market.py` | 43 | `round_price()` — **the fix, with zero callers** |
+| `libs/core/src/atp_core/domain/market.py` | 41 | `round_price()` — **the fix, with zero callers** |
 | `libs/core/src/atp_core/domain/market.py` | 32 | `tick_size: Decimal = Decimal("0.01")` — the quantum, already declared |
 
 **Log corroboration.** 85 `order.broker_rejected`, 85 of them matching
@@ -189,7 +198,7 @@ down: a price that leaves the platform is quantised to the instrument's tick.
 **Fix.** Quantise at the boundary, in `router._stop_order`, using the instrument's own tick:
 
 ```python
-stop_price=instrument.round_price(level),
+Order(..., stop_price=instrument.round_price(level))
 ```
 
 Round *conservatively*, not to nearest: a long's stop rounds **down** and a short's **up**, so
@@ -252,9 +261,9 @@ machinery for admitting a gap is right there and unused.
 
 ### F2a — The dashboard showed a stop on every position that did not have one `critical`
 
-The operator read `/api/v1/positions` **six times between 14:23 and 14:29**, by which point
-16 `order.position_unprotected` CRITICALs had already fired for KO, PEP, PFE, INTC, JNJ and
-CSCO.
+The operator read `/api/v1/positions` **six times between 14:24:24 and 14:29:19**. Twelve
+`order.position_unprotected` CRITICALs had already fired before the first of those reads, and
+thirteen before the last — KO, PEP, PFE, INTC, JNJ and CSCO.
 
 The screen told them those positions were protected.
 
@@ -263,9 +272,8 @@ design, and the reason the engine-side fallback works at all. But
 `dashboard/snapshot.py:310` then reads that same field:
 
 ```python
-stop_loss_price=position.stop_loss_price,      # armed, not working
-...
-stop = position.stop_loss_price                # snapshot.py:328 — drives the gauge
+PositionView(..., stop_loss_price=position.stop_loss_price)  # armed, not working
+stop = position.stop_loss_price  # snapshot.py:328 — drives the gauge
 ```
 
 and `apps/web/src/components/PositionsTable.tsx:49` renders `StopGauge({fraction, hasStop})`
@@ -327,9 +335,7 @@ visible in one line:
 
 ```python
 # apps/worker/src/atp_worker/scheduler.py:289-290
-report = await session.reconciler.reconcile(
-    session.portfolio, known_orders=session.open_orders()
-)
+report = await session.reconciler.reconcile(session.portfolio, known_orders=session.open_orders())
 ```
 
 `session.open_orders()` is a **call**, evaluated as an argument expression *before* the
@@ -395,6 +401,13 @@ prevent, produced by a halt that was a false positive to begin with.
 **Fix.** An impugnment raised by a *transient* reconciliation artifact must not void the exit
 carve-out. Re-read before impugning (F4), and let a symbol out on a confirmed flat.
 
+**Related, and the mirror image.** `b8bdc94` adds a residual to ADR 0029 for the opposite
+failure: when the record *carrying* the impugnment cannot be decoded, the evidence is lost and
+the carve-out is left **open** for a symbol something meant to close it for. That is accepted
+there as narrow and one-sided toward permitting an exit. This finding is the other side — the
+carve-out wrongly **closed** by an impugnment that was never real. Both are the same underlying
+gap: the impugnment is trusted without being re-verified.
+
 ### F4b — The reconciler's halt writes no audit row `medium`
 
 The 4h37m global halt exists only as a log line and a Redis key. `HALT_ENGAGED` is written at
@@ -403,12 +416,23 @@ four sites — `api/routers/risk.py:762,872` and `scripts/halt.py:312,352` — a
 
 ### F4c — The halt reminder goes silent exactly when it is needed most `high`
 
-`remind_about_halts` is RTH-gated: 26 firings from 13:30 to 19:45, then nothing. The halt ran
-until 21:38. The reminder was silent for the final **1h53m** — the longest unattended stretch
-of the incident, and the only part of it after the operator might plausibly have finished their
-day.
+`remind_about_halts` is RTH-gated. The job was invoked **26 times** from 13:30 to 19:45 and
+produced **11 reminders** — it returns early when no halt is active, and none was before
+17:00:52. After 19:45:09 the cadence stops entirely, while the halt ran until 21:38.
+
+The platform was not wholly silent in that window, and the review should say so: a **CRITICAL**
+`session.summary.2026-09-08` alert went to Telegram at 20:00:00.754 titled *"Session closed —
+STILL HALTED"*, and the daily report followed at 20:30. But the *repeating* channel — the one
+designed to keep nagging until somebody acts — stopped 1h53m before the halt was cleared, and
+the last critical alert of any kind preceded the clear by **1h38m**.
 
 **Fix.** An engaged halt is a state, not a market-hours event. Remind until it clears.
+
+**`b8bdc94` covers the payload and not the cadence.** That commit adds tests asserting
+`_halt_line` carries its unproven symbols into both the 15-minute reminder and the close-of-day
+summary — a real gap closed, and the reason the 20:00 summary named the halt correctly. What no
+test pins is `market_hours_only: True` at `scheduler.py:785`. The reminder's *content* is now
+regression-proof; its *schedule* is still whatever the flag says.
 
 ### F5 — `from_reason=None` reads as a bug and is not one `low`
 
@@ -669,9 +693,11 @@ audit rows are written at exactly four sites — `api/routers/risk.py:762,872` a
 But the consequence is worse than the caveat admits. The halt that engaged at 17:00:52 was
 `engaged_by=reconciler`, so it wrote **no** row. The operator's clear came at 21:38:31 — 68
 minutes *after* the 20:30 report was generated. The only mutating HTTP requests in the entire
-capture are the 14:23 login and that 21:38 resume. So the "1 recorded" halt is a row from
-**outside this session**, swept in by the report's rolling `now - timedelta(days=1)` window at
-`scheduler.py:418`.
+capture are the 14:23 login and that 21:38 resume. So the "1 recorded" halt is a row this
+capture does not contain, swept in by the report's rolling `now - timedelta(days=1)` window at
+`scheduler.py:418`. That window is `[2026-09-07T20:30Z, 2026-09-08T20:30Z)`, and the capture
+opens at 11:16:47Z — so the row may be from the previous day *or* from the unobserved
+00:00–11:16 stretch of this one. Either way it is not the halt the report was describing.
 
 The halt that cost three hours of RTH, 40 refusals and 11 CRITICAL reminders contributes
 **zero** to the day's halt count, and a halt from a previous day is reported in its place.
@@ -700,6 +726,13 @@ in §4 that begins "nothing says so".
 **Fix.** Either stand up a scraper and make the metrics real, or stop declaring metrics and
 invest the same effort in the durable rows F2 and F3 need. A metrics endpoint nobody reads is
 indistinguishable from no metrics, and it is worse, because it looks like coverage.
+
+**`b8bdc94` fixes the documentation half of this and not the collection half.** It adds
+`atp_halts_escalated_total` to `docs/OBSERVABILITY.md`'s table — it had shipped undocumented —
+and adds a test comparing that table against `metrics/registry.py` **in both directions**, which
+found three further names the table carried only in prose. That is the right guard and it now
+exists. It does not change the fact that nothing scraped `/metrics` on day 2, so every metric it
+documents was still write-only.
 
 ---
 
@@ -873,7 +906,7 @@ written: `round_price`, `RESERVED_TEST_SYMBOLS`, and an alert route for the one 
 most needed one.
 
 The pattern is worth naming, because it is the same pattern four times: `round_price`
-(`market.py:43`), `RESERVED_TEST_SYMBOLS` (`seed.py:59`), `broker_side_protected_qty`
+(`market.py:41`), `RESERVED_TEST_SYMBOLS` (`seed.py:59`), `broker_side_protected_qty`
 (`router.py:585`), and an alert route for the one condition that most needed one. This codebase
 reasons carefully — the docstrings on all of them are correct, and several predict the exact
 failure that then occurred. What is missing is not judgement. **It is the call site.**
