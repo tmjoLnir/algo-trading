@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from datetime import datetime
 
+    from atp_core.alerts.ports import AlertSink
     from atp_core.brokers.alpaca import AlpacaBroker
     from atp_core.clock import Clock, TradingCalendar
     from atp_core.config import Settings
@@ -170,6 +171,7 @@ def build_runner(
     signal_repo: SignalRepository,
     snapshot_store: SnapshotStore | None = None,
     publisher: EventPublisher | None = None,
+    alerts: AlertSink | None = None,
 ) -> tuple[StrategyRunner, Reconciler]:
     """Assemble the live loop from settings.
 
@@ -214,6 +216,11 @@ def build_runner(
         signal_repo=signal_repo,
         snapshot_store=snapshot_store,
         publisher=publisher,
+        # The same sink the kill switch and the halt reminder hold. Day 2 sent
+        # 17 alerts, 11 of them for a false-positive halt, and none for the 38
+        # positions running with no stop at the venue — the halt machinery had
+        # this wire and the protection machinery did not (F3).
+        alerts=alerts,
         tick_interval_seconds=float(settings.engine_tick_interval_seconds),
     )
     return runner, reconciler
@@ -322,7 +329,10 @@ async def consume_trade_updates(
                 attempts=event.attempts,
                 msg="re-reading the book over REST — events during the gap are lost",
             )
-            report = await reconciler.reconcile(portfolio, known_orders=runner.open_orders)
+            # Deferred for F4's reason, and this caller needs it most: a
+            # trade-updates reconnect is exactly the moment fills are in flight,
+            # which is the condition that produced both of day 2's false halts.
+            report = await reconciler.reconcile(portfolio, known_orders=lambda: runner.open_orders)
             if not report.is_clean:
                 # The reconciler has already halted. Say so here too: this is
                 # the path where a missed fill turns up, and an operator

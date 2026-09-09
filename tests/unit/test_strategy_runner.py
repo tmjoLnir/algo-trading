@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import pytest
 from structlog.testing import capture_logs
 
+from atp_core.alerts.ports import Alert, Severity
 from atp_core.brokers.ports import TradeUpdate
 from atp_core.channels import CHANNEL_ORDERS, CHANNEL_SIGNALS
 from atp_core.clock import SimulatedClock
@@ -363,7 +364,11 @@ class FakeReconciler:
     async def reconcile(
         self, portfolio: Portfolio, *, known_orders: Any, **kwargs: Any
     ) -> ReconciliationReport:
-        self.calls.append(list(known_orders))
+        # Resolves a callable exactly as the real `Reconciler._compare` does.
+        # Callers now defer the read so both local books are taken at one
+        # instant (F4), and a fake that could only accept the eagerly evaluated
+        # form would make the fix untestable through the runner.
+        self.calls.append(list(known_orders() if callable(known_orders) else known_orders))
         report = ReconciliationReport(checked_at=START)
         if not self.clean:
             report.orphan_order_ids.append("atp-orphan")
@@ -379,6 +384,17 @@ class FakeCalendar:
 
     def next_open(self, after: datetime) -> datetime:
         return after + timedelta(hours=1)
+
+
+class RecordingAlertSink:
+    """Every alert, in order. `AlertSink` implementations must not raise, and
+    this one cannot — which is the contract, not a convenience."""
+
+    def __init__(self) -> None:
+        self.sent: list[Alert] = []
+
+    def send(self, alert: Alert) -> None:
+        self.sent.append(alert)
 
 
 def close_bar(runner: StrategyRunner, b: Bar) -> None:
@@ -403,6 +419,7 @@ def build(
     signal_repo: FakeSignalRepository | None = None,
     snapshot_store: FakeSnapshotStore | None = None,
     publisher: FakePublisher | None = None,
+    alerts: RecordingAlertSink | None = None,
     signal_limit: int = DEFAULT_SIGNAL_LIMIT,
 ) -> tuple[StrategyRunner, FakeRouter, FakeKillSwitch, FakeReconciler, Portfolio, list[float]]:
     router = FakeRouter()
@@ -434,6 +451,7 @@ def build(
         signal_repo=signal_repo or FakeSignalRepository(),
         snapshot_store=snapshot_store,
         publisher=publisher,
+        alerts=alerts,
         signal_limit=signal_limit,
         sleep=sleep,
     )
@@ -2165,3 +2183,134 @@ class TestAClosedPositionTakesItsStopWithIt:
         assert router.protection_cancelled == [], (
             "shares are still held; the stop over them must stay working"
         )
+
+
+class TestAPositionWithNoVenueStopReachesAHuman:
+    """Day 2 logged `position_unprotected` CRITICAL 85 times and sent 0 alerts.
+
+    Every one of the 17 alerts that day was halt lifecycle or a scheduled
+    report. The platform woke a human 11 times for a halt that turned out to be
+    a false positive, and zero times for a real, total loss of protection across
+    all 20 symbols (docs/paper-week/day-2-review.md, F3).
+
+    There was no throttle suppressing it. Log level and notification are wholly
+    decoupled here — 47 `log.critical` call sites against 11 `Alert(...)` sites
+    — and `position_unprotected` simply had no route. These tests are that
+    route, and the deduplication that makes it survivable: one page naming every
+    naked symbol, not 85 naming one fill each.
+    """
+
+    def _naked(self, portfolio: Portfolio, *symbols: str, qty: str = "10") -> None:
+        """Hold `symbols` with nothing covering them at the venue."""
+        for symbol in symbols:
+            position = portfolio.position(symbol)
+            position.qty = Decimal(qty)
+            position.avg_entry_price = Decimal(100)
+            position.last_price = Decimal(100)
+            position.stop_loss_price = Decimal(95)
+            position.broker_protected_qty = Decimal(0)
+
+    def test_one_page_names_every_naked_symbol(self) -> None:
+        """The rollup. 85 fill-level events on 20 symbols must not be 85 pages
+        — a phone that buzzes 85 times is a phone that gets silenced."""
+        alerts = RecordingAlertSink()
+        runner, _router, _switch, _rec, portfolio, _slept = build(alerts=alerts)
+        self._naked(portfolio, "KO", "PEP", "INTC")
+
+        runner._mark_broker_protection(portfolio)
+
+        assert len(alerts.sent) == 1
+        alert = alerts.sent[0]
+        assert alert.severity is Severity.CRITICAL
+        assert "3 position(s)" in alert.title
+        assert "INTC, KO, PEP" in alert.body
+        # `alerts/ports.py`: an alert names the fact, never the book. It renders
+        # on a lock screen in a coffee shop.
+        assert "100" not in alert.body
+
+    def test_an_unchanged_naked_set_does_not_page_again(self) -> None:
+        """The loop runs once a minute for six and a half hours. Re-paging every
+        pass is the same failure as never paging, arrived at from the other
+        side."""
+        alerts = RecordingAlertSink()
+        runner, _router, _switch, _rec, portfolio, _slept = build(alerts=alerts)
+        self._naked(portfolio, "KO")
+
+        for _ in range(5):
+            runner._mark_broker_protection(portfolio)
+
+        assert len(alerts.sent) == 1
+
+    def test_a_growing_naked_set_re_pages_once_the_cooldown_passes(self) -> None:
+        """A second symbol going naked is news, but not news worth a page every
+        minute. Day 2 accumulated 20 of them over three hours."""
+        alerts = RecordingAlertSink()
+        runner, _router, _switch, _rec, portfolio, _slept = build(alerts=alerts)
+        clock = runner.clock
+        self._naked(portfolio, "KO")
+        runner._mark_broker_protection(portfolio)
+
+        self._naked(portfolio, "PEP")
+        runner._mark_broker_protection(portfolio)
+        assert len(alerts.sent) == 1, "inside the cooldown, so still one page"
+
+        clock.set(clock.now() + timedelta(seconds=901))  # type: ignore[attr-defined]
+        runner._mark_broker_protection(portfolio)
+
+        assert len(alerts.sent) == 2
+        assert "KO, PEP" in alerts.sent[1].body
+
+    def test_the_all_clear_is_sent_too(self) -> None:
+        """An operator who was paged is owed the sentence that says it is over.
+        Without it the only way to learn is to go and look — which is the
+        behaviour that made day 2 unsurvivable in the first place."""
+        alerts = RecordingAlertSink()
+        runner, _router, _switch, _rec, portfolio, _slept = build(alerts=alerts)
+        self._naked(portfolio, "KO")
+        runner._mark_broker_protection(portfolio)
+
+        runner.router.protected_qty["KO"] = Decimal(10)  # type: ignore[attr-defined]
+        runner._mark_broker_protection(portfolio)
+
+        assert len(alerts.sent) == 2
+        assert alerts.sent[1].severity is Severity.INFO
+        assert "Protection restored" in alerts.sent[1].title
+
+    def test_a_clean_book_pages_nobody(self) -> None:
+        alerts = RecordingAlertSink()
+        runner, _router, _switch, _rec, portfolio, _slept = build(alerts=alerts)
+        self._naked(portfolio, "KO")
+        runner.router.protected_qty["KO"] = Decimal(10)  # type: ignore[attr-defined]
+
+        runner._mark_broker_protection(portfolio)
+
+        assert alerts.sent == []
+
+    def test_the_gauge_is_set_every_pass_including_to_zero(self) -> None:
+        """docs/SAFETY.md's go-live gate is evaluated from this number, so
+        "clean" has to be a reading rather than an absence of readings."""
+        from prometheus_client import generate_latest
+
+        from atp_core.metrics.registry import get_registry
+
+        runner, _router, _switch, _rec, portfolio, _slept = build()
+        self._naked(portfolio, "KO", "PEP")
+        runner._mark_broker_protection(portfolio)
+        assert b"atp_positions_unprotected 2.0" in generate_latest(get_registry())
+
+        runner.router.protected_qty.update(  # type: ignore[attr-defined]
+            {"KO": Decimal(10), "PEP": Decimal(10)}
+        )
+        runner._mark_broker_protection(portfolio)
+        assert b"atp_positions_unprotected 0.0" in generate_latest(get_registry())
+
+    def test_a_worker_with_no_sink_still_records_the_exposure(self) -> None:
+        """The sink is optional; the fact is not. A worker that cannot reach a
+        phone must still write the book down honestly."""
+        runner, _router, _switch, _rec, portfolio, _slept = build(alerts=None)
+        self._naked(portfolio, "KO")
+
+        runner._mark_broker_protection(portfolio)
+
+        assert portfolio.position("KO").unprotected_qty == Decimal(10)
+        assert portfolio.position("KO").broker_protected_qty == Decimal(0)

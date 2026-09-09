@@ -527,3 +527,186 @@ class TestTheAlertBodyIsNotAnImpugnmentTest:
         assert len(sink.sent) == 2
         assert "cannot prove SPY" in sink.sent[1].title
         assert switch.halt_state(symbol="SPY").position_is_unproven("SPY")
+
+
+class TestADisagreementIsReadTwiceBeforeItHalts:
+    """Day 2 halted global trading twice on a race, not on a divergence.
+
+    The reconciler read the local order set *before* the coroutine started (it
+    was an argument expression, `session.open_orders()`) and the local book
+    *after* three broker awaits — 1.4 seconds apart, with exits filling in
+    between. Every field of the resulting halt decoded to a read artifact: the
+    `orphan_order` was the platform's own QQQ exit, submitted 1.12s after the
+    order snapshot that could not contain it; the `missing_position` was INTC,
+    booked locally 200ms after `get_positions()` had already answered.
+
+    The proof is total. Of 78 scheduled runs, exactly the 2 with an order
+    submitted or filled inside their window halted; all 76 quiet windows were
+    clean, and the run five minutes later was clean with no intervention. Cost:
+    2h59m of RTH with every entry refused, and a halt that outlived the close by
+    1h38m (docs/paper-week/day-2-review.md, F4).
+
+    Two things had to change, and both are tested here: the local reads happen
+    at one instant, and a disagreement is re-read once before it halts.
+    """
+
+    def _settling(
+        self, cash: str = "100000"
+    ) -> tuple[Reconciler, FakeBroker, FakeKillSwitch, Portfolio, list[float]]:
+        """A reconciler whose settle costs no wall-clock time."""
+        broker = FakeBroker()
+        switch = FakeKillSwitch()
+        slept: list[float] = []
+
+        async def sleep(seconds: float) -> None:
+            slept.append(seconds)
+
+        reconciler = Reconciler(broker, switch, SimulatedClock(NOW), sleep=sleep)
+        portfolio = Portfolio(cash=Decimal(cash), starting_equity=Decimal(cash))
+        return reconciler, broker, switch, portfolio, slept
+
+    @pytest.mark.asyncio
+    async def test_a_fill_that_lands_mid_read_does_not_halt_trading(self) -> None:
+        """INTC, at 17:00:52.451 on 2026-09-08.
+
+        The broker holds 47 shares; we have not booked them yet, so the first
+        read says `missing_position`. By the re-read the fill is booked and the
+        books agree — which is what actually happened five minutes later, with
+        no intervention.
+        """
+        broker = FakeBroker()
+        switch = FakeKillSwitch()
+        portfolio = Portfolio(cash=Decimal("100000"), starting_equity=Decimal("100000"))
+        broker.positions["INTC"] = Position(
+            symbol="INTC", qty=Decimal("47"), avg_entry_price=Decimal("101")
+        )
+        slept: list[float] = []
+
+        async def settle(seconds: float) -> None:
+            # The fill books during the settle, which is the whole point of it:
+            # on 2026-09-08 INTC's 47 shares filled at 17:00:52.451 and the
+            # halt was engaged at 17:00:52.799, 348ms later.
+            slept.append(seconds)
+            hold(portfolio, "INTC", "47", price="101")
+
+        reconciler = Reconciler(broker, switch, SimulatedClock(NOW), sleep=settle)
+
+        report = await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert report.is_clean
+        assert switch.engaged is False
+        assert slept == [2.0]
+
+    @pytest.mark.asyncio
+    async def test_an_exit_submitted_after_the_snapshot_is_not_an_orphan(self) -> None:
+        """QQQ, `atp-8c1a369c511562feff193f54`, submitted 1.12s after the
+        `known_orders` snapshot that could not possibly have contained it.
+
+        Passing the callable is the fix: the order set is read inside, at the
+        same instant as the book, and read *again* for the re-read — by which
+        time the runner knows about its own order.
+        """
+        reconciler, broker, switch, portfolio, _slept = self._settling()
+        ours = an_order("atp-8c1a369c511562feff193f54", symbol="QQQ")
+        await broker.submit_order(ours)
+        known: list[Order] = []
+
+        def open_orders() -> list[Order]:
+            # Empty on the first read, as it was; populated by the second, as
+            # the runner's own map would have been.
+            snapshot = list(known)
+            known.append(ours)
+            return snapshot
+
+        report = await reconciler.reconcile(portfolio, known_orders=open_orders)
+
+        assert report.is_clean
+        assert switch.engaged is False
+
+    @pytest.mark.asyncio
+    async def test_a_divergence_that_survives_the_re_read_still_halts(self) -> None:
+        """Nothing is softened. The second reading decides, with the same rules
+        — a book that is genuinely wrong halts exactly as it did before, one
+        settle later."""
+        reconciler, broker, switch, portfolio, slept = self._settling()
+        broker.positions["SPY"] = Position(
+            symbol="SPY", qty=Decimal("100"), avg_entry_price=Decimal("500")
+        )
+
+        report = await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert not report.is_clean
+        assert [d.kind for d in report.discrepancies] == [DiscrepancyKind.MISSING_POSITION]
+        assert switch.engaged is True, "a real divergence must still halt"
+        assert switch.engagements[0][1] == HaltReason.RECONCILIATION_MISMATCH.value
+        assert slept == [2.0], "and it must have paid for exactly one re-read"
+
+    @pytest.mark.asyncio
+    async def test_a_clean_book_is_never_re_read(self) -> None:
+        """76 of day 2's 78 runs were clean. The settle is dead time on a job
+        that runs every five minutes, and a clean run must not pay it."""
+        reconciler, _broker, _switch, portfolio, slept = self._settling()
+
+        report = await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert report.is_clean
+        assert slept == []
+
+    @pytest.mark.asyncio
+    async def test_the_re_read_can_be_switched_off(self) -> None:
+        """`settle_seconds=0` restores the old behaviour exactly, for a caller
+        that genuinely wants the first reading to decide."""
+        broker = FakeBroker()
+        switch = FakeKillSwitch()
+        reconciler = Reconciler(broker, switch, SimulatedClock(NOW), settle_seconds=0)
+        portfolio = Portfolio(cash=Decimal("100000"), starting_equity=Decimal("100000"))
+        broker.positions["SPY"] = Position(
+            symbol="SPY", qty=Decimal("100"), avg_entry_price=Decimal("500")
+        )
+
+        report = await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert not report.is_clean
+        assert switch.engaged is True
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_broker_is_not_retried(self) -> None:
+        """An unreachable broker is not a race. Retrying it here would double
+        the time trading continues against a book nothing can confirm."""
+        reconciler, broker, switch, portfolio, slept = self._settling()
+
+        async def unreachable() -> list[Position]:
+            raise BrokerConnectionError("connection reset by peer")
+
+        broker.get_positions = unreachable  # type: ignore[method-assign]
+
+        with pytest.raises(BrokerConnectionError):
+            await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert slept == []
+        assert switch.engagements[0][1] == HaltReason.BROKER_UNREACHABLE.value
+
+    @pytest.mark.asyncio
+    async def test_both_local_books_are_read_at_one_instant(self) -> None:
+        """The structural half of the fix, asserted structurally.
+
+        `known_orders` must be resolved *before* the first broker await, in the
+        same breath as the position snapshot — not by the caller, minutes of
+        wall-clock earlier in the argument list.
+        """
+        reconciler, broker, _switch, portfolio, _slept = self._settling()
+        order_of_reads: list[str] = []
+
+        def open_orders() -> list[Order]:
+            order_of_reads.append("local")
+            return []
+
+        async def positions() -> list[Position]:
+            order_of_reads.append("broker")
+            return []
+
+        broker.get_positions = positions  # type: ignore[method-assign]
+
+        await reconciler.reconcile(portfolio, known_orders=open_orders)
+
+        assert order_of_reads == ["local", "broker"]

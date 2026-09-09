@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from atp_core import metrics
+from atp_core.alerts.ports import Alert, Severity
 from atp_core.channels import CHANNEL_ORDERS, CHANNEL_SIGNALS
 from atp_core.dashboard import SignalSummary, build_snapshot
 from atp_core.dashboard.snapshot import DEFAULT_SIGNAL_LIMIT
@@ -60,6 +61,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
     from datetime import datetime
 
+    from atp_core.alerts.ports import AlertSink
     from atp_core.brokers.ports import TradeUpdate
     from atp_core.clock import Clock, TradingCalendar
     from atp_core.dashboard.ports import SnapshotStore
@@ -314,6 +316,8 @@ class StrategyRunner:
         signal_repo: SignalRepository,
         snapshot_store: SnapshotStore | None = None,
         publisher: EventPublisher | None = None,
+        alerts: AlertSink | None = None,
+        unprotected_alert_cooldown_seconds: float = 900.0,
         signal_limit: int = DEFAULT_SIGNAL_LIMIT,
         tick_interval_seconds: float = 60.0,
         sleep: Callable[[float], Awaitable[None]] | None = None,
@@ -361,6 +365,24 @@ class StrategyRunner:
         #: refusing to start over it would stop trading to protect a screen.
         self.snapshot_store = snapshot_store
         self.publisher = publisher
+        #: Optional, like the publisher and for a weaker version of the same
+        #: reason: a worker with no sink still protects positions and still
+        #: writes the CRITICAL line, it just cannot reach a phone. Refusing to
+        #: start over it would stop trading to protect a notification.
+        #:
+        #: That said, this is the wire whose absence day 2 was: 85 CRITICAL
+        #: lines, 17 alerts sent, and not one of them about the fact that every
+        #: position in the book was naked. The halt machinery alerted 11 times
+        #: for a false positive; the protection machinery had no route at all
+        #: (docs/paper-week/day-2-review.md, F3).
+        self.alerts = alerts
+        self.unprotected_alert_cooldown_seconds = unprotected_alert_cooldown_seconds
+        #: The unprotected set as last paged, and when. Together they are the
+        #: deduplication: 85 fill-level events collapse to one page naming every
+        #: affected symbol, and the page repeats only when the set changes and
+        #: the cooldown has passed.
+        self._alerted_unprotected: frozenset[str] = frozenset()
+        self._unprotected_alerted_at: datetime | None = None
         self.tick_interval_seconds = tick_interval_seconds
         self._sleep: Callable[[float], Awaitable[None]] = (
             sleep if sleep is not None else asyncio.sleep
@@ -474,7 +496,11 @@ class StrategyRunner:
                 client_order_ids=[o.client_order_id for o in restored],
             )
 
-        report = await self.reconciler.reconcile(portfolio, known_orders=self.open_orders)
+        # A lambda, not the property's value: `open_orders` is evaluated at the
+        # call site otherwise, which is the early half of F4's read-ordering
+        # race. Deferring it lets the reconciler read both local books at one
+        # instant, and read them again if it has to re-check.
+        report = await self.reconciler.reconcile(portfolio, known_orders=lambda: self.open_orders)
         if not report.is_clean:
             raise ExecutionError(
                 f"refusing to start: the book does not match the broker's — {report.summary()}. "
@@ -803,11 +829,131 @@ class StrategyRunner:
         the disease. It is logged at warning, once per pass, and the missing
         snapshot is visible on the dashboard as an age that stops advancing.
         """
+        self._mark_broker_protection(portfolio)
         for order in self._open_orders.values():
             await self.order_repo.save(order, run_mode=self.run_mode)
         at = self.clock.now()
         await self.portfolio_repo.snapshot(portfolio, at=at, run_mode=self.run_mode)
         await self._publish_snapshot(portfolio, at)
+
+    def _mark_broker_protection(self, portfolio: Portfolio) -> None:
+        """Record how much of each position the *venue* is holding a stop over.
+
+        Written here, immediately before both the durable snapshot and the
+        published one, so the two artifacts an operator reads carry the same
+        answer as the engine — and so the answer is about the moment it is
+        published rather than about whenever a stop was last placed.
+
+        **This closes the gap that made day 2 unsurvivable.** The router arms
+        `position.stop_loss_price` before submitting the protective child, so
+        the field is populated whether or not the venue accepted anything; the
+        dashboard read it and drew a healthy gauge over 38 naked positions while
+        85 CRITICAL lines went nowhere (docs/paper-week/day-2-review.md, F2a).
+        The truth was in `OrderRouter.broker_side_protected_qty` the whole time
+        — the runner already called it, on every engine-side trigger, and no
+        screen ever did.
+
+        Reading the router rather than `self._unprotected`: that map is a record
+        of refusals *this process* saw, which is the right input for
+        `_stop_is_missing` and the wrong one for a screen. A stop cancelled by
+        the venue, or one resting from before a restart, moves the router's
+        count and never touches the map.
+        """
+        naked: dict[str, Decimal] = {}
+        for position in portfolio.open_positions:
+            position.broker_protected_qty = self.router.broker_side_protected_qty(
+                position.symbol, position
+            )
+            if position.unprotected_qty > 0:
+                naked[position.symbol] = position.unprotected_qty
+
+        # The gauge docs/SAFETY.md's go-live gate is evaluated from. Set every
+        # pass, including to zero, so "no unprotected positions" is a reading
+        # rather than an absence of readings.
+        metrics.positions_unprotected(len(naked))
+        self._announce_unprotected(naked)
+
+    def _announce_unprotected(self, naked: dict[str, Decimal]) -> None:
+        """Page a human when positions are running without a venue-side stop.
+
+        **This is the route that did not exist.** `position_unprotected` was
+        logged `CRITICAL` 85 times on day 2 and reached no transport, because
+        log level and notification are entirely decoupled in this platform —
+        47 `log.critical` call sites, 11 `Alert(...)` sites, and nothing
+        reconciling them. There was no throttle suppressing it; there was
+        nothing to throttle (F3).
+
+        Deduplicated by *set*, not by event. One page naming every naked symbol
+        is one thing an operator can act on; 85 pages naming one fill each is a
+        silenced phone. The page repeats only when the set changes and the
+        cooldown has passed, so a position that stays naked does not re-page
+        every minute — and a *new* episode pages immediately, because the first
+        naked position after a clean book is news.
+
+        The clear is sent too, at INFO. An operator who was paged is owed the
+        sentence that says it is over; without it the only way to learn is to
+        go and look, which is the behaviour that made day 2 unsurvivable.
+
+        Carries no quantity or price: `alerts/ports.py` is explicit that an
+        alert names the fact and never the book, because it renders on a lock
+        screen. The count and the symbols are what send somebody to the
+        dashboard.
+        """
+        if self.alerts is None:
+            return
+
+        current = frozenset(naked)
+        if not current:
+            if self._alerted_unprotected:
+                self.alerts.send(
+                    Alert(
+                        severity=Severity.INFO,
+                        title="Protection restored — every position has a venue stop",
+                        body=(
+                            "Every open position now has a stop working at the broker. "
+                            "Nothing further is required."
+                        ),
+                        key="protection.restored",
+                        context={"symbols": str(len(self._alerted_unprotected))},
+                    )
+                )
+            self._alerted_unprotected = frozenset()
+            self._unprotected_alerted_at = None
+            return
+
+        now = self.clock.now()
+        fresh_episode = not self._alerted_unprotected
+        if not fresh_episode:
+            if current == self._alerted_unprotected:
+                return
+            since = self._unprotected_alerted_at
+            if (
+                since is not None
+                and (now - since).total_seconds() < self.unprotected_alert_cooldown_seconds
+            ):
+                # The set grew, but somebody was told less than a cooldown ago
+                # and the next pass will tell them again. Recorded as unsent so
+                # the change is not lost — `_alerted_unprotected` is what was
+                # *paged*, and leaving it stale is what makes the retry happen.
+                return
+
+        symbols = sorted(current)
+        self.alerts.send(
+            Alert(
+                severity=Severity.CRITICAL,
+                title=f"{len(symbols)} position(s) with NO stop at the broker",
+                body=(
+                    f"No protective order is working at the venue for: {', '.join(symbols)}.\n"
+                    "The engine-side stop only exists while this worker is running — it "
+                    "does not survive a crash, a restart or the overnight gap.\n"
+                    "docs/RUNBOOK.md, and check the broker's own UI."
+                ),
+                key="protection.unprotected",
+                context={"symbols": str(len(symbols))},
+            )
+        )
+        self._alerted_unprotected = current
+        self._unprotected_alerted_at = now
 
     async def _publish_snapshot(self, portfolio: Portfolio, at: datetime) -> None:
         """Hand the dashboard one consistent picture of the book.

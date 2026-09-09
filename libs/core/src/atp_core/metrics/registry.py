@@ -139,6 +139,37 @@ class _Instruments:
             registry=registry,
         )
 
+        # ─── protection ──────────────────────────────────────────────────
+        # docs/SAFETY.md's go-live gate is "there are no unprotected
+        # positions", and until day 2 of the paper week nothing here could
+        # answer it: 19 metric names covering halts, risk, orders, stream,
+        # strategy, alerts and the API, and none for protection. The platform's
+        # own verdict tool told the operator to run
+        # `docker compose logs worker | grep runner.position_unprotected`
+        # (docs/paper-week/day-2-review.md, F3).
+        #
+        # A gauge and not a counter, because the question is "how many right
+        # now" rather than "how many since boot" — a position that ran naked
+        # for an hour and was then covered must stop being counted the moment
+        # it is covered, or the gate can never be satisfied again without a
+        # restart. Set from the runner's own book on every pass, so a worker
+        # that dies stops publishing rather than leaving a stale zero.
+        self.positions_unprotected = Gauge(
+            "atp_positions_unprotected",
+            "Open positions with no stop working at the venue, right now.",
+            registry=registry,
+        )
+        # The counter half, and it counts a different thing: protective orders
+        # the venue refused. Day 2's number here would have been 85 while the
+        # gauge sat at 38 — one is the exposure, the other is how hard the
+        # platform was trying and failing to remove it.
+        self.protective_orders_rejected = Counter(
+            "atp_protective_orders_rejected_total",
+            "Protective orders that did not reach the venue, by where they stopped.",
+            ["stage"],
+            registry=registry,
+        )
+
         # ─── market data ─────────────────────────────────────────────────
         self.stream_messages = Counter(
             "atp_stream_messages_total",
@@ -315,6 +346,22 @@ def order_rejected(stage: str) -> None:
     and we do not know). The last one is the one worth alerting on.
     """
     _m.orders_rejected.labels(stage=stage).inc()
+
+
+def positions_unprotected(count: int) -> None:
+    """How many open positions have nothing resting at the venue, right now.
+
+    Set, not incremented: this is a level. See `_Instruments` for why the
+    distinction matters to the go-live gate.
+    """
+    _m.positions_unprotected.set(count)
+
+
+def protective_order_rejected(stage: str) -> None:
+    """A stop or target that did not reach the venue. `stage` matches
+    `order_rejected`'s vocabulary — "risk", "broker", "acknowledgement" — so the
+    two can be read side by side."""
+    _m.protective_orders_rejected.labels(stage=stage).inc()
 
 
 def order_submit_seconds(broker: str, seconds: float) -> None:

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -38,9 +38,22 @@ class Instrument:
         if self.symbol != self.symbol.upper():
             raise ValueError(f"symbol must be uppercase, got {self.symbol!r}")
 
-    def round_price(self, price: Decimal) -> Decimal:
-        """Snap to the venue tick. Sending an off-tick price is a rejection."""
-        return (price / self.tick_size).quantize(Decimal("1")) * self.tick_size
+    def round_price(self, price: Decimal, rounding: str = ROUND_HALF_UP) -> Decimal:
+        """Snap to the venue tick. Sending an off-tick price is a rejection.
+
+        `rounding` is a `decimal` mode and defaults to nearest, which is the
+        right answer for a price being *displayed*. It is the wrong answer for
+        a price being *sent*: rounding a protective stop to nearest moves it
+        towards the market half the time, and a stop that quantising tightened
+        is a stop the platform did not choose. Callers on the submission path
+        pass `ROUND_FLOOR` or `ROUND_CEILING` explicitly — see
+        `execution.router._on_tick`, which owns that decision per side.
+
+        The quantum is `tick_size` rather than a fixed two decimal places, so a
+        venue or an instrument that trades in something else is a constructor
+        argument and not a second copy of this method.
+        """
+        return (price / self.tick_size).quantize(Decimal("1"), rounding=rounding) * self.tick_size
 
 
 @dataclass(frozen=True, slots=True)

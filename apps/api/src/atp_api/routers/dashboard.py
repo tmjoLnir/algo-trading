@@ -117,6 +117,23 @@ class PositionView(BaseModel):
     #: closed, without arithmetic in the reader's head. **Negative means price
     #: is already through the stop and the exit has not happened.**
     distance_to_stop_pct: Decimal | None
+    #: What is actually holding this position: `working` (the venue holds a stop
+    #: over all of it), `partial` (over some of it), `armed_only` (a level
+    #: exists, nothing rests at the venue) or `none`.
+    #:
+    #: **`armed_only` is not a variant of protected.** `stop_loss_price` above
+    #: is armed before the protective order is submitted, so it is populated
+    #: whether or not the venue accepted anything — and on day 2 of the paper
+    #: week every one of its 85 protective orders was rejected while this
+    #: endpoint reported a stop on all 38 positions. The operator read it six
+    #: times in six minutes and was reassured (docs/paper-week/day-2-review.md,
+    #: F2a). Only a venue-side stop survives this platform not running.
+    protection: str
+    #: The two quantities behind `protection`, so a reader can see *how much* is
+    #: naked rather than only that something is. A partly covered position is
+    #: the case a boolean gets wrong.
+    broker_protected_qty: Decimal
+    unprotected_qty: Decimal
     opened_at: datetime | None
 
 

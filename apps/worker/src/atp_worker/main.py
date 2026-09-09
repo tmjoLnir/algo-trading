@@ -305,6 +305,7 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
                 signal_repo=PostgresSignalRepository(session_factory),
                 snapshot_store=snapshot_store,
                 publisher=publisher,
+                alerts=alerts,
             )
             portfolio = await trading.restore_or_adopt(
                 reconciler, portfolio_repo, settings.run_mode
