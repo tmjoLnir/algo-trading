@@ -254,7 +254,7 @@ catches only two of the three:
 # libs/core/src/atp_core/execution/router.py:1074-1091
 try:
     acknowledged = await self.broker.submit_order(order)
-except OrderRejectedError as exc:          # ← would have logged order.broker_rejected
+except OrderRejectedError as exc:  # ← would have logged order.broker_rejected
     ...
     return SubmitResult(order=order, decision=decision, submitted=False)
 except BrokerConnectionError as exc:
