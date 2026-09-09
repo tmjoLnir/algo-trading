@@ -514,6 +514,45 @@ class TestTheHaltReminder:
         assert alerts.sent[0].severity is Severity.CRITICAL
         assert "staleness_monitor" in alerts.sent[0].body
 
+    async def test_the_reminder_repeats_what_cannot_be_closed(self) -> None:
+        """F8 is why this job exists, and the half that matters most is the one
+        it was leaving out.
+
+        The halt's own alert names the unproven symbols once, when it engages.
+        Nothing repeated them — so the operator who dismissed that notification
+        at 09:15 had no channel telling them, at 09:30 and every quarter hour
+        after, that the platform still will not close SPY. Repeating only "still
+        halted" is repeating the half they already had.
+        """
+        at = datetime(2024, 6, 3, 18, 46, tzinfo=UTC)
+        watch, alerts = _watch(
+            _halted(
+                reason=HaltReason.RECONCILIATION_MISMATCH,
+                engaged_by="reconciler",
+                impugned=(
+                    Impugnment(
+                        ("QQQ", "SPY"), HaltReason.RECONCILIATION_MISMATCH, at, "reconciler"
+                    ),
+                ),
+            )
+        )
+
+        await remind_about_halts(watch)
+
+        body = alerts.sent[0].body
+        assert "QQQ, SPY" in body
+        assert "will NOT close" in body
+        assert "broker's own UI" in body
+
+    async def test_a_halt_that_impugns_nothing_reads_as_it_always_did(self) -> None:
+        """The majority case is unchanged — no extra clause on an ordinary
+        feed halt, which impugns nothing."""
+        watch, alerts = _watch(_halted())
+
+        await remind_about_halts(watch)
+
+        assert "will NOT close" not in alerts.sent[0].body
+
     async def test_consecutive_reminders_do_not_collapse_into_one(self) -> None:
         """`key` is what a transport collapses repeats on (`alerts.ports`), so
         a fixed key would make the reminder mute itself after the first — which
@@ -560,6 +599,28 @@ class TestTheSessionSummary:
 
         assert alerts.sent[0].severity is Severity.CRITICAL
         assert "STILL HALTED" in alerts.sent[0].title
+
+    async def test_a_day_that_ends_holding_something_it_cannot_close_says_so(self) -> None:
+        """The close-of-day message is the last thing an operator reads before
+        tomorrow's open. A position the platform will not close is exactly what
+        they must not discover in the morning."""
+        at = datetime(2024, 6, 3, 18, 46, tzinfo=UTC)
+        watch, alerts = _watch(
+            _halted(
+                reason=HaltReason.RECONCILIATION_MISMATCH,
+                engaged_by="reconciler",
+                impugned=(
+                    Impugnment(("SPY",), HaltReason.RECONCILIATION_MISMATCH, at, "reconciler"),
+                ),
+            ),
+            stats=RunnerStats(),
+        )
+
+        await summarise_the_session(watch)
+
+        body = alerts.sent[0].body
+        assert "SPY" in body
+        assert "will NOT close" in body
 
     async def test_an_ordinary_day_is_informational(self) -> None:
         watch, alerts = _watch(stats=RunnerStats(orders_submitted=4))
