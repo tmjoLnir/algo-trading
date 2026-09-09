@@ -294,6 +294,11 @@ class EquitySnapshotRow(Base):
     equity: Mapped[Decimal] = mapped_column(MONEY)
     cash: Mapped[Decimal] = mapped_column(MONEY)
     gross_exposure: Mapped[Decimal] = mapped_column(MONEY)
+    #: How much of the venue's fee charges `cash` on this row already reflects.
+    #: On this table and not on `broker_fees` so that it is written by the same
+    #: statement as the cash it describes — the two cannot disagree across a
+    #: crash, which is the whole of ADR 0031.
+    fees_settled: Mapped[Decimal] = mapped_column(MONEY, default=Decimal(0))
     run_mode: Mapped[str] = mapped_column(String(10))
 
 
@@ -486,5 +491,10 @@ class BrokerFeeRow(Base):
     #: The venue's name for the kind of fee: CAT, REG, TAF.
     sub_type: Mapped[str] = mapped_column(String(32), default="")
     description: Mapped[str] = mapped_column(Text, default="")
-    #: When *we* applied it, which is the audit question this table answers.
-    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    #: When we first *saw* it. Not when it was applied — this table records the
+    #: charges the venue has told us about, and whether they are reflected in
+    #: cash is `Portfolio.fees_settled`'s answer, on the row that carries the
+    #: cash. The column was called `applied_at` for one day and was wrong for
+    #: all of it: rows stamped 10:25:29 on 2026-09-09 had never been applied to
+    #: any durable balance (ADR 0031).
+    seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

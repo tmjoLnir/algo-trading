@@ -71,6 +71,11 @@ EXPECTED_TABLES = {
     "audit_log",
     "backtest_runs",
     "bars",
+    # Added with the table's second migration rather than its first. `broker_fees`
+    # landed in b6c1e84f37a2 and was absent from this set, so nothing asserted it
+    # was created — and `test_downgrade_removes_the_schema` intersects with this
+    # set, so a downgrade that left it behind would have passed too.
+    "broker_fees",
     "equity_snapshots",
     "fills",
     "orders",

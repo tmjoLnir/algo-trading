@@ -1132,23 +1132,23 @@ class FakeBacktestQueue:
 
 
 class FakeFeeLedger:
-    """An in-memory `FeeLedger`, with the same exactly-once contract.
+    """An in-memory `FeeLedger`.
 
-    The real one gets that from a primary key; this gets it from a set, and the
-    point of both is that `record_unseen` may hand a charge back only once
-    however often the venue's feed offers it.
+    Records charges by id and totals them, exactly as the real one does — and
+    like the real one it makes no claim about what has been *applied*. That
+    claim is `Portfolio.fees_settled`'s, which is what lets a test drive the
+    case the real bug needed: a ledger holding charges that a stale book has
+    never settled.
     """
 
     def __init__(self) -> None:
-        self.seen: set[str] = set()
-        #: Every batch this was offered, so a test can prove the reconciler's
-        #: re-read does not go looking for fees a second time in vain.
+        self.seen: dict[str, FeeActivity] = {}
+        #: Every batch this was offered, so a test can prove the sweep still
+        #: consults the ledger when the venue's feed comes back empty.
         self.calls: list[int] = []
 
-    async def record_unseen(
-        self, activities: Sequence[FeeActivity], *, run_mode: RunMode
-    ) -> list[FeeActivity]:
+    async def record_seen(self, activities: Sequence[FeeActivity], *, run_mode: RunMode) -> Decimal:
         self.calls.append(len(activities))
-        unseen = [item for item in activities if item.activity_id not in self.seen]
-        self.seen.update(item.activity_id for item in unseen)
-        return unseen
+        for item in activities:
+            self.seen.setdefault(item.activity_id, item)
+        return sum((item.amount for item in self.seen.values()), Decimal(0))

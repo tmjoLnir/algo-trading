@@ -198,6 +198,22 @@ class Portfolio:
 
     cash: Decimal
     starting_equity: Decimal
+    #: How much of the venue's own fee charges is already reflected in `cash`.
+    #:
+    #: A running total, not a flag, and it lives here rather than in the fee
+    #: ledger for one reason: it is persisted by the same statement that
+    #: persists `cash`. A ledger row saying "applied" and a cash balance that
+    #: does not reflect it are two writes that can disagree, and on 2026-09-09
+    #: they did — the charges committed, the corrected cash never reached a
+    #: snapshot, and $4.14 was lost permanently while the worker crash-looped
+    #: on the drift it explained (ADR 0031).
+    #:
+    #: Because both numbers travel together, the correction owed at any moment
+    #: is `total fees seen − fees_settled`, which is re-derivable from durable
+    #: state after a crash at any point. That is a stronger property than
+    #: applying each charge exactly once: it self-heals rather than merely
+    #: avoiding a double-count.
+    fees_settled: Decimal = Decimal(0)
     positions: dict[str, Position] = field(default_factory=dict)
     equity_curve: list[tuple[datetime, Decimal]] = field(default_factory=list)
 

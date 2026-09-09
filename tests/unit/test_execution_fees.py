@@ -94,6 +94,7 @@ class TestSettling:
 
         assert result.total == Decimal("4.14")  # type: ignore[attr-defined]
         assert book.cash == BROKER_CASH, "our book now says what the venue says"
+        assert book.fees_settled == Decimal("4.14"), "and records that it does"
 
     @pytest.mark.asyncio
     async def test_a_second_pass_charges_nothing(self) -> None:
@@ -112,7 +113,7 @@ class TestSettling:
 
     @pytest.mark.asyncio
     async def test_a_fee_feed_that_will_not_answer_is_not_a_halt(self) -> None:
-        """A venue outage must not become a refusal to reconcile. The unapplied
+        """A venue outage must not become a refusal to reconcile. The unsettled
         charge stays visible as drift, which is the behaviour that existed
         before this module — degraded to, not worse than."""
         broker, ledger, book = FakeBroker(), FakeFeeLedger(), a_book()
@@ -143,20 +144,28 @@ class TestSettling:
         assert book.cash == OUR_CASH + Decimal("2.00")
 
     @pytest.mark.asyncio
-    async def test_a_quiet_venue_is_not_a_database_round_trip(self) -> None:
+    async def test_a_quiet_venue_still_asks_the_ledger(self) -> None:
+        """Changed deliberately from "a quiet venue is not a round trip".
+
+        An empty sweep used to return before consulting the ledger, and that is
+        exactly how a book gets stuck: the charges are already recorded, so the
+        feed has nothing new to offer, and a settlement that skips the ledger on
+        an empty feed would wait forever for a fee that arrived days ago.
+        """
         broker, ledger, book = FakeBroker(), FakeFeeLedger(), a_book()
 
         result = await settle(book, broker, ledger)
 
         assert result.is_empty  # type: ignore[attr-defined]
-        assert ledger.calls == [], "nothing offered means nothing recorded"
+        assert ledger.calls == [0], "asked, and told there is nothing owed"
 
     @pytest.mark.asyncio
     async def test_the_window_reaches_back_past_a_long_weekend(self) -> None:
         """Alpaca stamped 2026-09-08's fees with `created_at` after midnight on
-        the 9th. A one-day window would already have been too narrow, and a
-        holiday weekend makes it worse — so the default is wide, and it costs
-        only a larger response because the ledger discards the rest."""
+        the 9th, and the API filters on `created_at`. A one-day window would
+        already have been too narrow, and a holiday weekend makes it worse — so
+        the default is wide, and it costs only a larger response because the
+        total is over the ledger rather than over the sweep."""
         broker, ledger, book = FakeBroker(), FakeFeeLedger(), a_book()
 
         await settle(book, broker, ledger)
@@ -171,6 +180,89 @@ class TestSettling:
         await settle(book, broker, ledger, lookback_days=-5)
 
         assert broker.fee_queries == [TODAY]
+
+
+class TestRecoveringAnInterruptedSettlement:
+    """The failure ADR 0030 could not survive and ADR 0031 exists for.
+
+    On 2026-09-09 a worker recorded all three charges, subtracted $4.14 from an
+    in-memory balance, and ended before any snapshot made that cash durable.
+    The ledger then said applied; the book had never seen it; and no later run
+    could tell the difference, because "applied" was a claim the ledger made
+    alone. Every restart read the stale balance, found nothing new, and halted
+    on the drift the charges explained.
+
+    Under the derived scheme that state is not special. It is simply a book
+    whose `fees_settled` is behind the ledger's total, which is the one
+    condition this module exists to close.
+    """
+
+    @staticmethod
+    async def _ledger_holding_day_two() -> FakeFeeLedger:
+        ledger = FakeFeeLedger()
+        await ledger.record_seen(DAY_TWO_FEES, run_mode=RunMode.PAPER)
+        ledger.calls.clear()
+        return ledger
+
+    @pytest.mark.asyncio
+    async def test_a_book_that_never_settled_recorded_fees_is_brought_level(self) -> None:
+        """The exact state the database was left in: three charges recorded,
+        `fees_settled` zero, cash still 100094.20."""
+        broker, book = FakeBroker(), a_book()
+        ledger = await self._ledger_holding_day_two()
+        broker.fee_activities = list(DAY_TWO_FEES)
+
+        result = await settle(book, broker, ledger)
+
+        assert result.total == Decimal("4.14")  # type: ignore[attr-defined]
+        assert book.cash == BROKER_CASH
+        assert book.fees_settled == Decimal("4.14")
+
+    @pytest.mark.asyncio
+    async def test_it_recovers_even_when_the_venue_reports_nothing_now(self) -> None:
+        """The charges are days old, so a narrow feed may no longer offer them.
+        Recovery must not depend on the venue repeating itself."""
+        broker, book = FakeBroker(), a_book()
+        ledger = await self._ledger_holding_day_two()
+
+        result = await settle(book, broker, ledger)
+
+        assert result.total == Decimal("4.14")  # type: ignore[attr-defined]
+        assert book.cash == BROKER_CASH
+
+    @pytest.mark.asyncio
+    async def test_a_settlement_dropped_before_it_persisted_is_simply_redone(self) -> None:
+        """The crash itself. A pass settles, the process dies before a snapshot,
+        and the next boot reloads the *old* book — same cash, same
+        `fees_settled` of zero. Under ADR 0030 that book was unrecoverable;
+        here the next pass derives the same correction again."""
+        broker, ledger = FakeBroker(), FakeFeeLedger()
+        broker.fee_activities = list(DAY_TWO_FEES)
+        lost = a_book()
+        await settle(lost, broker, ledger)
+        assert lost.cash == BROKER_CASH, "settled, then never persisted"
+
+        reloaded = a_book()  # what the next boot reads back
+        result = await settle(reloaded, broker, ledger)
+
+        assert result.total == Decimal("4.14")  # type: ignore[attr-defined]
+        assert reloaded.cash == BROKER_CASH, "self-healed, with nothing deleted by hand"
+
+    @pytest.mark.asyncio
+    async def test_a_book_ahead_of_the_ledger_is_credited_back(self) -> None:
+        """The other direction, and it is legitimate: a charge reversed at the
+        venue, or an operator removing a row, leaves the book having settled
+        more than the venue says it charged. Returning the money is the honest
+        response rather than a refusal."""
+        broker, ledger, book = FakeBroker(), FakeFeeLedger(), a_book()
+        book.fees_settled = Decimal("4.14")
+        book.cash = BROKER_CASH
+
+        result = await settle(book, broker, ledger)
+
+        assert result.total == Decimal("-4.14")  # type: ignore[attr-defined]
+        assert book.cash == OUR_CASH
+        assert book.fees_settled == Decimal(0)
 
 
 class TestTheHaltOfTheNinth:

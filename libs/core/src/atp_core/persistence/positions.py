@@ -50,6 +50,12 @@ class PostgresPortfolioRepository:
                     equity=portfolio.equity,
                     cash=portfolio.cash,
                     gross_exposure=portfolio.gross_exposure,
+                    # Written beside the cash, in the same statement, on
+                    # purpose: it is the claim about how much fee that cash
+                    # already reflects, and a claim one transaction away from
+                    # the number it describes is a claim that can be wrong
+                    # (ADR 0031).
+                    fees_settled=portfolio.fees_settled,
                     run_mode=run_mode.value,
                 )
             )
@@ -109,6 +115,10 @@ class PostgresPortfolioRepository:
 
         portfolio = Portfolio(
             cash=equity_row.cash,
+            # Restored with the cash it belongs to. Without this the reloaded
+            # book would claim to have settled nothing and the next reconcile
+            # would subtract the venue's whole fee history from it again.
+            fees_settled=equity_row.fees_settled,
             # Not the original starting equity — that is not stored, and this
             # is the honest substitute rather than a guess. It means
             # `total_return` restarts from the reload point, so P&L since

@@ -17,8 +17,16 @@ run to clear it.
 So this module makes the fee a first-class movement of cash rather than
 something the tolerance is asked to absorb. It is deliberately *not* an
 estimate: nothing here models a fee schedule, and nothing attributes an
-account-level charge back to the fill that caused it. We apply what the venue
-says it charged, once each, and let reconciliation keep judging the result.
+account-level charge back to the fill that caused it.
+
+**The correction is derived on every pass rather than applied once** (ADR
+0031). `Portfolio.fees_settled` says how much fee the book already reflects and
+is persisted by the same statement as the cash; the ledger says what the venue
+has charged in total. The difference is what is owed, and both operands survive
+a crash, so an interrupted settlement is recomputed rather than lost. The
+previous design recorded each charge as applied and then adjusted an in-memory
+balance that reached the database minutes later, which cost $4.14 and a second
+crash-loop on the morning of 2026-09-09.
 """
 
 from __future__ import annotations
@@ -54,9 +62,14 @@ DEFAULT_LOOKBACK_DAYS = 30
 class FeeSettlement:
     """What one settling pass moved, for a log line and for a test.
 
-    `total` is what left cash. Zero with an empty `applied` is the steady
-    state — the venue has charged nothing since the last pass — and is not
-    worth a log line above DEBUG.
+    `total` is the correction that left cash — the *derived* amount owed, which
+    is not the same as the sum of `applied`. On a book that is level they are
+    both effectively nothing; on a book recovering from an interrupted
+    settlement `total` is what was still owed while `applied` is every charge
+    the venue reported in the window.
+
+    Negative is legitimate and means money came back: the ledger shrank, so the
+    book had settled more than the venue now says it charged.
     """
 
     total: Decimal = Decimal(0)
@@ -64,7 +77,10 @@ class FeeSettlement:
 
     @property
     def is_empty(self) -> bool:
-        return not self.applied
+        """Whether this pass moved any money. Keyed on `total` and not on
+        `applied`, because a sweep can return a hundred charges and owe nothing
+        — which is the steady state, not an empty one."""
+        return self.total == 0
 
 
 async def settle_broker_fees(
@@ -76,26 +92,39 @@ async def settle_broker_fees(
     today: date,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
 ) -> FeeSettlement:
-    """Take the venue's unapplied fees out of `portfolio.cash`. Idempotent.
+    """Bring `portfolio.cash` up to date with the venue's fee charges.
 
-    The idempotency is the ledger's, not this function's: `record_unseen`
-    durably records what it returns, in one atomic statement, so a charge is
-    handed back exactly once no matter how often the feed is re-read. That
-    matters because this runs on every reconcile — every five minutes, and
-    twice more whenever a disagreement is re-read.
+    **The correction is derived, not applied once.** Every call computes
 
-    **Recorded before it is applied.** If the process dies between the two, the
-    fee is lost from our cash and reconciliation reports it as drift: visible,
-    and the thing an operator is already equipped to read. The other ordering
-    loses the *record* and re-applies the charge on the next pass, which
-    silently walks our cash below the venue's — a wrong book that looks like a
-    right one.
+        owed = (total fees the venue has told us about) - portfolio.fees_settled
 
-    Failure is not fatal. A venue that will not answer is a fee we cannot
-    apply, and refusing to reconcile because of it would turn a fee-feed
-    outage into a halt. The unapplied charge stays visible as drift, so the
-    worst case degrades to exactly the behaviour that existed before this
-    module.
+    and moves both numbers together. Both operands are durable — the total is
+    the ledger's, the settled figure rides on the same snapshot row as the cash
+    — so a crash at any point leaves the next run able to derive exactly the
+    same answer. Nothing is marked done before the thing it describes is true.
+
+    That is the property ADR 0030 lacked. It recorded each charge as applied and
+    then subtracted it from an in-memory balance that reached the database only
+    at the next scheduled snapshot. A worker that did the first and not the
+    second left a ledger insisting three charges were applied to a book that had
+    never seen them, and no later run could tell — every one of them read a
+    stale balance, found nothing new to apply, and halted on the $4.14 it was
+    supposed to have settled (2026-09-09).
+
+    Self-healing follows from the same arithmetic and is worth stating
+    separately: a book that is behind by any amount of fee, for any reason
+    including that bug, is brought level by the next call. Nothing has to be
+    deleted by hand.
+
+    `owed` of zero is the steady state and does nothing. A negative `owed` is
+    possible and is applied as a credit — it means the ledger shrank, which
+    happens when a charge is reversed or an operator removes a row, and in both
+    cases returning the money is the honest response rather than a refusal.
+
+    Failure is not fatal. A venue that will not answer is a fee we cannot see,
+    and refusing to reconcile because of it would turn a fee-feed outage into a
+    halt. The unsettled charge stays visible as drift, so the worst case
+    degrades to exactly the behaviour that existed before this module.
 
     Fees are charged to cash only, never to `Position.fees_paid`: an
     account-level debit belongs to no position, and dividing it across the
@@ -109,38 +138,39 @@ async def settle_broker_fees(
             "execution.fees.unavailable",
             error=str(exc),
             since=since.isoformat(),
-            msg="could not read the venue's fee feed; unapplied fees stay visible "
+            msg="could not read the venue's fee feed; unsettled fees stay visible "
             "to reconciliation as cash drift",
         )
         return FeeSettlement()
 
-    if not charged:
+    # Called even when the sweep returned nothing. The ledger may already hold
+    # charges this book has not settled — which is exactly the state 2026-09-09
+    # left behind — and skipping the call on an empty feed would leave the book
+    # stuck there forever, waiting for a fee that has already been recorded.
+    total_seen = await ledger.record_seen(charged, run_mode=run_mode)
+    owed = total_seen - portfolio.fees_settled
+
+    if owed == 0:
+        log.info(
+            "execution.fees.level",
+            offered=len(charged),
+            total_seen=str(total_seen),
+            msg="the book already reflects every fee the venue has charged",
+        )
         return FeeSettlement()
 
-    unseen = await ledger.record_unseen(charged, run_mode=run_mode)
-    if not unseen:
-        log.debug("execution.fees.nothing_new", offered=len(charged))
-        return FeeSettlement()
-
-    total = sum((item.amount for item in unseen), Decimal(0))
-    portfolio.cash -= total
+    portfolio.cash -= owed
+    portfolio.fees_settled = total_seen
 
     log.info(
         "execution.fees.settled",
-        count=len(unseen),
-        total=str(total),
+        owed=str(owed),
+        total_seen=str(total_seen),
+        offered=len(charged),
         cash=str(portfolio.cash),
-        fees=[
-            {
-                "id": item.activity_id,
-                "date": item.booked_on.isoformat(),
-                "sub_type": item.sub_type,
-                "amount": str(item.amount),
-            }
-            for item in unseen
-        ],
+        msg="cash and fees_settled move together, and persist together",
     )
-    return FeeSettlement(total=total, applied=list(unseen))
+    return FeeSettlement(total=owed, applied=list(charged))
 
 
 def _lookback_floor(today: date, lookback_days: int) -> date:

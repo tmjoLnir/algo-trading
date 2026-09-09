@@ -187,8 +187,26 @@ Our book disagrees with the broker's. **Do not resume until it is understood.**
 **A cash-only mismatch with matching positions is a different animal.** Cash
 moves for reasons that are not fills, and on Alpaca the reason is regulatory
 fees — CAT, REG and TAF — which the venue books on the account activity feed and
-never on the fill. Those are settled automatically now (ADR 0030), so a cash
-gap that *survives* reconciliation is a genuine missed fill and step 3 applies.
+never on the fill. Those are settled automatically now (ADR 0030, ADR 0031), so a
+cash gap that *survives* reconciliation is a genuine missed fill and step 3
+applies.
+
+The settlement is **self-healing**, and knowing that saves an afternoon. The
+correction is derived on every pass as `total fees the venue has charged` minus
+`equity_snapshots.fees_settled`, so a book behind on fees for any reason — a
+worker that died mid-settlement, a restore from an older snapshot — is brought
+level by the next reconcile. There is no repair script and no row to delete. If
+the two numbers disagree and the gap is *not* closing, that is a bug in the
+settlement path and not a state to fix by hand:
+
+```sql
+SELECT (SELECT COALESCE(SUM(amount), 0) FROM broker_fees WHERE run_mode = 'paper') AS charged,
+       (SELECT fees_settled FROM equity_snapshots
+         WHERE run_mode = 'paper' ORDER BY ts DESC LIMIT 1) AS settled;
+```
+
+`execution.fees.settled` names the correction it applied; `execution.fees.level`
+says the book already reflects everything charged.
 Before that fix they accumulated silently: one session cost $4.14 against a
 $1.00 tolerance and crash-looped the worker the next morning. To see the venue's
 own fee rows for a day:
