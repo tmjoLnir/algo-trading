@@ -152,6 +152,34 @@ Everything is declared in one file — `libs/core/src/atp_core/metrics/registry.
 transport and could not be resolved against the venue — we may be holding a
 position nobody knows about. It always comes with a halt.
 
+**Protection**
+
+| Metric | |
+|---|---|
+| `atp_positions_unprotected` | open positions with **no stop working at the venue**, right now |
+| `atp_protective_orders_rejected_total{stage}` | protective orders that did not reach the venue |
+
+`atp_positions_unprotected` is how docs/SAFETY.md's go-live gate — *"there are
+no unprotected positions"* — is evaluated. **It must be zero.** Anything else
+means the platform is holding exposure that only survives while the worker
+process does: the engine-side stop is real and fires, but it acts on a completed
+bar at roughly a minute's cadence and dies with the process, so it cannot cover
+a crash, a restart or the overnight gap.
+
+A gauge rather than a counter, because the question is "how many now" — a
+position covered after an hour naked must stop being counted the moment it is
+covered, or the gate could never be satisfied again without a restart. It is set
+from the runner's own book on every pass, including to zero, so "clean" is a
+reading and not an absence of readings.
+
+The two numbers answer different questions and are worth reading together. On
+day 2 of the paper week the gauge would have sat at 38 while the counter climbed
+to 85: one is the exposure, the other is how hard the platform was trying and
+failing to remove it. `stage` uses the same vocabulary as
+`atp_orders_rejected_total`, so 85 at `broker` and zero elsewhere is legible as
+a venue refusing every stop — which is exactly what happened
+(docs/paper-week/day-2-review.md, B1 and F3).
+
 **Market data**
 
 | Metric | |

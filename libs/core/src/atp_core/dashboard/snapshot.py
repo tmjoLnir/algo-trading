@@ -85,6 +85,20 @@ class PositionSummary:
     #: because an absolute one would render the most alarming state on the
     #: screen as an ordinary small number.
     distance_to_stop_pct: Decimal | None
+    #: How much of the position has a stop **working at the venue**, and how
+    #: much has nothing. `stop_loss_price` above is the level this platform
+    #: armed and says nothing about whether an order exists — the router arms it
+    #: before submitting the child, on purpose. Day 2 of the paper week rejected
+    #: every protective order it sent and this screen went on reporting a stop
+    #: for all 38 positions, because it had no other number to read (F2a).
+    broker_protected_qty: Decimal
+    unprotected_qty: Decimal
+    #: The state a reader actually needs, resolved here rather than in the
+    #: browser. Two screens render this book — the live dashboard and the stored
+    #: one — and a protection state computed twice is a protection state that
+    #: can disagree with itself, on the one figure that says whether the
+    #: position survives this process dying.
+    protection: str
     strategy_id: str | None
     opened_at: datetime | None
 
@@ -310,9 +324,52 @@ def position_summary(position: Position) -> PositionSummary:
         stop_loss_price=position.stop_loss_price,
         take_profit_price=position.take_profit_price,
         distance_to_stop_pct=_distance_to_stop(position),
+        broker_protected_qty=position.broker_protected_qty,
+        unprotected_qty=position.unprotected_qty,
+        protection=_protection_state(position),
         strategy_id=None,
         opened_at=position.opened_at,
     )
+
+
+#: The four states a position's protection can be in, most protected first.
+#: Strings rather than an enum because this crosses the wire to a browser, and
+#: the API's `PositionView` mirrors it verbatim.
+PROTECTION_WORKING = "working"
+PROTECTION_PARTIAL = "partial"
+PROTECTION_ARMED_ONLY = "armed_only"
+PROTECTION_NONE = "none"
+
+
+def _protection_state(position: Position) -> str:
+    """What is actually holding this position, in one word.
+
+    The distinction this makes is the entire finding F2a:
+
+    - `working` — the venue holds a stop over the whole position. This is the
+      only state that survives the worker dying, a restart, or the overnight
+      gap, and `router._stop_order`'s docstring says so.
+    - `partial` — the venue covers some of it. Real and common: an entry that
+      fills in tranches gets a stop per tranche, and one refused child leaves a
+      naked remainder under a position that still looks protected in total.
+    - `armed_only` — a level exists, nothing is resting at the venue. **This is
+      the state all 38 of day 2's positions were in for ten hours**, rendered
+      as a healthy gauge. The engine-side fallback is watching, which is not
+      nothing — it fired 19 times — but it exists only while this process does,
+      and it acts on a completed bar at roughly a minute's cadence.
+    - `none` — no venue stop and no armed level.
+
+    Ordered by what is actually holding the shares, so a screen can sort or
+    colour on it without re-deriving the logic. A flat position is `none`; it
+    holds nothing to protect and no caller renders it.
+    """
+    if position.is_flat:
+        return PROTECTION_NONE
+    if position.broker_protected_qty <= 0:
+        return PROTECTION_ARMED_ONLY if position.stop_loss_price is not None else PROTECTION_NONE
+    if position.unprotected_qty > 0:
+        return PROTECTION_PARTIAL
+    return PROTECTION_WORKING
 
 
 def _distance_to_stop(position: Position) -> Decimal | None:
@@ -439,6 +496,9 @@ def encode_snapshot(snapshot: LiveSnapshot) -> dict[str, Any]:
                 "stop_loss_price": _money(p.stop_loss_price),
                 "take_profit_price": _money(p.take_profit_price),
                 "distance_to_stop_pct": _money(p.distance_to_stop_pct),
+                "broker_protected_qty": str(p.broker_protected_qty),
+                "unprotected_qty": str(p.unprotected_qty),
+                "protection": p.protection,
                 "strategy_id": p.strategy_id,
                 "opened_at": _ts(p.opened_at),
             }
@@ -517,6 +577,18 @@ def decode_snapshot(payload: Mapping[str, Any]) -> LiveSnapshot:
                 stop_loss_price=_decimal(p["stop_loss_price"]),
                 take_profit_price=_decimal(p["take_profit_price"]),
                 distance_to_stop_pct=_decimal(p["distance_to_stop_pct"]),
+                # Defaulted rather than required, so a payload written by a
+                # worker from before this field existed still decodes. It is
+                # read back by the dashboard after a restart, and refusing a
+                # snapshot over a missing protection figure would blank the
+                # screen at exactly the moment somebody came to look at it.
+                broker_protected_qty=_require_decimal(
+                    p.get("broker_protected_qty", "0"), "position.broker_protected_qty"
+                ),
+                unprotected_qty=_require_decimal(
+                    p.get("unprotected_qty", "0"), "position.unprotected_qty"
+                ),
+                protection=p.get("protection", PROTECTION_NONE),
                 strategy_id=p["strategy_id"],
                 opened_at=_parse_ts(p["opened_at"], "position.opened_at"),
             )

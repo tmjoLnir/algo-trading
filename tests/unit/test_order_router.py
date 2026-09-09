@@ -27,6 +27,7 @@ import pytest
 from atp_core.clock import SimulatedClock, TradingCalendar
 from atp_core.domain import (
     Fill,
+    Instrument,
     Order,
     OrderRequest,
     OrderStatus,
@@ -1250,3 +1251,188 @@ class TestAcknowledgement:
         assert result.order is not None
         assert result.order.status is OrderStatus.REJECTED
         assert result.order.reject_reason == "insufficient buying power"
+
+
+# ── the venue tick ──────────────────────────────────────────────────────────
+
+
+class TestPricesAreQuantisedToTheVenueTick:
+    """Day 2 of the paper week placed 85 protective stops and had 85 rejected.
+
+    Every one carried a price like `88.21881579149739452` and came back
+    *"sub-penny increment does not fulfill minimum pricing criteria"*. For ten
+    hours, across all 20 symbols, no position held a broker-side stop — the one
+    condition docs/SAFETY.md's go-live gate exists to forbid.
+
+    The cause is worth stating exactly, because it is not a rule being broken.
+    An ATR is a float statistic; `runner.py` converts it with
+    `Decimal(str(value))`, which is rule §1.1 followed correctly and which
+    faithfully preserves all seventeen of the float's digits. **Obeying §1.1 is
+    what produced the off-tick price.** Decimal exactness and venue tick
+    conformance are two different constraints and the rule only names the first.
+
+    So these tests are about the second one: a price that leaves the platform is
+    a multiple of the instrument's tick, and it is rounded *away* from the
+    market so that quantising can never tighten a stop into it.
+    """
+
+    async def _entry(
+        self,
+        broker: FakeBroker,
+        portfolio: Portfolio,
+        routed: OrderRouter,
+        *,
+        side: Side = Side.BUY,
+    ) -> Order:
+        result = await routed.submit(request(side=side, qty=100), portfolio)
+        assert result.order is not None
+        return result.order
+
+    async def test_the_price_the_venue_refused_is_now_on_tick(self) -> None:
+        """The exact number from the day-2 review, reproduced and then fixed.
+
+        `Decimal('88.39') - 2 * Decimal(str(0.08559210425130274))` is
+        byte-for-byte what Alpaca refused. The assertion is the one the review
+        asked for: what reaches the broker carries exactly two decimal places.
+        """
+        atr = Decimal(str(0.08559210425130274))
+        broker, portfolio = FakeBroker(), book()
+        routed = router(broker)
+        entry = await self._entry(broker, portfolio, routed)
+        fill(entry, portfolio, 100, 88.39)
+
+        protection = await routed.submit_protective_orders(
+            entry,
+            portfolio,
+            stop_config=StopConfig(stop_type=StopType.ATR, multiplier=Decimal(2)),
+            atr_value=atr,
+        )
+
+        stop = protection.stop_order
+        assert stop is not None
+        assert stop.stop_price is not None
+        # The level before quantising, kept here so this test fails loudly if
+        # the stop maths changes underneath it rather than passing vacuously.
+        assert Decimal("88.39") - Decimal(2) * atr == Decimal("88.21881579149739452")
+        assert stop.stop_price == Decimal("88.21")
+        # `brokers/alpaca.py` serialises with `str()`, so this is the wire.
+        assert str(stop.stop_price) == "88.21"
+        assert stop.stop_price.as_tuple().exponent == -2
+
+    async def test_a_long_s_stop_rounds_down_and_never_up(self) -> None:
+        """Away from the market, not to nearest.
+
+        `88.2188…` is nearer to `88.22`, and `88.22` is a cent *closer* to a
+        long's entry — a stop quantising pulled tighter than the platform chose.
+        The one place that difference is collected is a gap, which is the only
+        place a stop matters.
+        """
+        broker, portfolio = FakeBroker(), book()
+        routed = router(broker)
+        entry = await self._entry(broker, portfolio, routed)
+        fill(entry, portfolio, 100, 88.39)
+
+        protection = await routed.submit_protective_orders(
+            entry,
+            portfolio,
+            stop_config=StopConfig(stop_type=StopType.ATR, multiplier=Decimal(2)),
+            atr_value=Decimal(str(0.08559210425130274)),
+        )
+
+        stop = protection.stop_order
+        assert stop is not None
+        assert stop.side is Side.SELL
+        assert stop.stop_price == Decimal("88.21")  # floor, not the nearer 88.22
+
+    async def test_a_short_s_stop_rounds_up_and_never_down(self) -> None:
+        """The mirror, and the reason the direction is read off the side rather
+        than hard-coded: a short's stop sits *above* the market, so away from it
+        is up."""
+        broker, portfolio = FakeBroker(), book()
+        routed = router(broker)
+        entry = await self._entry(broker, portfolio, routed, side=Side.SELL)
+        fill(entry, portfolio, 100, 88.39)
+
+        protection = await routed.submit_protective_orders(
+            entry,
+            portfolio,
+            stop_config=StopConfig(stop_type=StopType.ATR, multiplier=Decimal(2)),
+            atr_value=Decimal(str(0.08559210425130274)),
+        )
+
+        stop = protection.stop_order
+        assert stop is not None
+        assert stop.side is Side.BUY
+        # 88.39 + 2 × atr = 88.5611842…, ceiled away from the market.
+        assert stop.stop_price == Decimal("88.57")
+
+    async def test_the_armed_level_is_the_level_the_venue_holds(self) -> None:
+        """Otherwise the engine watches one price, the venue holds another and
+        the dashboard draws a third, differing by up to a tick — a discrepancy
+        no single screen could explain."""
+        broker, portfolio = FakeBroker(), book()
+        routed = router(broker)
+        entry = await self._entry(broker, portfolio, routed)
+        fill(entry, portfolio, 100, 88.39)
+
+        protection = await routed.submit_protective_orders(
+            entry,
+            portfolio,
+            stop_config=StopConfig(stop_type=StopType.ATR, multiplier=Decimal(2)),
+            atr_value=Decimal(str(0.08559210425130274)),
+        )
+
+        stop = protection.stop_order
+        assert stop is not None
+        assert portfolio.position("SPY").stop_loss_price == stop.stop_price
+
+    async def test_a_sell_limit_never_asks_less_and_a_buy_limit_never_bids_more(
+        self,
+    ) -> None:
+        """A limit rounds the *opposite* way to a stop, which is the easiest
+        thing in this module to get backwards.
+
+        A stop rounds away from the market so it cannot be tightened. A limit
+        rounds away from a worse price: a sell that ceils never asks less than
+        it meant to, a buy that floors never pays more than risk sized it for.
+        The cost is a fill that may not happen, which is the cheaper mistake.
+        """
+        broker, portfolio = FakeBroker(), book()
+        routed = router(broker)
+
+        sell = await routed.submit(
+            request(side=Side.SELL, qty=10, limit_price=Decimal("88.211111")), portfolio
+        )
+        buy = await routed.submit(
+            request(side=Side.BUY, qty=10, limit_price=Decimal("88.218888")), portfolio
+        )
+
+        assert sell.order is not None and sell.order.limit_price == Decimal("88.22")
+        assert buy.order is not None and buy.order.limit_price == Decimal("88.21")
+
+    async def test_an_instrument_with_a_coarser_tick_is_honoured(self) -> None:
+        """The quantum is the instrument's, not a hard-coded two places — so a
+        venue that trades in something else is a constructor argument rather
+        than a second copy of this logic."""
+        broker = FakeBroker()
+        routed = OrderRouter(
+            broker,
+            permissive(),
+            StopManager(),
+            SimulatedClock(OPEN_HOURS),
+            instruments={"SPY": Instrument(symbol="SPY", tick_size=Decimal("0.25"))},
+        )
+        portfolio = book()
+
+        result = await routed.submit(
+            request(side=Side.BUY, qty=10, limit_price=Decimal("88.61")), portfolio
+        )
+
+        assert result.order is not None
+        assert result.order.limit_price == Decimal("88.50")
+
+    async def test_an_unregistered_symbol_still_gets_a_penny_tick(self) -> None:
+        """A default rather than a `KeyError`: the alternative is a platform
+        that refuses to trade a name nobody remembered to register, and the
+        default is correct for every symbol in the watchlist."""
+        assert router().instrument("NVDA").tick_size == Decimal("0.01")

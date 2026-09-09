@@ -32,8 +32,18 @@ from atp_core.dashboard.snapshot import (
     build_snapshot,
     decode_snapshot,
     encode_snapshot,
+    position_summary,
 )
-from atp_core.domain import Order, OrderStatus, OrderType, Portfolio, Position, RunMode, Side
+from atp_core.domain import (
+    Fill,
+    Order,
+    OrderStatus,
+    OrderType,
+    Portfolio,
+    Position,
+    RunMode,
+    Side,
+)
 from atp_core.execution.ports import EquityPoint
 
 NOW = datetime(2024, 6, 3, 14, 30, tzinfo=UTC)
@@ -382,3 +392,85 @@ class TestEquityCurve:
         series = self.points(5, every=timedelta(minutes=1))
 
         assert last_before_or_at(series, NOW - timedelta(minutes=1)) is None
+
+
+class TestProtectionIsVenueSideOrItIsNotProtection:
+    """The read model must not report an armed level as a working stop.
+
+    `Position.stop_loss_price` is armed by the router *before* it submits the
+    protective child order — deliberately, so a refused stop still leaves the
+    engine-side fallback a level to watch. The consequence is that the field is
+    populated whether or not anything exists at the venue, and on day 2 of the
+    paper week that is exactly what happened: 85 protective orders rejected, 38
+    positions naked for 24 position-hours, and every screen reporting a stop
+    (docs/paper-week/day-2-review.md, F2a).
+
+    Resolved here rather than in the browser because two screens render this
+    book — the live dashboard and the stored one — and a protection state
+    computed twice is one that can disagree with itself.
+    """
+
+    def _held(
+        self,
+        qty: str = "100",
+        *,
+        stop: str | None = "95",
+        covered: str = "0",
+    ) -> Position:
+        position = Position(symbol="SPY", qty=Decimal(qty), avg_entry_price=Decimal(100))
+        position.last_price = Decimal(100)
+        position.stop_loss_price = Decimal(stop) if stop is not None else None
+        position.broker_protected_qty = Decimal(covered)
+        return position
+
+    def test_a_stop_working_over_the_whole_position_is_working(self) -> None:
+        assert position_summary(self._held(covered="100")).protection == "working"
+
+    def test_an_armed_level_with_nothing_at_the_venue_is_not_protection(self) -> None:
+        """The day-2 state, and the one this whole finding is about."""
+        summary = position_summary(self._held(covered="0"))
+
+        assert summary.protection == "armed_only"
+        assert summary.unprotected_qty == Decimal(100)
+        # The armed level is still reported — the engine-side fallback watches
+        # it and it is a real number. What it must not do is imply cover.
+        assert summary.stop_loss_price == Decimal(95)
+
+    def test_a_partly_covered_position_is_neither_protected_nor_naked(self) -> None:
+        """A boolean reports this as protected and hides the naked remainder,
+        which is the reason `broker_side_protected_qty` returns a quantity."""
+        summary = position_summary(self._held(covered="60"))
+
+        assert summary.protection == "partial"
+        assert summary.broker_protected_qty == Decimal(60)
+        assert summary.unprotected_qty == Decimal(40)
+
+    def test_no_stop_and_no_cover_is_none(self) -> None:
+        assert position_summary(self._held(stop=None, covered="0")).protection == "none"
+
+    def test_a_short_is_measured_on_magnitude_not_sign(self) -> None:
+        """`qty` is signed inside a position; cover is not. Netting the two
+        would report a fully covered short as over-covered by twice its size."""
+        summary = position_summary(self._held(qty="-100", stop="105", covered="100"))
+
+        assert summary.protection == "working"
+        assert summary.unprotected_qty == Decimal(0)
+
+    def test_cover_beyond_the_position_never_reports_negative_exposure(self) -> None:
+        """Over-cover is its own defect — a stop that would flip the position
+        when it triggers. Reported as zero naked here rather than as negative,
+        which would net against a genuinely naked position in any total."""
+        assert position_summary(self._held(covered="150")).unprotected_qty == Decimal(0)
+
+    def test_cover_does_not_outlive_the_position_it_covered(self) -> None:
+        """Otherwise the next position opened in this symbol inherits cover
+        earned by shares that no longer exist, and reads as protected before
+        anything has been placed for it."""
+        position = self._held(covered="100")
+        position.apply_fill(
+            Fill(order_id="o1", ts=NOW, qty=Decimal(100), price=Decimal(101)),
+            Decimal(-100),
+        )
+
+        assert position.is_flat
+        assert position.broker_protected_qty == Decimal(0)

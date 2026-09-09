@@ -45,13 +45,14 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import TYPE_CHECKING
 
 from atp_core import metrics
 from atp_core.domain import (
     ROUTING,
     SIZING,
+    Instrument,
     Order,
     OrderRequest,
     OrderStatus,
@@ -76,7 +77,7 @@ from atp_core.risk.rules import position_size, reference_price
 from atp_core.risk.stops import FROM_ENTRY_TYPES
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Mapping
     from datetime import datetime
 
     from atp_core.brokers.ports import BrokerPort
@@ -88,6 +89,23 @@ if TYPE_CHECKING:
     from atp_core.strategy.rules import PositionSizeSpec
 
 log = get_logger(__name__)
+
+
+def _refusal_stage(order: Order) -> str:
+    """Where a protective order stopped, in `metrics.order_rejected`'s words.
+
+    The same vocabulary as the general order counter on purpose: "how many
+    protective orders were refused, and by what" is only useful next to "how
+    many orders were refused, and by what". Day 2's answer would have been 85
+    at the `broker` stage against zero at any other, which is a different
+    incident from 85 refused by a risk rule.
+    """
+    if order.status is OrderStatus.REJECTED_RISK:
+        return "risk"
+    if order.status is OrderStatus.REJECTED:
+        return "broker"
+    return "acknowledgement"
+
 
 #: Stages that can refuse before any `RiskRule` runs. They appear in
 #: `SubmitResult.decision.rule`, so a human reading a refusal on the dashboard is
@@ -198,6 +216,7 @@ class OrderRouter:
         clock: Clock,
         *,
         kill_switch: KillSwitch | None = None,
+        instruments: Mapping[str, Instrument] | None = None,
     ) -> None:
         """
         `clock` supplies submission timestamps. It is injected rather than read
@@ -216,12 +235,21 @@ class OrderRouter:
         Without a switch that case is still logged `CRITICAL` and still raises,
         but nothing stops the next order, which is the reason to pass one in
         production.
+
+        `instruments` supplies the venue rules a price must satisfy, keyed by
+        symbol. Optional because every symbol this platform trades today is a
+        US equity on a one-cent tick, which is `Instrument`'s own default — so
+        an absent mapping is the correct answer rather than a missing one. It
+        exists as a seam: the moment something here trades a sub-dollar name, a
+        future or a crypto pair, the tick stops being a constant and this is
+        where it is told.
         """
         self.broker = broker
         self.risk_engine = risk_engine
         self.stop_manager = stop_manager
         self.clock = clock
         self.kill_switch = kill_switch
+        self._instruments: Mapping[str, Instrument] = instruments or {}
 
         #: entry order id → the protective levels its request asked for. Intent,
         #: not truth: what we were told to protect, never what the venue holds.
@@ -486,6 +514,19 @@ class OrderRouter:
                     entry_price, entry_order.side, stop_config
                 )
 
+        if stop_level is not None:
+            # Quantised here as well as in `_on_tick`, and the redundancy is the
+            # point: this is the level that gets *armed* on the position, which
+            # the engine-side fallback watches and the dashboard draws. Arming
+            # an unrounded level would leave the screen, the engine and the
+            # venue holding three prices for one stop, differing by up to a
+            # tick — a discrepancy nobody could explain from any one of them.
+            # Rounding is idempotent, so `_on_tick` re-snapping the child order
+            # changes nothing.
+            stop_level = self.instrument(symbol).round_price(
+                stop_level, ROUND_FLOOR if closing is Side.SELL else ROUND_CEILING
+            )
+
         if stop_level is not None and not _protects(position, stop_level):
             # A level the market has already passed is not a stop: submitted, it
             # is a market order wearing a stop's clothes. The reachable case is
@@ -543,13 +584,19 @@ class OrderRouter:
             # pointless there, since trading is already stopped. That one does
             # not clear by waiting either, which is why the halt's own alert
             # names the symbol and points at the broker's UI.
+            metrics.protective_order_rejected(_refusal_stage(stop_child))
             log.critical(
                 "order.position_unprotected",
                 symbol=symbol,
                 entry_order_id=entry_order.id,
                 qty=str(increment),
-                rule=outcome.decision.rule,
-                detail=outcome.decision.reason,
+                rule=outcome.decision.rule or stop_child.rejected_by or "",
+                # The approving `RiskDecision` is what comes back from a
+                # *broker* refusal, and its `reason` is `""` — so this line said
+                # nothing about why on all 85 of day 2's rejections, while
+                # docs/RUNBOOK.md's procedure opens "read `rule` in the log
+                # line". The venue's own message is on the order.
+                detail=outcome.decision.reason or stop_child.reject_reason or "",
             )
             return ProtectionResult(
                 refused=[outcome], unprotected_qty=increment, engine_side_stop=armed
@@ -903,6 +950,64 @@ class OrderRouter:
             created_at=entry_order.filled_at or entry_order.created_at,
         )
 
+    def instrument(self, symbol: str) -> Instrument:
+        """The venue rules for `symbol`, defaulting to a one-cent US equity.
+
+        A default rather than a `KeyError`, because the alternative is a
+        platform that refuses to trade a symbol nobody remembered to register —
+        and the default is right for every name in the watchlist. What must
+        never happen is the *other* default, a price sent unquantised, which is
+        what `_on_tick` exists to prevent.
+        """
+        return self._instruments.get(symbol) or Instrument(symbol=symbol)
+
+    def _on_tick(self, order: Order) -> None:
+        """Snap this order's prices to the venue tick, away from the market.
+
+        **This is the guard that was written and never called.** A stop level
+        computed from an ATR is a float-derived `Decimal` carrying seventeen
+        significant digits (`Instrument.round_price`'s docstring predicted the
+        rejection; day 2 of the paper week collected 85 of them, one per fill
+        event, and not one protective stop reached the venue). Rule §1.1 makes
+        the arithmetic exact; exactness is not tick conformance, and the venue
+        checks the second one.
+
+        Placed here rather than in `_stop_order` on purpose. `_route` is the
+        single submission path rule §1.5 names, so quantising here covers every
+        price on every order — a limit entry, an exit, a child this class does
+        not yet build — instead of the one builder that happened to be the
+        symptom.
+
+        **Direction is per side, and stops and limits round opposite ways.**
+
+        A stop rounds *away from the market*, so quantising can never tighten a
+        stop into it: the stop that closes a long sits below the market and
+        floors, the stop that closes a short sits above it and ceils. A stop
+        pulled a tick closer by rounding is a stop the platform did not choose,
+        and on a gap it is the difference between a stop and a fill.
+
+        A limit rounds *away from a worse price*, which is the opposite
+        arithmetic for the same word: a sell never asks less than it meant to
+        and so ceils, a buy never bids more and so floors. The cost is a fill
+        that may not happen; the alternative is a fill a cent through the price
+        risk sized the order against.
+
+        Mutates rather than returning a copy: `client_order_id` is derived from
+        the decision and not from any price (`idempotency.py`), so the key is
+        unchanged and a retry is still the same order to the venue (§1.4).
+        """
+        instrument = self.instrument(order.symbol)
+        if order.stop_price is not None:
+            order.stop_price = instrument.round_price(
+                order.stop_price,
+                ROUND_FLOOR if order.side is Side.SELL else ROUND_CEILING,
+            )
+        if order.limit_price is not None:
+            order.limit_price = instrument.round_price(
+                order.limit_price,
+                ROUND_CEILING if order.side is Side.SELL else ROUND_FLOOR,
+            )
+
     async def _route(
         self, order: Order, portfolio: Portfolio, pending: Iterable[Order] = ()
     ) -> SubmitResult:
@@ -921,6 +1026,12 @@ class OrderRouter:
                 f"client_order_id is derived from the decision, so the retry "
                 f"reuses the key (CLAUDE.md §1.4)"
             )
+
+        # Before `validate`, not after: risk sizes against a reference price and
+        # must see the number the venue will see. A tick is small, but a rule
+        # that approved one price while the broker was sent another is a rule
+        # that did not check the order that was placed.
+        self._on_tick(order)
 
         decision = self.risk_engine.validate(order, portfolio, pending)
         if not decision.approved:

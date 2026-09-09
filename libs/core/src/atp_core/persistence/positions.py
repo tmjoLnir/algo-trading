@@ -75,6 +75,7 @@ class PostgresPortfolioRepository:
                         stop_loss_price=position.stop_loss_price,
                         take_profit_price=position.take_profit_price,
                         high_water_mark=position.high_water_mark,
+                        broker_protected_qty=position.broker_protected_qty,
                         opened_at=position.opened_at,
                         run_mode=run_mode.value,
                     )
@@ -191,6 +192,7 @@ class PostgresPortfolioRepository:
                 stop_loss_price=row.stop_loss_price,
                 take_profit_price=row.take_profit_price,
                 high_water_mark=row.high_water_mark,
+                broker_protected_qty=row.broker_protected_qty,
             )
             for row in rows
         ]

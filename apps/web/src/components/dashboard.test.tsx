@@ -55,6 +55,9 @@ const POSITION: PositionView = {
   stop_loss_price: '90.00',
   take_profit_price: '130.00',
   distance_to_stop_pct: '2.0000',
+  protection: 'working',
+  broker_protected_qty: '10',
+  unprotected_qty: '0',
   opened_at: '2024-06-02T14:30:00Z',
 }
 
@@ -188,6 +191,72 @@ describe('PositionsTable', () => {
 
     expect(screen.getByText('stop set, unmarked')).toBeDefined()
     expect(screen.queryByText('no stop')).toBeNull()
+  })
+
+  it('refuses to draw a gauge for a stop that is armed but not working', () => {
+    // The day-2 failure, in one assertion. All 85 protective orders were
+    // rejected off-tick; `stop_loss_price` was armed on all 38 positions
+    // regardless, because the router arms before it submits. This table read
+    // that field and drew a healthy green bar over ten hours of naked
+    // exposure (docs/paper-week/day-2-review.md, F2a).
+    render(
+      <PositionsTable
+        positions={[
+          {
+            ...POSITION,
+            protection: 'armed_only',
+            broker_protected_qty: '0',
+            unprotected_qty: '10',
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText(/NO VENUE STOP/)).toBeDefined()
+    // Emphatically not the reassuring reading of the same row.
+    expect(screen.queryByText('200%')).toBeNull()
+  })
+
+  it('strikes through a stop price nothing at the venue is holding', () => {
+    // A price printed plainly under a column headed "Stop" is a claim, and for
+    // an armed-only position it is the wrong one.
+    render(
+      <PositionsTable
+        positions={[
+          {
+            ...POSITION,
+            protection: 'armed_only',
+            broker_protected_qty: '0',
+            unprotected_qty: '10',
+          },
+        ]}
+      />,
+    )
+
+    const cell = screen.getByTitle(/Armed in the engine only/)
+    expect(cell.className).toContain('line-through')
+  })
+
+  it('names the naked remainder of a partly covered position', () => {
+    // The case a boolean gets wrong, which is why the server sends a quantity:
+    // an entry filling in tranches gets a stop per tranche, and one refused
+    // child leaves shares uncovered under a position that still shows a stop.
+    render(
+      <PositionsTable
+        positions={[
+          {
+            ...POSITION,
+            protection: 'partial',
+            broker_protected_qty: '6',
+            unprotected_qty: '4',
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText(/4 NAKED/)).toBeDefined()
+    // The covered part is genuinely protected, so the bar is still drawn.
+    expect(screen.getByText('200%')).toBeDefined()
   })
 
   it('renders an unmarked position without inventing a value', () => {

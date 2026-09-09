@@ -286,9 +286,15 @@ async def reconcile_with_broker(session: SessionJobs) -> None:
     is running" observable rather than assumed — the absence of a halt proves
     nothing, since a job that never ran also never halts.
     """
-    report = await session.reconciler.reconcile(
-        session.portfolio, known_orders=session.open_orders()
-    )
+    # `session.open_orders` — the callable, not its result. Called as an
+    # argument expression it was evaluated *before* the coroutine started, while
+    # `session.portfolio` was read inside it after three broker awaits: the
+    # local order set too early, the local book too late, and 1.4 seconds of
+    # in-flight fills in between. That read ordering, not any divergence, is
+    # what halted trading for 2h59m on day 2 (docs/paper-week/day-2-review.md,
+    # F4). Passing the callable lets the reconciler take both local reads at one
+    # instant, and take them again for its re-read.
+    report = await session.reconciler.reconcile(session.portfolio, known_orders=session.open_orders)
     if report.is_clean:
         log.info("worker.reconcile.clean", checked_at=report.checked_at.isoformat())
         return

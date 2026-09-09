@@ -25,6 +25,10 @@ exactly when it matters most.
 
 from atp_core.dashboard.ports import SnapshotStore
 from atp_core.dashboard.snapshot import (
+    PROTECTION_ARMED_ONLY,
+    PROTECTION_NONE,
+    PROTECTION_PARTIAL,
+    PROTECTION_WORKING,
     AccountSummary,
     LiveSnapshot,
     OrderSummary,
@@ -38,6 +42,10 @@ from atp_core.dashboard.snapshot import (
 )
 
 __all__ = [
+    "PROTECTION_ARMED_ONLY",
+    "PROTECTION_NONE",
+    "PROTECTION_PARTIAL",
+    "PROTECTION_WORKING",
     "AccountSummary",
     "LiveSnapshot",
     "OrderSummary",

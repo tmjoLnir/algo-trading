@@ -39,6 +39,27 @@ class Position:
     take_profit_price: Decimal | None = None
     high_water_mark: Decimal | None = None  # for trailing stops
 
+    #: How much of this position has a stop **working at the venue**, as
+    #: opposed to a level this platform has merely armed.
+    #:
+    #: The distinction is the whole point of the field, and it is not
+    #: pedantic. `stop_loss_price` above is *intent*: the router arms it before
+    #: submitting the child order, deliberately, so that a refused stop still
+    #: leaves the engine-side fallback something to watch. That makes it a
+    #: number which is present whether or not any order exists — and on day 2
+    #: of the paper week it was present on all 38 positions while all 85
+    #: protective orders were rejected. Every screen read the armed level, and
+    #: every screen said "protected".
+    #:
+    #: A quantity rather than a boolean, for the reason
+    #: `OrderRouter.broker_side_protected_qty` gives: a boolean reports a
+    #: partly covered position as protected and hides the naked remainder.
+    #:
+    #: Unsigned, unlike `qty` — it is an amount of cover, not a direction. Zero
+    #: means nothing is resting at the venue, which is also the honest value
+    #: for a position this process has not yet asked about.
+    broker_protected_qty: Decimal = Decimal(0)
+
     @property
     def is_flat(self) -> bool:
         return self.qty == 0
@@ -50,6 +71,23 @@ class Position:
     @property
     def is_short(self) -> bool:
         return self.qty < 0
+
+    @property
+    def unprotected_qty(self) -> Decimal:
+        """How many shares are exposed with no stop resting at the venue.
+
+        docs/SAFETY.md's go-live gate is *"there are no unprotected
+        positions"*, and until this existed the only way to evaluate it was
+        `docker compose logs worker | grep runner.position_unprotected` — which
+        is how the day-2 review found the failure, a day late. Riding the
+        position into the snapshot makes the gate a query.
+
+        Floored at zero: over-cover is a different defect (a stop that would
+        flip the position when it triggers) and reporting it as negative
+        exposure here would net it against a genuinely naked position
+        elsewhere.
+        """
+        return max(Decimal(0), abs(self.qty) - self.broker_protected_qty)
 
     @property
     def market_value(self) -> Decimal:
@@ -145,6 +183,11 @@ class Position:
             self.stop_loss_price = None
             self.take_profit_price = None
             self.high_water_mark = None
+            # Cover follows the position it covered. Left standing, the next
+            # position opened in this symbol would inherit a coverage figure
+            # earned by shares that no longer exist, and read as protected
+            # before anything had been placed for it.
+            self.broker_protected_qty = Decimal(0)
 
         return realized
 

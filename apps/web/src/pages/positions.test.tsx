@@ -60,6 +60,9 @@ const POSITION: PositionView = {
   stop_loss_price: '90.00',
   take_profit_price: '130.00',
   distance_to_stop_pct: '2.0000',
+  protection: 'working',
+  broker_protected_qty: '10',
+  unprotected_qty: '0',
   opened_at: '2026-08-02T14:30:00Z',
 }
 

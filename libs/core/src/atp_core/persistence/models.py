@@ -266,6 +266,17 @@ class PositionSnapshotRow(Base):
     #: silently dropped is a position with no upside exit.
     take_profit_price: Mapped[Decimal | None] = mapped_column(MONEY, nullable=True)
     high_water_mark: Mapped[Decimal | None] = mapped_column(MONEY, nullable=True)
+    #: How much of the position had a stop *working at the venue* when this row
+    #: was written — as against `stop_loss_price` above, which is the level the
+    #: platform armed and carries no claim that any order exists. The two were
+    #: indistinguishable until day 2 of the paper week rejected all 85
+    #: protective orders and every screen went on reporting the armed level
+    #: (docs/paper-week/day-2-review.md, F2a).
+    #:
+    #: Not nullable and defaulted to zero: "nothing is resting at the venue" is
+    #: a fact, and a NULL here would be read as "protected, probably" by exactly
+    #: the reader this column exists to stop misleading.
+    broker_protected_qty: Mapped[Decimal] = mapped_column(MONEY, default=Decimal(0))
     #: Nullable because a position adopted from the broker has no opening time
     #: we know of, and a time stop measuring from "now" would exit late rather
     #: than never — worth telling apart from a genuine zero.

@@ -20,6 +20,7 @@ same thing to anyone sizing an order against it.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
@@ -30,7 +31,7 @@ from atp_core.logging import get_logger
 from atp_core.risk.killswitch import HaltReason, HaltScope
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Iterable
+    from collections.abc import Awaitable, Callable, Collection, Iterable
     from datetime import datetime
 
     from atp_core.brokers.ports import BrokerPort
@@ -47,6 +48,22 @@ log = get_logger(__name__)
 #: layer 7 fire constantly and get switched off, which is worse than a loose
 #: tolerance.
 DEFAULT_CASH_TOLERANCE = Decimal("1.00")
+
+#: How long to wait before re-reading both books when they first disagree.
+#:
+#: Day 2 of the paper week halted global trading twice on a disagreement that
+#: was not one. Of the 78 scheduled reconcile runs, **exactly the 2 that had an
+#: order submitted or filled inside their job window are the 2 that halted**;
+#: all 76 quiet windows were clean, and the run five minutes after the first
+#: halt was clean with no intervention. Perfect precision, and the cost was
+#: 2h59m of RTH with every entry refused (docs/paper-week/day-2-review.md, F4).
+#:
+#: Two seconds because the race it covers is a fill landing between two reads —
+#: the observed window was about 1.4s end to end — and because this is dead time
+#: on a job that runs every five minutes. Long enough to let an in-flight fill
+#: book, short enough that a *real* divergence is still acted on inside a
+#: single job. Set to 0 to disable the re-read.
+DEFAULT_SETTLE_SECONDS = 2.0
 
 #: An account-level discrepancy belongs to no instrument. Empty rather than a
 #: sentinel like "CASH", because `symbol` is an uppercase ticker everywhere
@@ -144,16 +161,34 @@ class Reconciler:
     dependencies: a default that quietly worked would be a default nobody chose.
     """
 
-    def __init__(self, broker: BrokerPort, kill_switch: KillSwitch, clock: Clock) -> None:
+    def __init__(
+        self,
+        broker: BrokerPort,
+        kill_switch: KillSwitch,
+        clock: Clock,
+        *,
+        settle_seconds: float = DEFAULT_SETTLE_SECONDS,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+    ) -> None:
         self.broker = broker
         self.kill_switch = kill_switch
         self.clock = clock
+        #: How long to wait before re-reading both books on a disagreement. See
+        #: `reconcile` for why a disagreement is re-read at all.
+        self.settle_seconds = settle_seconds
+        #: Injected so a test can prove the re-read happens without spending the
+        #: settle in wall-clock time. Not the `Clock`: this is a real pause on
+        #: one machine, not a moment in market time, and a `SimulatedClock`
+        #: cannot make an in-flight fill land.
+        self._sleep: Callable[[float], Awaitable[None]] = (
+            sleep if sleep is not None else asyncio.sleep
+        )
 
     async def reconcile(
         self,
         portfolio: Portfolio,
         *,
-        known_orders: Collection[Order],
+        known_orders: Collection[Order] | Callable[[], Collection[Order]],
         halt_on_mismatch: bool = True,
         cash_tolerance: Decimal = DEFAULT_CASH_TOLERANCE,
     ) -> ReconciliationReport:
@@ -177,7 +212,135 @@ class Reconciler:
         to "skip check 3" would silently disable a documented safety check.
         Neither is a decision this class may make for a caller — the caller is
         the only thing that knows what it submitted.
+
+        **Pass it as a callable.** A `Collection` is evaluated by the caller
+        before this coroutine starts, and that is one half of the read-ordering
+        race described below; a callable is invoked here, at the same instant
+        the local book is snapshotted, and can be invoked again for the
+        re-read. The collection form is still accepted for callers with a
+        genuinely fixed set.
+
+        ── The race this method used to lose ────────────────────────────────
+
+        Day 2 of the paper week halted global trading twice on a divergence
+        that did not exist, costing 2h59m of RTH with every entry refused. The
+        cause was entirely inside this method's read ordering:
+
+            report = await session.reconciler.reconcile(
+                session.portfolio, known_orders=session.open_orders()
+            )
+
+        `session.open_orders()` is a **call**, evaluated as an argument
+        expression *before* the coroutine runs. `session.portfolio` is a **live
+        object reference**, read *inside*, after three sequential broker awaits.
+        So the local order set was read too early, the local book too late, and
+        the venue's three snapshots were scattered across the 1.4 seconds
+        between them. For any order in flight both errors point the same way:
+
+        - an exit submitted 1.12s after the order snapshot is an `orphan_order`
+        - a fill booked locally after `get_positions()` returned is a
+          `missing_position`
+        - a partly filled exit is a `position_qty`
+
+        Every field of that halt decoded to a read artifact. The proof is
+        statistical and total: of 78 scheduled runs, exactly the 2 with an
+        `order.submitted` or a fill inside their window halted, and all 76 quiet
+        windows were clean (F4).
+
+        ── The two fixes ───────────────────────────────────────────────────
+
+        1. **Both local reads happen at one instant**, in `_compare`, before any
+           broker call. The local book can still drift from the venue's during
+           the awaits — nothing here can prevent that — but it is no longer
+           internally inconsistent with itself.
+
+        2. **A disagreement is re-read once before it halts.** A divergence that
+           clears on an immediate re-read was a race; one that survives is real.
+           This is what makes the difference cheap: the cost of the re-read is
+           `settle_seconds` on a job that runs every five minutes, and the cost
+           of not having it was three hours of a trading day.
+
+        A real divergence is delayed by `settle_seconds` and then halts exactly
+        as before. Nothing is softened: the second reading is the one that
+        decides, and it decides with the same rules.
         """
+        report = await self._compare(portfolio, known_orders, cash_tolerance, halt_on_mismatch)
+        if report.is_clean:
+            return report
+
+        if self.settle_seconds > 0:
+            # Logged before the wait, so a reader of the log can see that the
+            # halt which did not follow was withheld deliberately rather than
+            # lost.
+            log.warning(
+                "execution.reconcile.rereading",
+                summary=report.summary(),
+                settle_seconds=self.settle_seconds,
+                detail="books disagree — re-reading once before halting (F4)",
+            )
+            await self._sleep(self.settle_seconds)
+            report = await self._compare(portfolio, known_orders, cash_tolerance, halt_on_mismatch)
+            if report.is_clean:
+                # The whole point. This line is the one that would have replaced
+                # both of day 2's halts.
+                log.info(
+                    "execution.reconcile.race_cleared",
+                    detail=(
+                        "the disagreement cleared on an immediate re-read — it was an "
+                        "in-flight order, not a divergence"
+                    ),
+                )
+                return report
+
+        log.error("execution.reconcile.mismatch", summary=report.summary())
+        if halt_on_mismatch:
+            # Only the kinds that impugn a *position*. A cash drift past the
+            # tolerance and an orphan order — which this module's own comment
+            # calls "most often a protective stop we placed before a restart" —
+            # halt exactly as they do today, and name nothing: neither says
+            # anything about a quantity, and voiding the exit carve-out on them
+            # would refuse every protective stop across the whole book,
+            # unattended, every five minutes (ADR 0029).
+            self.kill_switch.engage(
+                HaltScope.GLOBAL,
+                HaltReason.RECONCILIATION_MISMATCH,
+                engaged_by="reconciler",
+                detail=report.summary(),
+                unproven_symbols=sorted(
+                    {d.symbol for d in report.discrepancies if d.kind.impugns_position and d.symbol}
+                ),
+            )
+        return report
+
+    async def _compare(
+        self,
+        portfolio: Portfolio,
+        known_orders: Collection[Order] | Callable[[], Collection[Order]],
+        cash_tolerance: Decimal,
+        halt_on_mismatch: bool,
+    ) -> ReconciliationReport:
+        """One reading of both books. Called twice on a disagreement.
+
+        **The local side is read first and all at once.** `ours` and `known_ids`
+        are taken before any `await`, so they describe a single instant; that is
+        the half of F4's race this method can actually eliminate. The venue's
+        three snapshots still take time, and a fill landing during them still
+        shows as a difference — which is precisely what the caller's re-read is
+        for.
+
+        Read without `Portfolio.position()`, which creates on access and would
+        add an entry for every broker symbol while we are deciding whether one
+        is missing.
+        """
+        ours = {
+            symbol: position.qty
+            for symbol, position in portfolio.positions.items()
+            if not position.is_flat
+        }
+        our_cash = portfolio.cash
+        orders = known_orders() if callable(known_orders) else known_orders
+        known_ids = {order.client_order_id for order in orders}
+
         try:
             broker_positions = await self.broker.get_positions()
             broker_orders = await self.broker.get_open_orders()
@@ -186,6 +349,10 @@ class Reconciler:
             # Layer 7's own failure mode. We cannot verify the book, which is
             # indistinguishable from knowing it is wrong for anyone about to
             # size an order against it.
+            #
+            # Not subject to the re-read: an unreachable broker is not a race,
+            # and retrying it here would double the time trading continues
+            # against a book nothing can confirm.
             log.error("execution.reconcile.broker_unreachable", error=str(exc))
             if halt_on_mismatch:
                 self.kill_switch.engage(
@@ -197,12 +364,11 @@ class Reconciler:
             raise
 
         report = ReconciliationReport(checked_at=self.clock.now())
-        report.discrepancies.extend(self._position_discrepancies(portfolio, broker_positions))
+        report.discrepancies.extend(self._position_discrepancies(ours, broker_positions))
         report.discrepancies.extend(
-            self._cash_discrepancies(portfolio, account.cash, cash_tolerance)
+            self._cash_discrepancies(our_cash, account.cash, cash_tolerance)
         )
 
-        known_ids = {order.client_order_id for order in known_orders}
         for order in broker_orders:
             if order.client_order_id in known_ids:
                 continue
@@ -230,47 +396,23 @@ class Reconciler:
                 positions=len(broker_positions),
                 open_orders=len(broker_orders),
             )
-            return report
-
-        log.error("execution.reconcile.mismatch", summary=report.summary())
-        if halt_on_mismatch:
-            # Only the kinds that impugn a *position*. A cash drift past the
-            # tolerance and an orphan order — which this module's own comment
-            # calls "most often a protective stop we placed before a restart" —
-            # halt exactly as they do today, and name nothing: neither says
-            # anything about a quantity, and voiding the exit carve-out on them
-            # would refuse every protective stop across the whole book,
-            # unattended, every five minutes (ADR 0029).
-            self.kill_switch.engage(
-                HaltScope.GLOBAL,
-                HaltReason.RECONCILIATION_MISMATCH,
-                engaged_by="reconciler",
-                detail=report.summary(),
-                unproven_symbols=sorted(
-                    {d.symbol for d in report.discrepancies if d.kind.impugns_position and d.symbol}
-                ),
-            )
         return report
 
     def _position_discrepancies(
-        self, portfolio: Portfolio, broker_positions: Iterable[Position]
+        self, ours: dict[str, Decimal], broker_positions: Iterable[Position]
     ) -> list[Discrepancy]:
         """Checks 1 and 2, in both directions.
 
         Compared on *signed* quantity, so a long we believe is a short is a
         discrepancy rather than a match on magnitude — which is the one
         disagreement that doubles the loss when it is acted on.
+
+        Takes the local side as an already-taken snapshot rather than the live
+        `Portfolio`. Reading it here would read it *after* three broker awaits,
+        which is the second half of F4's race — see `_compare`.
         """
         found: list[Discrepancy] = []
         theirs = {position.symbol: position.qty for position in broker_positions}
-        # Read without `Portfolio.position()`, which creates on access and would
-        # add an entry for every broker symbol while we are deciding whether one
-        # is missing.
-        ours = {
-            symbol: position.qty
-            for symbol, position in portfolio.positions.items()
-            if not position.is_flat
-        }
 
         for symbol in sorted(theirs.keys() | ours.keys()):
             their_qty = theirs.get(symbol, Decimal(0))
@@ -296,7 +438,7 @@ class Reconciler:
 
     @staticmethod
     def _cash_discrepancies(
-        portfolio: Portfolio, broker_cash: Decimal, tolerance: Decimal
+        our_cash: Decimal, broker_cash: Decimal, tolerance: Decimal
     ) -> list[Discrepancy]:
         """Check 4. Cash only — equity is not compared.
 
@@ -307,14 +449,14 @@ class Reconciler:
         drift beyond the tolerance means a fill one of us does not know about —
         which is exactly what this exists to catch.
         """
-        drift = portfolio.cash - broker_cash
+        drift = our_cash - broker_cash
         if abs(drift) <= tolerance:
             return []
         return [
             Discrepancy(
                 kind=DiscrepancyKind.CASH,
                 symbol=_NO_SYMBOL,
-                ours=portfolio.cash,
+                ours=our_cash,
                 theirs=broker_cash,
                 detail=f"cash differs by {drift}, beyond the {tolerance} tolerance",
             )

@@ -2548,6 +2548,8 @@ export interface components {
         PositionView: {
             /** Avg Entry Price */
             avg_entry_price: string;
+            /** Broker Protected Qty */
+            broker_protected_qty: string;
             /** Distance To Stop Pct */
             distance_to_stop_pct: string | null;
             /** Fees Paid */
@@ -2558,6 +2560,8 @@ export interface components {
             market_value: string | null;
             /** Opened At */
             opened_at: string | null;
+            /** Protection */
+            protection: string;
             /** Qty */
             qty: string;
             /** Realized Pnl */
@@ -2568,6 +2572,8 @@ export interface components {
             symbol: string;
             /** Take Profit Price */
             take_profit_price: string | null;
+            /** Unprotected Qty */
+            unprotected_qty: string;
             /** Unrealized Pnl */
             unrealized_pnl: string | null;
             /** Unrealized Pnl Pct */

@@ -17,6 +17,16 @@
  * delivered a newer tick for that symbol it is shown beside it, marked live,
  * rather than written over the mark — the P&L next to it was computed from the
  * mark, and quietly swapping the price would put two instants in one row.
+ *
+ * **An armed level is not a working stop.** This is the third rule, and it was
+ * learned the hard way. `stop_loss_price` is armed by the router *before* the
+ * protective order is submitted, so it is populated whether or not the venue
+ * accepted anything. On day 2 of the paper week all 85 protective orders were
+ * rejected off-tick and this table drew a healthy green gauge over 38 naked
+ * positions for ten hours; the operator read it six times in six minutes and
+ * was reassured (docs/paper-week/day-2-review.md, F2a). The server now sends
+ * `protection`, and a position the venue is not holding is never drawn as one
+ * that it is.
  */
 
 import {
@@ -45,8 +55,37 @@ interface Props {
  * because nothing has priced the position — which is a row showing a stop price
  * beside the words "no stop", i.e. a contradiction on its face. The second is
  * the more alarming of the two and used to be rendered as the first.
+ *
+ * `protection` gates all of it. A bar drawn from an armed level says "this
+ * position is 40% of the way to its stop" about a stop that does not exist, so
+ * for `armed_only` **no bar is drawn at all** — the review's own words are that
+ * a gauge which cannot tell the two apart should not be drawn. `partial` still
+ * draws one, because the covered part of the position genuinely is protected,
+ * with the naked remainder stated beside it.
  */
-function StopGauge({ fraction, hasStop }: { fraction: string | null; hasStop: boolean }) {
+function StopGauge({
+  fraction,
+  hasStop,
+  protection,
+  unprotectedQty,
+}: {
+  fraction: string | null
+  hasStop: boolean
+  protection: string
+  unprotectedQty: string
+}) {
+  if (protection === 'armed_only') {
+    // The day-2 state. Loud, and deliberately not a bar: there is nothing at
+    // the venue for a bar to measure against.
+    return (
+      <span
+        className="text-xs font-semibold text-rose-400"
+        title="A stop level is armed in the engine, but no stop order is working at the broker. The engine-side fallback only exists while the worker is running — it does not survive a crash, a restart, or the overnight gap."
+      >
+        ⚠ NO VENUE STOP
+      </span>
+    )
+  }
   if (fraction === null) {
     return hasStop ? (
       <span
@@ -75,6 +114,14 @@ function StopGauge({ fraction, hasStop }: { fraction: string | null; hasStop: bo
         {formatPercent(fraction, { places: 0 })}
       </span>
       {through ? <span className="text-xs font-semibold text-rose-400">THROUGH STOP</span> : null}
+      {protection === 'partial' ? (
+        <span
+          className="text-xs font-semibold text-amber-400"
+          title="Only part of this position has a stop working at the broker. The rest is naked."
+        >
+          {formatDecimal(unprotectedQty)} NAKED
+        </span>
+      ) : null}
     </div>
   )
 }
@@ -175,9 +222,26 @@ export default function PositionsTable({ positions, quotes = {} }: Props) {
                       <StopGauge
                         fraction={position.distance_to_stop_pct}
                         hasStop={position.stop_loss_price !== null}
+                        protection={position.protection}
+                        unprotectedQty={position.unprotected_qty}
                       />
                     </td>
-                    <td className="px-3 py-2 text-right tabular-nums text-slate-400">
+                    <td
+                      className={`px-3 py-2 text-right tabular-nums ${
+                        // The number itself is struck through when nothing at
+                        // the venue is holding it. A price rendered plainly in
+                        // a column headed "Stop" is a claim, and for
+                        // `armed_only` it is the wrong one.
+                        position.protection === 'armed_only'
+                          ? 'text-rose-400/70 line-through'
+                          : 'text-slate-400'
+                      }`}
+                      title={
+                        position.protection === 'armed_only'
+                          ? 'Armed in the engine only — no stop order is working at the broker.'
+                          : undefined
+                      }
+                    >
                       {formatMoney(position.stop_loss_price)}
                     </td>
                     <td className="px-3 py-2 text-right tabular-nums text-slate-400">
