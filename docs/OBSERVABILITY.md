@@ -133,6 +133,7 @@ Everything is declared in one file — `libs/core/src/atp_core/metrics/registry.
 | Metric | |
 |---|---|
 | `atp_halts_engaged_total{scope,reason}` | counts a *new* halt. Re-engaging an active one is not a second incident, the same way it is not a second notification (ADR 0012) |
+| `atp_halts_escalated_total{scope,reason}` | **exits stopped too**, for the symbols the halt names (ADR 0029). A second counter and not a second `halts_engaged`, so one incident does not read as two — it fires when a standing halt learns something it cannot prove, and when a halt is *created* already carrying evidence, which is the common case |
 | `atp_halts_cleared_total{scope}` | every one of these is somebody's decision |
 | `atp_halt_active{scope,reason,target}` | read from Redis at scrape time, API only |
 | `atp_halt_state_readable` | **0 means orders are being refused** — the kill switch fails closed |

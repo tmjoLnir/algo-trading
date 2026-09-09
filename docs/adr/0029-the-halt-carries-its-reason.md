@@ -118,6 +118,19 @@ Five properties, each chosen against the alternative:
   "halted for reasons we could not read" and "halted for reasons that impugn
   nothing" are different, and a caller that conflates them picks a policy nobody
   chose.
+
+  **The residual, stated rather than left implicit.** That reasoning is about an
+  *outage*, and there is a second way to reach `unreadable`: a record this
+  process cannot decode. When the record it cannot read is the one carrying the
+  impugnment, the evidence is genuinely lost — the halt still stands, but the
+  carve-out is open for a symbol something meant to close it for. Nothing better
+  is available: an unreadable record cannot name its symbols, and the only
+  alternative — impugning the whole book whenever any record fails to decode —
+  refuses every exit and every protective stop across the account on a rolling
+  deploy, which is the outage this bullet exists to prevent. The exposure is
+  narrow (a `HaltReason` a newer process wrote, during a deploy window) and it
+  is one-sided in the direction of *permitting* an exit, so it is accepted here
+  and named rather than argued away.
 - **`DiscrepancyKind` is a `StrEnum` with `match`/`assert_never`**, not a set
   membership test. **Both defaults are wrong** — a sixth kind defaulting to
   "impugns" strands every stop on a benign finding, defaulting to "does not"

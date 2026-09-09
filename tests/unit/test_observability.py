@@ -18,8 +18,10 @@ so its refusals are tested by what they would produce, not by the regex.
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -128,6 +130,80 @@ class TestTheRegistryItself:
         assert value("atp_risk_denials_total", rule="max_position_size") == 1
 
 
+class TestTheDocumentedMetricsAreTheRealOnes:
+    """docs/OBSERVABILITY.md enumerates every metric this platform exports, and
+    a table that lags the registry is worse than no table: an operator building
+    an alert reads it as the complete set.
+
+    It had already lagged. `atp_halts_escalated_total` shipped with ADR 0029 and
+    was absent from that table — nothing compared the two, so nothing said so.
+    Derived here rather than trusted, the same standing `rules.EXIT_BLIND_RULES`
+    and `config._ENV_MODELS` have, and for the same reason.
+
+    Compared on the *exported* names taken from a render of the live registry,
+    because that is what a scrape returns — a test reading Python attribute
+    names would agree with itself while the wire format drifted.
+    """
+
+    @staticmethod
+    def _exported() -> set[str]:
+        """Every series the registry renders, less the derived suffixes.
+
+        Prometheus appends `_created` to a counter and `_bucket`/`_sum`/`_count`
+        to a histogram. The table documents the base name a person greps for, so
+        those come off; `_total` stays, because the table carries it.
+        """
+        names = {
+            line.split(" ")[2]
+            for line in metrics.render().decode().splitlines()
+            if line.startswith("# TYPE ")
+        }
+        return {n for n in names if not n.endswith(("_created", "_bucket", "_sum", "_count"))}
+
+    @staticmethod
+    def _documented() -> set[str]:
+        """Every `atp_*` name the document mentions, wherever it mentions it.
+
+        Anywhere, not just in the tables: three of them — the two API series and
+        `atp_build_info` — are written up in a prose paragraph instead, and a
+        matcher that only read table rows would have called them undocumented
+        and taught the next person to silence this test.
+        """
+        doc = (Path(__file__).resolve().parents[2] / "docs" / "OBSERVABILITY.md").read_text()
+        return set(re.findall(r"`(atp_[a-z_]+)(?:\{[^}]*\})?`", doc))
+
+    #: Exported by the API at scrape time from an authoritative Redis read
+    #: rather than by this registry, which is deliberate — `metrics/registry.py`
+    #: keeps no second source of truth for halt state (ADR 0029).
+    _API_ONLY = frozenset({"atp_halt_active", "atp_halt_state_readable"})
+
+    def test_every_exported_metric_is_documented(self) -> None:
+        # Touch the halt recorders first: a labelled counter renders nothing
+        # until it is used once, so an untouched series would look absent and
+        # this test would pass over exactly the drift it exists to catch.
+        metrics.halt_engaged(HaltScope.GLOBAL, HaltReason.MANUAL)
+        metrics.halt_escalated(HaltScope.GLOBAL, HaltReason.RECONCILIATION_MISMATCH)
+        metrics.halt_cleared(HaltScope.GLOBAL)
+
+        undocumented = self._exported() - self._documented()
+
+        assert undocumented == set(), (
+            "exported but absent from docs/OBSERVABILITY.md, so an operator reading "
+            "that table as the complete set would miss them:\n  "
+            + "\n  ".join(sorted(undocumented))
+        )
+
+    def test_every_documented_metric_exists(self) -> None:
+        """The other direction. A metric documented and never exported sends
+        somebody to build an alert on a series that will never fire, which is
+        this file's own "confidently wrong rather than absent"."""
+        phantom = self._documented() - self._exported() - self._API_ONLY
+
+        assert phantom == set(), (
+            "documented but not exported by the core registry:\n  " + "\n  ".join(sorted(phantom))
+        )
+
+
 class TestTheKillSwitchIsCounted:
     """The counter and the phone notification must agree, since both hang off
     `engage` for the same reason (ADR 0012)."""
@@ -154,6 +230,69 @@ class TestTheKillSwitchIsCounted:
             switch.engage(HaltScope.GLOBAL, HaltReason.DATA_FEED_LOST, engaged_by="monitor")
 
         assert value("atp_halts_engaged_total", scope="global", reason="data_feed_lost") == 1
+
+    def test_an_escalation_is_counted_apart_from_the_halt(self) -> None:
+        """ADR 0029: "a second counter, not a second `halt_engaged` … one
+        incident must not read as two on the graph".
+
+        Driven through the real switch, because the whole point of this file is
+        that a metric must agree with the thing it counts. Both directions are
+        asserted: the escalation counter moves, and `halts_engaged` does *not* —
+        counting an escalation as a second halt would double every incident that
+        starts manual and learns something, against every rate alert built on
+        it.
+        """
+        switch = RedisKillSwitch(FakeRedis())  # type: ignore[arg-type]
+        switch.engage(HaltScope.GLOBAL, HaltReason.MANUAL, engaged_by="ops")
+
+        switch.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            engaged_by="reconciler",
+            unproven_symbols=("SPY",),
+        )
+
+        assert (
+            value("atp_halts_escalated_total", scope="global", reason="reconciliation_mismatch")
+            == 1
+        )
+        assert value("atp_halts_engaged_total", scope="global", reason="manual") == 1
+        assert (
+            value("atp_halts_engaged_total", scope="global", reason="reconciliation_mismatch") == 0
+        ), "one incident, not two"
+
+    def test_a_halt_born_with_evidence_counts_both(self) -> None:
+        """The common case, and the one that has no escalation to hang off.
+
+        The five-minute reconcile normally finds its mismatch on a platform that
+        was trading happily, so nothing is halted and the record is *created*
+        impugned. Two different facts happened at once — trading stopped, and
+        exits stopped for a named symbol — so both counters move.
+        """
+        switch = RedisKillSwitch(FakeRedis())  # type: ignore[arg-type]
+
+        switch.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            engaged_by="reconciler",
+            unproven_symbols=("SPY",),
+        )
+
+        assert (
+            value("atp_halts_engaged_total", scope="global", reason="reconciliation_mismatch") == 1
+        )
+        assert (
+            value("atp_halts_escalated_total", scope="global", reason="reconciliation_mismatch")
+            == 1
+        )
+
+    def test_a_halt_that_impugns_nothing_does_not_count_an_escalation(self) -> None:
+        """The majority case stays a single fact."""
+        switch = RedisKillSwitch(FakeRedis())  # type: ignore[arg-type]
+
+        switch.engage(HaltScope.GLOBAL, HaltReason.MANUAL, engaged_by="ops")
+
+        assert value("atp_halts_escalated_total", scope="global", reason="manual") == 0
 
     def test_clearing_counts_only_when_something_was_engaged(self) -> None:
         switch = RedisKillSwitch(FakeRedis())  # type: ignore[arg-type]

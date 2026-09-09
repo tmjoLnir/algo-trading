@@ -23,6 +23,7 @@ per file is one the next file forgets.
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -134,24 +135,63 @@ def test_no_test_hides_inside_a_class_pytest_does_not_collect() -> None:
     time side effect cannot hide from it and a syntax error is a loud failure
     rather than a skip. Names, not `pytest`'s own collection: the point is to
     catch the file where the two disagree.
-    """
-    import ast
 
+    **Three shapes, because the first version of this guard missed two of them**
+    — including the one it was written for. `pytest` never descends into a class
+    it will not collect, so a `Test*` class *nested* inside an ordinary one is
+    as invisible as a `test_` method is, and the original check skipped any
+    class whose own name began with `Test` without looking at what enclosed it.
+    A `Test*` class with an `__init__` is the third: `pytest` refuses it with a
+    `PytestCollectionWarning` that nothing in `make check` turns into a failure.
+    All three were found by an adversarial review of the guard itself, and each
+    is verified here by construction rather than by argument.
+    """
     tests_root = Path(__file__).resolve().parent.parent
     orphans: list[str] = []
+
+    def walk(node: ast.AST, path: Path, enclosing: tuple[str, ...], collected: bool) -> None:
+        """Descend the way `pytest` does, carrying whether it can still reach us.
+
+        `collected` is False the moment any enclosing class is one `pytest`
+        skips: nothing beneath such a class is ever reached, however it is
+        named. That is the whole correction — the flag is inherited, not
+        recomputed from the node's own name.
+        """
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                takeable = collected and _is_collectable(child)
+                walk(child, path, (*enclosing, child.name), takeable)
+            elif (
+                isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
+                and child.name.startswith("test_")
+                and enclosing
+                and not collected
+            ):
+                orphans.append(
+                    f"{path.relative_to(tests_root)}::{'::'.join(enclosing)}::{child.name}"
+                )
+
     for path in sorted(tests_root.rglob("*.py")):
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ClassDef) or node.name.startswith("Test"):
-                continue
-            orphans += [
-                f"{path.relative_to(tests_root)}::{node.name}::{item.name}"
-                for item in node.body
-                if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef)
-                and item.name.startswith("test_")
-            ]
+        walk(ast.parse(path.read_text(), filename=str(path)), path, (), True)
 
     assert orphans == [], (
-        "these test methods live on a class pytest will not collect, so they "
-        "never run — rename the class to Test* or move the method out:\n  " + "\n  ".join(orphans)
+        "these test methods live under a class pytest will not collect, so they "
+        "never run — rename the class to Test*, give it no __init__, or move the "
+        "method out:\n  " + "\n  ".join(orphans)
+    )
+
+
+def _is_collectable(node: ast.ClassDef) -> bool:
+    """Whether `pytest` would collect tests from this class at all.
+
+    Two refusals, and neither is loud enough to catch on its own: a name that
+    does not start with `Test` is skipped silently, and an `__init__` is skipped
+    with a `PytestCollectionWarning` that `make check` does not turn into a
+    failure.
+    """
+    if not node.name.startswith("Test"):
+        return False
+    return not any(
+        isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef) and item.name == "__init__"
+        for item in node.body
     )
