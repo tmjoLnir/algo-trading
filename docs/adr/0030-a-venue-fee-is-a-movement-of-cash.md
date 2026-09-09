@@ -1,6 +1,6 @@
 # 30. A venue fee is a movement of cash, not drift for a tolerance to absorb
 
-**Status:** Accepted · 2026-09-09
+**Status:** Accepted · 2026-09-09 · amended by [ADR 0031](0031-a-fee-is-settled-when-the-cash-says-so.md)
 
 Narrows a premise ADR 0011 and `Reconciler` both rest on. The reconciliation
 design is otherwise unchanged and this depends on it.

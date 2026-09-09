@@ -156,33 +156,37 @@ class OrderRepository(Protocol):
 
 
 class FeeLedger(Protocol):
-    """Which venue fees this platform has already taken out of its cash.
+    """Which venue fees this platform has been told about.
 
-    The reconciler re-reads the venue's fee feed on every run, so the same
-    charge is offered over and over; this is what makes applying it exactly
-    once possible. It is a *ledger* and not a watermark on purpose — a fee
-    booked late would slip behind a date cursor and never be applied, and the
-    symptom of that is the drift the whole path exists to remove.
+    Told about — not applied. The distinction is the whole of ADR 0031. A
+    ledger that recorded what it had *applied* was two writes away from the
+    cash it claimed to describe, and on 2026-09-09 those two writes disagreed:
+    the charges committed, the corrected cash never reached a snapshot, and
+    nothing in the schema could tell "applied" from "recorded and then lost".
+    Whether a charge is reflected in the book is `Portfolio.fees_settled`'s
+    answer, and it is written by the same statement as the cash.
 
-    Implementations must be atomic: two workers reconciling at the same instant
-    must not both be told a charge is new. Postgres does this with
-    `INSERT ... ON CONFLICT DO NOTHING RETURNING`, which is one statement and
-    needs no lock.
+    A ledger rather than a date watermark, still, for ADR 0030's reason: a fee
+    booked late slips behind a cursor and is never seen at all.
     """
 
-    async def record_unseen(
-        self, activities: Sequence[FeeActivity], *, run_mode: RunMode
-    ) -> list[FeeActivity]:
-        """Store what has not been stored, and return exactly that.
+    async def record_seen(self, activities: Sequence[FeeActivity], *, run_mode: RunMode) -> Decimal:
+        """Record any charges not already recorded; return the total of all of them.
 
-        The return value is the contract: everything in it has been durably
-        recorded and has *not* been applied to cash by anyone before, so the
-        caller must apply all of it. Anything already known is dropped
-        silently — that is the normal case on every run after the first.
+        The return value is the total over **every** fee ever seen for this run
+        mode, not over the argument. That is what makes the caller's arithmetic
+        re-derivable: the correction owed is this total minus what the stored
+        book says it has settled, so a crash between recording and settling
+        leaves both operands durable and the next run derives the same answer.
 
-        Scoped by `run_mode` because a paper account and a live account are
-        different money with their own fee streams, and the ids are only
-        unique within one of them.
+        Summing only the recent window would be wrong in the one direction that
+        looks like diligence — as old charges age out of the caller's lookback
+        the total would fall, and the difference would read as a credit owed
+        back to cash.
+
+        Scoped by `run_mode`: paper money and real money are different accounts
+        with their own fee streams, and an activity id is only unique inside
+        one of them.
         """
         ...
 

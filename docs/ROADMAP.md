@@ -974,8 +974,13 @@ above.
   fill, so our cash was a fills-only total against a venue cash that was not —
   a ratchet, not drift. It reached $4.14 against a $1.00 tolerance in one
   session and crash-looped the worker on 2026-09-09. Closed by
-  `get_fee_activities` and `atp_core.execution.fees` (ADR 0030). A comment
-  naming a gap is not a plan to close it.
+  `get_fee_activities` and `atp_core.execution.fees` (ADR 0030) — then closed
+  again properly the same day. The first fix recorded a charge as applied in one
+  transaction and adjusted cash in another, so a worker that died between them
+  lost the correction permanently and crash-looped a second time on the same
+  $4.14. The claim now rides on the row that carries the cash, and the
+  correction is re-derived on every pass (ADR 0031). A comment naming a gap is
+  not a plan to close it, and a fix that has not survived a crash is not a fix.
 
   One gap is stated rather than left to be discovered: REST reports
   `filled_qty` and `filled_avg_price` as running totals, so a fill read this
