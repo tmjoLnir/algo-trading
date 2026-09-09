@@ -64,9 +64,7 @@ def upgrade() -> None:
         sa.Column("description", sa.Text(), nullable=False, server_default=""),
         sa.Column("applied_at", sa.DateTime(timezone=True), nullable=False),
     )
-    op.create_index(
-        "ix_broker_fees_run_mode_booked_on", "broker_fees", ["run_mode", "booked_on"]
-    )
+    op.create_index("ix_broker_fees_run_mode_booked_on", "broker_fees", ["run_mode", "booked_on"])
 
 
 def downgrade() -> None:
