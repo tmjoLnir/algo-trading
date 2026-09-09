@@ -169,13 +169,43 @@ absence of alerts and a working platform look identical from a phone.
 
 Our book disagrees with the broker's. **Do not resume until it is understood.**
 
-1. Compare `GET /api/v1/positions` with the broker's own UI.
-2. Usual causes: a fill during a restart, a missed WS event, a corporate action,
+1. **Read the numbers off the log.** `execution.reconcile.mismatch` carries
+   `findings` — each discrepancy with `ours`, `theirs` and the sentence that
+   explains it. The one-line `summary` names the kind and the symbol only, and a
+   cash finding has no symbol, so on its own it reads `cash: account` and tells
+   you nothing about size.
+2. Compare `GET /api/v1/positions` with the broker's own UI. For cash,
+   `uv run python scripts/status.py` prints the venue's `equity` and `cash`
+   beside local state.
+3. Usual causes: a fill during a restart, a missed WS event, a corporate action,
    a manual trade placed outside the platform.
-3. Once you know *why*, `adopt_broker_state()` to resync. Not before —
+4. Once you know *why*, `adopt_broker_state()` to resync. Not before —
    adopting silently hides the bug, and if the cause is duplicate submission you
    will do it again tomorrow.
-4. Clear the halt.
+5. Clear the halt.
+
+**A cash-only mismatch with matching positions is a different animal.** Cash
+moves for reasons that are not fills, and on Alpaca the reason is regulatory
+fees — CAT, REG and TAF — which the venue books on the account activity feed and
+never on the fill. Those are settled automatically now (ADR 0030), so a cash
+gap that *survives* reconciliation is a genuine missed fill and step 3 applies.
+Before that fix they accumulated silently: one session cost $4.14 against a
+$1.00 tolerance and crash-looped the worker the next morning. To see the venue's
+own fee rows for a day:
+
+```bash
+curl -s -H "APCA-API-KEY-ID: $ALPACA_KEY" -H "APCA-API-SECRET-KEY: $ALPACA_SECRET" \
+  "$ALPACA_BASE/v2/account/activities?activity_types=FEE&after=2026-09-08"
+```
+
+Note `activity_types=FEE` and not `REG` or `TAF`: those two are
+`activity_sub_type` values *under* `FEE`, and asking for them as types returns
+an empty list that looks like a venue charging nothing.
+
+**`Position.fees_paid` stays zero on Alpaca, and that is not a bug to chase.** A
+regulatory fee is charged against the account for a day's proceeds, so it
+belongs to no position; it settles against cash. Per-position P&L is therefore
+gross of regulatory fees, and account equity is not.
 
 **While it stands, the mismatched symbols cannot be closed by the platform** —
 not by a flatten, not by a protective stop (ADR 0029). That is the point: an

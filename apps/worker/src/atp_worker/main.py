@@ -51,6 +51,7 @@ from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.dashboard import RedisSnapshotStore
 from atp_core.persistence.db import create_engine, create_session_factory
 from atp_core.persistence.events import RedisEventPublisher
+from atp_core.persistence.fees import PostgresFeeLedger
 from atp_core.persistence.orders import PostgresOrderRepository
 from atp_core.persistence.positions import PostgresPortfolioRepository
 from atp_core.persistence.quotes import RedisQuoteCache
@@ -300,6 +301,11 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
                 calendar=TradingCalendar(),
                 last_tick_at=ingestor.last_tick_at,
                 order_repo=PostgresOrderRepository(session_factory),
+                # Without this the reconciler compares our fills-only cash
+                # against a venue that also charges regulatory fees, and the
+                # gap widens every session until it halts the worker
+                # (`atp_core.execution.fees`).
+                fee_ledger=PostgresFeeLedger(session_factory, clock),
                 portfolio_repo=portfolio_repo,
                 strategy_repo=PostgresStrategyRepository(session_factory, clock),
                 signal_repo=PostgresSignalRepository(session_factory),

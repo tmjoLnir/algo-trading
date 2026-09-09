@@ -12,6 +12,7 @@ order status nobody mapped is the case that reports a dead order as working.
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -492,3 +493,140 @@ class TestCancelAndFlatten:
 
         with pytest.raises(BrokerError, match="QQQ"):
             await make_broker().close_all_positions()
+
+
+ACTIVITIES_URL = f"{BASE}/v2/account/activities"
+
+#: The account feed for 2026-09-08, verbatim. Kept whole rather than trimmed to
+#: the fields the parser reads, because the shape is half of what is under test
+#: — `REG` and `TAF` are `activity_sub_type` values under one `FEE`
+#: `activity_type`, and a reader who takes them for activity types asks a
+#: question the venue answers with an empty list.
+DAY_TWO_ACTIVITIES: list[dict[str, Any]] = [
+    {
+        "id": "20260908000000000::da7b17a5-2eb4-4990-858c-ff53b830f8de",
+        "activity_type": "FEE",
+        "activity_sub_type": "CAT",
+        "date": "2026-09-08",
+        "created_at": "2026-09-09T00:06:01.682153Z",
+        "net_amount": "-0.01",
+        "description": "CAT fee for proceed of 174 trades on 2026-09-08 by PA3C8I8RRUBZ",
+        "status": "executed",
+        "currency": "USD",
+    },
+    {
+        "id": "20260908000000000::97e8ab4e-6a81-42f5-8338-1bd6b5609864",
+        "activity_type": "FEE",
+        "activity_sub_type": "REG",
+        "date": "2026-09-08",
+        "created_at": "2026-09-09T00:17:05.448916Z",
+        "net_amount": "-3.82",
+        "description": "REG fee for proceed of $185271.37 on 2026-09-08 by PA3C8I8RRUBZ",
+        "status": "executed",
+        "currency": "USD",
+    },
+    {
+        "id": "20260908000000000::6fa7483d-449e-474d-8909-b1bc9a8e029b",
+        "activity_type": "FEE",
+        "activity_sub_type": "TAF",
+        "date": "2026-09-08",
+        "created_at": "2026-09-09T00:17:05.448916Z",
+        "net_amount": "-0.31",
+        "description": "TAF fee for proceed of 1572 shares (89 trades) on 2026-09-08",
+        "status": "executed",
+        "currency": "USD",
+    },
+]
+
+
+class TestFeeActivities:
+    """The endpoint two comments in this adapter called "a known gap the
+    activities endpoint closes" while nothing called it."""
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_the_real_feed_parses_to_the_four_dollars_that_halted_the_worker(
+        self,
+    ) -> None:
+        route = respx.get(ACTIVITIES_URL).mock(
+            return_value=httpx.Response(200, json=DAY_TWO_ACTIVITIES)
+        )
+
+        fees = await make_broker().get_fee_activities(date(2026, 8, 10))
+
+        assert sum(f.amount for f in fees) == Decimal("4.14")
+        # The venue's own order, not the order of a UUID suffix.
+        assert [f.sub_type for f in fees] == ["CAT", "REG", "TAF"]
+        assert all(f.booked_on == date(2026, 9, 8) for f in fees)
+        # One activity type, not three. Asking for REG and TAF as types is the
+        # mistake that returns nothing and looks like a venue charging nothing.
+        assert route.calls.last.request.url.params["activity_types"] == "FEE"
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_the_sign_is_normalised_to_positive_for_a_charge(self) -> None:
+        """Alpaca signs money leaving the account negative. Every caller settles
+        with `cash -= amount`, so the adapter owns the venue's convention and
+        nothing downstream has to remember it."""
+        respx.get(ACTIVITIES_URL).mock(
+            return_value=httpx.Response(200, json=[DAY_TWO_ACTIVITIES[1]])
+        )
+
+        fees = await make_broker().get_fee_activities(date(2026, 8, 10))
+
+        assert fees[0].amount == Decimal("3.82"), "positive, though the wire said -3.82"
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_second_page_is_followed(self) -> None:
+        """A partial read looks exactly like a session that paid fewer fees."""
+        first = [dict(row, id=f"page1-{i}") for i, row in enumerate(DAY_TWO_ACTIVITIES)]
+        first += [dict(DAY_TWO_ACTIVITIES[0], id=f"pad-{i}") for i in range(97)]
+        assert len(first) == 100
+        second = [dict(DAY_TWO_ACTIVITIES[1], id="page2-1")]
+        respx.get(ACTIVITIES_URL).mock(
+            side_effect=[httpx.Response(200, json=first), httpx.Response(200, json=second)]
+        )
+
+        fees = await make_broker().get_fee_activities(date(2026, 8, 10))
+
+        assert len(fees) == 101
+        assert any(f.activity_id == "page2-1" for f in fees)
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_fee_the_venue_has_not_charged_yet_is_not_applied(self) -> None:
+        """Applying a pending fee puts our cash *below* the venue's — drift in
+        the other direction, reported identically and harder to read."""
+        respx.get(ACTIVITIES_URL).mock(
+            return_value=httpx.Response(200, json=[dict(DAY_TWO_ACTIVITIES[1], status="pending")])
+        )
+
+        assert await make_broker().get_fee_activities(date(2026, 8, 10)) == []
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_one_unreadable_row_costs_that_row_and_not_the_batch(self) -> None:
+        """The same argument `sweepable_series` makes for one dead ticker. What
+        is skipped stays unapplied and therefore stays visible as drift."""
+        rows: list[dict[str, Any]] = [{"id": "broken", "activity_type": "FEE"}]
+        rows += DAY_TWO_ACTIVITIES
+
+        fees = await self._fetch(rows)
+
+        assert sum(f.amount for f in fees) == Decimal("4.14")
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_venue_that_charges_nothing_returns_nothing(self) -> None:
+        assert await self._fetch([]) == []
+
+    @staticmethod
+    async def _fetch(rows: list[dict[str, Any]]) -> list[Any]:
+        respx.get(ACTIVITIES_URL).mock(return_value=httpx.Response(200, json=rows))
+        return await make_broker().get_fee_activities(date(2026, 8, 10))
+
+
+@pytest.mark.asyncio
+async def test_the_adapter_still_satisfies_the_port() -> None:
+    assert isinstance(make_broker(), BrokerPort)

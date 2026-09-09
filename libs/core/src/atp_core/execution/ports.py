@@ -19,9 +19,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from datetime import datetime
     from decimal import Decimal
 
+    from atp_core.brokers.ports import FeeActivity
     from atp_core.domain import Order, OrderStatus, Portfolio, RunMode
 
 
@@ -149,6 +151,38 @@ class OrderRepository(Protocol):
         Scoped by run mode for the same reason as `open_orders`: paper and live
         share a table, and a screen mixing them is worse than one showing
         neither.
+        """
+        ...
+
+
+class FeeLedger(Protocol):
+    """Which venue fees this platform has already taken out of its cash.
+
+    The reconciler re-reads the venue's fee feed on every run, so the same
+    charge is offered over and over; this is what makes applying it exactly
+    once possible. It is a *ledger* and not a watermark on purpose — a fee
+    booked late would slip behind a date cursor and never be applied, and the
+    symptom of that is the drift the whole path exists to remove.
+
+    Implementations must be atomic: two workers reconciling at the same instant
+    must not both be told a charge is new. Postgres does this with
+    `INSERT ... ON CONFLICT DO NOTHING RETURNING`, which is one statement and
+    needs no lock.
+    """
+
+    async def record_unseen(
+        self, activities: Sequence[FeeActivity], *, run_mode: RunMode
+    ) -> list[FeeActivity]:
+        """Store what has not been stored, and return exactly that.
+
+        The return value is the contract: everything in it has been durably
+        recorded and has *not* been applied to cash by anyone before, so the
+        caller must apply all of it. Anything already known is dropped
+        silently — that is the normal case on every run after the first.
+
+        Scoped by `run_mode` because a paper account and a live account are
+        different money with their own fee streams, and the ids are only
+        unique within one of them.
         """
         ...
 

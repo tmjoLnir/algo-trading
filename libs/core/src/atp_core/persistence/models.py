@@ -14,7 +14,7 @@ Schema notes that matter:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -23,6 +23,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -446,3 +447,44 @@ class AuditLogRow(Base):
     action: Mapped[str] = mapped_column(String(50))
     target: Mapped[str | None] = mapped_column(String(100), nullable=True)
     detail: Mapped[JsonDict] = mapped_column(JSON, default=dict)
+
+
+class BrokerFeeRow(Base):
+    """One venue fee this platform has taken out of its own cash.
+
+    The table is a *ledger of what we applied*, not a copy of the venue's feed.
+    It exists for one question — "have we already charged this?" — asked on
+    every reconcile, because the fee feed is re-read every time and the same
+    charge is offered over and over.
+
+    `activity_id` is the venue's identifier and it is the primary key, so
+    applying a fee twice is impossible rather than merely unlikely: the second
+    `INSERT ... ON CONFLICT DO NOTHING` returns no row and the caller applies
+    nothing. A watermark by date was the alternative and is wrong — Alpaca
+    stamped 2026-09-08's fees with `created_at` after midnight on the 9th, so a
+    fee booked late would slip behind a cursor and never be applied at all.
+
+    Not a foreign key to anything. A regulatory fee is charged against the
+    account for a day's proceeds ("REG fee for proceed of $185271.37 on
+    2026-09-08"), so it belongs to no order and no position, and inventing an
+    attribution would put a number nobody chose into per-position P&L.
+    """
+
+    __tablename__ = "broker_fees"
+    __table_args__ = (Index("ix_broker_fees_run_mode_booked_on", "run_mode", "booked_on"),)
+
+    #: The venue's activity id. Primary key, and therefore the idempotency key.
+    activity_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    #: Paper money and real money are different accounts with their own fee
+    #: streams, and an id is only unique inside one of them.
+    run_mode: Mapped[str] = mapped_column(String(10))
+    #: The day the venue booked the charge, which is not the day it told us.
+    booked_on: Mapped[date] = mapped_column(Date)
+    #: Positive for money that left the account — normalised by the adapter, so
+    #: this column reads the same whatever a venue's own sign convention is.
+    amount: Mapped[Decimal] = mapped_column(MONEY)
+    #: The venue's name for the kind of fee: CAT, REG, TAF.
+    sub_type: Mapped[str] = mapped_column(String(32), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    #: When *we* applied it, which is the audit question this table answers.
+    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

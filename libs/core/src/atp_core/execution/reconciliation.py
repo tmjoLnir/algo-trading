@@ -27,6 +27,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, assert_never
 
 from atp_core.errors import BrokerError
+from atp_core.execution.fees import settle_broker_fees
 from atp_core.logging import get_logger
 from atp_core.risk.killswitch import HaltReason, HaltScope
 
@@ -36,7 +37,8 @@ if TYPE_CHECKING:
 
     from atp_core.brokers.ports import BrokerPort
     from atp_core.clock import Clock
-    from atp_core.domain import Order, Portfolio, Position
+    from atp_core.domain import Order, Portfolio, Position, RunMode
+    from atp_core.execution.ports import FeeLedger
     from atp_core.risk.killswitch import KillSwitch
 
 log = get_logger(__name__)
@@ -151,6 +153,59 @@ class ReconciliationReport:
             parts.append(f"orphan orders: {', '.join(sorted(self.orphan_order_ids))}")
         return " | ".join(parts)
 
+    def findings(self) -> list[dict[str, str]]:
+        """Every discrepancy with its numbers, for the structured log line.
+
+        `summary()` is the one-line version and it deliberately drops
+        everything but the kind and the symbol, which is right for a phone
+        notification (docs/RUNBOOK.md keeps balances off the alert on purpose)
+        and wrong for the log an operator opens next.
+
+        A cash discrepancy carries `_NO_SYMBOL`, so `summary()` renders it as
+        the bare string `cash: account` — and on 2026-09-09 that string was the
+        *entire* diagnostic in the worker's log, in the halt record and in the
+        alert. The drift was $4.14 against a $1.00 tolerance and none of the
+        three said so; the operator had to run `scripts/status.py` against the
+        venue to learn a number this object was already holding. `ours`,
+        `theirs` and `detail` are built on every `Discrepancy` — the sentence
+        `_cash_discrepancies` writes is the whole explanation — and were
+        thrown away one call short of the log.
+
+        Rendered as strings because these are `Decimal`s and a structlog
+        processor is not required to keep them exact on the way to JSON, which
+        is the same argument rule §1.1 makes everywhere else.
+        """
+        return [
+            {
+                "kind": item.kind,
+                "symbol": item.symbol or "account",
+                "ours": "-" if item.ours is None else str(item.ours),
+                "theirs": "-" if item.theirs is None else str(item.theirs),
+                "detail": item.detail,
+            }
+            for item in self.discrepancies
+        ]
+
+    def explain(self) -> str:
+        """`summary()` plus the numbers, as one line for an exception message.
+
+        The refusal `StrategyRunner.warmup` raises reaches an operator as a
+        traceback and as the body of a CRITICAL alert, and both were carrying
+        `summary()` alone. A halt an operator cannot size is a halt they cannot
+        triage.
+        """
+        if self.is_clean:
+            return "clean"
+        parts = [
+            f"{item.kind} {item.symbol or 'account'}: {item.detail}"
+            if item.detail
+            else f"{item.kind} {item.symbol or 'account'}: ours {item.ours}, theirs {item.theirs}"
+            for item in self.discrepancies
+        ]
+        if self.orphan_order_ids:
+            parts.append(f"orphan orders: {', '.join(sorted(self.orphan_order_ids))}")
+        return "; ".join(parts)
+
 
 class Reconciler:
     """Compare our book against the venue's, and halt when they disagree.
@@ -169,10 +224,22 @@ class Reconciler:
         *,
         settle_seconds: float = DEFAULT_SETTLE_SECONDS,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        fee_ledger: FeeLedger | None = None,
+        run_mode: RunMode | None = None,
     ) -> None:
         self.broker = broker
         self.kill_switch = kill_switch
         self.clock = clock
+        #: Where the venue's own fee charges are settled against our cash before
+        #: the two books are compared. Optional, and `None` means the check runs
+        #: exactly as it did before this existed — which is what a backtest and
+        #: most tests want, because `SimulatedBroker` charges its fees on the
+        #: fill and has nothing to settle.
+        #:
+        #: Both or neither: a ledger scopes its rows by run mode, so a ledger
+        #: without one could not tell paper money from real money.
+        self.fee_ledger = fee_ledger if run_mode is not None else None
+        self.run_mode = run_mode
         #: How long to wait before re-reading both books on a disagreement. See
         #: `reconcile` for why a disagreement is re-read at all.
         self.settle_seconds = settle_seconds
@@ -264,6 +331,12 @@ class Reconciler:
         as before. Nothing is softened: the second reading is the one that
         decides, and it decides with the same rules.
         """
+        # Before the comparison, not after it. A fee the venue has charged is
+        # money that has already left the account — settling it is bringing our
+        # book up to date, not adjusting the answer to make a mismatch go away.
+        # Idempotent, so the re-read below does not double-charge.
+        await self._settle_fees(portfolio)
+
         report = await self._compare(portfolio, known_orders, cash_tolerance, halt_on_mismatch)
         if report.is_clean:
             return report
@@ -275,6 +348,7 @@ class Reconciler:
             log.warning(
                 "execution.reconcile.rereading",
                 summary=report.summary(),
+                findings=report.findings(),
                 settle_seconds=self.settle_seconds,
                 detail="books disagree — re-reading once before halting (F4)",
             )
@@ -292,7 +366,15 @@ class Reconciler:
                 )
                 return report
 
-        log.error("execution.reconcile.mismatch", summary=report.summary())
+        # `findings` carries `ours`, `theirs` and each discrepancy's own
+        # sentence. Without it this line said `cash: account` and nothing else,
+        # which is a halt an operator cannot size without asking the venue
+        # directly (`scripts/status.py`).
+        log.error(
+            "execution.reconcile.mismatch",
+            summary=report.summary(),
+            findings=report.findings(),
+        )
         if halt_on_mismatch:
             # Only the kinds that impugn a *position*. A cash drift past the
             # tolerance and an orphan order — which this module's own comment
@@ -435,6 +517,25 @@ class Reconciler:
                 Discrepancy(kind=kind, symbol=symbol, ours=our_qty, theirs=their_qty, detail=detail)
             )
         return found
+
+    async def _settle_fees(self, portfolio: Portfolio) -> None:
+        """Apply the venue's unapplied fee charges to our cash.
+
+        A no-op when no ledger is wired, which keeps every existing caller —
+        backtests, the fakes, `SimulatedBroker` — behaving exactly as before.
+
+        `clock.now()` rather than a wall-clock read, so the window this asks
+        for means the same thing under a `SimulatedClock` (rule §1.2).
+        """
+        if self.fee_ledger is None or self.run_mode is None:
+            return
+        await settle_broker_fees(
+            portfolio,
+            broker=self.broker,
+            ledger=self.fee_ledger,
+            run_mode=self.run_mode,
+            today=self.clock.now().date(),
+        )
 
     @staticmethod
     def _cash_discrepancies(

@@ -967,6 +967,16 @@ above.
     the case rule §1.4 exists for, and the difference between a network blip
     and a duplicate position.
 
+  A second gap was stated and then left open for a fortnight, which is the
+  lesson worth keeping: both `Fill` sites set `fee=0` with a comment calling the
+  activities endpoint "a known gap the activities endpoint closes", and nothing
+  ever called it. Alpaca books CAT, REG and TAF on that feed and never on the
+  fill, so our cash was a fills-only total against a venue cash that was not —
+  a ratchet, not drift. It reached $4.14 against a $1.00 tolerance in one
+  session and crash-looped the worker on 2026-09-09. Closed by
+  `get_fee_activities` and `atp_core.execution.fees` (ADR 0030). A comment
+  naming a gap is not a plan to close it.
+
   One gap is stated rather than left to be discovered: REST reports
   `filled_qty` and `filled_avg_price` as running totals, so a fill read this
   way is **one** synthetic `Fill` for the whole quantity. That is right for
@@ -1089,8 +1099,13 @@ above.
     marks, and our marks come from our feed while the broker's come from
     theirs; two feeds a tick apart on an open position is not a book
     discrepancy, and reporting it as one would make layer 7 fire on every
-    volatile day. Cash is arithmetic on fills, so drift there means a fill one
-    of us does not know about — which is the thing worth catching.
+    volatile day. Cash is arithmetic on fills *once the venue's own charges are
+    settled against it* — which was the half this line originally left out.
+    Alpaca books CAT, REG and TAF fees on the account activity feed and never on
+    the fill, so our fills-only cash ratcheted away from the venue's by every
+    session's fee take until it halted the worker ($4.14 against a $1.00
+    tolerance, 2026-09-09). `Reconciler` now settles them first (ADR 0030), and
+    only then does drift mean a fill one of us does not know about.
   - **An orphan order is reported, never cancelled.** It is most often a
     protective stop placed before a restart, and cancelling it blindly leaves
     the position it guards naked — a worse state than the one being reported.

@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from datetime import datetime
+    from datetime import date, datetime
     from decimal import Decimal
 
     from atp_core.domain import Fill, Order, OrderStatus, Position
@@ -42,6 +42,51 @@ class AccountSnapshot:
     is_pattern_day_trader: bool
     trading_blocked: bool
     as_of: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class FeeActivity:
+    """One fee the venue charged the account, as the venue booked it.
+
+    **Cash moves for reasons that are not fills, and this is the one that
+    matters to us.** `Reconciler._cash_discrepancies` states the platform's
+    working assumption — "cash is arithmetic on fills, so a drift beyond the
+    tolerance means a fill one of us does not know about" — and that is true of
+    a venue which charges nothing else. Alpaca charges regulatory fees (the SEC
+    fee and FINRA's TAF, both sell-side) and books them on the account activity
+    feed, *not* on the fill: `AlpacaBroker` sets `Fill.fee` to zero at both
+    sites it builds one, with a comment at each saying so.
+
+    The consequence is not drift, it is a ratchet. Our cash is a fills-only
+    total, the venue's is not, and the gap only ever widens. The account feed
+    for 2026-09-08 — one session — held exactly three rows:
+
+        FEE / CAT  -0.01   FEE / REG  -3.82   FEE / TAF  -0.31
+
+    which is the $4.14 that halted the worker at `warmup` the next morning,
+    against a $1.00 tolerance. One session breaches it four times over, so
+    `adopt_broker_state` clears this for less than a day.
+
+    `activity_id` is the venue's own identifier and it is the idempotency key.
+    A fee applied twice is a wrong ledger in the other direction, and a fee
+    feed is re-read on every reconcile — so the identifier is what the ledger
+    stores, not the date and not the amount.
+
+    `amount` is **positive for money leaving the account**, which is the
+    opposite sign to the `net_amount` Alpaca reports. Adapters normalise it, so
+    nothing downstream has to remember a venue's convention: settling a fee is
+    always `cash -= amount`.
+    """
+
+    activity_id: str
+    booked_on: date
+    amount: Decimal
+    #: The venue's own name for the kind of fee — Alpaca books `CAT`, `REG` and
+    #: `TAF` as sub-types under one `FEE` activity type. Carried because it is
+    #: what an operator reconciling a session reads, and because it is the
+    #: field that says whether a charge is one this platform caused.
+    sub_type: str = ""
+    description: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +200,26 @@ class BrokerPort(Protocol):
     async def get_positions(self) -> list[Position]:
         """The broker's positions. Reconciliation compares these to ours;
         any disagreement halts trading (`ReconciliationError`)."""
+        ...
+
+    async def get_fee_activities(self, since: date) -> list[FeeActivity]:
+        """Fees the venue charged on or after `since`, oldest first.
+
+        On the port rather than left to the Alpaca adapter because the gap it
+        closes is not Alpaca's: any venue that charges a fee it does not put on
+        a fill will drift our cash the same way, and the reconciler must be
+        able to ask without knowing which venue it is talking to.
+
+        `since` is a date and not an instant because that is the granularity a
+        fee is booked at. Callers should ask for more history than they think
+        they need — the ledger discards what it has already applied, so a wide
+        window costs a larger response and nothing else, while a narrow one
+        silently loses a fee booked late.
+
+        A venue that charges nothing outside the fill returns an empty list;
+        that is a real answer and not a stub. `SimulatedBroker` is such a
+        venue — its cost model charges the fill itself.
+        """
         ...
 
     async def close_position(self, symbol: str) -> Order: ...

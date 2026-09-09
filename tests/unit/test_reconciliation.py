@@ -710,3 +710,72 @@ class TestADisagreementIsReadTwiceBeforeItHalts:
         await reconciler.reconcile(portfolio, known_orders=open_orders)
 
         assert order_of_reads == ["local", "broker"]
+
+
+class TestWhatAHaltTellsAnOperator:
+    """`summary()` renders a cash discrepancy as the bare string
+    `cash: account`, because a cash finding carries no symbol. On 2026-09-09
+    that string was the whole diagnostic in the worker's log, in the halt record
+    and in the alert — the drift was $4.14 against a $1.00 tolerance and none of
+    the three said so, so the operator had to ask the venue directly."""
+
+    @pytest.mark.asyncio
+    async def test_the_summary_alone_does_not_say_how_far_apart_they_are(self) -> None:
+        """The behaviour that made the morning expensive, pinned so a change
+        that reintroduced it would have to do so deliberately."""
+        reconciler, broker, _, portfolio = build(cash="100094.20")
+        broker.equity = Decimal("100090.06")
+
+        report = await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert report.summary() == "cash: account"
+        assert "4.14" not in report.summary()
+
+    @pytest.mark.asyncio
+    async def test_findings_carry_both_books_and_the_sentence(self) -> None:
+        reconciler, broker, _, portfolio = build(cash="100094.20")
+        broker.equity = Decimal("100090.06")
+
+        report = await reconciler.reconcile(portfolio, known_orders=[])
+
+        [finding] = report.findings()
+        assert finding["kind"] == DiscrepancyKind.CASH
+        assert finding["symbol"] == "account"
+        assert finding["ours"] == "100094.20"
+        assert finding["theirs"] == "100090.06"
+        assert "4.14" in finding["detail"], "the number an operator needs"
+
+    @pytest.mark.asyncio
+    async def test_explain_is_the_one_line_an_exception_can_carry(self) -> None:
+        """`StrategyRunner.warmup` puts this in the `ExecutionError` that
+        becomes the body of a CRITICAL alert and the last line of a traceback."""
+        reconciler, broker, _, portfolio = build(cash="100094.20")
+        broker.equity = Decimal("100090.06")
+
+        report = await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert "4.14" in report.explain()
+        assert "100090.06" in report.explain() or "beyond the 1.00" in report.explain()
+
+    @pytest.mark.asyncio
+    async def test_a_clean_book_has_nothing_to_explain(self) -> None:
+        reconciler, _, _, portfolio = build()
+
+        report = await reconciler.reconcile(portfolio, known_orders=[])
+
+        assert report.findings() == []
+        assert report.explain() == "clean"
+
+    @pytest.mark.asyncio
+    async def test_a_position_finding_names_its_symbol_in_the_findings_too(self) -> None:
+        """Not only cash. An operator reading a position discrepancy wants the
+        two quantities, and `summary()` gives them the ticker alone."""
+        reconciler, broker, _, portfolio = build()
+        broker.hold("SPY", Decimal("1000"), Decimal("500"))
+        hold(portfolio, "SPY", "100")
+
+        report = await reconciler.reconcile(portfolio, known_orders=[])
+
+        qty = [f for f in report.findings() if f["kind"] == DiscrepancyKind.POSITION_QTY]
+        assert qty and qty[0]["symbol"] == "SPY"
+        assert qty[0]["ours"] == "100" and qty[0]["theirs"] == "1000"
