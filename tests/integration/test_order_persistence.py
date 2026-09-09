@@ -296,6 +296,7 @@ class TestBookSnapshots:
             stop_loss_price=Decimal("480"),
             take_profit_price=Decimal("560"),
             high_water_mark=Decimal("515"),
+            broker_protected_qty=Decimal("60"),
         )
         return portfolio
 
@@ -332,6 +333,35 @@ class TestBookSnapshots:
         assert position.high_water_mark == Decimal("515")
         assert position.opened_at == T0
         assert position.fees_paid == Decimal("1.25")
+
+    @pytest.mark.asyncio
+    async def test_venue_side_cover_survives_and_is_not_the_armed_level(
+        self, book: PostgresPortfolioRepository
+    ) -> None:
+        """The column docs/SAFETY.md's go-live gate is evaluated from.
+
+        `stop_loss_price` is armed before the protective order is submitted, so
+        it is populated whether or not the venue accepted anything — which is
+        why day 2 of the paper week could show a stop on all 38 positions while
+        holding none. This row is the other half of that sentence, and a
+        snapshot that dropped it would put the gate back to grepping container
+        logs (docs/paper-week/day-2-review.md, F2a and F3).
+
+        60 of 100 covered, deliberately: a fully covered position and a fully
+        naked one both survive a field that silently rounds to a boolean, and
+        the partly covered one is the case that does not.
+        """
+        await book.snapshot(self.a_portfolio(), at=T0, run_mode=RunMode.PAPER)
+
+        restored = await book.latest(RunMode.PAPER)
+
+        assert restored is not None
+        position = restored.positions["SPY"]
+        assert position.broker_protected_qty == Decimal("60")
+        assert position.unprotected_qty == Decimal("40")
+        # Restored beside the armed level rather than in place of it. Both are
+        # real, and reporting either one alone is what F2a is about.
+        assert position.stop_loss_price == Decimal("480")
 
     @pytest.mark.asyncio
     async def test_the_newest_snapshot_wins(self, book: PostgresPortfolioRepository) -> None:
