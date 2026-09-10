@@ -11,11 +11,19 @@ is the specification and the procedure. **This document is neither.** It is a
 survey of what is available at zero cost, written against that specification so
 that the choice can be made with the tradeoffs in front of it.
 
-> **A target has since been chosen, and this document did not choose it.**
-> [ADR 0021](adr/0021-the-paper-host-is-the-operators-own-mac.md) picked
-> "hardware you already own" — specifically the operator's own Mac — for the
-> paper host, on the reasoning in the section of that name below.
-> [LOCAL_HOSTING.md](LOCAL_HOSTING.md) is the procedure.
+> **A target has since been chosen — twice — and this document did not choose
+> either.** [ADR 0021](adr/0021-the-paper-host-is-the-operators-own-mac.md)
+> picked "hardware you already own" — the operator's own Mac — on the reasoning
+> in the section of that name below.
+> [ADR 0032](adr/0032-the-paper-host-moves-off-the-mac.md) **superseded it** and
+> picked **Oracle Cloud Always Free (Ampere A1)**, the other row in the survey
+> that clears the bar, after the Mac went dark for 79.8% of regular trading
+> hours on day 3 of the paper week. [ORACLE_HOSTING.md](ORACLE_HOSTING.md) is
+> the procedure; [LOCAL_HOSTING.md](LOCAL_HOSTING.md) is what it moved off.
+>
+> **Both sections below are left as they were written**, which is the point of
+> a survey: 0021 was decided against the Mac section and 0032 against the Oracle
+> one, and neither reads honestly if it is edited to agree with the outcome.
 >
 > This survey stays as it is, and stays useful for two reasons: **live still
 > needs a second host** (`docs/SAFETY.md` layer 3), and the Mac is explicitly a
@@ -106,8 +114,9 @@ comfortable on both, but above the 4 GB floor.
 **If you are actually going to do it**, [ORACLE_HOSTING.md](ORACLE_HOSTING.md)
 is the step-by-step: the provisioning decisions that cannot be undone, settling
 the ARM question before anything is trading, and the cutover from a host that is
-already running. Like this document it chooses nothing — ADR 0021 still says the
-paper host is the Mac, and moving off it needs an ADR rather than a procedure.
+already running. This document still chooses nothing; the decision is
+[ADR 0032](adr/0032-the-paper-host-moves-off-the-mac.md), and the three caveats
+below are what it accepted.
 
 Three caveats, in the order they are likely to bite.
 
@@ -164,11 +173,13 @@ instance is not accumulating idle time before you rely on it.
 
 ## Hardware you already own
 
-**This is the option that was taken** —
-[ADR 0021](adr/0021-the-paper-host-is-the-operators-own-mac.md), for paper only,
-with the procedure in [LOCAL_HOSTING.md](LOCAL_HOSTING.md). What follows is the
-reasoning as it stood before that choice, which is what the ADR was decided
-against.
+**This is the option that was taken first, and then given back** —
+[ADR 0021](adr/0021-the-paper-host-is-the-operators-own-mac.md) chose it for
+paper, and [ADR 0032](adr/0032-the-paper-host-moves-off-the-mac.md) superseded
+that after two sessions lost time to the machine sleeping. What follows is the
+reasoning as it stood before either choice, which is what both ADRs were decided
+against. The paragraph below about a residential connection having no snapshots
+is the one that aged best.
 
 A mini PC, a NUC, or a laptop that has stopped being a laptop. It is the only
 permanently free option that no vendor can reclaim, resize or reprice, and the
@@ -207,12 +218,15 @@ VM is a decision to make after that, not before it.
 
 - **A free paper host, accepting vendor risk:** Oracle A1, sized for 12 GB,
   having read all three caveats and confirmed the ARM build yourself.
+  **This is what was chosen** (ADR 0032), with the procedure in
+  [ORACLE_HOSTING.md](ORACLE_HOSTING.md).
 - **A free paper host, accepting latency instead:** hardware you own, with
   BACKUPS.md scheduled from the first day rather than the first incident.
-  **This is what was chosen** (ADR 0021). If the machine is one that sleeps —
-  a Mac, or any laptop — that is a disqualifying property until it is
-  configured away, and LOCAL_HOSTING.md §1 is the part to read before the
-  rest.
+  **This was chosen first** (ADR 0021) **and did not hold.** If the machine is
+  one that sleeps — a Mac, or any laptop — that is a disqualifying property
+  until it is configured away, and the configuring is the part that failed:
+  LOCAL_HOSTING.md §1 prescribed it, nobody ran it, and a session lost 79.8% of
+  its trading hours. Read that section before choosing this row again.
 - **Neither is free:** any commodity VPS in US-East at the 8 GB / 4 vCPU row.
   ADR 0011 names DigitalOcean, Vultr, Linode, Hetzner and Lightsail and declines
   to choose between them, which is still the right answer.

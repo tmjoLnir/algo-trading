@@ -137,10 +137,16 @@ shared destination cannot let one database evict another's history.
 **On macOS, cron is the wrong mechanism** and the differences are not cosmetic:
 the job must be a LaunchAgent rather than a LaunchDaemon to see Docker, the
 mounted drive and `uv` at all, and launchd re-runs a calendar job missed while
-the machine slept where cron simply skips it. ADR 0021 chose a Mac as the paper
-host, so that recipe is the one most likely to be used —
-[LOCAL_HOSTING.md](LOCAL_HOSTING.md), "On a schedule, with launchd", carries it
-along with the guard an external drive needs.
+the machine slept where cron simply skips it.
+[LOCAL_HOSTING.md](LOCAL_HOSTING.md), "On a schedule, with launchd", carries
+that recipe along with the guard an external drive needs.
+
+**The cron lines above are the ones the deployment uses.**
+[ADR 0032](adr/0032-the-paper-host-moves-off-the-mac.md) moved the paper host
+from that Mac to a Linux VM, superseding ADR 0021 — so launchd's catch-up for a
+job missed while the machine slept stops being a feature and starts being a
+description of the problem that ADR removed. The macOS recipe is kept for the
+rollback target and for a Mac used in development.
 
 There is no alerting wired into this. `scripts/check_alerts.py` and
 `docs/OBSERVABILITY.md` are how a failure reaches a phone, and the cron line
@@ -213,8 +219,8 @@ pg_restore -t audit_log -d atp --data-only backups/atp-atp-20260819T052226Z.dump
 ## What is not here
 
 - **This repository still schedules nothing, and cannot.** A host is chosen now
-  (ADR 0021) and both recipes above are written for real machines rather than
-  hypothetical ones — but whether an agent or a cron line is actually loaded is
+  (ADR 0032, superseding ADR 0021) and both recipes above are written for real
+  machines rather than hypothetical ones — but whether an agent or a cron line is actually loaded is
   a property of that host, not of this checkout. Check it there; a schedule
   nobody verified is the same as no schedule, and it looks better.
 - **No off-host copy.** `ATP_BACKUP_DIR` is where you make that true; the tool

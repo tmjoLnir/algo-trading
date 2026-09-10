@@ -1,6 +1,17 @@
 # 21. The paper host is the operator's own Mac
 
-**Status:** Accepted · 2026-08-30
+**Status:** **Superseded** by [ADR 0032](0032-the-paper-host-moves-off-the-mac.md) ·
+accepted 2026-08-30 · superseded 2026-09-10
+
+> **Superseded, and the text below is left exactly as it was written.** What was
+> believed at the time is the point (`docs/adr/README.md`).
+>
+> The condition this ADR made itself conditional on — a machine configured not
+> to sleep — was not met in practice. Day 3 of the paper week was dark for 79.8%
+> of regular trading hours, and the same failure had already appeared on day 2 as
+> a 129.6-second stall that the review filed under papercuts.
+> [ADR 0032](0032-the-paper-host-moves-off-the-mac.md) takes the fallback this
+> document named for itself and moves the paper host to an Oracle Cloud A1.
 
 Extends [ADR 0011](0011-one-vm-deployed-by-hand.md), which chose the deployment
 *shape* and deliberately left the machine open. This picks the machine. It

@@ -3100,23 +3100,36 @@ has met a database holding a real strategy's history.
   hosts so that docs/SAFETY.md layer 3 is structural rather than conventional.
   That ADR deliberately did not pick a machine or a vendor.
 
-  **ADR 0021 picks one, for paper: the operator's own Mac.** It amends ADR 0011's
-  x86-64 clause (Apple Silicon is arm64, and docs/HOSTING.md's manifest analysis
-  is what it rests on), accepts the loss of US-East proximity and of provider
-  snapshots, and is conditional on the machine being configured not to sleep —
-  which is the property ADR 0011 rejected a laptop for, and the one thing that
-  decides whether a paper week is possible at all. docs/LOCAL_HOSTING.md is the
-  delta against docs/DEPLOYMENT.md; live still needs a second host.
+  **ADR 0021 picked one, for paper: the operator's own Mac** — amending ADR
+  0011's x86-64 clause (Apple Silicon is arm64, on docs/HOSTING.md's manifest
+  analysis), accepting the loss of US-East proximity and of provider snapshots,
+  and conditional on the machine being configured not to sleep.
 
-  **Unticked, and choosing a host is not what would tick it.** This item's
+  **ADR 0032 superseded it. The paper host is an Oracle Cloud Ampere A1 in
+  `us-ashburn-1`.** That condition was not met: day 3 of the paper week was dark
+  for 79.8% of regular trading hours, and day 2 had already recorded the same
+  failure as a 129.6-second stall filed under papercuts. 0032 takes the fallback
+  0021 named for itself, regains the US-East proximity 0021 gave up, and upgrades
+  the tenancy to Pay As You Go so that idle reclamation does not replace a host
+  that sleeps with a host that is taken away. docs/ORACLE_HOSTING.md is the
+  procedure and the cutover; docs/LOCAL_HOSTING.md is the superseded host, kept
+  as the rollback route. Live still needs a second host.
+
+  **Unticked, and choosing a host is still not what would tick it.** This item's
   demonstration is a host with the stack actually on it, `scripts/status.py`
-  answering, and an alert that reached a phone — none of which is a decision,
-  and none of which has happened. What ADR 0021 closes is the sentence "no host
-  has been selected", which docs/DEPLOYMENT.md, docs/HOSTING.md and this item
-  were all carrying. What stays open is everything that needs the machine to
-  exist and to have run. The secrets-manager half is likewise unchanged: SOPS +
-  age is chosen and `scripts/manage_secrets.py` is written, and on a machine the
-  operator is sitting at it is optional rather than load-bearing.
+  answering, and an alert that reached a phone — none of which is a decision, and
+  none of which has happened. **Three ADRs have now chosen a target and none has
+  deployed one**, which is the thing to notice rather than repeat: what closes
+  this item is a cutover that happened, not a fourth choice. What 0021 and 0032
+  between them close is the sentence "no host has been selected", which
+  docs/DEPLOYMENT.md, docs/HOSTING.md and this item were all carrying.
+
+  The secrets-manager half is chosen and written — SOPS + age,
+  `scripts/manage_secrets.py` — and **0032 makes it load-bearing again**. ADR
+  0011's purpose for the bundle is getting secrets onto a machine you are not
+  sitting at; on the Mac that made it optional, and on a rented VM it is the
+  mechanism. The age private key becoming a thing that has to survive the move is
+  a consequence of 0032 rather than of this item.
 
   **Tailscale is not the deployment target**, and where the docs name it they
   mean the access layer: the VPN that keeps the dashboard off a public address.
