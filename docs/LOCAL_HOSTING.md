@@ -436,6 +436,10 @@ additions specific to hosting here:
 - **A second host for live.** `docs/SAFETY.md` layer 3 wants paper and live on
   separate machines with separate key pairs, and ADR 0021 chose a paper host
   only. Going live is a decision to make after the paper week, not before it.
+- **Somewhere to go when this stops being enough.** ADR 0021 names a dedicated
+  Linux box as the upgrade path and HOSTING.md costs the free alternative;
+  [hosting_on_oracle.md](hosting_on_oracle.md) is the procedure for that
+  alternative, including the cutover from this machine while it is running.
 - **Isolation from your own use of the machine.** This is also the computer you
   work on. A reboot for an unrelated reason is now a deploy-time event, and
   `docs/SAFETY.md` rule 4 — never in the last thirty minutes of a session —
