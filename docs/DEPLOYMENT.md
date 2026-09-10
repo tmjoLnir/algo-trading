@@ -27,7 +27,11 @@ are allowed to deploy.
 > not listed there is here and is unchanged.
 >
 > [HOSTING.md](HOSTING.md) surveys what else can satisfy the table — including
-> what is available at zero cost, and what each free tier fails on.
+> what is available at zero cost, and what each free tier fails on, and
+> [ORACLE_HOSTING.md](ORACLE_HOSTING.md) is the procedure for one of them:
+> provisioning an Oracle Cloud A1 instance and cutting a running deployment over
+> to it. Nobody has decided to; it is written so the option is sequenced rather
+> than improvised.
 >
 > **Tailscale is not the host.** It is the access layer: a VPN that puts the
 > dashboard on a private network instead of a public address. Whatever host is
