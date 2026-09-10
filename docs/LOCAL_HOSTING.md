@@ -438,8 +438,8 @@ additions specific to hosting here:
   only. Going live is a decision to make after the paper week, not before it.
 - **Somewhere to go when this stops being enough.** ADR 0021 names a dedicated
   Linux box as the upgrade path and HOSTING.md costs the free alternative;
-  [hosting_on_oracle.md](hosting_on_oracle.md) is the procedure for that
-  alternative, including the cutover from this machine while it is running.
+  [ORACLE_HOSTING.md](ORACLE_HOSTING.md) is the procedure for that alternative,
+  including the cutover from this machine while it is running.
 - **Isolation from your own use of the machine.** This is also the computer you
   work on. A reboot for an unrelated reason is now a deploy-time event, and
   `docs/SAFETY.md` rule 4 — never in the last thirty minutes of a session —

@@ -103,12 +103,11 @@ instances at 1 OCPU / 6 GB each gives you the separate paper and live hosts
 `docs/SAFETY.md` layer 3 asks for, out of one free tenancy — tighter than
 comfortable on both, but above the 4 GB floor.
 
-**If you are actually going to do it**,
-[hosting_on_oracle.md](hosting_on_oracle.md) is the step-by-step: the
-provisioning decisions that cannot be undone, settling the ARM question before
-anything is trading, and the cutover from a host that is already running. Like
-this document it chooses nothing — ADR 0021 still says the paper host is the
-Mac, and moving off it needs an ADR rather than a procedure.
+**If you are actually going to do it**, [ORACLE_HOSTING.md](ORACLE_HOSTING.md)
+is the step-by-step: the provisioning decisions that cannot be undone, settling
+the ARM question before anything is trading, and the cutover from a host that is
+already running. Like this document it chooses nothing — ADR 0021 still says the
+paper host is the Mac, and moving off it needs an ADR rather than a procedure.
 
 Three caveats, in the order they are likely to bite.
 

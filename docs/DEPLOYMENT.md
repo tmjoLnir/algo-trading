@@ -28,7 +28,7 @@ are allowed to deploy.
 >
 > [HOSTING.md](HOSTING.md) surveys what else can satisfy the table — including
 > what is available at zero cost, and what each free tier fails on, and
-> [hosting_on_oracle.md](hosting_on_oracle.md) is the procedure for one of them:
+> [ORACLE_HOSTING.md](ORACLE_HOSTING.md) is the procedure for one of them:
 > provisioning an Oracle Cloud A1 instance and cutting a running deployment over
 > to it. Nobody has decided to; it is written so the option is sequenced rather
 > than improvised.
