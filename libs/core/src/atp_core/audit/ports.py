@@ -133,6 +133,19 @@ class Action:
     #: written hours apart, by different processes, and sometimes the engagement
     #: is a trigger that wrote no row at all.
     HALT_CLEARED = "halt_cleared"
+    #: The stored book was replaced with the broker's, by an operator who had
+    #: looked at why the two disagreed. Lands with its handler exactly as this
+    #: class asks — `scripts/adopt_broker_state.py`, which is the entry point
+    #: docs/RUNBOOK.md's "Reconciliation mismatch" procedure prescribed and
+    #: nothing supplied (docs/paper-week/day-3-review.md, B2).
+    #:
+    #: Worth a verb of its own rather than folding into the halt rows around it:
+    #: this is the moment the platform stopped believing its own record of what
+    #: it owns, and "when did our book last get overwritten, and by whom" is a
+    #: question every later number depends on. `actor` is the script, for the
+    #: reason `HALT_ENGAGED`'s is — nothing here proves a person — and
+    #: `detail["by"]` carries the claimed name for what it is worth.
+    BOOK_ADOPTED = "book_adopted"
     #: A strategy was stored. The first of the lifecycle verbs, and it arrives
     #: with `POST /api/v1/strategies` rather than ahead of it.
     #:

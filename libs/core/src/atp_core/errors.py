@@ -98,7 +98,23 @@ class OrderRejectedError(BrokerError):
     """The venue refused the order (buying power, halted symbol, bad price)."""
 
 
-class InsufficientFundsError(BrokerError): ...
+class InsufficientFundsError(OrderRejectedError):
+    """The venue refused the order for want of buying power.
+
+    **A subclass of `OrderRejectedError` rather than a sibling of it**, and that
+    relationship is load-bearing rather than taxonomic. It was a sibling, so
+    `OrderRouter._route`'s `except OrderRejectedError` did not catch it — and on
+    day 3 of the paper week a wash-trade rejection that the adapter had
+    misclassified as this class escaped a router that handles refusals perfectly
+    well, unwound `submit_protective_orders`, `_protect` and `on_fill_event`,
+    ended the trade-updates consumer, and killed the worker
+    (docs/paper-week/day-3-review.md, B2).
+
+    Running out of money *is* the venue saying no. Every caller that handles a
+    "no" must handle this one, and a type relationship is the only place that
+    can guarantee it — a second `except` clause somewhere is a thing the next
+    call site forgets.
+    """
 
 
 # ── risk ────────────────────────────────────────────────────────────────────
@@ -176,6 +192,23 @@ class LookaheadError(BacktestError):
 
 # ── execution ───────────────────────────────────────────────────────────────
 class ExecutionError(ATPError): ...
+
+
+class ReconciliationDivergedError(ExecutionError):
+    """The stored book and the broker's disagree, and no code here can repair it.
+
+    Its own class so that the one caller who can do something sensible with it —
+    `StrategyRunner.run` — can tell it from a bug. Refusing to trade against a
+    book the broker contradicts is right, is docs/SAFETY.md's whole posture, and
+    is not what changed.
+
+    *Exiting the process* on one is what changed. A divergence is identical on
+    every boot, nothing in the loop repairs it, and `restart: unless-stopped`
+    carries no attempt cap — so day 3 of the paper week died on this condition
+    **129 consecutive times**, a median 16.9 seconds apart, paging a human on
+    each one (docs/paper-week/day-3-review.md, B2 and F1). A guard that cannot
+    be satisfied must not be a restart loop.
+    """
 
 
 class InvalidStateTransitionError(ExecutionError):

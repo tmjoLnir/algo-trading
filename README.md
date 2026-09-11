@@ -90,8 +90,8 @@ env flag plus a typed confirmation.
 | [TESTING.md](docs/TESTING.md) | Test layout and what must be covered |
 | [DEPLOYMENT.md](docs/DEPLOYMENT.md) | Shipping it somewhere |
 | [HOSTING.md](docs/HOSTING.md) | Picking the machine to ship it to, free options included |
-| [LOCAL_HOSTING.md](docs/LOCAL_HOSTING.md) | Running it on your own Mac — where that differs from a rented VM |
-| [ORACLE_HOSTING.md](docs/ORACLE_HOSTING.md) | Moving that Mac deployment onto an Oracle Cloud A1 instance, step by step |
+| [ORACLE_HOSTING.md](docs/ORACLE_HOSTING.md) | **The chosen paper host** — provisioning an Oracle Cloud A1 and cutting over to it |
+| [LOCAL_HOSTING.md](docs/LOCAL_HOSTING.md) | Running it on your own Mac — the superseded host, kept as the rollback route |
 | [OBSERVABILITY.md](docs/OBSERVABILITY.md) | Metrics, the scrape endpoints, correlation ids |
 | [RUNBOOK.md](docs/RUNBOOK.md) | Something is broken in production |
 | [BACKUPS.md](docs/BACKUPS.md) | Taking a backup, and restoring one |

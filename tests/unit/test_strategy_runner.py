@@ -12,6 +12,7 @@ repositories and the clock are all fakes (CLAUDE.md §1.7).
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
 from decimal import Decimal
@@ -41,7 +42,10 @@ from atp_core.domain import (
     StopType,
     Timeframe,
 )
-from atp_core.errors import BrokerConnectionError, ExecutionError
+from atp_core.errors import (
+    BrokerConnectionError,
+    ReconciliationDivergedError,
+)
 from atp_core.execution.idempotency import FLATTEN, STOP_LOSS, TAKE_PROFIT, TIME_EXIT
 from atp_core.execution.reconciliation import ReconciliationReport
 from atp_core.execution.router import ProtectionResult, SubmitResult
@@ -527,8 +531,91 @@ class TestWarmup:
         is running and silently declining to trade."""
         runner, _, _, _, portfolio, _ = build(clean=False)
 
-        with pytest.raises(ExecutionError, match="does not match the broker"):
+        with pytest.raises(ReconciliationDivergedError, match="does not match the broker"):
             await runner.warmup(portfolio)
+
+
+class TestADivergedBookQuarantinesRatherThanCrashLoops:
+    """Day 3's 129 boots, as a test.
+
+    The guard itself is not what changed and must not change: a book the broker
+    contradicts still stops this runner dead. What changed is that stopping is
+    no longer the same act as *exiting*, because exiting fed
+    `restart: unless-stopped`, which has no attempt cap, a divergence that is
+    identical on every boot, and one human on the other end of every CRITICAL
+    (docs/paper-week/day-3-review.md, B2 and F1).
+    """
+
+    async def _run_until_parked(self, runner: StrategyRunner, portfolio: Portfolio) -> None:
+        """Run, and require that it neither returns nor raises.
+
+        The whole assertion is the timeout. A `run` that returned would end a
+        supervised responsibility, which the worker treats as a death exactly as
+        it treats a raise — so "did not raise" on its own would pass while the
+        crash loop carried on through the other door.
+        """
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(runner.run(portfolio), timeout=0.05)
+
+    @pytest.mark.asyncio
+    async def test_it_stays_up_instead_of_ending_the_responsibility(self) -> None:
+        runner, _, _, _, portfolio, _ = build(clean=False)
+
+        await self._run_until_parked(runner, portfolio)
+
+    @pytest.mark.asyncio
+    async def test_it_halts_globally_before_it_parks(self) -> None:
+        """Parked is not the same as safe. The kill switch is what makes it so,
+        and it is engaged before anything else — including the alert, because a
+        halt that failed to record is worse than a page nobody got."""
+        runner, _, switch, _, portfolio, _ = build(clean=False)
+
+        await self._run_until_parked(runner, portfolio)
+
+        assert switch.engaged
+        scope, reason, _, _ = switch.engagements[0]
+        assert scope == HaltScope.GLOBAL
+        assert reason == HaltReason.RECONCILIATION_MISMATCH
+
+    @pytest.mark.asyncio
+    async def test_it_pages_once_and_says_nothing_will_retry(self) -> None:
+        """One page, not 129. The count is the finding: day 3 sent an identical
+        CRITICAL on every boot for ten hours, which is how an alert channel
+        stops being one."""
+        alerts = RecordingAlertSink()
+        runner, _, _, _, portfolio, _ = build(clean=False, alerts=alerts)
+
+        await self._run_until_parked(runner, portfolio)
+
+        assert len(alerts.sent) == 1
+        assert alerts.sent[0].severity is Severity.CRITICAL
+        assert "will not trade" in alerts.sent[0].body
+
+    @pytest.mark.asyncio
+    async def test_the_page_carries_no_numbers_from_the_book(self) -> None:
+        """`alerts/ports.py`'s rule, and it bites hardest here: the divergence
+        is *made of* cash and quantities, and an alert renders on a lock screen
+        and travels through a third party. The log line carries the detail."""
+        alerts = RecordingAlertSink()
+        runner, _, _, _, portfolio, _ = build(clean=False, alerts=alerts)
+
+        await self._run_until_parked(runner, portfolio)
+
+        sent = alerts.sent[0]
+        assert "cash" not in f"{sent.title}{sent.body}".lower()
+        assert not any(char.isdigit() for char in sent.body)
+
+    @pytest.mark.asyncio
+    async def test_it_never_evaluates_a_strategy(self) -> None:
+        """The guard, still a guard. Nothing here is a softer refusal — the
+        strategy is not started and no order is routed."""
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG}, warmup=1)
+        runner, router, _, _, portfolio, _ = build(strategy, clean=False)
+
+        await self._run_until_parked(runner, portfolio)
+
+        assert strategy.started is False
+        assert router.calls == []
 
     @pytest.mark.asyncio
     async def test_it_tells_the_reconciler_what_we_believe_is_working(self) -> None:

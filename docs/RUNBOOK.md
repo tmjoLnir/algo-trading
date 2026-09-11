@@ -169,6 +169,17 @@ absence of alerts and a working platform look identical from a phone.
 
 Our book disagrees with the broker's. **Do not resume until it is understood.**
 
+**At worker start-up this looks different, and it is the same thing.** The
+runner refuses to trade against a book the broker contradicts, logs
+`runner.quarantined`, engages a global halt and then **stays up** — serving
+`/healthz`, `/metrics` and the dashboard, with the ingestor and the scheduler
+still running. It does not exit and it will not retry; one CRITICAL is sent and
+no more. Before this it exited, and `restart: unless-stopped` turned an
+unsatisfiable guard into a crash loop: 129 boots and 129 identical pages in one
+session (docs/paper-week/day-3-review.md, B2 and F1). A worker that is up and
+not trading is the intended state here — read the log line, not the container
+status.
+
 1. **Read the numbers off the log.** `execution.reconcile.mismatch` carries
    `findings` — each discrepancy with `ours`, `theirs` and the sentence that
    explains it. The one-line `summary` names the kind and the symbol only, and a
@@ -179,10 +190,26 @@ Our book disagrees with the broker's. **Do not resume until it is understood.**
    beside local state.
 3. Usual causes: a fill during a restart, a missed WS event, a corporate action,
    a manual trade placed outside the platform.
-4. Once you know *why*, `adopt_broker_state()` to resync. Not before —
-   adopting silently hides the bug, and if the cause is duplicate submission you
-   will do it again tomorrow.
-5. Clear the halt.
+4. Once you know *why*, resync. Not before — adopting silently hides the bug,
+   and if the cause is duplicate submission you will do it again tomorrow.
+
+   ```bash
+   uv run python scripts/adopt_broker_state.py --by "<you>" --dry-run   # look first
+   uv run python scripts/adopt_broker_state.py --by "<you>"
+   ```
+
+   It refuses to run unless trading is halted — adopting while a runner is live
+   races it — prints both books, and asks you to type the position count back.
+   **Every adopted position comes back unprotected**: the venue knows a position
+   exists and does not know the stop we intended for it, so re-arm protection
+   before step 5 rather than after.
+
+   This used to read *"`adopt_broker_state()` to resync"*, naming a method whose
+   only production caller runs when there is no stored book at all — so the
+   instruction was unexecutable in exactly the situation it was written for.
+5. Clear the halt, deliberately: `uv run python scripts/halt.py clear --by "<you>"`.
+   Adopting does not clear it and is not meant to. A book that is now true is not
+   the same fact as a platform that should be trading.
 
 **A cash-only mismatch with matching positions is a different animal.** Cash
 moves for reasons that are not fills, and on Alpaca the reason is regulatory

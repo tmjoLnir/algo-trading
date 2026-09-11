@@ -4,14 +4,16 @@ How to move the paper deployment off the operator's Mac and onto an Oracle
 Cloud Always Free **Ampere A1** instance, in the order the steps have to happen,
 with the point of no return marked.
 
-**This is a procedure. It is not a decision, and it does not make one.**
-[ADR 0021](adr/0021-the-paper-host-is-the-operators-own-mac.md) chose the Mac
-and *explicitly rejected* this host, for three reasons
-[HOSTING.md](HOSTING.md) sets out. A document cannot overturn an ADR. If the
-migration below is actually performed, it needs a new ADR that supersedes 0021
-and says what changed the answer — §11 says what that ADR has to contain.
-Until then this is here so that the option is costed and sequenced rather than
-improvised on the day.
+**The decision behind it is
+[ADR 0032](adr/0032-the-paper-host-moves-off-the-mac.md)**, which supersedes
+[ADR 0021](adr/0021-the-paper-host-is-the-operators-own-mac.md) — that document
+had chosen the Mac and explicitly rejected this host on three grounds
+[HOSTING.md](HOSTING.md) sets out. Read 0032 for what changed the answer and for
+the strongest argument against the move, which it records rather than hides.
+This document is the procedure and takes the decision as given.
+
+**It is still a procedure that nobody has run.** §11 has not moved: no part of
+what follows describes something that happened.
 
 Four documents cover this ground and none of them is redundant:
 
@@ -1007,14 +1009,13 @@ Five additions specific to this host:
   that ran and a suite that passed, and on arm64 neither has — CI is x86-64.
   §5 exists so that the first person to find out is not doing it during a
   cutover.
-- **It still needs an ADR.** ADR 0021 says the paper host is the operator's Mac
-  and rejected A1 on three named grounds. If this migration happens, the ADR
-  that records it has to say what changed the answer — most plausibly the day-3
-  finding that the Mac was asleep for 79.8% of regular trading hours, against
-  which "the allowance might halve again" is the smaller risk — and it has to
-  carry whatever §5 turned up. A doc that describes a move nobody decided on is
-  how a repository ends up with two documents disagreeing about where the
-  platform lives.
+- **The ADR exists; what §5 turns up still has to reach it.**
+  [ADR 0032](adr/0032-the-paper-host-moves-off-the-mac.md) decided this move and
+  superseded ADR 0021, on the day-3 finding that the Mac was dark for 79.8% of
+  regular trading hours and the day-2 stall that was the same failure smaller.
+  It records the ARM build as an outstanding condition discharged by §5 rather
+  than by argument — so whatever §5 finds is an amendment to that ADR, and the
+  first person to run it owes one.
 - **Live still needs a second host.** `docs/SAFETY.md` layer 3 wants paper and
   live on separate machines with separate key pairs. Splitting one A1
   entitlement into two 1 OCPU / 6 GB halves is technically available and is

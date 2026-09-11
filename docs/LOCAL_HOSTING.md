@@ -1,5 +1,17 @@
 # Hosting this on your own Mac
 
+> **This is no longer the deployment.**
+> [ADR 0032](adr/0032-the-paper-host-moves-off-the-mac.md) moved the paper host
+> to an Oracle Cloud A1 and superseded
+> [ADR 0021](adr/0021-the-paper-host-is-the-operators-own-mac.md), which had
+> chosen the operator's own macOS machine. §1 below is why.
+>
+> This document stays, and stays useful, for three reasons: it is the **rollback
+> target** while the cutover is fresh ([ORACLE_HOSTING.md](ORACLE_HOSTING.md)
+> §8), it is the reference for anyone running the stack on a Mac for
+> development, and §1 is the best-documented reason in this repository not to
+> trade from a laptop.
+
 [ADR 0021](adr/0021-the-paper-host-is-the-operators-own-mac.md) chose the
 operator's own macOS machine as the paper host.
 [DEPLOYMENT.md](DEPLOYMENT.md) is still **the** procedure and this does not
