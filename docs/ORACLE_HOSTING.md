@@ -4,13 +4,18 @@ How to move the paper deployment off the operator's Mac and onto an Oracle
 Cloud Always Free **Ampere A1** instance, in the order the steps have to happen,
 with the point of no return marked.
 
-**The decision behind it is
-[ADR 0032](adr/0032-the-paper-host-moves-off-the-mac.md)**, which supersedes
-[ADR 0021](adr/0021-the-paper-host-is-the-operators-own-mac.md) — that document
-had chosen the Mac and explicitly rejected this host on three grounds
-[HOSTING.md](HOSTING.md) sets out. Read 0032 for what changed the answer and for
-the strongest argument against the move, which it records rather than hides.
-This document is the procedure and takes the decision as given.
+**This is the escape route, not the current plan.**
+[ADR 0032](adr/0032-the-paper-host-moves-off-the-mac.md) decided this move and
+was superseded a day later by
+[ADR 0033](adr/0033-the-mac-stays-and-the-condition-becomes-a-number.md), which
+keeps the paper host on the operator's Mac. **Nothing was provisioned at
+Oracle.**
+
+That makes this document *more* useful rather than less, and 0033 is explicit
+about it: that ADR names one condition — the Mac's sleep/wake count rising
+during a session it was trading — and names this file as what happens next if it
+does. The sizing, the region argument and the Pay-As-You-Go reasoning in 0032
+stand as research; superseding a decision does not discard the work under it.
 
 **It is still a procedure that nobody has run.** §11 has not moved: no part of
 what follows describes something that happened.

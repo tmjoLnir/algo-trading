@@ -1,7 +1,24 @@
 # 32. The paper host moves off the Mac to an Oracle Cloud A1
 
-**Status:** Accepted · 2026-09-10 ·
+**Status:** **Superseded** by [ADR 0033](0033-the-mac-stays-and-the-condition-becomes-a-number.md) ·
+accepted 2026-09-10 · superseded 2026-09-11 ·
 supersedes [ADR 0021](0021-the-paper-host-is-the-operators-own-mac.md)
+
+> **Superseded after one day, and the text below is left exactly as it was
+> written.** What was believed at the time is the point (`docs/adr/README.md`),
+> and a decision that lasted a day is worth being able to read.
+>
+> This ADR's own Alternatives section named the paragraph that would undo it —
+> *"it is entirely possible that `sudo pmset -c disablesleep 1`, verified once,
+> was all that stood between day 3 and a clean week"*. On 2026-09-11 that
+> command was run and read back, and the same readout supplied the feedback loop
+> this document argued did not exist. [ADR 0033](0033-the-mac-stays-and-the-condition-becomes-a-number.md)
+> keeps the Mac and makes its condition a checkable number with a trip-wire that
+> points back here.
+>
+> **Nothing was ever provisioned at Oracle**, so none of the consequences below
+> took effect. The sizing, the region argument and the Pay-As-You-Go reasoning
+> stand as research and are the route if the trip-wire fires.
 
 Supersedes 0021, which chose the operator's own Mac. It does not reopen
 [ADR 0011](0011-one-vm-deployed-by-hand.md): the *shape* — one always-on VM per

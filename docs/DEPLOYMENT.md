@@ -16,18 +16,20 @@ are allowed to deploy.
 > stack, reached over a private network, deployed by hand — and deliberately
 > did not pick a machine.
 > [ADR 0021](adr/0021-the-paper-host-is-the-operators-own-mac.md) picked one for
-> paper — the operator's own Mac — and
-> [ADR 0032](adr/0032-the-paper-host-moves-off-the-mac.md) **superseded it**:
-> the paper host is an **Oracle Cloud Ampere A1 instance in `us-ashburn-1`**.
-> Nothing in this repository has been deployed anywhere, so the table below is
-> still a specification rather than a description of something that exists.
+> paper — **the operator's own Mac** — and after a day spent pointing at an
+> Oracle A1 ([ADR 0032](adr/0032-the-paper-host-moves-off-the-mac.md), never
+> provisioned),
+> [ADR 0033](adr/0033-the-mac-stays-and-the-condition-becomes-a-number.md) keeps
+> it there. Nothing in this repository has been deployed anywhere, so the table
+> below is still a specification rather than a description of something that
+> exists.
 >
 > **If that is where you are deploying, read
-> [ORACLE_HOSTING.md](ORACLE_HOSTING.md) alongside this document.** It is the
-> Oracle-specific provisioning and the cutover from the Mac.
-> [LOCAL_HOSTING.md](LOCAL_HOSTING.md) is the superseded host, kept as the
-> rollback target and as a Mac-development reference — a delta of six steps, the
-> first of which is that the machine sleeps. Everything not listed in either is
+> [LOCAL_HOSTING.md](LOCAL_HOSTING.md) alongside this document.** It is a delta
+> — six steps where a Mac under a desk differs from the rented Linux VM this
+> document assumes, the first of which is that the machine sleeps.
+> [ORACLE_HOSTING.md](ORACLE_HOSTING.md) is the costed route off it, which
+> 0033's trip-wire names. Everything not listed in either is
 > here and is unchanged.
 >
 > [HOSTING.md](HOSTING.md) surveys what else can satisfy the table — including
