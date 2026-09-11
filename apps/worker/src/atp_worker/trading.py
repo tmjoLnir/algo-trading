@@ -382,6 +382,14 @@ async def consume_trade_updates(
                 attempts=event.attempts,
                 msg="re-reading the book over REST — events during the gap are lost",
             )
+            # The catch-up the marker's own docstring promises, and which
+            # nothing performed until now: re-read our working orders over REST
+            # and book what the gap swallowed. **Before the reconcile**, or the
+            # missed fill it exists to recover is instead reported as a
+            # divergence and halts the platform (docs/paper-week/
+            # day-3-review.md, F3).
+            await runner.catch_up_on_orders(portfolio)
+
             # Deferred for F4's reason, and this caller needs it most: a
             # trade-updates reconnect is exactly the moment fills are in flight,
             # which is the condition that produced both of day 2's false halts.
