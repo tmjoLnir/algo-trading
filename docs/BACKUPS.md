@@ -141,12 +141,13 @@ the machine slept where cron simply skips it.
 [LOCAL_HOSTING.md](LOCAL_HOSTING.md), "On a schedule, with launchd", carries
 that recipe along with the guard an external drive needs.
 
-**The cron lines above are the ones the deployment uses.**
-[ADR 0032](adr/0032-the-paper-host-moves-off-the-mac.md) moved the paper host
-from that Mac to a Linux VM, superseding ADR 0021 — so launchd's catch-up for a
-job missed while the machine slept stops being a feature and starts being a
-description of the problem that ADR removed. The macOS recipe is kept for the
-rollback target and for a Mac used in development.
+**The launchd recipe is the one the deployment uses.**
+[ADR 0033](adr/0033-the-mac-stays-and-the-condition-becomes-a-number.md) keeps
+the paper host on that Mac — ADR 0032 had moved it to a Linux VM and was
+superseded a day later, with nothing provisioned — so the cron lines above are
+the deferred ones, for whatever host follows. launchd's catch-up for a job
+missed while the machine slept therefore still matters, though if 0033's
+sleep invariant holds it should never have anything to catch up on.
 
 There is no alerting wired into this. `scripts/check_alerts.py` and
 `docs/OBSERVABILITY.md` are how a failure reaches a phone, and the cron line
@@ -219,7 +220,7 @@ pg_restore -t audit_log -d atp --data-only backups/atp-atp-20260819T052226Z.dump
 ## What is not here
 
 - **This repository still schedules nothing, and cannot.** A host is chosen now
-  (ADR 0032, superseding ADR 0021) and both recipes above are written for real
+  (ADR 0033, keeping ADR 0021's) and both recipes above are written for real
   machines rather than hypothetical ones — but whether an agent or a cron line is actually loaded is
   a property of that host, not of this checkout. Check it there; a schedule
   nobody verified is the same as no schedule, and it looks better.

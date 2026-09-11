@@ -11,19 +11,24 @@ is the specification and the procedure. **This document is neither.** It is a
 survey of what is available at zero cost, written against that specification so
 that the choice can be made with the tradeoffs in front of it.
 
-> **A target has since been chosen — twice — and this document did not choose
-> either.** [ADR 0021](adr/0021-the-paper-host-is-the-operators-own-mac.md)
-> picked "hardware you already own" — the operator's own Mac — on the reasoning
-> in the section of that name below.
-> [ADR 0032](adr/0032-the-paper-host-moves-off-the-mac.md) **superseded it** and
-> picked **Oracle Cloud Always Free (Ampere A1)**, the other row in the survey
-> that clears the bar, after the Mac went dark for 79.8% of regular trading
-> hours on day 3 of the paper week. [ORACLE_HOSTING.md](ORACLE_HOSTING.md) is
-> the procedure; [LOCAL_HOSTING.md](LOCAL_HOSTING.md) is what it moved off.
+> **A target has been chosen three times, and this document chose none of
+> them.** [ADR 0021](adr/0021-the-paper-host-is-the-operators-own-mac.md) picked
+> "hardware you already own" — the operator's own Mac.
+> [ADR 0032](adr/0032-the-paper-host-moves-off-the-mac.md) superseded it for
+> **Oracle Cloud Always Free (Ampere A1)** after the Mac went dark for 79.8% of
+> regular trading hours on day 3 of the paper week.
+> [ADR 0033](adr/0033-the-mac-stays-and-the-condition-becomes-a-number.md)
+> superseded *that* a day later, once the sleep setting 0021 was conditional on
+> was finally applied and read back: **the paper host is the Mac**, and the
+> condition is now an integer with a trip-wire rather than an intention.
 >
-> **Both sections below are left as they were written**, which is the point of
-> a survey: 0021 was decided against the Mac section and 0032 against the Oracle
-> one, and neither reads honestly if it is edited to agree with the outcome.
+> **Nothing was provisioned at Oracle.** [LOCAL_HOSTING.md](LOCAL_HOSTING.md) is
+> the procedure; [ORACLE_HOSTING.md](ORACLE_HOSTING.md) is the route out that
+> 0033's trip-wire names.
+>
+> **Both sections below are left as they were written**, which is the point of a
+> survey: each ADR was decided against one of them, and neither reads honestly
+> if it is edited to agree with whichever won most recently.
 >
 > This survey stays as it is, and stays useful for two reasons: **live still
 > needs a second host** (`docs/SAFETY.md` layer 3), and the Mac is explicitly a
@@ -216,17 +221,21 @@ VM is a decision to make after that, not before it.
 
 ## If you are choosing today
 
-- **A free paper host, accepting vendor risk:** Oracle A1, sized for 12 GB,
-  having read all three caveats and confirmed the ARM build yourself.
-  **This is what was chosen** (ADR 0032), with the procedure in
-  [ORACLE_HOSTING.md](ORACLE_HOSTING.md).
 - **A free paper host, accepting latency instead:** hardware you own, with
   BACKUPS.md scheduled from the first day rather than the first incident.
-  **This was chosen first** (ADR 0021) **and did not hold.** If the machine is
-  one that sleeps — a Mac, or any laptop — that is a disqualifying property
-  until it is configured away, and the configuring is the part that failed:
-  LOCAL_HOSTING.md §1 prescribed it, nobody ran it, and a session lost 79.8% of
-  its trading hours. Read that section before choosing this row again.
+  **This is what was chosen** — ADR 0021, briefly un-chosen by 0032, and kept by
+  [ADR 0033](adr/0033-the-mac-stays-and-the-condition-becomes-a-number.md). If
+  the machine is one that sleeps — a Mac, or any laptop — that is a
+  disqualifying property until it is configured away, and *the configuring is
+  the part that failed*: LOCAL_HOSTING.md §1 prescribed it, nobody ran it, and a
+  session lost 79.8% of its trading hours. Read that section before choosing
+  this row, and note what 0033 changed about it — the condition is checked
+  against a number now, not agreed with.
+- **A free paper host, accepting vendor risk:** Oracle A1, sized for 12 GB,
+  having read all three caveats and confirmed the ARM build yourself. Fully
+  costed in [ORACLE_HOSTING.md](ORACLE_HOSTING.md) and **chosen once** (ADR
+  0032) before being superseded; nothing was provisioned. It is the route 0033's
+  trip-wire points at.
 - **Neither is free:** any commodity VPS in US-East at the 8 GB / 4 vCPU row.
   ADR 0011 names DigitalOcean, Vultr, Linode, Hetzner and Lightsail and declines
   to choose between them, which is still the right answer.
