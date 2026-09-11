@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, assert_never
 
 from atp_core.errors import BrokerError
 from atp_core.execution.fees import settle_broker_fees
+from atp_core.execution.recovery import read_missed_updates
 from atp_core.logging import get_logger
 from atp_core.risk.killswitch import HaltReason, HaltScope
 
@@ -35,7 +36,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Collection, Iterable
     from datetime import datetime
 
-    from atp_core.brokers.ports import BrokerPort
+    from atp_core.brokers.ports import BrokerPort, TradeUpdate
     from atp_core.clock import Clock
     from atp_core.domain import Order, Portfolio, Position, RunMode
     from atp_core.execution.ports import FeeLedger
@@ -562,6 +563,32 @@ class Reconciler:
                 detail=f"cash differs by {drift}, beyond the {tolerance} tolerance",
             )
         ]
+
+    async def missed_order_updates(self, known_orders: Iterable[Order]) -> list[TradeUpdate]:
+        """What the venue says our working orders did while we were not listening.
+
+        **Call this before `reconcile`, not after.** The two answer different
+        questions and only one of them is a catch-up: this asks the venue about
+        orders *we* submitted and returns the events we never received;
+        `reconcile` compares positions and cash and halts when they disagree.
+        Run in the other order — or, as it was until now, not run at all — a
+        fill that landed inside a restart is never booked, so it surfaces as a
+        `missing_position` plus a `cash` drift and halts a worker that had
+        every piece of information needed to book it (`execution.recovery`,
+        and docs/paper-week/day-3-review.md F3 and F9).
+
+        Read-only and mutates nothing, including the orders passed in. Booking
+        a fill moves cash, moves a position and arms a protective stop; the
+        component that already does all three for a pushed fill is the one that
+        should do them for a recovered one, and there is no second path.
+
+        On the reconciler because the broker is here and this is the same
+        question layer 7 exists to ask, one level lower down: not "do the two
+        books agree" but "is our copy of this order current". A caller reaching
+        past this for `self.broker` would be a second component holding a venue
+        handle for no reason.
+        """
+        return await read_missed_updates(self.broker, known_orders, now=self.clock.now())
 
     async def adopt_broker_state(self, portfolio: Portfolio) -> None:
         """Overwrite local state with the broker's.

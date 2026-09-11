@@ -1087,6 +1087,26 @@ above.
   **signed** quantity, no local position the broker does not have, every open
   broker order accounted for, and cash within a tolerance.
 
+  **Reconciling was never the whole job, and day 3 is what showed it.** Layer 7
+  compares positions and cash and holds no opinion about *orders*, so a fill
+  that landed while the worker was down was never booked — it was reported, as
+  a `missing_position` plus the matching cash drift, and the report is a halt no
+  restart can clear. One 10-share MSFT fill produced 131 identical quarantines
+  over one session, with the order, its venue id and its fill within reach every
+  time (F3 and F9). `Reconciler.missed_order_updates` closes it: before the
+  comparison, at `warmup` and on every trade-updates reconnect, the venue is
+  asked what our own working orders did, and `execution.recovery` turns the
+  difference into the `TradeUpdate`s the stream never delivered. The runner
+  books them through the one fill path, so a recovered position is protected
+  like any other.
+
+  It is **not** adoption and the distinction is load-bearing: orders are
+  addressed by the venue id we hold for our own `client_order_id`, so nothing
+  can be learned about an order we did not submit. A venue position no order
+  explains, a cash move no order explains, an orphan order, and a venue
+  reporting *less* filled than we have booked all still halt, with the same
+  tolerance and the same rules.
+
   **Two things about the *un*happy path were wrong until day 3 exercised it.**
   The start-up guard refused to trade against a divergent book — correct — by
   raising out of the runner, which ended a supervised responsibility and exited
@@ -1459,7 +1479,12 @@ above.
   `async for` body runs to completion before the next event, so the consumer's
   REST catch-up provably happens before it handles anything from the new
   connection. The adapter deliberately does not re-read open orders itself — it
-  holds no book to correct.
+  holds no book to correct. **That catch-up was an ordering guarantee with
+  nothing behind it until 2026-09-11**: the consumer logged the reconnect and
+  went straight to `reconcile`, which compares positions and cash and cannot
+  book a missed fill. It now calls `StrategyRunner.catch_up_on_orders` first —
+  see the Reconciliation item above for what that does and what it refuses to
+  do.
 
   The account handshake is **not** the market-data one (`authenticate` with
   nested `key_id`/`secret_key`, versus `auth` with flat `key`/`secret`), and

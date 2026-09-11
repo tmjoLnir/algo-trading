@@ -188,8 +188,25 @@ status.
 2. Compare `GET /api/v1/positions` with the broker's own UI. For cash,
    `uv run python scripts/status.py` prints the venue's `equity` and `cash`
    beside local state.
-3. Usual causes: a fill during a restart, a missed WS event, a corporate action,
-   a manual trade placed outside the platform.
+3. Usual causes: a corporate action, a manual trade placed outside the platform,
+   a duplicate submission.
+
+   **A fill during a restart and a missed WebSocket event are no longer on that
+   list, and that is the first thing to check.** Before it compares books — at
+   `warmup` and on every trade-updates reconnect — the worker now re-reads every
+   order it believes is working over REST and books what the gap swallowed
+   (`runner.caught_up_on_orders`, `execution.recovery.missed_events`). So a
+   `missing_position` that survives to a halt is one **no order of ours
+   explains**, which is a much narrower and more serious finding than it used to
+   be. Look for the reverse case too: `execution.recovery.venue_filled_less`
+   means our book claims more filled than the venue admits, and that one is
+   refused deliberately rather than resolved.
+
+   Until this landed, a fill missed during downtime was unrecoverable without
+   you: nothing on the boot path ever booked it, so every restart re-read the
+   same stale book and quarantined on the same two numbers. Day 3 of the paper
+   week did that 131 times over one 10-share MSFT fill
+   (docs/paper-week/day-3-review.md, F3 and F9).
 4. Once you know *why*, resync. Not before — adopting silently hides the bug,
    and if the cause is duplicate submission you will do it again tomorrow.
 

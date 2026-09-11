@@ -559,6 +559,16 @@ class StrategyRunner:
                 client_order_ids=[o.client_order_id for o in restored],
             )
 
+        # What the venue did to those orders while this process was not
+        # running. **Before reconciling, not after**: a fill that landed during
+        # a restart exists only at the venue, so reconciling first turns it
+        # into a `missing_position` and a cash drift — a halt that every
+        # subsequent boot reproduces, because nothing on the boot path ever
+        # books the fill that would clear it. Day 3 of the paper week spent 131
+        # boots in exactly that loop with the order, its venue id and its fill
+        # all within reach (docs/paper-week/day-3-review.md, F3 and F9).
+        await self.catch_up_on_orders(portfolio)
+
         # A lambda, not the property's value: `open_orders` is evaluated at the
         # call site otherwise, which is the early half of F4's read-ordering
         # race. Deferring it lets the reconciler read both local books at one
@@ -1643,6 +1653,82 @@ class StrategyRunner:
         return None if value is None else Decimal(str(value))
 
     # ── fills ───────────────────────────────────────────────────────────────
+
+    async def catch_up_on_orders(self, portfolio: Portfolio) -> int:
+        """Book whatever the venue did to our working orders while we were away.
+
+        Returns the number of events applied, so a caller can say whether the
+        gap it just noticed actually contained anything.
+
+        Run at every point where our copy of an order may have gone stale: at
+        `warmup`, because the process was not running, and on a trade-updates
+        reconnect, because Alpaca does not replay the gap. Both are the same
+        condition — a venue event we were not there to receive — and both used
+        to go straight to reconciliation, which reports such an event as a
+        divergence instead of booking it.
+
+        **Everything goes through `on_fill_event`.** A recovered fill is a
+        fill: it must be checked against the duplicate guard, folded into cash
+        and the position by the same arithmetic the backtest uses, offered to
+        the strategy, persisted, and — the reason this cannot be a shortcut —
+        it must arm protection. The position the venue holds is real and has no
+        stop on it; routing this through a private booking path would recreate
+        the state this file calls the worst one in the system, while trying to
+        leave it. There is one fill path for the same reason there is one
+        submit path (rule §1.5).
+
+        The venue is read for the whole working set *before* anything is
+        applied. `on_fill_event` removes completed orders from `_open_orders`,
+        and a recovery that read and applied in one pass would be mutating the
+        set it is iterating.
+        """
+        if not self._open_orders:
+            return 0
+
+        updates = await self.reconciler.missed_order_updates(list(self._open_orders.values()))
+        applied = 0
+        for update in updates:
+            try:
+                await self.on_fill_event(update, portfolio)
+            except ATPError as exc:
+                # **A repair that fails is a divergence, and a divergence is not
+                # a crash loop.** Everything this can raise is a
+                # page-a-human outcome — `apply_trade_update` refusing a fill
+                # against an order our book has already killed, a protective
+                # submit whose outcome is unknown — and on this path every one
+                # of them is *deterministic*: the venue's answer is the same on
+                # the next boot and the one after. Left to propagate out of
+                # `warmup` it would end a supervised responsibility and exit the
+                # process, which is `restart: unless-stopped` with no attempt cap
+                # and an unsatisfiable condition — day 3's B2, rebuilt inside its
+                # own fix (docs/paper-week/day-3-review.md).
+                #
+                # Nothing is booked and nothing is softened. The reconcile that
+                # runs immediately after is the one component whose answer to an
+                # unresolvable disagreement is to stop, and it still gives it:
+                # the book is exactly as divergent as it was, so it halts and
+                # the runner parks with the process up. A bug that is not an
+                # `ATPError` still propagates — that is a defect, not a
+                # divergence, and hiding it would be worse than either.
+                log.critical(
+                    "runner.catch_up_refused",
+                    client_order_id=update.client_order_id,
+                    symbol=update.symbol,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    msg="could not book what the venue reported — leaving it for reconciliation",
+                )
+                continue
+            applied += 1
+        if applied:
+            log.warning(
+                "runner.caught_up_on_orders",
+                applied=applied,
+                cash=str(portfolio.cash),
+                positions=sorted(p.symbol for p in portfolio.open_positions),
+                msg="booked venue events that arrived while this process was not listening",
+            )
+        return applied
 
     async def on_fill_event(self, update: TradeUpdate, portfolio: Portfolio) -> None:
         """Handle a broker fill.

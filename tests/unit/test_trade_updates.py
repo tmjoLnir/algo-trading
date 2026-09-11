@@ -750,3 +750,87 @@ class TestTheApplier:
         apply_trade_update(order, a_fill_update("40"))
 
         assert order.broker_order_id == "brk-abc-123"
+
+
+class TestTheConsumerCatchesUpBeforeItCompares:
+    """`TradeUpdatesReconnected`'s own docstring: "the only way to learn what
+    happened during the gap is to re-read the open orders over REST".
+
+    Nothing performed that re-read. The consumer logged the marker and went
+    straight to `reconcile`, which compares positions and cash and cannot book a
+    fill — so a fill landing inside a WebSocket gap was reported as a divergence
+    and halted the platform, which is day 3's halt reached through the other
+    door (docs/paper-week/day-3-review.md, F3).
+    """
+
+    class SpyRunner:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.open_orders: list[Order] = []
+
+        async def catch_up_on_orders(self, _portfolio: object) -> int:
+            self.calls.append("catch_up")
+            return 1
+
+        async def on_fill_event(self, _update: object, _portfolio: object) -> None:
+            self.calls.append("fill")
+
+    class SpyReconciler:
+        def __init__(self, runner: TestTheConsumerCatchesUpBeforeItCompares.SpyRunner) -> None:
+            self._runner = runner
+
+        async def reconcile(self, _portfolio: object, **_kwargs: Any) -> Any:
+            self._runner.calls.append("reconcile")
+            from atp_core.execution.reconciliation import ReconciliationReport
+
+            return ReconciliationReport(checked_at=datetime(2024, 6, 3, 14, 30, tzinfo=UTC))
+
+    class ScriptedStream:
+        def __init__(self, events: Sequence[object]) -> None:
+            self._events = events
+
+        def stream_trade_updates(self) -> Any:
+            async def gen() -> Any:
+                for event in self._events:
+                    yield event
+
+            return gen()
+
+    @pytest.mark.asyncio
+    async def test_the_order_catch_up_runs_before_the_reconcile(self) -> None:
+        from atp_worker.trading import consume_trade_updates
+
+        marker = TradeUpdatesReconnected(
+            gap_since=datetime(2024, 6, 3, 14, 30, tzinfo=UTC),
+            reconnected_at=datetime(2024, 6, 3, 14, 31, tzinfo=UTC),
+            attempts=1,
+        )
+        runner = self.SpyRunner()
+        reconciler = self.SpyReconciler(runner)
+
+        await consume_trade_updates(
+            self.ScriptedStream([marker]),  # type: ignore[arg-type]
+            runner,  # type: ignore[arg-type]
+            reconciler,  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+        )
+
+        assert runner.calls == ["catch_up", "reconcile"]
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_event_is_not_a_catch_up(self) -> None:
+        """The catch-up is for the gap, not for every fill. Running it per
+        event would be a REST read per print."""
+        from atp_worker.trading import consume_trade_updates
+
+        runner = self.SpyRunner()
+        reconciler = self.SpyReconciler(runner)
+
+        await consume_trade_updates(
+            self.ScriptedStream([a_fill_update("40")]),  # type: ignore[arg-type]
+            runner,  # type: ignore[arg-type]
+            reconciler,  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+        )
+
+        assert runner.calls == ["fill"]

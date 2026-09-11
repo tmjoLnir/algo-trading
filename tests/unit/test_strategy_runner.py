@@ -382,6 +382,15 @@ class FakeReconciler:
     def __init__(self, clean: bool = True) -> None:
         self.clean = clean
         self.calls: list[list[Order]] = []
+        #: What the venue says our working orders did while nobody was
+        #: listening. Empty is the ordinary case — the stream delivered
+        #: everything — and a test about a missed fill fills it.
+        self.missed: list[TradeUpdate] = []
+        self.missed_calls: list[list[Order]] = []
+
+    async def missed_order_updates(self, known_orders: Any) -> list[TradeUpdate]:
+        self.missed_calls.append(list(known_orders))
+        return list(self.missed)
 
     async def reconcile(
         self, portfolio: Portfolio, *, known_orders: Any, **kwargs: Any
@@ -530,6 +539,198 @@ class TestWarmup:
         """The operator sees why at startup, rather than finding a process that
         is running and silently declining to trade."""
         runner, _, _, _, portfolio, _ = build(clean=False)
+
+        with pytest.raises(ReconciliationDivergedError, match="does not match the broker"):
+            await runner.warmup(portfolio)
+
+
+class TestCatchingUpOnWhatTheVenueDidWhileWeWereDown:
+    """Day 3's other half: the halt loop nothing on the boot path could clear.
+
+    B2's fix stopped the worker dying on a broker rejection, so it now reaches
+    `warmup` and quarantines politely instead of crash-looping. That is the
+    right behaviour for a book that is genuinely wrong — and this book was
+    wrong for a reason the platform could have resolved itself. A market BUY of
+    10 MSFT filled at the venue while the trade-updates consumer was dead; the
+    order, its venue id and its fill were all within reach on every one of the
+    131 boots, and nothing asked (docs/paper-week/day-3-review.md, F3 and F9).
+    """
+
+    def _missed_fill(self, order: Order) -> TradeUpdate:
+        """What `Reconciler.missed_order_updates` reconstructs from the venue's
+        REST view of an order it has completed."""
+        return TradeUpdate(
+            event="rest_recovery",
+            client_order_id=order.client_order_id,
+            broker_order_id="venue-1",
+            symbol=order.symbol,
+            at=START,
+            fill=Fill(
+                order_id=order.id,
+                ts=START,
+                qty=Decimal("10"),
+                price=Decimal("493.232"),
+                venue_fill_id="rest_recovery:venue-1:10",
+            ),
+        )
+
+    def _working(self) -> Order:
+        order = Order(
+            symbol=SYMBOL,
+            side=Side.BUY,
+            qty=Decimal("10"),
+            order_type=OrderType.MARKET,
+            client_order_id="atp-e82c4109cc2c0c8886b0e0b5",
+            broker_order_id="venue-1",
+        )
+        order.status = OrderStatus.SUBMITTED
+        return order
+
+    @pytest.mark.asyncio
+    async def test_it_asks_the_venue_before_it_compares_books(self) -> None:
+        """Ordering is the whole fix. Reconciling first turns a recoverable
+        missed fill into a halt that every later boot reproduces."""
+        repo = FakeOrderRepository()
+        repo.restorable = [self._working()]
+        runner, _, _, reconciler, portfolio, _ = build(order_repo=repo)
+
+        await runner.warmup(portfolio)
+
+        assert [o.client_order_id for o in reconciler.missed_calls[0]] == [
+            "atp-e82c4109cc2c0c8886b0e0b5"
+        ]
+        assert len(reconciler.missed_calls) == 1
+        assert len(reconciler.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_missed_fill_is_booked_into_cash_and_the_position(self) -> None:
+        """100,090.05 − 10 × 493.232 = 95,157.73 — the number the venue
+        reported all day while the platform insisted it held only cash."""
+        repo = FakeOrderRepository()
+        working = self._working()
+        repo.restorable = [working]
+        runner, _, _, reconciler, portfolio, _ = build(order_repo=repo)
+        portfolio.cash = Decimal("100090.05")
+        reconciler.missed = [self._missed_fill(working)]
+
+        await runner.warmup(portfolio)
+
+        assert portfolio.cash == Decimal("95157.73")
+        assert portfolio.position(SYMBOL).qty == Decimal("10")
+
+    @pytest.mark.asyncio
+    async def test_the_completed_order_stops_being_working(self) -> None:
+        """F9's symptom exactly: 131 boots re-adopted an order that had been
+        finished at the venue since 14:44 the previous day."""
+        repo = FakeOrderRepository()
+        working = self._working()
+        repo.restorable = [working]
+        runner, _, _, reconciler, portfolio, _ = build(order_repo=repo)
+        reconciler.missed = [self._missed_fill(working)]
+
+        await runner.warmup(portfolio)
+
+        # The entry is retired. What is working now is the protective stop
+        # the recovered fill armed, which is the point.
+        assert "atp-e82c4109cc2c0c8886b0e0b5" not in [o.client_order_id for o in runner.open_orders]
+        assert repo.saved["atp-e82c4109cc2c0c8886b0e0b5"].status is OrderStatus.FILLED
+
+    @pytest.mark.asyncio
+    async def test_the_recovered_position_gets_a_protective_stop(self) -> None:
+        """The position the venue holds is real and has nothing on it. Booking
+        the fill through any path that skipped this would reach the state this
+        runner calls the worst one in the system, while leaving it."""
+        repo = FakeOrderRepository()
+        working = self._working()
+        repo.restorable = [working]
+        runner, router, _, reconciler, portfolio, _ = build(order_repo=repo)
+        reconciler.missed = [self._missed_fill(working)]
+
+        await runner.warmup(portfolio)
+
+        assert [o.symbol for o in router.protected] == [SYMBOL]
+
+    @pytest.mark.asyncio
+    async def test_a_quiet_venue_changes_nothing(self) -> None:
+        """The ordinary case — the stream delivered everything — must cost a
+        boot nothing and move no money."""
+        repo = FakeOrderRepository()
+        repo.restorable = [self._working()]
+        runner, _, _, _, portfolio, _ = build(order_repo=repo)
+        before = portfolio.cash
+
+        await runner.warmup(portfolio)
+
+        assert portfolio.cash == before
+        assert [o.client_order_id for o in runner.open_orders] == ["atp-e82c4109cc2c0c8886b0e0b5"]
+
+    @pytest.mark.asyncio
+    async def test_nothing_working_means_the_venue_is_not_asked_at_all(self) -> None:
+        runner, _, _, reconciler, portfolio, _ = build()
+
+        await runner.warmup(portfolio)
+
+        assert reconciler.missed_calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_to_book_halts_rather_than_killing_the_worker(self) -> None:
+        """B2 must not be rebuilt inside its own fix.
+
+        `apply_trade_update` refuses a fill against an order our book has
+        already killed — correctly; nothing in code can tell which side is
+        wrong. On *this* path that refusal is deterministic: the venue answers
+        the same on the next boot and the one after. Raised out of `warmup` it
+        would end a supervised responsibility and exit the process, into
+        `restart: unless-stopped` with no attempt cap — which is exactly the
+        129-boot loop day 3 spent (docs/paper-week/day-3-review.md, B2).
+        """
+        repo = FakeOrderRepository()
+        working = self._working()
+        # Our book has it cancelled; the venue says it filled. Unresolvable.
+        working.status = OrderStatus.CANCELLED
+        repo.restorable = [working]
+        runner, _, _, reconciler, portfolio, _ = build(order_repo=repo)
+        reconciler.missed = [self._missed_fill(working)]
+        before = portfolio.cash
+
+        with capture_logs() as logs:
+            await runner.warmup(portfolio)
+
+        assert any(entry["event"] == "runner.catch_up_refused" for entry in logs)
+        # Nothing booked, nothing softened: the book is exactly as divergent as
+        # it was, which is what the reconcile that follows is there to find.
+        assert portfolio.cash == before
+        assert portfolio.position(SYMBOL).is_flat
+
+    @pytest.mark.asyncio
+    async def test_a_defect_is_not_swallowed_as_a_divergence(self) -> None:
+        """The swallow is typed on `ATPError` on purpose. A `TypeError` out of
+        this path is a bug in the platform, not a disagreement with the venue,
+        and a bug that halts trading silently every boot is worse than a loud
+        one."""
+        repo = FakeOrderRepository()
+        working = self._working()
+        repo.restorable = [working]
+        runner, _, _, reconciler, portfolio, _ = build(order_repo=repo)
+        reconciler.missed = [self._missed_fill(working)]
+
+        async def boom(*_: object, **__: object) -> None:
+            raise TypeError("a defect, not a divergence")
+
+        runner.on_fill_event = boom  # type: ignore[method-assign]
+
+        with pytest.raises(TypeError, match="a defect"):
+            await runner.warmup(portfolio)
+
+    @pytest.mark.asyncio
+    async def test_a_divergence_the_catch_up_cannot_explain_still_refuses_to_start(
+        self,
+    ) -> None:
+        """The guard is not relaxed by any of this. What the catch-up removes
+        is a known-missing input, not the reconciler's answer."""
+        repo = FakeOrderRepository()
+        repo.restorable = [self._working()]
+        runner, _, _, _, portfolio, _ = build(order_repo=repo, clean=False)
 
         with pytest.raises(ReconciliationDivergedError, match="does not match the broker"):
             await runner.warmup(portfolio)
