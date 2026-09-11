@@ -1073,7 +1073,28 @@ class OrderRouter:
         started = time.perf_counter()
         try:
             acknowledged = await self.broker.submit_order(order)
-        except OrderRejectedError as exc:
+        except BrokerConnectionError as exc:
+            # First, and deliberately: it is the one `BrokerError` that is not a
+            # refusal. The venue may or may not have the order, which is a
+            # different problem with a different answer.
+            metrics.order_submit_seconds(self.broker.name, time.perf_counter() - started)
+            return await self._resolve_indeterminate(order, decision, exc)
+        except BrokerError as exc:
+            # **Everything else the venue can say is "no", including the ones
+            # this adapter could not name.** This used to catch only
+            # `OrderRejectedError`, which was correct for every refusal the
+            # adapter classified and fatal for the first one it did not: day 3's
+            # wash-trade rejection arrived as `InsufficientFundsError` — a
+            # sibling class at the time — escaped both arms, and killed the task
+            # that books fills (docs/paper-week/day-3-review.md, B2).
+            #
+            # `errors.py` has since made that class a subclass, so this arm is
+            # the second lock rather than the fix. It is worth having as well:
+            # `_refusal` still returns a bare `BrokerError` for a status it does
+            # not recognise, a venue can invent a refusal tomorrow, and none of
+            # that should be able to end a consumer. A submit that did not
+            # happen is a submit that did not happen, whatever its exception was
+            # called — and every caller below already handles that outcome.
             metrics.order_submit_seconds(self.broker.name, time.perf_counter() - started)
             metrics.order_rejected("broker")
             transition(order, OrderStatus.REJECTED, reason=str(exc), rejected_by=self.broker.name)
@@ -1084,11 +1105,12 @@ class OrderRouter:
                 symbol=order.symbol,
                 broker=self.broker.name,
                 reason=str(exc),
+                # False means the adapter could not say *why* the venue refused.
+                # Day 3 logged nothing at all here; a line that admits it does
+                # not know is the one that gets the mapping fixed.
+                classified=isinstance(exc, OrderRejectedError),
             )
             return SubmitResult(order=order, decision=decision, submitted=False)
-        except BrokerConnectionError as exc:
-            metrics.order_submit_seconds(self.broker.name, time.perf_counter() - started)
-            return await self._resolve_indeterminate(order, decision, exc)
 
         metrics.order_submit_seconds(self.broker.name, time.perf_counter() - started)
         working = self._adopt(order, acknowledged)

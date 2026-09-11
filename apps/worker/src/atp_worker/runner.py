@@ -47,7 +47,12 @@ from atp_core.dashboard import SignalSummary, build_snapshot
 from atp_core.dashboard.snapshot import DEFAULT_SIGNAL_LIMIT
 from atp_core.domain import Order, Portfolio, RunMode, Side, SignalAction
 from atp_core.domain.enums import StopType
-from atp_core.errors import ATPError, DataGapError, ExecutionError
+from atp_core.errors import (
+    ATPError,
+    DataGapError,
+    ExecutionError,
+    ReconciliationDivergedError,
+)
 from atp_core.execution.idempotency import STOP_LOSS, TAKE_PROFIT, TIME_EXIT
 from atp_core.execution.router import NO_ACTION
 from atp_core.execution.trade_updates import apply_trade_update
@@ -102,6 +107,11 @@ RATE_LIMIT_STORM_REFUSALS = 5
 #: it next opens. A bounded nap rather than a spin, and short enough that a
 #: calendar that starts answering is picked up promptly.
 CLOSED_MARKET_FALLBACK_SECONDS = 300.0
+
+#: What the halt record says engaged it when the runner quarantines itself.
+#: A process, named as one — `scripts/halt.py` takes the same line about not
+#: putting an unverified human's name in a field that is meant to be evidence.
+_QUARANTINE_ACTOR = "strategy_runner"
 
 
 @dataclass(slots=True)
@@ -559,7 +569,10 @@ class StrategyRunner:
             # the CRITICAL alert `_announce_death` sends and the last line of
             # the traceback, and `summary()` renders a cash drift as the bare
             # string "cash: account" — a halt an operator cannot size.
-            raise ExecutionError(
+            # `ReconciliationDivergedError`, not a bare `ExecutionError`: `run`
+            # catches this one and quarantines instead of dying (see
+            # `_quarantine`). The refusal itself is unchanged and unrelaxed.
+            raise ReconciliationDivergedError(
                 f"refusing to start: the book does not match the broker's — {report.explain()}. "
                 "See docs/RUNBOOK.md 'Reconciliation mismatch'."
             )
@@ -693,8 +706,104 @@ class StrategyRunner:
         Between sessions, sleep until `calendar.next_open()` rather than
         spinning — and re-run `warmup()` at each open, because overnight
         corporate actions and after-hours fills change the picture.
+
+        A book that disagrees with the broker does not end this coroutine: it
+        parks it, halted, in `_quarantine`. Both `warmup` calls are inside the
+        guard, because a divergence found at the next open is the same condition
+        as one found at boot and deserves the same answer.
         """
         self._running = True
+        try:
+            await self._loop(portfolio)
+        except ReconciliationDivergedError as exc:
+            await self._quarantine(exc)
+
+    async def _quarantine(self, exc: ReconciliationDivergedError) -> None:
+        """Stop trading on a divergence and **stay up**. Never returns normally.
+
+        Refusing to trade against a book the broker contradicts is correct and
+        is exactly as strict here as it was before. What changes is the *price*
+        of refusing. This used to be an exception out of `run`, which ended a
+        supervised responsibility, which halted and killed the process — into
+        `restart: unless-stopped` with no attempt cap, against a divergence that
+        is identical on every boot. Day 3 of the paper week ran that loop **129
+        times** at a median 16.9 seconds, and sent a CRITICAL page on each pass
+        (docs/paper-week/day-3-review.md, B2 and F1).
+
+        So: halt, tell somebody **once**, and park.
+
+        Staying alive is the point rather than a side effect. The process keeps
+        answering `/healthz` and `/metrics`, keeps publishing the dashboard's
+        read models, and keeps the ingestor and the scheduler running in their
+        own tasks — an operator diagnosing a divergence wants the platform's own
+        instruments more than at any other moment, and a crash-looping container
+        is the one state in which none of them are there. Nothing trades,
+        because the kill switch says so *and* because this coroutine never
+        returns to the loop that would.
+
+        Cancelled like any other responsibility when the worker shuts down.
+
+        The way out is `scripts/adopt_broker_state.py`, which is the operator
+        entry point docs/RUNBOOK.md has always prescribed and nothing used to
+        provide.
+        """
+        detail = str(exc)
+        # Before the alert: a halt that failed to record is the one thing worse
+        # than an unsent notification, and `engage` raises rather than returning
+        # false (`KillSwitchUnavailableError`). If it does raise, this responsi-
+        # bility ends and the supervisor takes its normal path — which is the
+        # correct outcome, because then nothing is holding trading closed.
+        self.kill_switch.engage(
+            HaltScope.GLOBAL,
+            HaltReason.RECONCILIATION_MISMATCH,
+            engaged_by=_QUARANTINE_ACTOR,
+            detail=detail,
+        )
+        log.critical(
+            "runner.quarantined",
+            reason=HaltReason.RECONCILIATION_MISMATCH.value,
+            detail=detail,
+            remedy="uv run python scripts/adopt_broker_state.py --by <you>",
+            msg="halted and staying up — nothing will retry this",
+        )
+        self._alert_quarantined()
+        # Parked, not slept. An injected `_sleep` that returns immediately would
+        # make this a spin in a test, and a bounded nap would need a reason to
+        # wake up that does not exist — nothing this process can do repairs a
+        # divergence. `Event.wait()` is cancellable, which is all the shutdown
+        # path asks of it.
+        await asyncio.Event().wait()
+
+    def _alert_quarantined(self) -> None:
+        """One page, naming the fact and not the book.
+
+        No quantities, no prices, no symbols-with-numbers: `alerts/ports.py` is
+        explicit that an alert renders on a lock screen and travels through a
+        third party. The divergence itself — which position, how much cash — is
+        in the log line above and on the dashboard, both of which are behind
+        something.
+
+        A fixed `key`, so that if this somehow happens twice the transport folds
+        them rather than paging twice for one stuck worker.
+        """
+        if self.alerts is None:
+            return
+        self.alerts.send(
+            Alert(
+                severity=Severity.CRITICAL,
+                title="Trading halted — the book does not match the broker's",
+                body=(
+                    "The worker is up and will not trade until an operator resolves this. "
+                    "Nothing will retry it and no further alerts will be sent.\n"
+                    "The worker's log names the difference; the dashboard shows the halt.\n"
+                    "docs/RUNBOOK.md, 'Reconciliation mismatch'."
+                ),
+                key="runner.reconciliation_diverged",
+            )
+        )
+
+    async def _loop(self, portfolio: Portfolio) -> None:
+        """`run`'s body, split out so one `except` covers both `warmup` calls."""
         await self.warmup(portfolio)
 
         while self._running:

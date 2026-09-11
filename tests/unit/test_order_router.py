@@ -39,7 +39,12 @@ from atp_core.domain import (
     TimeInForce,
 )
 from atp_core.domain.enums import StopType
-from atp_core.errors import BrokerConnectionError, ExecutionError
+from atp_core.errors import (
+    BrokerConnectionError,
+    BrokerError,
+    ExecutionError,
+    InsufficientFundsError,
+)
 from atp_core.execution.router import NO_ACTION, ROUTING, SIZING, OrderRouter
 from atp_core.risk.engine import RiskBooks, RiskDecision, RiskEngine, RiskRule, default_rules
 from atp_core.risk.limits import RiskLimits
@@ -266,6 +271,75 @@ class TestSubmit:
         # `status` says which vocabulary to read the name in.
         assert result.order.rejected_by == broker.name
         assert not switch.engaged
+
+    async def test_a_misclassified_refusal_is_a_value_too(self) -> None:
+        """The day-3 crash, as a test.
+
+        A wash-trade rejection came back from Alpaca as `InsufficientFundsError`
+        because the adapter read one 403 code as proof of a buying-power
+        problem. That class was a sibling of `OrderRejectedError`, so this
+        method's `except` missed it, and the exception unwound
+        `submit_protective_orders`, `_protect` and `on_fill_event` and ended the
+        trade-updates consumer — killing the worker over an outcome three frames
+        below already knew how to handle
+        (docs/paper-week/day-3-review.md, B2).
+
+        The class is a subclass now. Whatever the adapter decides a refusal is
+        called, the router turns it into a value.
+        """
+        broker = FakeBroker()
+        broker.raise_next = InsufficientFundsError("Alpaca refused POST /v2/orders: 40310000")
+        switch = FakeKillSwitch()
+
+        result = await router(broker, kill_switch=switch).submit(request(), book())
+
+        assert not result.submitted
+        assert result.order is not None
+        assert result.order.status is OrderStatus.REJECTED
+        assert result.order.rejected_by == broker.name
+        # A refusal is not an incident. Halting on one would stop every strategy
+        # over a single order the venue declined.
+        assert not switch.engaged
+
+    async def test_an_unclassified_broker_error_is_a_refusal_not_a_crash(self) -> None:
+        """`_refusal` still returns a bare `BrokerError` for a status it does not
+        recognise, and a venue can invent a refusal tomorrow.
+
+        Neither may end the task that books fills. The second lock: catch
+        `BrokerError`, not only the subclasses this adapter happens to name
+        today. `BrokerConnectionError` keeps its own arm above — it is the one
+        broker error that is *not* a refusal, because the venue may have the
+        order.
+        """
+        broker = FakeBroker()
+        broker.raise_next = BrokerError("Alpaca POST /v2/orders returned 418: teapot")
+        switch = FakeKillSwitch()
+
+        result = await router(broker, kill_switch=switch).submit(request(), book())
+
+        assert not result.submitted
+        assert result.order is not None
+        assert result.order.status is OrderStatus.REJECTED
+        assert not switch.engaged
+
+    async def test_a_transport_failure_still_takes_the_indeterminate_path(self) -> None:
+        """The arm ordering, asserted rather than assumed.
+
+        `BrokerConnectionError` is a `BrokerError`, so a single broad `except`
+        would swallow it into the refusal branch and record an order as REJECTED
+        that the venue may be holding — a lost order turned into a hidden one.
+        It is caught first, and this is what stops that regressing.
+        """
+        broker = FakeBroker()
+        broker.timeout_next = True
+        broker.accept_on_timeout = True
+
+        result = await router(broker).submit(request(), book())
+
+        # Adopted from the venue, not written off as a refusal.
+        assert result.order is not None
+        assert result.order.status is not OrderStatus.REJECTED
+        assert broker.submit_calls == [result.order.client_order_id]
 
     async def test_the_quantity_does_not_change_the_key(self) -> None:
         """A risk rule may shrink an order on its way through the chain. A key

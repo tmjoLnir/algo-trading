@@ -110,6 +110,14 @@ class FakeBroker:
         # ── the levers ──────────────────────────────────────────────────────
         #: Reject the next submit with this reason (a venue refusal).
         self.reject_next: str | None = None
+        #: Raise this exact exception from the next submit. `reject_next`
+        #: covers the refusal the router was written for; this one covers the
+        #: refusals it was not — the `BrokerError` subclass an adapter picked
+        #: wrongly, and the bare one it falls back to when it cannot classify at
+        #: all. Day 3 of the paper week is why that distinction has a lever:
+        #: `_route` caught two named subclasses, a third escaped it, and the
+        #: task that books fills died (docs/paper-week/day-3-review.md, B2).
+        self.raise_next: BaseException | None = None
         #: Time out the next submit. `accept_on_timeout` decides whether the
         #: venue got it anyway — the difference between a lost order and a
         #: hidden one, and the whole reason not to resubmit blind.
@@ -159,6 +167,10 @@ class FakeBroker:
 
     async def submit_order(self, order: Order) -> Order:
         self.submit_calls.append(order.client_order_id)
+
+        if self.raise_next is not None:
+            failure, self.raise_next = self.raise_next, None
+            raise failure
 
         if self.reject_next is not None:
             reason, self.reject_next = self.reject_next, None

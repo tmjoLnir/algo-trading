@@ -199,6 +199,50 @@ class TestSubmit:
 
     @respx.mock
     @pytest.mark.asyncio
+    async def test_a_wash_trade_rejection_is_a_rejection_not_a_funding_error(self) -> None:
+        """The refusal that killed the worker on day 3.
+
+        Alpaca reuses `40310000` as a generic 403 "order not permitted" bucket,
+        and a wash trade — an opposite-side stop against a working parent, which
+        is what a partial fill produces — is one of its members. Reading the
+        code as proof of a buying-power problem mislabelled it, and the label
+        decided whether the router could catch it
+        (docs/paper-week/day-3-review.md, B2).
+
+        The message is what separates the two, and the exception must be the
+        general one when the message does not say buying power.
+        """
+        respx.post(ORDERS_URL).mock(
+            return_value=httpx.Response(
+                403,
+                json={
+                    "code": 40310000,
+                    "message": "potential wash trade detected. use complex orders",
+                    "reject_reason": "opposite side market/stop order exists",
+                },
+            )
+        )
+
+        with pytest.raises(OrderRejectedError) as caught:
+            await make_broker().submit_order(an_order())
+
+        assert not isinstance(caught.value, InsufficientFundsError)
+        # The venue's own words survive into the exception, because they end up
+        # in the order's `reject_reason` and in the log line an operator reads.
+        assert "wash trade" in str(caught.value)
+
+    def test_a_funding_error_is_catchable_as_a_rejection(self) -> None:
+        """The type relationship, asserted directly.
+
+        Not a detail of taxonomy: `OrderRouter._route` catches refusals by this
+        class, and a sibling would escape it exactly as day 3's did. A future
+        refactor that makes `InsufficientFundsError` independent again would
+        reintroduce the crash silently, and this is the line that stops it.
+        """
+        assert issubclass(InsufficientFundsError, OrderRejectedError)
+
+    @respx.mock
+    @pytest.mark.asyncio
     async def test_a_transport_failure_that_landed_is_adopted_not_resubmitted(self) -> None:
         """The case that turns a network blip into a duplicate position.
 

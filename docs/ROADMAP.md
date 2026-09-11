@@ -1087,6 +1087,19 @@ above.
   **signed** quantity, no local position the broker does not have, every open
   broker order accounted for, and cash within a tolerance.
 
+  **Two things about the *un*happy path were wrong until day 3 exercised it.**
+  The start-up guard refused to trade against a divergent book — correct — by
+  raising out of the runner, which ended a supervised responsibility and exited
+  the process, into `restart: unless-stopped` with no attempt cap and a
+  divergence that is identical on every boot: 129 consecutive deaths and 129
+  identical CRITICAL pages in one session. It now halts, alerts once and parks
+  the runner with the process up, so the dashboard, `/metrics` and the ingestor
+  are all still there for whoever has to diagnose it. And `adopt_broker_state`
+  was implemented but unreachable: its only production caller runs when no
+  stored book exists at all, so docs/RUNBOOK.md's instruction to call it was
+  unexecutable in precisely the case it was written for.
+  `scripts/adopt_broker_state.py` is that entry point.
+
   Signed rather than absolute is the one to read twice. A long we believe is a
   short matches on magnitude and is the disagreement that *doubles* the loss
   when acted on, because every exit is then sized in the wrong direction. Pinned

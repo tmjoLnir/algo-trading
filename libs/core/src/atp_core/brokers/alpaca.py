@@ -88,6 +88,34 @@ log = get_logger(__name__)
 
 _MAX_ATTEMPTS = 5
 
+#: Alpaca's 403 code for "this order is not permitted". It is a **bucket, not a
+#: diagnosis**: buying power, a wash trade against a working order on the
+#: opposite side, and several other refusals all arrive carrying it.
+#:
+#: It is the only Alpaca error code this platform knows, and day 3 of the paper
+#: week is what that cost. `_refusal` read it as proof of a buying-power problem
+#: and returned `InsufficientFundsError` for a wash-trade rejection, which then
+#: escaped the router and killed the worker
+#: (docs/paper-week/day-3-review.md, B2). Treat a new code the same way when one
+#: turns up: a bucket to narrow inside, never a conclusion.
+_ORDER_NOT_PERMITTED = 40310000
+
+#: What the body actually says when the refusal really is buying power. Matched
+#: on the message because the code above cannot tell the cases apart, and
+#: matched loosely because the wording belongs to the venue and it will change.
+#:
+#: A miss here is cheap by construction: both branches return an
+#: `OrderRejectedError` subclass, so the worst outcome is an exception that says
+#: less than it could. That is the property to preserve if this list grows.
+_INSUFFICIENT_FUNDS_PHRASES = ("insufficient buying power", "insufficient funds")
+
+
+def _reads_as_insufficient_funds(message: str) -> bool:
+    """Whether a venue message names buying power as the reason."""
+    lowered = message.lower()
+    return any(phrase in lowered for phrase in _INSUFFICIENT_FUNDS_PHRASES)
+
+
 #: The non-trade activity types that move cash as a *charge* against trading.
 #:
 #: **One type, not three.** The account feed for 2026-09-08 answered:
@@ -422,17 +450,33 @@ class AlpacaBroker:
         Body, not headers — the request headers hold the API key (CLAUDE.md
         §1.6). Truncated, because a venue error body can be long and it ends up
         in a log line and an order's `reject_reason`.
+
+        **Every refusal returned here is an `OrderRejectedError` or a subclass
+        of one**, and that is what makes a wrong guess cheap. This method used
+        to read `code == 40310000` as proof of a buying-power refusal and return
+        `InsufficientFundsError` unconditionally, before even looking at the
+        status. On day 3 a wash-trade rejection carried that code, got that
+        class, and — the class being a sibling of `OrderRejectedError` at the
+        time — escaped the router's catch and killed the worker
+        (docs/paper-week/day-3-review.md, B2).
+
+        So the narrowing below decides how *specific* the exception is, never
+        whether a caller can catch it. A phrase this misses costs a less precise
+        error; it cannot cost a process.
         """
         detail = response.text[:400]
-        # 403 on an order submit is Alpaca's buying-power refusal; it carries a
-        # distinct code so a caller can tell "no money" from "no permission".
+        code, message = None, ""
         with contextlib.suppress(ValueError):
             payload = json.loads(response.text)
-            if isinstance(payload, dict) and payload.get("code") == 40310000:
-                return InsufficientFundsError(f"Alpaca refused {method} {path}: {detail}")
+            if isinstance(payload, dict):
+                code = payload.get("code")
+                message = str(payload.get("message") or "")
 
         if response.status_code in (httpx.codes.FORBIDDEN, httpx.codes.UNPROCESSABLE_ENTITY):
-            return OrderRejectedError(f"Alpaca refused {method} {path}: {detail}")
+            refused = f"Alpaca refused {method} {path}: {detail}"
+            if code == _ORDER_NOT_PERMITTED and _reads_as_insufficient_funds(message):
+                return InsufficientFundsError(refused)
+            return OrderRejectedError(refused)
         return BrokerError(f"Alpaca {method} {path} returned {response.status_code}: {detail}")
 
     async def _sleep_before_retry(self, attempt: int, response: httpx.Response | None) -> None:
