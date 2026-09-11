@@ -290,6 +290,51 @@ Clearing the halt is the only thing that lifts an impugnment. A later reconcile
 finding the symbol correct does not retract the earlier one; a human decides
 that a position is proven again.
 
+## A runner that will not start
+
+*Symptom:* `runner.quarantined` with a reason that is **not**
+`reconciliation_mismatch`, one CRITICAL page titled *"Trading halted — the
+worker cannot start"*, and a worker that is up, serving `/healthz`, `/metrics`
+and the dashboard, and trading nothing.
+
+The book is not the problem here — if it were, the section above would be the
+one that fired. This is the runner saying it got partway through starting and
+hit something a restart will not change.
+
+**The case that exists today:** a fill recovered from the venue is booked and
+then cannot be given a protective stop. `runner.catch_up_incomplete` names the
+order and the error; `runner.position_unprotected` names the symbol and the
+quantity. The most likely error is `atr stops need a positive ATR, got None`,
+which means exactly what it says — the configured stop is ATR-based and the
+symbol has no price history to compute one from. Check
+`runner.warmup_short_history` in the same boot: `have=0` across the board is a
+data problem wearing a risk problem's clothes.
+
+1. **The position is real and the book is right.** The fill was applied before
+   the failure, so cash and positions already match the venue. Do *not* run
+   `scripts/adopt_broker_state.py` — it answers a divergence, and pointed at a
+   book that is already correct it overwrites it and leaves the position just as
+   unprotected. The halt's own `remedy` field says so.
+2. **Decide what holds the position.** Either place a stop yourself through the
+   broker's UI, or flatten it there. Until one of those happens the position has
+   nothing on it — no venue stop, and no engine-side watch either if the reason
+   is missing bars, because the engine cannot compute a level it has no data
+   for.
+3. **Fix the cause before restarting**, or the next boot parks in the same
+   place. For the missing-ATR case that means getting bars in: run the backfill
+   over the window and confirm it wrote something, rather than assuming it did —
+   `data.backfill.done bars=0 empty_windows=20` is a successful-looking line
+   that means no data arrived.
+4. Clear the halt deliberately: `uv run python scripts/halt.py clear --by "<you>"`.
+
+**Why it parks rather than exits.** It used to exit. A condition identical on
+every boot, plus `restart: unless-stopped` with no attempt cap, is a crash loop
+and a pager storm — day 3 of the paper week ran that 129 times in a session
+(docs/paper-week/day-3-review.md, B2), and the first fix for it was scoped to
+divergence alone, so the next unsatisfiable condition walked straight through.
+Parking is stricter than exiting, not looser: nothing trades either way, and
+this way the instruments an operator needs are still running.
+
 ## Duplicate positions
 
 *Symptom:* position roughly double what it should be.
