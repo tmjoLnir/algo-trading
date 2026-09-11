@@ -1589,9 +1589,23 @@ above.
   monotonicity guarantee holds around a mark that has moved *down*.
 
   Unticked. The SQL is exercised by 15 integration tests against a real
-  Postgres in CI, but nothing here has survived an actual restart of a running
-  worker — which is the demonstration, and it is one the paper week produces
-  for free the first time the process is bounced.
+  Postgres in CI, and the demonstration this was waiting for — an actual
+  restart of a running worker — **has now happened and failed.** On day 4 of
+  the paper week the stack was bounced at 14:04:33 while the worker held a
+  position and $95,157.73 in cash; the process that came up read
+  `cash=100090.06 positions=[]`, which is day 3's closing book, 50 hours stale.
+  The session was saved by `execution.recovery`, which re-read the venue — so
+  the book that reconciled cleanly 78 times that day was reconstructed from the
+  broker it was being checked against, which is the specific circularity the
+  "What this is actually for" paragraph above says this item exists to end.
+
+  The cause is not the SQL. `PortfolioRepository.snapshot` has exactly one
+  caller in the worker, `StrategyRunner._persist`, and that is step 6 of
+  `evaluate` — so a worker that is not evaluating writes no book at all. The
+  pre-restart worker logged two hours of bar upserts, eight scheduled
+  reconciles and a fee settlement, and zero evaluations. Snapshotting has to
+  happen on a fill and from the reconcile job, not only from inside the
+  strategy loop (docs/paper-week/day-4-review.md, B2).
 
 *Verifiable:* a strategy trades the paper account for a week and reconciles clean.
 
