@@ -45,6 +45,7 @@ from atp_core.domain import (
 from atp_core.errors import (
     BrokerConnectionError,
     ReconciliationDivergedError,
+    WarmupBlockedError,
 )
 from atp_core.execution.idempotency import FLATTEN, STOP_LOSS, TAKE_PROFIT, TIME_EXIT
 from atp_core.execution.reconciliation import ReconciliationReport
@@ -703,24 +704,103 @@ class TestCatchingUpOnWhatTheVenueDidWhileWeWereDown:
         assert portfolio.position(SYMBOL).is_flat
 
     @pytest.mark.asyncio
-    async def test_a_defect_is_not_swallowed_as_a_divergence(self) -> None:
-        """The swallow is typed on `ATPError` on purpose. A `TypeError` out of
-        this path is a bug in the platform, not a disagreement with the venue,
-        and a bug that halts trading silently every boot is worse than a loud
-        one."""
+    async def test_a_stop_that_cannot_be_computed_parks_instead_of_exiting(self) -> None:
+        """**2026-09-11 01:30, and the reason this test is specific.**
+
+        The recovery worked: `execution.recovery.missed_events`, then
+        `execution.trade_update.filled qty=10 price=493.232 symbol=MSFT`. Then
+        `_protect` asked for an `atr` stop against a symbol with zero bars,
+        `StopManager.initial_stop` raised `ValueError: atr stops need a positive
+        ATR, got None`, and that left `warmup`, ended the `strategy_runner`
+        responsibility and exited the process — twice in 64 seconds, and it
+        would have run all night.
+
+        The first version of this method caught `ATPError` precisely to stop
+        that, and a bare `ValueError` walked straight through the gap. The
+        catch is on `Exception` now, and this asserts the *outcome* rather than
+        the exception class: whatever raised past a booked fill, the runner
+        parks.
+        """
         repo = FakeOrderRepository()
         working = self._working()
         repo.restorable = [working]
-        runner, _, _, reconciler, portfolio, _ = build(order_repo=repo)
+        runner, router, _, reconciler, portfolio, _ = build(order_repo=repo)
         reconciler.missed = [self._missed_fill(working)]
+        router.protection_raises = ValueError("atr stops need a positive ATR, got None")
 
-        async def boom(*_: object, **__: object) -> None:
-            raise TypeError("a defect, not a divergence")
-
-        runner.on_fill_event = boom  # type: ignore[method-assign]
-
-        with pytest.raises(TypeError, match="a defect"):
+        with pytest.raises(WarmupBlockedError, match="could not complete it"):
             await runner.warmup(portfolio)
+
+    @pytest.mark.asyncio
+    async def test_the_fill_it_could_not_finish_is_still_booked(self) -> None:
+        """Parking is not a rollback. The venue filled it, the money has moved,
+        and pretending otherwise would put the book back exactly where the
+        recovery found it."""
+        repo = FakeOrderRepository()
+        working = self._working()
+        repo.restorable = [working]
+        runner, router, _, reconciler, portfolio, _ = build(order_repo=repo)
+        portfolio.cash = Decimal("100090.05")
+        reconciler.missed = [self._missed_fill(working)]
+        router.protection_raises = ValueError("atr stops need a positive ATR, got None")
+
+        with pytest.raises(WarmupBlockedError):
+            await runner.warmup(portfolio)
+
+        assert portfolio.cash == Decimal("95157.73")
+        assert portfolio.position(SYMBOL).qty == Decimal("10")
+        # And the position is on record as having nothing holding it, which is
+        # what makes the halt legible rather than mysterious.
+        assert runner._unprotected[SYMBOL] == Decimal("10")
+
+    @pytest.mark.asyncio
+    async def test_parking_halts_and_stays_up_rather_than_ending_the_responsibility(
+        self,
+    ) -> None:
+        """The whole point of B2's fix, now reachable from the second
+        condition as well: `run` catches it, engages the halt and parks with
+        the process alive."""
+        repo = FakeOrderRepository()
+        working = self._working()
+        repo.restorable = [working]
+        runner, router, switch, reconciler, portfolio, _ = build(order_repo=repo)
+        reconciler.missed = [self._missed_fill(working)]
+        router.protection_raises = ValueError("atr stops need a positive ATR, got None")
+
+        task = asyncio.create_task(runner.run(portfolio))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert not task.done(), "a parked runner must not end its responsibility"
+        assert switch.engaged, "parking without a halt would leave trading open"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    @pytest.mark.asyncio
+    async def test_the_remedy_is_not_adopt_broker_state(self) -> None:
+        """`adopt_broker_state.py` answers a divergence. Pointed at a book that
+        is already correct it would overwrite it and leave the position just as
+        unprotected — so the halt must not send an operator there."""
+        repo = FakeOrderRepository()
+        working = self._working()
+        repo.restorable = [working]
+        runner, router, _, reconciler, portfolio, _ = build(order_repo=repo)
+        reconciler.missed = [self._missed_fill(working)]
+        router.protection_raises = ValueError("atr stops need a positive ATR, got None")
+
+        with capture_logs() as logs:
+            task = asyncio.create_task(runner.run(portfolio))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        parked = [entry for entry in logs if entry["event"] == "runner.quarantined"]
+        assert parked, "parking must say so in the log"
+        assert "adopt_broker_state" not in parked[0]["remedy"]
+        assert parked[0]["reason"] != HaltReason.RECONCILIATION_MISMATCH.value
 
     @pytest.mark.asyncio
     async def test_a_divergence_the_catch_up_cannot_explain_still_refuses_to_start(

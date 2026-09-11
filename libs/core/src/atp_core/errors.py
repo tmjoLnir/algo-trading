@@ -194,7 +194,29 @@ class LookaheadError(BacktestError):
 class ExecutionError(ATPError): ...
 
 
-class ReconciliationDivergedError(ExecutionError):
+class WarmupBlockedError(ExecutionError):
+    """A runner cannot start, and no restart will change that.
+
+    The principle is `ReconciliationDivergedError`'s, generalised because it was
+    never specific to reconciliation: **a guard that cannot be satisfied must
+    not be a restart loop.** Day 3 of the paper week proved the cost of getting
+    that wrong once (129 boots, 129 pages), and the narrow fix left the door
+    open for the next unsatisfiable condition to walk through — which it did,
+    the day the recovered fill could not be given a stop.
+
+    Anything raised as this class is caught by `StrategyRunner.run` and parks
+    the runner: halted, paged once, process up. That is a strictly *stronger*
+    guarantee than exiting — nothing trades either way, and this way the
+    dashboard, `/metrics`, the ingestor and the scheduler are all still there
+    for whoever has to diagnose it.
+
+    Raise it for conditions a human must clear. A transient failure is not one
+    of these and must not be dressed as one: parking on something that would
+    have healed by itself converts a blip into an outage that needs a person.
+    """
+
+
+class ReconciliationDivergedError(WarmupBlockedError):
     """The stored book and the broker's disagree, and no code here can repair it.
 
     Its own class so that the one caller who can do something sensible with it —

@@ -51,7 +51,10 @@ from atp_core.errors import (
     ATPError,
     DataGapError,
     ExecutionError,
+    InvalidStateTransitionError,
     ReconciliationDivergedError,
+    ReconciliationError,
+    WarmupBlockedError,
 )
 from atp_core.execution.idempotency import STOP_LOSS, TAKE_PROFIT, TIME_EXIT
 from atp_core.execution.router import NO_ACTION
@@ -112,6 +115,12 @@ CLOSED_MARKET_FALLBACK_SECONDS = 300.0
 #: A process, named as one — `scripts/halt.py` takes the same line about not
 #: putting an unverified human's name in a field that is meant to be evidence.
 _QUARANTINE_ACTOR = "strategy_runner"
+
+#: The refusals `apply_trade_update` raises *before* a fill touches the book.
+#: Named as a tuple so `catch_up_on_orders` can tell "nothing moved, let the
+#: reconciler explain it" from "something moved and then broke", which are the
+#: two halves of that method's error handling and want opposite answers.
+_BOOKING_REFUSED = (ReconciliationError, InvalidStateTransitionError)
 
 
 @dataclass(slots=True)
@@ -725,10 +734,10 @@ class StrategyRunner:
         self._running = True
         try:
             await self._loop(portfolio)
-        except ReconciliationDivergedError as exc:
+        except WarmupBlockedError as exc:
             await self._quarantine(exc)
 
-    async def _quarantine(self, exc: ReconciliationDivergedError) -> None:
+    async def _quarantine(self, exc: WarmupBlockedError) -> None:
         """Stop trading on a divergence and **stay up**. Never returns normally.
 
         Refusing to trade against a book the broker contradicts is correct and
@@ -758,6 +767,23 @@ class StrategyRunner:
         provide.
         """
         detail = str(exc)
+        # The halt reason and the remedy are the two things an operator reads
+        # first, and they are not the same for every condition that parks a
+        # runner. `adopt_broker_state.py` is the answer to a divergence and is
+        # actively the *wrong* answer to a position nothing could arm a stop
+        # for — it would overwrite a book that is already correct, and leave the
+        # position exactly as unprotected as it was.
+        reason, remedy = (
+            (
+                HaltReason.RECONCILIATION_MISMATCH,
+                "uv run python scripts/adopt_broker_state.py --by <you>",
+            )
+            if isinstance(exc, ReconciliationDivergedError)
+            else (
+                HaltReason.UNHANDLED_EXCEPTION,
+                "read the log line above — this needs a decision, not a restart",
+            )
+        )
         # Before the alert: a halt that failed to record is the one thing worse
         # than an unsent notification, and `engage` raises rather than returning
         # false (`KillSwitchUnavailableError`). If it does raise, this responsi-
@@ -765,18 +791,18 @@ class StrategyRunner:
         # correct outcome, because then nothing is holding trading closed.
         self.kill_switch.engage(
             HaltScope.GLOBAL,
-            HaltReason.RECONCILIATION_MISMATCH,
+            reason,
             engaged_by=_QUARANTINE_ACTOR,
             detail=detail,
         )
         log.critical(
             "runner.quarantined",
-            reason=HaltReason.RECONCILIATION_MISMATCH.value,
+            reason=reason.value,
             detail=detail,
-            remedy="uv run python scripts/adopt_broker_state.py --by <you>",
+            remedy=remedy,
             msg="halted and staying up — nothing will retry this",
         )
-        self._alert_quarantined()
+        self._alert_quarantined(exc)
         # Parked, not slept. An injected `_sleep` that returns immediately would
         # make this a spin in a test, and a bounded nap would need a reason to
         # wake up that does not exist — nothing this process can do repairs a
@@ -784,7 +810,7 @@ class StrategyRunner:
         # path asks of it.
         await asyncio.Event().wait()
 
-    def _alert_quarantined(self) -> None:
+    def _alert_quarantined(self, exc: WarmupBlockedError) -> None:
         """One page, naming the fact and not the book.
 
         No quantities, no prices, no symbols-with-numbers: `alerts/ports.py` is
@@ -798,17 +824,32 @@ class StrategyRunner:
         """
         if self.alerts is None:
             return
+        diverged = isinstance(exc, ReconciliationDivergedError)
+        title = (
+            "Trading halted — the book does not match the broker's"
+            if diverged
+            else "Trading halted — the worker cannot start"
+        )
+        where = (
+            "docs/RUNBOOK.md, 'Reconciliation mismatch'."
+            if diverged
+            else "docs/RUNBOOK.md, 'A runner that will not start'."
+        )
         self.alerts.send(
             Alert(
                 severity=Severity.CRITICAL,
-                title="Trading halted — the book does not match the broker's",
+                title=title,
                 body=(
                     "The worker is up and will not trade until an operator resolves this. "
                     "Nothing will retry it and no further alerts will be sent.\n"
                     "The worker's log names the difference; the dashboard shows the halt.\n"
-                    "docs/RUNBOOK.md, 'Reconciliation mismatch'."
+                    f"{where}"
                 ),
-                key="runner.reconciliation_diverged",
+                # Keyed by condition rather than fixed: two different stuck
+                # workers folded under one key would page for the first and go
+                # quiet for the second, which is the failure this key exists to
+                # prevent, inverted.
+                key="runner.reconciliation_diverged" if diverged else "runner.warmup_blocked",
             )
         )
 
@@ -1690,26 +1731,19 @@ class StrategyRunner:
         for update in updates:
             try:
                 await self.on_fill_event(update, portfolio)
-            except ATPError as exc:
-                # **A repair that fails is a divergence, and a divergence is not
-                # a crash loop.** Everything this can raise is a
-                # page-a-human outcome — `apply_trade_update` refusing a fill
-                # against an order our book has already killed, a protective
-                # submit whose outcome is unknown — and on this path every one
-                # of them is *deterministic*: the venue's answer is the same on
-                # the next boot and the one after. Left to propagate out of
-                # `warmup` it would end a supervised responsibility and exit the
-                # process, which is `restart: unless-stopped` with no attempt cap
-                # and an unsatisfiable condition — day 3's B2, rebuilt inside its
-                # own fix (docs/paper-week/day-3-review.md).
+            except _BOOKING_REFUSED as exc:
+                # **The fill was refused before anything moved.** These two are
+                # the whole of `apply_trade_update`'s contract for "our book and
+                # the venue's have genuinely diverged" — a fill against an order
+                # we have already killed, an overfill, an illegal transition —
+                # and it raises them before `_apply_to_portfolio` is reached, so
+                # no cash and no position have changed.
                 #
-                # Nothing is booked and nothing is softened. The reconcile that
-                # runs immediately after is the one component whose answer to an
-                # unresolvable disagreement is to stop, and it still gives it:
-                # the book is exactly as divergent as it was, so it halts and
-                # the runner parks with the process up. A bug that is not an
-                # `ATPError` still propagates — that is a defect, not a
-                # divergence, and hiding it would be worse than either.
+                # Left standing on purpose. The reconcile that runs immediately
+                # after is the component whose answer to an unresolvable
+                # disagreement is to stop, and it gives a far better one than
+                # this frame could: it names both books' numbers. Parking here
+                # would replace that diagnosis with a bare exception message.
                 log.critical(
                     "runner.catch_up_refused",
                     client_order_id=update.client_order_id,
@@ -1719,6 +1753,46 @@ class StrategyRunner:
                     msg="could not book what the venue reported — leaving it for reconciliation",
                 )
                 continue
+            except Exception as exc:
+                # **Everything else, and this branch is the one day 3 taught
+                # twice.** Past `apply_trade_update` the fill is already in the
+                # book: cash has moved, the position exists, and the failure is
+                # almost certainly `_protect` — a position we now hold and could
+                # not arm a stop for. `_protect` has already recorded that in
+                # `_unprotected` and logged CRITICAL before re-raising, so the
+                # fact survives whatever happens here.
+                #
+                # What must *not* happen here is the re-raise continuing. It
+                # leaves `warmup`, ends the `strategy_runner` responsibility and
+                # exits the process into `restart: unless-stopped`, against a
+                # condition that is identical on the next boot — B2's crash loop,
+                # rebuilt inside the fix for B2. The first version of this method
+                # caught `ATPError` to prevent exactly that and still lost:
+                # `StopManager.initial_stop` raises a bare `ValueError` when an
+                # `atr` stop has no ATR, which a book with no bars in it produces
+                # every single time.
+                #
+                # So it is caught on `Exception` — deliberately wide, because the
+                # question this branch answers is not "which error is this" but
+                # "can this runner safely trade now", and past a booked fill the
+                # answer is no whatever raised. Parking is *stricter* than
+                # exiting, not looser: nothing trades either way, and this way a
+                # human gets one page and a live dashboard instead of a restart
+                # loop and a pager storm.
+                log.critical(
+                    "runner.catch_up_incomplete",
+                    client_order_id=update.client_order_id,
+                    symbol=update.symbol,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    msg="the venue's fill is booked and something after it failed — parking",
+                )
+                raise WarmupBlockedError(
+                    f"refusing to start: booked the venue's fill for {update.client_order_id} "
+                    f"({update.symbol}) and then could not complete it — "
+                    f"{type(exc).__name__}: {exc}. The position is held and may be unprotected; "
+                    "see docs/RUNBOOK.md 'A runner that will not start'."
+                ) from exc
             applied += 1
         if applied:
             log.warning(
