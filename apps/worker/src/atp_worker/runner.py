@@ -9,7 +9,8 @@ Per evaluation, in this exact order:
     1. Refresh marks for open positions.
     2. Check stops and take-profits (engine-side ones; broker-side fire on their own).
     3. Process fills that arrived since the last pass.
-    4. Call `strategy.on_bar()` for each symbol whose bar just closed.
+    4. Call `strategy.on_bar()` for each symbol whose bar just closed, and
+       discard what it says about a symbol still short of `warmup_bars`.
     5. Size signals, run the risk engine, submit approved orders.
     6. Persist state and publish updates.
 
@@ -135,6 +136,11 @@ class RunnerStats:
     consecutive_errors: int = 0
     fills_applied: int = 0
     stops_triggered: int = 0
+    #: Tradeable signals thrown away because the symbol was not warm yet. The
+    #: number that says "this strategy tried to trade on a partial indicator",
+    #: and a session where it is large is a session whose trades mean less than
+    #: they look like they do (docs/paper-week/day-4-review.md, F6).
+    signals_discarded_cold: int = 0
 
 
 @dataclass(slots=True)
@@ -461,6 +467,38 @@ class StrategyRunner:
         """What we believe is working at the venue. Handed to the reconciler."""
         return list(self._open_orders.values())
 
+    @property
+    def bars_to_load(self) -> int:
+        """How much history `warmup` asks the repository for.
+
+        Floored at one because a read for zero rows is not a read. This is *not*
+        the number the signal gate uses — see `warm_after`, and the comment there
+        about why the two must not be collapsed.
+        """
+        return max(self.strategy.warmup_bars, 1)
+
+    @property
+    def warm_after(self) -> int:
+        """Bars a symbol must hold before a signal on it may trade.
+
+        **`strategy.warmup_bars` exactly, unfloored**, because this is a mirror
+        of `BacktestEngine.run`'s `if seen[symbol] <= warmup: continue` and that
+        comparison is against the raw declaration. Flooring it at one here — which
+        the first draft of this did, by reusing `bars_to_load` — silently makes a
+        strategy declaring zero warmup skip its first bar live while trading it in
+        a backtest. That is the same class of divergence as having no gate at all,
+        in the opposite direction, and it is worth two properties to keep the two
+        numbers from being confused again.
+
+        Nothing consulted any warmup number after `warmup` returned until day 4:
+        it loaded history, reported twenty symbols short, and the only thing then
+        standing between a cold indicator and a real order was whether the
+        strategy happened to check its own series length. `SmaCrossover` does;
+        nothing in the `Strategy` contract requires it, and the engine does not
+        rely on it (docs/paper-week/day-4-review.md, F6).
+        """
+        return self.strategy.warmup_bars
+
     def _warmup_floor(self, now: datetime) -> datetime | None:
         """The earliest bar this warmup may use, or `None` for no bound.
 
@@ -532,7 +570,7 @@ class StrategyRunner:
         # as an integrity error inside an evaluation.
         await self._ensure_strategy_row()
 
-        needed = max(self.strategy.warmup_bars, 1)
+        needed = self.bars_to_load
         floor = self._warmup_floor(self.clock.now())
 
         short: list[str] = []
@@ -1030,6 +1068,11 @@ class StrategyRunner:
                 else None
             ),
             signals=len(signals),
+            # Of the watchlist, how much of it is not tradeable yet. Zero is the
+            # strategy actually running; twenty for a whole session is a
+            # timeframe and a lookback that do not fit inside one (F6).
+            cold_symbols=self._cold_symbols(),
+            discarded_cold=self.stats.signals_discarded_cold,
             open_positions=len(portfolio.open_positions),
             working_orders=len(self._open_orders),
             submitted=self.stats.orders_submitted,
@@ -1466,11 +1509,73 @@ class StrategyRunner:
         return signals
 
     def _poll_strategy(self, closed: list[Bar]) -> list[Signal]:
-        """Step 4. `on_bar` for each symbol whose bar just closed."""
+        """Step 4. `on_bar` for each symbol whose bar just closed.
+
+        **A signal on a symbol still short of `warm_after` is discarded.** Not
+        suppressed upstream: `on_bar` is still called, so the strategy's own
+        indicators keep warming on every bar, and only what it *says* while cold
+        is thrown away. That is `BacktestEngine.run` step 5 verbatim —
+
+            if seen[symbol] <= warmup:
+                continue
+
+        — and having it there and not here is the divergence this module's
+        docstring calls the one this platform's premise cannot survive. A
+        backtest opens with no trades until the window fills; live, the first bar
+        at which a strategy's own length check happened to pass produced a real
+        order.
+
+        Day 4 of the paper week ran with every one of twenty symbols short:
+        warmup said so twenty times, `warmup_short_history` had by then fired 540
+        times across three sessions, and not one of those lines had ever stopped
+        anything (docs/paper-week/day-4-review.md, F6). What held the line was
+        `SmaCrossover.on_bar`'s own `if len(closes) < slow_n + 1: return []` —
+        correct, and nothing in the `Strategy` contract requires it. The next
+        strategy without it would have traded on an SMA over six bars.
+
+        **Transient by construction, so it must not park the runner.** A cold
+        symbol warms up on its own as bars close, which is exactly what
+        `WarmupBlockedError` warns against dressing up as unsatisfiable. The
+        right answer is the engine's: drop the signal, say so, carry on.
+
+        Counted, because a discard is the strategy asking to trade and being
+        told no — `stats.signals_discarded_cold` is what makes a session where
+        that happened legible afterwards. HOLD is not counted: it is the
+        strategy saying nothing happened, and `_submit` would not have routed it
+        either.
+        """
         signals: list[Signal] = []
         for bar in closed:
-            signals.extend(self.strategy.on_bar(self._context, bar) or [])
+            produced = self.strategy.on_bar(self._context, bar) or []
+            have = len(self._bars.get(bar.symbol) or ())
+            if have > self.warm_after:
+                signals.extend(produced)
+                continue
+            for signal in produced:
+                if signal.action is SignalAction.HOLD:
+                    continue
+                self.stats.signals_discarded_cold += 1
+                log.warning(
+                    "runner.signal_discarded_cold",
+                    symbol=bar.symbol,
+                    action=signal.action.value,
+                    have=have,
+                    needed=self.warm_after,
+                    detail=(
+                        "the strategy is not warm for this symbol yet — "
+                        "the backtest discards this signal too"
+                    ),
+                )
         return signals
+
+    def _cold_symbols(self) -> int:
+        """How many of the watchlist cannot trade yet for want of history.
+
+        A count rather than the list, because the list is the watchlist on the
+        first pass of every intraday session and says nothing by being long. The
+        number going to zero is the moment the strategy is actually running.
+        """
+        return sum(1 for s in self.symbols if len(self._bars.get(s) or ()) <= self.warm_after)
 
     async def _submit(self, signals: list[Signal], portfolio: Portfolio) -> None:
         """Step 5. Size, risk-check and send.
