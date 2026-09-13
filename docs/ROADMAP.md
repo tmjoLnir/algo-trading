@@ -1028,6 +1028,22 @@ above.
   of those failed silently before: the result object reported the position
   fully protected.
 
+  **A fourth class, and the one that cost a session: closing a position the
+  venue's own stop was holding.** A venue reserves the quantity a working order
+  covers, so the GTC stop this router places over a whole position reserves the
+  whole position and the close that would flatten it is refused for want of
+  shares the account demonstrably holds. Both close paths made it worse by
+  submitting before cancelling — deliberately, so that a refused close could not
+  leave a position naked — which turned the refusal into the only possible
+  outcome. On day 4 of the paper week 38 of 39 exit signals never reached the
+  venue, every position that closed left at its stop, and the strategy's exit
+  rule was therefore never once tested
+  (docs/paper-week/day-4-review.md, B1). `_close` now tries the close, releases
+  protection only on the venue's own `InventoryHeldError`, retries, and re-arms
+  under a fresh key if that retry is refused — so the old invariant holds and the
+  deadlock does not. `FakeBroker` reserves inventory now too; nothing in the
+  suite could fail on this before, because the fake said yes to both orders.
+
   Three deliberate refusals. A submit that fails in transport gets one lookup
   and then stops — it does not resubmit, because the venue may already hold the
   order, and it halts on `BROKER_UNREACHABLE` (the second auto-engage trigger to

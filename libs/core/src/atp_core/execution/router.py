@@ -44,7 +44,7 @@ and there is no layer for targets.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import TYPE_CHECKING
 
@@ -61,7 +61,13 @@ from atp_core.domain import (
     SignalAction,
     TimeInForce,
 )
-from atp_core.errors import BrokerConnectionError, BrokerError, ExecutionError, OrderRejectedError
+from atp_core.errors import (
+    BrokerConnectionError,
+    BrokerError,
+    ExecutionError,
+    InventoryHeldError,
+    OrderRejectedError,
+)
 from atp_core.execution.idempotency import (
     ENTRY,
     EXIT,
@@ -125,6 +131,11 @@ class SubmitResult:
     order: Order | None
     decision: RiskDecision
     submitted: bool
+    #: The venue refused because one of our own working orders reserves the
+    #: shares (`InventoryHeldError`). A flag rather than a caller re-reading the
+    #: exception text, because `_close` branches on it and string-matching a
+    #: venue's wording in core is how an adapter's vocabulary leaks upward.
+    inventory_held: bool = False
 
     @classmethod
     def no_action(cls, reason: str) -> SubmitResult:
@@ -146,6 +157,22 @@ class SubmitResult:
     def refused(cls, stage: str, reason: str, order: Order | None = None) -> SubmitResult:
         """Refused before the risk chain could run, or by the venue."""
         return cls(order=order, decision=RiskDecision.deny(stage, reason), submitted=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _Cover:
+    """What a protective child covers, kept so it can be re-armed.
+
+    `protective_client_order_id` is a one-way digest, so a child cannot be
+    rebuilt from its own key — the range has to be remembered. `released` counts
+    the deliberate cancels of this exact cover and feeds the key's `attempt`, so
+    a re-arm is a new order at the venue while a *retry* of one is not.
+    """
+
+    parent_client_order_id: str
+    covered_from: Decimal
+    covered_to: Decimal
+    released: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,6 +296,12 @@ class OrderRouter:
         #: order for `Reconciler` to report (a separate Phase 4 item), which is
         #: documented there as report-do-not-auto-cancel.
         self._protective: dict[str, list[Order]] = {}
+        #: protective child order id → the cover it was keyed on, so a stop
+        #: released to free the inventory a close needs can be re-armed under a
+        #: key the venue has not already seen. Same lifetime argument as
+        #: `_covered`: dropping an entry here would re-mint a key the venue
+        #: already holds against a cancelled order.
+        self._cover: dict[str, _Cover] = {}
 
     # ── the submission path ─────────────────────────────────────────────────
 
@@ -311,6 +344,7 @@ class OrderRouter:
 
         position = portfolio.positions.get(signal.symbol)
 
+        closing = False
         if signal.action is SignalAction.EXIT:
             if position is None or position.is_flat:
                 return SubmitResult.no_action(f"{signal.symbol}: exit signal on a flat position")
@@ -319,6 +353,7 @@ class OrderRouter:
             side = Side.SELL if position.is_long else Side.BUY
             qty = abs(position.qty)
             purpose = EXIT
+            closing = True
         elif signal.action in (SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT):
             side = Side.BUY if signal.action is SignalAction.ENTER_LONG else Side.SELL
             sized = self._size(signal, portfolio, sizing_config)
@@ -343,6 +378,13 @@ class OrderRouter:
             decided_at=signal.ts,
             order_type=OrderType.LIMIT if signal.limit_price is not None else OrderType.MARKET,
             qty=qty,
+            # GTC on a close, for `flatten`'s reason and one of its own: having
+            # released the venue stop to make room for this order, a DAY close
+            # that expires unfilled at the bell would leave the position open
+            # overnight with neither a stop nor a working exit. An entry keeps
+            # the `OrderRequest` default — a DAY entry that does not fill is a
+            # missed trade, not an exposed one.
+            time_in_force=TimeInForce.GTC if closing else TimeInForce.DAY,
             limit_price=signal.limit_price,
             stop_loss_price=signal.stop_loss_price,
             take_profit_price=signal.take_profit_price,
@@ -350,6 +392,8 @@ class OrderRouter:
             signal_id=signal.id,
             purpose=purpose,
         )
+        if closing:
+            return await self._close(request, portfolio, pending=pending)
         return await self.submit(request, portfolio, pending=pending)
 
     async def submit(
@@ -404,6 +448,85 @@ class OrderRouter:
             )
 
         return await self._route(order, portfolio, pending)
+
+    async def _close(
+        self, request: OrderRequest, portfolio: Portfolio, *, pending: Iterable[Order] = ()
+    ) -> SubmitResult:
+        """The one path that closes a position. Try the close; if our own stop is
+        what refused it, release that stop, try once more, and put it back if the
+        retry fails too.
+
+        **A working stop reserves the shares it covers, so the close that would
+        flatten the position is refused for want of them.** This is day 4 of the
+        paper week, and it is not a rare race: 38 of 39 exit signals never
+        reached the venue, every one of them answered
+        `insufficient qty available (available: 0, held_for_orders: N)`, and the
+        one that did get through was the single position whose stop had been
+        refused (docs/paper-week/day-4-review.md, B1). Every closed round trip
+        that session left at its stop, because leaving at a stop was the only way
+        out the platform had.
+
+        `flatten` used to submit and then cancel, and argued that ordering in
+        terms worth keeping: *"Cancel first and there is a live path that ends
+        with the position open, its stop cancelled and the close refused. A
+        refused flatten must leave the position protected."* The objection is
+        right. What the old ordering bought with it was not protection, though —
+        it was a close that could never be accepted while protection existed.
+
+        **So the close goes first, and protection comes off only once the venue
+        has said in so many words that one of our own orders is holding the
+        shares** (`InventoryHeldError`). Releasing up front would be simpler and
+        is wrong: against a venue refusing submits for some *other* reason — an
+        account restriction, a halted symbol, buying power on a short — the
+        cancel succeeds, the close is refused anyway, the re-arm is refused too,
+        and the position ends naked by a path that did not exist before this
+        method. Trying first costs one refused submit per blocked exit and buys
+        the guarantee that a stop is never given up speculatively. A close the
+        venue accepts, or refuses for any other reason, leaves protection where it
+        was — which is also why there is no special case here for a position with
+        no stop on it.
+
+        Two things already built hold the gap between the cancel and the fill. The
+        engine-side level stays armed on the `Position` throughout —
+        `submit_protective_orders` arms it *before* it submits anything, precisely
+        so that a refused child leaves something watching — and the close is GTC,
+        so it cannot expire into a position with neither a stop nor a working
+        exit.
+
+        **The residual, named rather than hidden.** Across that gap the venue
+        holds no stop: the engine-side level is the only one, and it dies with
+        this process. That is the price of being able to exit at all, it is
+        bounded by the fill of a market order, and it is the same reduced
+        guarantee this module already accepts for every protective child a risk
+        rule refuses. It shrinks to nothing on the `BrokerPort` bracket item —
+        which is also what `flatten` named as the real fix for the double-sell
+        race, and that race is unchanged by any of this.
+        """
+        result = await self.submit(request, portfolio, pending=pending)
+        if result.submitted:
+            # The close went straight through, so nothing was reserving the
+            # shares — but a stop left working against a position that is about
+            # to be flat *opens* one when it triggers, which is the hazard
+            # `cancel_protection` has always existed for. Unchanged from the
+            # ordering this method replaced.
+            await self.cancel_protection(request.symbol)
+            return result
+        if not result.inventory_held:
+            return result
+
+        released = await self._release_protection(request.symbol, request.side)
+        if not released:
+            # Nothing of ours was holding the shares, or the cancels all failed.
+            # Either way the venue's answer stands and the position keeps
+            # whatever protection it had.
+            return result
+
+        retried = await self.submit(request, portfolio, pending=pending)
+        if not retried.submitted:
+            await self._rearm(request.symbol, released, portfolio)
+        # No `cancel_protection` on this branch: the stops that would have needed
+        # it are the ones just released, and the close was accepted.
+        return retried
 
     async def submit_protective_orders(
         self,
@@ -608,6 +731,11 @@ class OrderRouter:
         covered = stop_child.qty
         self._covered[entry_order.id] = covered_from + covered
         self._protective.setdefault(symbol, []).append(stop_child)
+        self._cover[stop_child.id] = _Cover(
+            parent_client_order_id=entry_order.client_order_id,
+            covered_from=covered_from,
+            covered_to=covered_to,
+        )
         if entry_order.is_complete and entry_order.filled_qty <= self._covered[entry_order.id]:
             # Nothing further can fill against this entry, so the levels it
             # asked for are spent. Dropped so a long-running worker's
@@ -789,14 +917,18 @@ class OrderRouter:
         have already halted, and correct precisely when our own view of the book
         is the thing you cannot build a request from.
 
-        **Submits before cancelling protection**, and the order matters. Cancel
-        first and there is a live path that ends with the position open, its
-        stop cancelled and the close refused. A refused flatten must leave the
-        position protected. The residual is named rather than hidden: between
-        the close being acknowledged and the stop being cancelled, the stop can
-        fire and the position sells twice. That window exists in either ordering
-        — `cancel_order` can lose the race outright — and the fix is a venue-side
-        bracket on the `BrokerPort` item, not a reordering.
+        **Goes through `_close`**, which owns the one sequence that can close a
+        position the venue's own stop is holding, and argues it. This method used
+        to submit and then cancel, on the reasoning that a refused flatten must
+        leave the position protected; day 4 of the paper week showed what that
+        ordering cost — a close refused for the shares its own stop reserves, so
+        the position could not be closed at all
+        (docs/paper-week/day-4-review.md, B1). The invariant survives: a close
+        that is accepted still cancels protection here, and one refused by the
+        stop releases it, retries, and re-arms. The double-sell race the old note
+        named is unchanged — it exists in either ordering, because `cancel_order`
+        can lose it outright, and the fix for it is still the venue-side bracket
+        on the `BrokerPort` item.
 
         `decided_at` defaults to now, which makes each call a new decision with
         its own idempotency key. Pin it to retry a flatten whose outcome you
@@ -831,10 +963,7 @@ class OrderRouter:
             time_in_force=TimeInForce.GTC,
             purpose=purpose,
         )
-        result = await self.submit(request, portfolio)
-        if result.submitted:
-            await self.cancel_protection(symbol)
-        return result
+        return await self._close(request, portfolio)
 
     # ── internals ───────────────────────────────────────────────────────────
 
@@ -897,6 +1026,140 @@ class OrderRouter:
         )
         return cancelled
 
+    async def _release_protection(self, symbol: str, closing_side: Side) -> list[Order]:
+        """Cancel the stops reserving `symbol`'s inventory; return what came off.
+
+        Side-aware for `_protected_qty`'s reason: only a child facing
+        `closing_side` holds the shares this close needs. One facing the other way
+        reserves nothing here and is `_cancel_stale_protection`'s problem.
+
+        **A cancel that fails keeps its order tracked and out of the returned
+        list.** The close is then very likely to be refused — the venue still
+        holds those shares — and the refusal is the correct outcome, because
+        something is still protecting the position. Reporting it as released
+        would let `_rearm` place a second stop over shares that already have one.
+        """
+        children = self._protective.get(symbol, [])
+        holding = [
+            c
+            for c in children
+            if not c.is_complete and c.side is closing_side and c.broker_order_id is not None
+        ]
+        if not holding:
+            return []
+
+        released: list[Order] = []
+        for child in holding:
+            assert child.broker_order_id is not None  # narrowed by the filter above
+            try:
+                await self.broker.cancel_order(child.broker_order_id)
+            except BrokerError as exc:
+                log.critical(
+                    "order.protection_not_released",
+                    symbol=symbol,
+                    broker_order_id=child.broker_order_id,
+                    error=str(exc),
+                    detail="the stop still holds these shares, so the close will be refused",
+                )
+                continue
+            released.append(child)
+            children.remove(child)
+            cover = self._cover.get(child.id)
+            if cover is not None:
+                self._cover[child.id] = replace(cover, released=cover.released + 1)
+
+        if not children:
+            self._protective.pop(symbol, None)
+        log.info(
+            "order.protection_released",
+            symbol=symbol,
+            released=len(released),
+            still_live=len(holding) - len(released),
+            detail="freeing the shares the close needs — the armed level covers the gap",
+        )
+        return released
+
+    async def _rearm(self, symbol: str, released: list[Order], portfolio: Portfolio) -> None:
+        """Put back the stops a refused close left the position without.
+
+        The close did not happen, so the exposure `released` was covering is
+        still held and still needs a venue-side stop. Each goes back under a key
+        carrying its release count, because the venue holds the old key against a
+        cancelled order and would hand that back instead of opening a new stop
+        (`protective_client_order_id`).
+
+        Best-effort and loud, like every other protective submission: a stop that
+        will not go back on is docs/SAFETY.md layer 5 not holding, and the
+        position is real either way. The engine-side level is still armed on the
+        `Position` — `_close` did not touch it — so a failure here is the reduced
+        guarantee rather than nothing at all.
+
+        Sized off the position as it stands, not off what the child covered.
+        A close refused after a partial fill leaves less than the stop was
+        written for, and a stop for the original quantity would sell shares the
+        position no longer has.
+        """
+        position = portfolio.positions.get(symbol)
+        if position is None or position.is_flat:
+            return
+        closing = Side.SELL if position.is_long else Side.BUY
+        for child in released:
+            cover = self._cover.get(child.id)
+            if cover is None or child.stop_price is None:
+                log.critical(
+                    "order.protection_not_rearmed",
+                    symbol=symbol,
+                    order_id=child.id,
+                    detail="no cover recorded for this stop — it cannot be re-keyed",
+                )
+                continue
+            room = abs(position.qty) - self._protected_qty(symbol, closing)
+            qty = min(child.remaining_qty, room)
+            if qty <= 0:
+                continue
+            replacement = Order(
+                symbol=symbol,
+                side=closing,
+                qty=qty,
+                order_type=OrderType.STOP,
+                time_in_force=TimeInForce.GTC,
+                stop_price=child.stop_price,
+                strategy_id=child.strategy_id,
+                signal_id=child.signal_id,
+                parent_order_id=child.parent_order_id,
+                purpose=STOP_LOSS,
+                client_order_id=protective_client_order_id(
+                    cover.parent_client_order_id,
+                    STOP_LOSS,
+                    cover.covered_from,
+                    cover.covered_to,
+                    cover.released,
+                ),
+                created_at=child.created_at,
+            )
+            outcome = await self._route(replacement, portfolio)
+            if not outcome.submitted:
+                metrics.protective_order_rejected(_refusal_stage(replacement))
+                log.critical(
+                    "order.position_unprotected",
+                    symbol=symbol,
+                    entry_order_id=child.parent_order_id or "",
+                    qty=str(qty),
+                    rule=outcome.decision.rule or replacement.rejected_by or "",
+                    detail=outcome.decision.reason or replacement.reject_reason or "",
+                )
+                continue
+            self._protective.setdefault(symbol, []).append(replacement)
+            self._cover[replacement.id] = replace(cover, released=cover.released)
+            log.warning(
+                "order.protection_rearmed",
+                symbol=symbol,
+                stop_order_id=replacement.id,
+                qty=str(replacement.qty),
+                level=str(child.stop_price),
+                detail="the close was refused, so the stop it displaced goes back on",
+            )
+
     def _forget_protective(self, cancelled: Order) -> None:
         """Drop a protective child we have just cancelled through `cancel_all`."""
         children = self._protective.get(cancelled.symbol)
@@ -916,6 +1179,7 @@ class OrderRouter:
         level: Decimal,
         covered_from: Decimal,
         covered_to: Decimal,
+        attempt: int = 0,
     ) -> Order:
         """Build the protective stop child of `entry_order`.
 
@@ -945,7 +1209,7 @@ class OrderRouter:
             parent_order_id=entry_order.id,
             purpose=STOP_LOSS,
             client_order_id=protective_client_order_id(
-                entry_order.client_order_id, STOP_LOSS, covered_from, covered_to
+                entry_order.client_order_id, STOP_LOSS, covered_from, covered_to, attempt
             ),
             created_at=entry_order.filled_at or entry_order.created_at,
         )
@@ -1110,7 +1374,12 @@ class OrderRouter:
                 # not know is the one that gets the mapping fixed.
                 classified=isinstance(exc, OrderRejectedError),
             )
-            return SubmitResult(order=order, decision=decision, submitted=False)
+            return SubmitResult(
+                order=order,
+                decision=decision,
+                submitted=False,
+                inventory_held=isinstance(exc, InventoryHeldError),
+            )
 
         metrics.order_submit_seconds(self.broker.name, time.perf_counter() - started)
         working = self._adopt(order, acknowledged)

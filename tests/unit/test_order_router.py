@@ -33,6 +33,7 @@ from atp_core.domain import (
     OrderStatus,
     OrderType,
     Portfolio,
+    Position,
     Side,
     Signal,
     SignalAction,
@@ -1510,3 +1511,196 @@ class TestPricesAreQuantisedToTheVenueTick:
         that refuses to trade a name nobody remembered to register, and the
         default is correct for every symbol in the watchlist."""
         assert router().instrument("NVDA").tick_size == Decimal("0.01")
+
+
+# ── closing a position the venue's own stop is holding ──────────────────────
+
+
+class TestClosingReleasesProtection:
+    """Day 4 of the paper week, as assertions.
+
+    A venue reserves the shares a working stop covers. The platform placed a
+    GTC stop over every share of every position the moment it filled, then asked
+    to sell those same shares — and was refused 38 times out of 39, once per exit
+    signal the strategy produced. Every position that closed that session closed
+    at its stop, so every closed round trip was a loss and the strategy's exit
+    rule was never once tested (docs/paper-week/day-4-review.md, B1).
+
+    Nothing in the suite could fail on it, for two reasons worth keeping apart.
+    `FakeBroker` said yes to both orders, so the reservation did not exist to be
+    tripped over — that is `reserves_inventory`. And no test asked the only
+    question that matters here: *can this platform get out of a position it has
+    protected?*
+    """
+
+    async def _open_protected(
+        self, broker: FakeBroker, routed: OrderRouter, portfolio: Portfolio
+    ) -> Order:
+        """A long SPY position with a working venue-side stop over all of it, on
+        the venue's book as well as ours — the state day 4 held 50 times."""
+        entry_result = await routed.submit(request(stop_loss_price=Decimal(95)), portfolio)
+        entry = entry_result.order
+        assert entry is not None
+        fill(entry, portfolio, 100, 100)
+        # Marked, so the chain can price the symbol. Without it every later
+        # order is refused for want of a price and the test passes for the wrong
+        # reason.
+        portfolio.position("SPY").last_price = Decimal(100)
+        # The venue holds the position too, so its reservation check has
+        # something to reserve against.
+        venue = broker.positions.setdefault("SPY", Position(symbol="SPY"))
+        venue.qty = Decimal(100)
+        venue.avg_entry_price = Decimal(100)
+        stop = (await routed.submit_protective_orders(entry, portfolio)).stop_order
+        assert stop is not None
+        assert broker.open_stops("SPY") == 1
+        return stop
+
+    async def test_the_fake_actually_reserves_the_shares(self) -> None:
+        """**The guard under the rest of this class.** If `reserves_inventory`
+        did not bite, every test here would pass without the fix — which is
+        precisely how day 4 shipped. Asserted directly, against the router, so a
+        later change that quietly loosens the fake fails here rather than
+        silently removing the coverage."""
+        broker, portfolio = FakeBroker(), book()
+        routed = router(broker, chain())
+        await self._open_protected(broker, routed, portfolio)
+
+        # The stop already holds all 100 shares, so this sell has none to take.
+        refused = await routed.submit(
+            request(side=Side.SELL, qty=100, ts=OPEN_HOURS + timedelta(minutes=1)), portfolio
+        )
+
+        assert not refused.submitted
+        assert refused.inventory_held, "the venue's refusal must be classified, not generic"
+        assert refused.order is not None
+        assert "insufficient qty available" in (refused.order.reject_reason or "")
+        assert "held_for_orders" in (refused.order.reject_reason or "")
+
+    async def test_an_exit_signal_reaches_the_venue_through_its_own_stop(self) -> None:
+        """**The test day 4 did not have.** The exit is refused for want of the
+        shares its own stop is holding unless the stop comes off first."""
+        broker, portfolio = FakeBroker(), book()
+        routed = router(broker, chain())
+        stop = await self._open_protected(broker, routed, portfolio)
+
+        result = await routed.submit_signal(
+            signal(SignalAction.EXIT), portfolio, sizing(), pending=()
+        )
+
+        assert result.submitted, "an exit must reach the venue, not be refused for its own stop"
+        assert result.order is not None
+        assert result.order.qty == Decimal(100)
+        assert result.order.time_in_force is TimeInForce.GTC
+        assert stop.broker_order_id in broker.cancelled
+
+    async def test_a_flatten_reaches_the_venue_through_its_own_stop(self) -> None:
+        """`flatten` is the operator's button and the engine's exit path both.
+        It was refused for the same reason, and the runbook's emergency close is
+        the worst place in the system to discover it."""
+        broker, portfolio = FakeBroker(), book()
+        routed = router(broker, chain())
+        stop = await self._open_protected(broker, routed, portfolio)
+
+        result = await routed.flatten("SPY", portfolio)
+
+        assert result.submitted
+        assert stop.broker_order_id in broker.cancelled
+
+    async def test_a_refused_close_puts_the_stop_back(self) -> None:
+        """The objection the old ordering was built on, answered rather than
+        avoided: the close is refused, so the shares are still held, so they are
+        still protected at the venue — under a key the venue has not seen, or it
+        would hand back the cancelled order."""
+        broker, portfolio = FakeBroker(), book()
+        routed = router(broker, chain())
+        stop = await self._open_protected(broker, routed, portfolio)
+
+        # Armed by the cancel, so the *first* close still earns the venue's
+        # inventory refusal — which is what triggers the release — and the retry
+        # after it is the one that fails. `reject_next` is one-shot, so the
+        # re-arm that follows is not caught by it, which is the point: this test
+        # is about a refused close, not about a venue refusing everything.
+        real_cancel = broker.cancel_order
+
+        async def refuse_the_retry(broker_order_id: str) -> None:
+            await real_cancel(broker_order_id)
+            broker.reject_next = "the close is refused, for a reason of its own"
+
+        broker.cancel_order = refuse_the_retry  # type: ignore[method-assign]
+
+        result = await routed.flatten("SPY", portfolio)
+
+        assert not result.submitted
+        assert stop.broker_order_id in broker.cancelled
+        assert routed.has_broker_side_protection("SPY", portfolio.position("SPY"))
+        assert broker.open_stops("SPY") == 1
+        rearmed = next(
+            o
+            for o in broker.accepted.values()
+            if o.order_type is OrderType.STOP and not o.is_complete
+        )
+        assert rearmed.client_order_id != stop.client_order_id
+        assert rearmed.stop_price == stop.stop_price
+        assert rearmed.qty == Decimal(100)
+        assert rearmed.time_in_force is TimeInForce.GTC
+
+    async def test_the_engine_side_level_survives_the_release(self) -> None:
+        """What covers the gap between the cancel and the fill. It is armed on
+        the position before anything is submitted, and `_close` must not clear
+        it — a release that de-armed the level would leave the window with
+        nothing watching it at all."""
+        broker, portfolio = FakeBroker(), book()
+        routed = router(broker, chain())
+        await self._open_protected(broker, routed, portfolio)
+        armed = portfolio.position("SPY").stop_loss_price
+        assert armed == Decimal(95)
+
+        await routed.flatten("SPY", portfolio)
+
+        assert portfolio.position("SPY").stop_loss_price == armed
+
+    async def test_a_stop_that_will_not_cancel_blocks_the_close_and_is_not_replaced(self) -> None:
+        """A cancel that failed leaves the shares reserved, so the close is
+        refused — correctly, because something is still protecting the position.
+        Reporting it released would place a second stop over shares that already
+        have one, which is the bug in the other direction."""
+        broker, portfolio = FakeBroker(), book()
+        routed = router(broker, chain())
+        stop = await self._open_protected(broker, routed, portfolio)
+        assert stop.broker_order_id is not None
+        broker.cancel_refuses.add(stop.broker_order_id)
+
+        result = await routed.flatten("SPY", portfolio)
+
+        assert not result.submitted
+        assert result.order is not None
+        assert "insufficient qty available" in (result.order.reject_reason or "")
+        assert broker.open_stops("SPY") == 1, "no second stop over the same shares"
+        assert routed.has_broker_side_protection("SPY", portfolio.position("SPY"))
+
+    async def test_a_close_with_nothing_to_release_cancels_nothing(self) -> None:
+        """An unprotected position closes by the plain path and pays none of
+        this — the common case must not acquire a broker round trip."""
+        broker, portfolio = FakeBroker(), book(SPY=(100, 100))
+        result = await router(broker, chain()).flatten("SPY", portfolio)
+
+        assert result.submitted
+        assert broker.cancelled == []
+
+    async def test_the_stop_is_not_released_for_an_entry(self) -> None:
+        """Only a close releases protection. An entry that grew a position must
+        leave the stop over the shares already held."""
+        broker, portfolio = FakeBroker(), book()
+        # Room for a second tranche: the point is what the router does with the
+        # existing stop, not where the position cap sits.
+        routed = router(broker, chain(max_position_pct=Decimal("0.50")))
+        await self._open_protected(broker, routed, portfolio)
+
+        result = await routed.submit_signal(
+            signal(SignalAction.ENTER_LONG), portfolio, sizing(), pending=()
+        )
+
+        assert result.submitted
+        assert broker.cancelled == []
+        assert broker.open_stops("SPY") == 1

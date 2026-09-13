@@ -133,7 +133,11 @@ def client_order_id(
 
 
 def protective_client_order_id(
-    parent_client_order_id: str, purpose: str, covered_from: Decimal, covered_to: Decimal
+    parent_client_order_id: str,
+    purpose: str,
+    covered_from: Decimal,
+    covered_to: Decimal,
+    attempt: int = 0,
 ) -> str:
     """The key for a protective child of an already-keyed entry.
 
@@ -162,6 +166,23 @@ def protective_client_order_id(
     Both bounds are normalised through `Decimal.normalize`, so `100` and
     `100.00` — one quantity written two ways — do not become two stops against
     one position.
+
+    **`attempt` separates a re-placed stop from the one it replaces, and only a
+    deliberate cancel may raise it.** Everything above makes a refused child
+    re-derive one key, which is right: the venue never had it, so a retry must
+    not become a second stop. A stop the router *cancelled on purpose* — to free
+    the inventory a close needs, because a venue reserves the shares a working
+    stop covers and refuses the close otherwise
+    (docs/paper-week/day-4-review.md, B1) — is the opposite case. The venue holds
+    that key against a CANCELLED order, so re-arming the same range under it
+    returns the cancelled order and the position is left naked while the router
+    books it as covered. A counter of how many times this exact cover has been
+    released is the honest discriminator: same shares, a genuinely different
+    order.
+
+    Zero is absent from the digest rather than written into it, so every key
+    minted before this parameter existed is byte-identical — an order stored then
+    and rebuilt now is still one order to the venue.
     """
     if not parent_client_order_id:
         raise ValueError("a protective order needs its parent's client_order_id")
@@ -174,9 +195,14 @@ def protective_client_order_id(
             f"a protective order must cover something, got the empty range "
             f"({covered_from}, {covered_to}]"
         )
-    return _digest(
+    if attempt < 0:
+        raise ValueError(f"a re-arm attempt counts up from zero, got {attempt}")
+    parts = [
         parent_client_order_id,
         purpose,
         str(covered_from.normalize()),
         str(covered_to.normalize()),
-    )
+    ]
+    if attempt:
+        parts.append(f"attempt={attempt}")
+    return _digest(*parts)

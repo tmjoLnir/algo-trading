@@ -72,6 +72,7 @@ from atp_core.errors import (
     BrokerConnectionError,
     BrokerError,
     InsufficientFundsError,
+    InventoryHeldError,
     MissingBrokerCredentialsError,
     OrderRejectedError,
 )
@@ -114,6 +115,32 @@ def _reads_as_insufficient_funds(message: str) -> bool:
     """Whether a venue message names buying power as the reason."""
     lowered = message.lower()
     return any(phrase in lowered for phrase in _INSUFFICIENT_FUNDS_PHRASES)
+
+
+#: What the body says when the shares exist and one of *our own* working orders
+#: has them reserved. Shares the same 40310000 bucket as buying power and means
+#: the opposite — the account holds the position, a resting order of ours holds
+#: the quantity. Alpaca names the holder in the body it returns:
+#:
+#:     {"available":"0","code":40310000,"existing_qty":"6","held_for_orders":"6",
+#:      "message":"insufficient qty available for order (requested: 6, available: 0)"}
+#:
+#: Narrowed because the answer is specific and nothing else's answer fits:
+#: cancel the order doing the holding, then place the close again
+#: (`OrderRouter._close`). Read as a generic rejection it looks like a market
+#: condition to wait out, and day 4 of the paper week waited it out 38 times.
+_INVENTORY_HELD_PHRASES = ("insufficient qty available", "held_for_orders")
+
+
+def _reads_as_inventory_held(message: str, body: str) -> bool:
+    """Whether a venue refusal says our own working order holds the shares.
+
+    Checks the whole body as well as the parsed message: `held_for_orders` is a
+    field name rather than prose, and it is the half of this that cannot be
+    reworded without the API changing.
+    """
+    haystack = f"{message}\n{body}".lower()
+    return any(phrase in haystack for phrase in _INVENTORY_HELD_PHRASES)
 
 
 #: The non-trade activity types that move cash as a *charge* against trading.
@@ -476,6 +503,8 @@ class AlpacaBroker:
             refused = f"Alpaca refused {method} {path}: {detail}"
             if code == _ORDER_NOT_PERMITTED and _reads_as_insufficient_funds(message):
                 return InsufficientFundsError(refused)
+            if _reads_as_inventory_held(message, detail):
+                return InventoryHeldError(refused)
             return OrderRejectedError(refused)
         return BrokerError(f"Alpaca {method} {path} returned {response.status_code}: {detail}")
 

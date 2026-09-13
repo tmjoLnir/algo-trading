@@ -98,6 +98,28 @@ class OrderRejectedError(BrokerError):
     """The venue refused the order (buying power, halted symbol, bad price)."""
 
 
+class InventoryHeldError(OrderRejectedError):
+    """The venue refused a reducing order because another working order of ours
+    already reserves the shares.
+
+    **Always our own bug, never a market condition**, which is why it is a class
+    rather than a string in a log line. A venue reserves the quantity a working
+    order covers; a protective stop over a whole position therefore reserves the
+    whole position, and the close that would flatten it is refused for want of
+    shares the account demonstrably holds. On day 4 of the paper week that
+    refused 38 of 39 exit signals, so every position that closed did so at its
+    stop and the strategy's exit rule was never tested
+    (docs/paper-week/day-4-review.md, B1).
+
+    `OrderRouter._close` is the only thing that should need to recognise it: the
+    answer is to cancel the order doing the holding and try the close again, not
+    to wait or to retry unchanged. It is a subclass of `OrderRejectedError` for
+    the reason `InsufficientFundsError` is — every caller that handles a "no"
+    must handle this one, and a type relationship is the only thing that
+    guarantees it.
+    """
+
+
 class InsufficientFundsError(OrderRejectedError):
     """The venue refused the order for want of buying power.
 
