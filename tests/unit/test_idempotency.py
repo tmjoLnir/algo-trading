@@ -188,6 +188,39 @@ class TestProtectiveChildren:
             != self.parent()
         )
 
+    def test_a_rearm_after_a_deliberate_cancel_is_a_new_order(self) -> None:
+        """The distinction `attempt` exists for, and it is the opposite of the
+        retry above. A stop cancelled on purpose — to free the shares a close
+        needs — is a key the venue now holds against a CANCELLED order, so
+        re-arming the same range under it returns that cancelled order and the
+        position is naked while the router books it as covered
+        (docs/paper-week/day-4-review.md, B1)."""
+        placed = protective_client_order_id(self.parent(), STOP_LOSS, Decimal(0), Decimal(100))
+        rearmed = protective_client_order_id(self.parent(), STOP_LOSS, Decimal(0), Decimal(100), 1)
+        again = protective_client_order_id(self.parent(), STOP_LOSS, Decimal(0), Decimal(100), 2)
+        assert placed != rearmed != again
+        assert placed != again
+
+    def test_a_rearm_is_still_reproducible(self) -> None:
+        """`attempt` is derived from router state, not from a counter that moves
+        on its own: the same release count must re-derive the same key, or a
+        retried re-arm becomes a second stop."""
+        first = protective_client_order_id(self.parent(), STOP_LOSS, Decimal(0), Decimal(100), 1)
+        second = protective_client_order_id(self.parent(), STOP_LOSS, Decimal(0), Decimal(100), 1)
+        assert first == second
+
+    def test_the_unreleased_key_is_unchanged_by_the_new_parameter(self) -> None:
+        """Every key minted before `attempt` existed has to stay byte-identical,
+        or an order stored then and rebuilt now is two orders at the venue. Zero
+        is absent from the digest rather than written into it."""
+        assert protective_client_order_id(
+            self.parent(), STOP_LOSS, Decimal(0), Decimal(100)
+        ) == protective_client_order_id(self.parent(), STOP_LOSS, Decimal(0), Decimal(100), 0)
+
+    def test_a_negative_attempt_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="counts up"):
+            protective_client_order_id(self.parent(), STOP_LOSS, Decimal(0), Decimal(100), -1)
+
     @pytest.mark.parametrize(
         ("covered_from", "covered_to"),
         [(Decimal(100), Decimal(100)), (Decimal(100), Decimal(50)), (Decimal(-1), Decimal(100))],

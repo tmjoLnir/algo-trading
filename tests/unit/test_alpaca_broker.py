@@ -29,6 +29,7 @@ from atp_core.errors import (
     BrokerConnectionError,
     BrokerError,
     InsufficientFundsError,
+    InventoryHeldError,
     OrderRejectedError,
 )
 
@@ -230,6 +231,42 @@ class TestSubmit:
         # The venue's own words survive into the exception, because they end up
         # in the order's `reject_reason` and in the log line an operator reads.
         assert "wash trade" in str(caught.value)
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_our_own_working_order_holding_the_shares_is_its_own_error(self) -> None:
+        """Day 4's refusal, and the third member of the `40310000` bucket.
+
+        The account holds the position and one of *our* resting orders holds the
+        quantity, which is the opposite of a buying-power problem and has a
+        specific answer: cancel the holder, place the close again. Read as a
+        generic rejection it looks like a market condition to wait out, and the
+        platform waited it out 38 times in one session while every position left
+        at its stop (docs/paper-week/day-4-review.md, B1).
+        """
+        respx.post(ORDERS_URL).mock(
+            return_value=httpx.Response(
+                403,
+                json={
+                    "available": "0",
+                    "code": 40310000,
+                    "existing_qty": "6",
+                    "held_for_orders": "6",
+                    "message": "insufficient qty available for order (requested: 6, available: 0)",
+                },
+            )
+        )
+
+        with pytest.raises(InventoryHeldError) as caught:
+            await make_broker().submit_order(an_order())
+
+        assert not isinstance(caught.value, InsufficientFundsError)
+        assert "held_for_orders" in str(caught.value)
+
+    def test_inventory_held_is_catchable_as_a_rejection(self) -> None:
+        """Same argument as the funding error below: `_route` catches refusals by
+        `OrderRejectedError`, and a sibling would escape it as day 3's did."""
+        assert issubclass(InventoryHeldError, OrderRejectedError)
 
     def test_a_funding_error_is_catchable_as_a_rejection(self) -> None:
         """The type relationship, asserted directly.

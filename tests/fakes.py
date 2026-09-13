@@ -37,6 +37,7 @@ from atp_core.domain import (
 from atp_core.errors import (
     BrokerConnectionError,
     BrokerError,
+    InventoryHeldError,
     OrderRejectedError,
     StrategyExistsError,
 )
@@ -132,6 +133,17 @@ class FakeBroker:
         #: `reads_fail`: the lookup succeeds and the retraction does not,
         #: which is the case where an order is known to still be working.
         self.cancel_refuses: set[str] = set()
+        #: Whether a working order reserves the shares it covers, so a second
+        #: order over the same inventory is refused. **On by default, because
+        #: the venue does it and a fake that did not let day 4 of the paper week
+        #: ship**: a protective stop held every share of each position, so all
+        #: 38 exit signals that session were refused
+        #: `insufficient qty available` and every position that closed did so at
+        #: its stop (docs/paper-week/day-4-review.md, B1). Nothing in 354 unit
+        #: tests could fail on that, because this object said yes to both
+        #: orders. Turn it off only for a test that is deliberately not about
+        #: inventory.
+        self.reserves_inventory = True
         #: What the venue's fee feed returns. Empty by default, so every test
         #: written before fees existed sees the behaviour it was written
         #: against; a test about fees fills it.
@@ -187,7 +199,44 @@ class FakeBroker:
         # a second order.
         if order.client_order_id in self.accepted:
             return self.accepted[order.client_order_id]
+
+        if self.reserves_inventory:
+            self._guard_inventory(order)
         return self._accept(order)
+
+    def _guard_inventory(self, order: Order) -> None:
+        """Refuse an order whose shares a working order already holds.
+
+        Alpaca's message, near enough to match on: a reducing order is checked
+        against the position *less* what other working orders on that side have
+        reserved, and `available: 0` is what a fully covered position answers.
+
+        Only reducing orders are checked. An order that opens or grows a position
+        is limited by buying power, which is a different refusal and not what this
+        models — so a short sale against no position passes straight through.
+        """
+        position = self.positions.get(order.symbol)
+        if position is None or position.is_flat:
+            return
+        closing = Side.SELL if position.qty > 0 else Side.BUY
+        if order.side is not closing:
+            return
+        held = sum(
+            (
+                o.remaining_qty
+                for o in self.accepted.values()
+                if o.symbol == order.symbol and o.side is closing and not o.is_complete
+            ),
+            Decimal(0),
+        )
+        available = abs(position.qty) - held
+        if order.qty > available:
+            raise InventoryHeldError(
+                f'{{"available":"{max(available, Decimal(0))}","code":40310000,'
+                f'"existing_qty":"{abs(position.qty)}","held_for_orders":"{held}",'
+                f'"message":"insufficient qty available for order '
+                f'(requested: {order.qty}, available: {max(available, Decimal(0))})"}}'
+            )
 
     async def cancel_order(self, broker_order_id: str) -> None:
         self._guard_reads()
