@@ -235,3 +235,15 @@ requires.
 - **Trading the open.** The first 5 minutes are the widest spreads and the worst
   fills of the day. Wait, unless the edge is specifically there.
 - **Too many symbols too early.** Get one working first.
+- **Running a strategy at a timeframe it was never backtested at.** The most
+  expensive mistake on this list, because nothing refuses it: `timeframe` is a
+  `WorkerConfig` row, a strategy's own declaration is only a default, and the two
+  disagreeing is silent. `sma_crossover` declares `1d`, was run at `1m` for a
+  paper session, and closed 41 of 41 round trips at their stop. Backtested across
+  both, the same code returns **+23.63% at `1d` and −58.23% at `1m`** — and no
+  stop multiplier changes the second number, because the binding constraint is
+  paying the spread 2,667 times a month rather than 605 times in five years.
+  A stop config inherits the same trap: `atr x2 period=14` is ~4% of price on
+  daily bars and ~0.12% on one-minute bars, written identically either way.
+  `runner.warmed_up` now reports `stop_width_bps` so the pair in force is visible
+  at boot. See `docs/paper-week/f8-timeframe-and-stop-sizing.md`.
