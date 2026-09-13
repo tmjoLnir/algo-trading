@@ -212,6 +212,13 @@ async def summarise_the_session(watch: SessionWatch) -> None:
         )
 
     lines = [headline]
+    if stats is not None and stats.signals_discarded_cold:
+        # On its own line, because it changes what every other number on the
+        # headline means: signals the strategy produced before it was warm were
+        # discarded rather than traded, so a session with a large count measured
+        # less of the strategy than its evaluation count suggests
+        # (docs/paper-week/day-4-review.md, F6).
+        lines.append(f"{stats.signals_discarded_cold} signals discarded — symbol not warm yet.")
     if halts:
         lines.append(f"STILL HALTED at the close — {len(halts)} active:")
         # The unproven symbols go in the close-of-day summary too. A position
@@ -225,6 +232,7 @@ async def summarise_the_session(watch: SessionWatch) -> None:
         "worker.session_summary",
         orders_submitted=stats.orders_submitted if stats else None,
         evaluations=stats.evaluations if stats else None,
+        signals_discarded_cold=stats.signals_discarded_cold if stats else None,
         halted=bool(halts),
     )
     watch.alerts.send(

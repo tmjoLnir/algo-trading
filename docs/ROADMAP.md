@@ -1388,6 +1388,19 @@ above.
   approved is the one divergence this platform's premise cannot survive. The
   engine delegates to it and its tests pass unchanged.
 
+  **The ordering was mirrored and the warmup gate was not**, which is the same
+  class of divergence found the hard way. `BacktestEngine.run` discards every
+  signal a strategy produces while a symbol is short of `warmup_bars`, so a
+  backtest opens with no trades until the window fills. Nothing live did: warmup
+  loaded history, logged `warmup_short_history` for each symbol it could not
+  fill, and then acted on whatever the strategy said on the next bar. Across
+  three paper sessions that line fired 540 times and stopped nothing
+  (docs/paper-week/day-4-review.md, F6). What held the line was
+  `SmaCrossover.on_bar`'s own length check — which the `Strategy` contract does
+  not require and the engine does not rely on. `_poll_strategy` now discards on
+  the engine's own comparison, counts what it threw away, and reports how much of
+  the watchlist is not tradeable yet on every pass.
+
   Decisions worth reading:
 
   - **A mismatched book refuses to start.** `warmup` reconciles and raises on a
@@ -1395,6 +1408,13 @@ above.
     then, so the chain would refuse every order anyway — raising means the
     operator sees why at startup instead of finding a process that is up and
     silently not trading.
+  - **A cold symbol is not a mismatched book.** It warms up on its own as bars
+    close, so it is discarded-and-logged rather than raised: parking the runner
+    on a condition that heals itself is what `WarmupBlockedError` exists to warn
+    against. The two numbers are also deliberately separate — `bars_to_load`
+    floors at one because a read for zero rows is not a read, while `warm_after`
+    is the declaration unfloored, because flooring it would make a strategy
+    declaring no warmup skip its first bar live and trade it in a backtest.
   - **The strategy decides on bars; the book is marked on quotes.** `LiveContext
     .last_price` is the last *completed* bar's close, because a decision taken
     on a mid-quote inside an unfinished bar is one the backtest can never

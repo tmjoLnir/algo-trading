@@ -2846,3 +2846,114 @@ class TestWarmupCannotReachAcrossAClosure:
 
         assert floor is not None
         assert floor > datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
+
+
+class TestAColdSymbolCannotTrade:
+    """Day 4 of the paper week, and the divergence underneath it.
+
+    `BacktestEngine.run` discards every signal a strategy produces while a
+    symbol is short of `warmup_bars` — so a backtest opens with no trades until
+    the window fills. The live runner had no equivalent: it loaded history,
+    logged `warmup_short_history` for each symbol it could not fill, and then
+    acted on whatever the strategy said on the very next bar. Across three
+    sessions that line fired 540 times and stopped nothing
+    (docs/paper-week/day-4-review.md, F6).
+
+    What actually held the line live was `SmaCrossover.on_bar`'s own
+    `if len(closes) < slow_n + 1: return []`. Nothing in the `Strategy` contract
+    requires that check and the engine does not rely on it — so a strategy
+    written without one traded on a partial indicator live and not in its
+    backtest, which is the one divergence this module's docstring says the
+    platform's premise cannot survive.
+    """
+
+    @staticmethod
+    async def _feed(runner: Any, portfolio: Portfolio, count: int) -> None:
+        """Close `count` bars, one per evaluation.
+
+        One at a time through the repository, because that is how the runner
+        actually accumulates history: `_refresh_bars` appends the newest bar it
+        has not seen, so a static series closes exactly one bar however many
+        times it is polled.
+        """
+        for index in range(count):
+            runner.bar_repo.bars[SYMBOL] = [bar(i) for i in range(index + 1)]
+            await runner.evaluate(portfolio)
+
+    @pytest.mark.asyncio
+    async def test_a_signal_from_a_cold_symbol_is_discarded(self) -> None:
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG}, warmup=5)
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+
+        await self._feed(runner, portfolio, 2)
+
+        assert router.signals == [], "a cold symbol must not reach the router"
+        assert runner.stats.signals_discarded_cold == 1
+        assert strategy.calls == 2, "on_bar is still called — indicators warm on every bar"
+
+    @pytest.mark.asyncio
+    async def test_the_boundary_matches_the_backtest_engine_exactly(self) -> None:
+        """`seen <= warmup` discards, so the first tradeable bar is the
+        `warmup + 1`-th. Asserted on the boundary itself, because an off-by-one
+        here is a divergence rather than a rounding difference: one bar early
+        trades on an indicator the backtest refused, one bar late skips a trade
+        the backtest took.
+        """
+        # The signal lands on the 3rd bar shown, with 3 bars held against a
+        # declared warmup of 3 — exactly warmup, which is still cold.
+        at_warmup = ScriptedStrategy({2: SignalAction.ENTER_LONG}, warmup=3)
+        runner, router, _, _, portfolio, _ = build(at_warmup, bars=[bar(0)])
+        await self._feed(runner, portfolio, 3)
+        assert router.signals == [], "exactly warmup bars is still cold"
+        assert runner.stats.signals_discarded_cold == 1
+
+        # The same signal one bar later: 4 held against 3, which is warm.
+        one_more = ScriptedStrategy({3: SignalAction.ENTER_LONG}, warmup=3)
+        runner, router, _, _, portfolio, _ = build(one_more, bars=[bar(0)])
+        await self._feed(runner, portfolio, 4)
+        assert len(router.signals) == 1, "warmup + 1 bars is warm"
+        assert runner.stats.signals_discarded_cold == 0
+
+    @pytest.mark.asyncio
+    async def test_a_strategy_declaring_no_warmup_trades_on_its_first_bar(self) -> None:
+        """**The floor that must not be applied here.** `warmup` asks the
+        repository for `max(warmup_bars, 1)` rows, because a read for zero rows
+        is not a read — and reusing that floored number as the gate would make a
+        strategy declaring zero skip its first bar live while trading it in a
+        backtest. The same divergence as having no gate, pointing the other way.
+        """
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG}, warmup=0)
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+
+        await self._feed(runner, portfolio, 1)
+
+        assert len(router.signals) == 1
+        assert runner.stats.signals_discarded_cold == 0
+        assert runner.warm_after == 0, "the gate reads the declaration, unfloored"
+        assert runner.bars_to_load == 1, "the loader still asks for a row"
+
+    @pytest.mark.asyncio
+    async def test_a_hold_from_a_cold_symbol_is_not_counted_as_discarded(self) -> None:
+        """A HOLD is the strategy saying nothing happened. Counting it would
+        inflate the one number that says "this strategy tried to trade before it
+        was warm", and `_submit` would not have routed it either."""
+        strategy = ScriptedStrategy({0: SignalAction.HOLD}, warmup=5)
+        runner, _, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+
+        await self._feed(runner, portfolio, 2)
+
+        assert runner.stats.signals_discarded_cold == 0
+
+    @pytest.mark.asyncio
+    async def test_the_cold_count_reaches_the_evaluation_line(self) -> None:
+        """The number an operator reads to know the strategy is not running yet.
+        Day 4 had twenty symbols cold for the first fifty minutes of a session
+        and nothing said so on a line anybody aggregates."""
+        strategy = ScriptedStrategy(warmup=5)
+        runner, _, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+
+        await self._feed(runner, portfolio, 2)
+        assert runner._cold_symbols() == 1
+
+        await self._feed(runner, portfolio, 6)
+        assert runner._cold_symbols() == 0, "the gate opens rather than latching"

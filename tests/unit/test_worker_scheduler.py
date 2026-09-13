@@ -632,6 +632,26 @@ class TestTheSessionSummary:
         assert alerts.sent[0].severity is Severity.INFO
         assert "Not halted." in alerts.sent[0].body
 
+    async def test_discarded_cold_signals_are_named_in_the_summary(self) -> None:
+        """A session that discarded signals measured less of the strategy than
+        its evaluation count suggests, and the close-of-day message is where an
+        operator finds that out (docs/paper-week/day-4-review.md, F6)."""
+        watch, alerts = _watch(stats=RunnerStats(orders_submitted=4, signals_discarded_cold=7))
+
+        await summarise_the_session(watch)
+
+        assert "7 signals discarded" in alerts.sent[0].body
+        assert "not warm yet" in alerts.sent[0].body
+
+    async def test_a_fully_warm_session_says_nothing_about_it(self) -> None:
+        """Zero earns no line. A summary that reports every number it could
+        report is one nobody reads to the end."""
+        watch, alerts = _watch(stats=RunnerStats(orders_submitted=4))
+
+        await summarise_the_session(watch)
+
+        assert "discarded" not in alerts.sent[0].body
+
     async def test_a_data_only_worker_still_reports(self) -> None:
         """The worker that owed somebody a message on day 1 was the one *not*
         trading, so no strategy must not mean no summary."""
