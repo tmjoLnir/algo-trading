@@ -2957,3 +2957,74 @@ class TestAColdSymbolCannotTrade:
 
         await self._feed(runner, portfolio, 6)
         assert runner._cold_symbols() == 0, "the gate opens rather than latching"
+
+
+class TestTheConfiguredStopHasAWidth:
+    """F8. A stop config only means something against a timeframe, and nothing
+    said which pair was in force.
+
+    `atr x2 period=14` reads identically in every log line this platform writes.
+    On daily bars it is about 4% of price; on one-minute bars, about 0.12% — a
+    factor of thirty-four, measured over 346,000 real bars across the twenty-name
+    watchlist. Day 4 of the paper week traded the 1m end of that and closed all 41
+    round trips at their stop (docs/paper-week/day-4-review.md, F8).
+
+    Establishing that took fetching bars and recomputing the ATR a week after the
+    session. The number is available at warmup, so it goes on the line that says
+    what the runner is configured to do.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_fixed_pct_stop_reports_its_own_percentage(self) -> None:
+        """The arithmetic, against a stop whose width is its configuration: 2%
+        is 200 basis points, whatever the price."""
+        runner, _, _, _, portfolio, _ = build(
+            bars=[bar(0, close=100.0)],
+            stop_config=StopConfig(stop_type=StopType.FIXED_PCT, value=Decimal("0.02")),
+        )
+        await runner.evaluate(portfolio)
+
+        assert runner._stop_width_bps() == 200
+
+    @pytest.mark.asyncio
+    async def test_a_tight_stop_is_distinguishable_from_a_wide_one(self) -> None:
+        """The comparison the field exists to make. Two configs that log
+        identically apart from a multiplier, and the number that tells them
+        apart."""
+        tight, _, _, _, portfolio_a, _ = build(
+            bars=[bar(0, close=100.0)],
+            stop_config=StopConfig(stop_type=StopType.FIXED_PCT, value=Decimal("0.001")),
+        )
+        await tight.evaluate(portfolio_a)
+
+        wide, _, _, _, portfolio_b, _ = build(
+            bars=[bar(0, close=100.0)],
+            stop_config=StopConfig(stop_type=StopType.FIXED_PCT, value=Decimal("0.04")),
+        )
+        await wide.evaluate(portfolio_b)
+
+        assert tight._stop_width_bps() == 10
+        assert wide._stop_width_bps() == 400
+
+    @pytest.mark.asyncio
+    async def test_no_bars_reports_absent_rather_than_zero(self) -> None:
+        """A width of zero is a stop at the entry price, which is a different and
+        much worse claim than "nothing to measure yet"."""
+        runner, _, _, _, _, _ = build(
+            stop_config=StopConfig(stop_type=StopType.FIXED_PCT, value=Decimal("0.02"))
+        )
+
+        assert runner._stop_width_bps() is None
+
+    @pytest.mark.asyncio
+    async def test_a_time_stop_has_no_width(self) -> None:
+        """`initial_stop` refuses a time stop rather than inventing a level, so
+        this reports absent rather than letting that exception reach warmup —
+        which would turn a diagnostic into the reason a runner cannot start."""
+        runner, _, _, _, portfolio, _ = build(
+            bars=[bar(0, close=100.0)],
+            stop_config=StopConfig(stop_type=StopType.TIME, bars=10),
+        )
+        await runner.evaluate(portfolio)
+
+        assert runner._stop_width_bps() is None

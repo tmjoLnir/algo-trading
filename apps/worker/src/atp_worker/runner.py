@@ -32,6 +32,7 @@ premise cannot survive.
 from __future__ import annotations
 
 import asyncio
+import statistics
 import time
 from collections import deque
 from dataclasses import dataclass, replace
@@ -666,7 +667,54 @@ class StrategyRunner:
             needed=needed,
             short=len(short),
             not_before=floor.isoformat() if floor is not None else None,
+            # **How wide the configured stop actually is, on the bars just
+            # loaded.** A stop config is only meaningful against a timeframe, and
+            # nothing anywhere said which pair was in force. `atr x2 period=14`
+            # reads identically in every log line this platform writes and is
+            # ~4% of price on daily bars against ~0.12% on one-minute bars — a
+            # factor of thirty-four. Day 4 of the paper week traded the 1m end of
+            # that: stops roughly a tenth of a percent from entry, inside the
+            # noise, so all 41 round trips closed at their stop
+            # (docs/paper-week/day-4-review.md, F8). Discovering it took fetching
+            # bars and recomputing the ATR a week later. It is one number, it is
+            # known at warmup, and it belongs on the line that says what this
+            # runner is configured to do.
+            stop_width_bps=self._stop_width_bps(),
         )
+
+    def _stop_width_bps(self) -> int | None:
+        """The configured stop's distance from entry, in basis points.
+
+        The median across the watchlist, priced off each symbol's most recent
+        close and the bars warmup just loaded. `None` when nothing can be
+        computed — no bars, or a `time` stop, which has no price level at all.
+
+        Goes through `StopManager.initial_stop`, the same call the router makes
+        when it arms a real stop, so this reports the platform's own number
+        rather than a second implementation of it that could drift from the first
+        (ADR 0006's reasoning, applied to a diagnostic).
+        """
+        widths: list[int] = []
+        for symbol in self.symbols:
+            bars = self._bars.get(symbol)
+            if not bars:
+                continue
+            entry = bars[-1].close
+            if entry <= 0:
+                continue
+            try:
+                level = self.stop_manager.initial_stop(
+                    entry, Side.BUY, self.stop_config, self._atr(symbol)
+                )
+            except (ValueError, TypeError):
+                # A `time` stop has no level, and a config missing the field its
+                # type needs raises rather than inventing one. Neither is this
+                # method's business to report on.
+                return None
+            widths.append(int(abs(entry - level) / entry * 10_000))
+        if not widths:
+            return None
+        return int(statistics.median(widths))
 
     def _escalate(self, decision: RiskDecision) -> None:
         """Turn a risk refusal that means something worse into a halt.
