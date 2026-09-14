@@ -1,6 +1,8 @@
 # 21. The paper host is the operator's own Mac
 
-**Status:** **Superseded** by [ADR 0032](0032-the-paper-host-moves-off-the-mac.md) ·
+**Status:** **Superseded** by [ADR 0032](0032-the-paper-host-moves-off-the-mac.md),
+which was itself superseded by
+[ADR 0033](0033-the-mac-stays-and-the-condition-becomes-a-number.md) ·
 accepted 2026-08-30 · superseded 2026-09-10
 
 > **Superseded, and the text below is left exactly as it was written.** What was
@@ -12,6 +14,19 @@ accepted 2026-08-30 · superseded 2026-09-10
 > a 129.6-second stall that the review filed under papercuts.
 > [ADR 0032](0032-the-paper-host-moves-off-the-mac.md) takes the fallback this
 > document named for itself and moves the paper host to an Oracle Cloud A1.
+>
+> **Read 0033 before acting on either.** A day after 0032 merged,
+> [ADR 0033](0033-the-mac-stays-and-the-condition-becomes-a-number.md) superseded
+> it: `sudo pmset -c disablesleep 1` was applied and read back, `pmset -g log`'s
+> sleep/wake counter supplied the feedback loop 0032 argued did not exist, and
+> **the paper host is this machine again. Nothing was ever provisioned at
+> Oracle**, so none of 0032's consequences took effect.
+>
+> This document is still superseded and is not the current decision. What 0033
+> keeps from it is the machine and nothing else: the condition that sank this
+> ADR is a number with a trip-wire in 0033 rather than the sentence it is below,
+> and [ORACLE_HOSTING.md](../ORACLE_HOSTING.md) is the costed route out if that
+> trip-wire fires. [LOCAL_HOSTING.md](../LOCAL_HOSTING.md) is the procedure.
 
 Extends [ADR 0011](0011-one-vm-deployed-by-hand.md), which chose the deployment
 *shape* and deliberately left the machine open. This picks the machine. It
