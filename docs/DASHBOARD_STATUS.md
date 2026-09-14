@@ -15,7 +15,9 @@ That bounds what the reading is worth. Every fixture response was shaped from
 `apps/web/src/api/schema.d.ts` — the types generated from the app's own OpenAPI
 document — and every enum value checked against the domain rather than guessed
 (`OrderStatus`, `SignalAction`, `StrategyState`, the four backtest statuses in
-`atp_core.backtest.ports`, and the twelve audit verbs in `atp_core.audit.ports`).
+`atp_core.backtest.ports`, and the twelve audit verbs `atp_core.audit.ports`
+declared at the time — it declares thirteen now, `BOOK_ADOPTED` having been added
+with the broker-state adoption path).
 So what follows describes **what the front end renders for a given contract**,
 and says nothing whatever about whether the server can produce that contract
 from a real database. Phase 5's *Verifiable:* line — a book a real worker

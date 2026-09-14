@@ -1018,14 +1018,28 @@ acknowledged".
 4. Reconcile before clearing the halt. Trading on against a book you have not
    confirmed is the thing the halt bought you time to avoid.
 
-## Position open with no stop (`order.position_unprotected`)
+## Position open with no stop (`order.position_unprotected`, `order.protection_not_rearmed`)
 
-*Symptom:* a `CRITICAL` log with that event name.
+*Symptom:* a `CRITICAL` log with either event name.
 
-An entry filled and its protective stop was refused, or there was no stop to
-place. The position is live and the venue holds nothing against it. An
-engine-side level may be armed, which protects you only while the worker is up —
-that is not the guarantee a broker-side stop gives.
+The position is live and the venue holds nothing against it. An engine-side
+level may be armed, which protects you only while the worker is up — that is not
+the guarantee a broker-side stop gives.
+
+**Two histories lead here, and the second one has an outstanding exit as well.**
+
+- **An entry filled and its protective stop was refused**, or there was no stop
+  to place. `order.position_unprotected`, and steps 1–3 below are the triage.
+- **A close released the stop and it could not be put back.** A working stop
+  reserves the shares it covers, so it is what refuses the close that would
+  flatten the position; `OrderRouter._close` submits the close first and cancels
+  those stops only once the venue names one of our own orders as the holder,
+  then retries the close once and re-arms on the way out if that retry is
+  refused (docs/RISK.md, "A close is the one thing that may take a stop off").
+  A re-arm that does not land is `order.protection_not_rearmed` when the router
+  could not rebuild the order, and `order.position_unprotected` when the risk
+  chain refused the replacement. Either way **the exit did not happen either** —
+  read "A stop released for a close" below before working the steps.
 
 1. Read `rule` in the log line. Usually it names one of three
    (`rules.EXIT_BLIND_RULES`): `stale_data`, `trading_hours` or `rate_limit`.
@@ -1050,6 +1064,47 @@ that is not the guarantee a broker-side stop gives.
 3. `no stop level was requested and no stop_config was supplied` is a strategy
    configuration bug, not an incident: the strategy is trading without a stop.
    docs/SAFETY.md makes that a go-live blocker.
+
+### A stop released for a close
+
+Expect `order.protection_released` immediately before any of this. On the
+ordinary version of the story the stop goes straight back and you get
+`order.protection_rearmed` at `WARNING`, naming the replacement's `level` and
+`qty` — that one is not an incident, but it does tell you an exit was refused
+twice and is still outstanding.
+
+When it does *not* go back:
+
+1. **Go to the broker's own UI and read the position.** Do not infer it from the
+   dashboard: this sequence is one the engine's view of the book has just been
+   wrong about twice.
+2. **Put a stop back by hand.** `order.protection_rearmed` is absent, so its
+   `level` is not in the log. Take it from this symbol's
+   `order.protective_stop_placed`, which carries the `level` and `qty` of the
+   protection that was later released, or from the position's armed level on the
+   dashboard. The armed level dies with the worker; the one you place by hand
+   does not.
+3. **Then find out why the close was refused the second time.** It is not the
+   inventory hold — the release answered that. On `order.position_unprotected`
+   from this path, `rule` names the risk rule that refused the *re-arm*, and the
+   close's own refusal is the log line above it: a halted symbol, an account
+   restriction and buying power on a short all reach here. The exit signal is
+   still outstanding and the next one is refused the same way until you clear it.
+4. If the position must go now and the venue will not take the close, flatten
+   through the broker's UI rather than retrying the loop. **Halt first** — the
+   runner can re-enter within a tick of the book going flat.
+
+`order.protection_not_rearmed` carries
+`detail="no cover recorded for this stop — it cannot be re-keyed"`: the router
+lost the record of what the stop covered, so it did not attempt a replacement at
+all. Same remedy, and it is a bug worth an issue — the cover is meant to outlive
+the release.
+
+**`order.protection_not_released` is not this.** It is also `CRITICAL`, and it
+means a *cancel* failed — so the stop is still working and the position is still
+protected. The close is refused for exactly that reason, which is the correct
+outcome. Work it as a broker problem (see "Broker unreachable"), not as an
+uncovered position.
 
 ## Emergency flatten
 

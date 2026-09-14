@@ -104,6 +104,32 @@ ATR(14).
   additive rather than cancel-and-replace: replacing opens an unprotected window
   between the cancel landing and the replacement being acknowledged, and the
   cancel can lose the race outright.
+- **A close is the one thing that may take a stop off, and only after the venue
+  says so.** A working order reserves the shares it covers, so the GTC stop over
+  a whole position reserves the whole position and the close that would flatten
+  it is refused for want of shares the account demonstrably holds. On day 4 of
+  the paper week that was 38 of 39 exit signals, every one answered
+  `insufficient qty available` (docs/paper-week/day-4-review.md, B1).
+  `OrderRouter._close` is now the only path that closes a position, and its
+  order is deliberate: **submit first**, and release the stops facing the close
+  only once the venue has named our own order as what is holding the shares
+  (`InventoryHeldError`). Then retry once, and re-arm the released stops if that
+  retry is refused too. Releasing up front would be simpler and is wrong —
+  against a venue refusing the submit for any *other* reason the cancel
+  succeeds, the close is refused anyway and the re-arm with it, and the position
+  ends naked by a path that did not previously exist. A close the venue accepts,
+  or refuses for any other reason, leaves protection exactly where it was.
+
+  **The residual, named rather than hidden.** Between the cancel and the fill
+  the venue holds no stop: the armed engine-side level is the only one, and it
+  dies with the process. It is bounded by the fill of a market order, the close
+  is GTC so it cannot expire into a position with neither a stop nor a working
+  exit, and it is the same reduced guarantee this chain already accepts for a
+  protective child a rule refused. It closes on the `BrokerPort` bracket item.
+  A re-arm the chain refuses logs `order.position_unprotected`, the same
+  `CRITICAL` as a stop refused at entry; a re-arm the router cannot rebuild logs
+  `order.protection_not_rearmed`. Both are docs/RUNBOOK.md, "Position open with
+  no stop".
 - **A protective stop can be refused.** Three of the nine rules judge the order
   rather than whether it reduces a position, so trading hours, the rate limit and
   stale data can each block one. The list is `rules.EXIT_BLIND_RULES`, and a
