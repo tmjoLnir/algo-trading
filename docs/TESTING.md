@@ -17,9 +17,10 @@ make test               # everything
 ```
 
 **Some unit tests have a Markdown file as their subject.** They are ordinary
-tests in `tests/unit/`, and they are here because two of this repository's
-records — what is built, and what is wrong with what is built — are documents
-that go stale silently and are believed while they do:
+tests in `tests/unit/`, and they are here because three of this repository's
+records — what is built, what is wrong with what is built, and which routes the
+API actually serves — are documents that go stale silently and are believed
+while they do:
 
 | Test | Holds |
 |---|---|
@@ -27,6 +28,7 @@ that go stale silently and are believed while they do:
 | `test_roadmap_wip_markers.py` | the *format* of its `wip` markers (`scripts/check_roadmap_wip.py` asks GitHub about their truth, in CI) |
 | `test_audit_summary.py` | `AUDIT.md`'s tables, header and §8 against its 82 findings |
 | `test_audit_citations.py` | that every `file:line` in `AUDIT.md` still names a file and a line inside it |
+| `test_api_doc_routes.py` | `docs/API.md` §7's route table and its counts against the routes the app serves |
 
 None of them can check whether a document is *right* — only whether it still
 agrees with itself and with the tree. That is a narrower claim than it sounds
