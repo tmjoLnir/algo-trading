@@ -5,12 +5,12 @@
 **Findings:** 82 (14 high, 40 medium, 28 low)
 
 **State reviewed:** 2026-09-07 against `c0886b6`, under the record conventions
-`docs/ROADMAP.md` sets for a file of this kind. 15 closed, 7 half-closed, 60
+`docs/ROADMAP.md` sets for a file of this kind. 16 closed, 7 half-closed, 59
 open; every unresolved finding was re-checked against the tree. The first review, and why this file needed one at all, is §10; the second
 is §11; the third — the one that re-checked every open finding against the tree
 rather than the file against itself — is §12. §13 is the first section whose
 diff *fixes* what it marks closed, rather than recording work that had already
-merged.
+merged, and §14 is the second.
 
 ---
 
@@ -86,10 +86,10 @@ roadmap's summary. §10.6 said this was missing; it is not any more (#129).
 |---|---:|---:|---:|---:|
 | 🔴 High | 2 | 2 | 10 | **14** |
 | 🟠 Medium | 10 | 5 | 25 | **40** |
-| 🟡 Low | 3 | 0 | 25 | **28** |
-| **Total** | **15** | **7** | **60** | **82** |
+| 🟡 Low | 4 | 0 | 24 | **28** |
+| **Total** | **16** | **7** | **59** | **82** |
 
-Of the 60 still open, **39 are still marked ⚠️ Reported**.
+Of the 59 still open, **39 are still marked ⚠️ Reported**.
 
 That sentence used to read "47 have never been re-checked by anyone", and §12
 made it false: all seventy unresolved findings were re-checked against the tree,
@@ -1683,7 +1683,9 @@ It is installed into both the worker and queue containers (both built from infra
 
 #### 65. README.md's documentation index links to docs/API.md, which does not exist
 
-`README.md:89` · Broken · 🟡 Low · ✅ Verified · 🔴 **Open**
+`README.md:89` · Broken · 🟡 Low · ✅ Verified · 🟢 **Closed** — @claude (#161)
+
+*Record note (§14, 2026-09-14): Closed by this diff, which writes the page. The repository's relative links now all resolve — the count went from 2 unresolved (this row and `AUDIT.md:1690`, which cites it) to 0. The substitute the finding said did not exist is no longer needed: `docs/API.md` covers the conventions rather than restating the generated schema, and §7 of it marks which twelve of the forty-nine routes are stubs — which is the thing the scattered sections in DASHBOARD.md, ANALYTICS.md and BACKTESTING.md never said anywhere.*
 
 **Evidence**
 
@@ -2802,3 +2804,58 @@ mark is unchanged.
   carve-out reading a halt's reason instead of its evidence was found in
   `docs/paper-week/day-1-fix-audit.md` §3.1a, not in the 82, and it is recorded
   as ADR 0029. Findings 48 and 49 are the only entries here that move.
+
+---
+
+## 14. One finding, closed by writing the page it asked for — 2026-09-14
+
+The second section whose diff *fixes* what it marks closed, after §13. The
+convention is §2's and CLAUDE.md §6's: a state annotated with the PR that earned
+it, in the same diff.
+
+Fixed at `0a231de`, on the branch that became #161.
+
+### 14.1 What closed
+
+**Finding 65** — `README.md`'s documentation index linked `docs/API.md`, which
+had never existed. The page is now written, and the finding's own evidence is
+the check that confirms it: the repository's relative links went from two
+unresolved to none. The second of the two was inside this file, at
+`AUDIT.md:1690`, quoting the first — a finding that could not be cited without
+reproducing the defect it described.
+
+**It was open because it could not be closed by an edit.** Every other docs
+finding in this file names a sentence that is wrong and is fixed by correcting
+the sentence. This one named an absence, and the only thing that closes an
+absence is the work. That is why it sat through §10, §11 and §12 marked ✅
+Verified and 🔴 Open, with nothing to re-check: the claim was never in doubt.
+
+### 14.2 What the page says that the finding did not ask for
+
+The finding asked for "the REST/WS surface and conventions" and observed that
+the surface was documented only in scattered sections of DASHBOARD.md,
+ANALYTICS.md and BACKTESTING.md. Writing it turned up something none of those
+sections say and the generated schema cannot: **twelve of the forty-nine routes
+raise `NotImplementedError`**, and they appear in the OpenAPI document exactly
+like the thirty-seven that work, because FastAPI documents a handler by its
+signature. Five of the seven strategy routes, all three market-data reads,
+manual order entry, both single-position reads and `/dashboard/health`.
+
+That is not a new finding and is not added to the table — the stubs are
+deliberate, each carries a docstring saying why, and `docs/ROADMAP.md` is where
+unbuilt work belongs. It is recorded here because it is the answer to the
+question the finding said the missing page would have answered, and because a
+reader who generates a client from the schema and trusts it will not find it
+anywhere else.
+
+### 14.3 What this pass did not do
+
+- **It re-checked nothing.** §12 re-checked all seventy unresolved findings on
+  2026-09-07 and §13 moved two on 2026-09-08; the other 59 open findings carry
+  those marks untouched. This is one entry changing state, not a fifth review.
+- **It closes no half-closed finding.** The seven at 🟡 are where §12 left them.
+- **Finding 66 is untouched and stays closed.** Its record note undercounted the
+  audit verbs a second time — twelve when `atp_core.audit.ports` now declares
+  thirteen — and that was corrected in `docs/DASHBOARD_STATUS.md` by #160, in
+  the document rather than in this table. A closed finding is terminal (§2); the
+  drift was in the page it describes, not in the finding.
