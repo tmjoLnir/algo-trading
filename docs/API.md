@@ -304,16 +304,23 @@ implementation. Calling one is a `500`.
 This is the single most useful thing this page can tell a client author, and it
 is why generating a client from the schema and trusting it is a mistake here.
 
+**The table is checked against the source on every test run.**
+`tests/unit/test_api_doc_routes.py` takes the paths from the app's own OpenAPI
+document and the stub marks from an AST walk of the routers, and fails if a row
+is missing, invented, or marked wrongly — so implementing one of these without
+moving its mark breaks the build rather than leaving a page that quietly
+understates the platform. It cannot check the third column, which is prose.
+
 Legend: **✅** implemented · **🔲** stub, raises `NotImplementedError` → 500.
 
-### Auth — `/api/v1/auth`
+### Auth
 
 | | Route | Notes |
 |---|---|---|
-| ✅ | `POST /login` | Rate limited. `429` with `Retry-After` |
-| ✅ | `POST /logout` | `204` |
-| ✅ | `GET /me` | `{user, scope}` |
-| ✅ | `GET /context` | Pre-session. Run mode only — what the login screen may know |
+| ✅ | `POST /api/v1/auth/login` | Rate limited. `429` with `Retry-After` |
+| ✅ | `POST /api/v1/auth/logout` | `204` |
+| ✅ | `GET /api/v1/auth/me` | `{user, scope}` |
+| ✅ | `GET /api/v1/auth/context` | Pre-session. Run mode only — what the login screen may know |
 
 ### The book
 
@@ -346,10 +353,10 @@ Legend: **✅** implemented · **🔲** stub, raises `NotImplementedError` → 5
 | ✅ | `GET /api/v1/strategies` | |
 | ✅ | `POST /api/v1/strategies` | `201`, and **no `Location` header** — pointing a client at the stub below would be worse than pointing it nowhere |
 | 🔲 | `GET /api/v1/strategies/available` | |
-| 🔲 | `GET /api/v1/strategies/{id}` | |
-| 🔲 | `PATCH /api/v1/strategies/{id}` | |
-| 🔲 | `POST /api/v1/strategies/{id}/promote` | |
-| 🔲 | `POST /api/v1/strategies/{id}/pause` | |
+| 🔲 | `GET /api/v1/strategies/{strategy_id}` | |
+| 🔲 | `PATCH /api/v1/strategies/{strategy_id}` | |
+| 🔲 | `POST /api/v1/strategies/{strategy_id}/promote` | |
+| 🔲 | `POST /api/v1/strategies/{strategy_id}/pause` | |
 
 Five of seven. A strategy is authored in code and registered
 (`docs/STRATEGY_AUTHORING.md`); editing one over HTTP is what ADR 0007's
