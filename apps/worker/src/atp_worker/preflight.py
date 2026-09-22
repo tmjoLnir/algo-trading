@@ -34,6 +34,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from atp_core.data.providers.alpaca import STREAMED_BAR_TIMEFRAME
 from atp_core.domain import RunMode, Timeframe
 from atp_core.domain.enums import StopType
 from atp_core.errors import ATPError
@@ -248,7 +249,12 @@ def check_strategy(config: WorkerConfig) -> Check:
             "different strategy, because its periods mean a different span of time",
             fix=(
                 f'set strategy_params.timeframe to "{config.bar_timeframe.value}" and re-tune '
-                f'the periods for it, or set the worker\'s timeframe to "{declared.value}"'
+                f"the periods for it"
+                + (
+                    ""
+                    if declared is not STREAMED_BAR_TIMEFRAME
+                    else f', or set the worker\'s timeframe to "{declared.value}"'
+                )
             ),
         )
     return Check(
@@ -401,6 +407,46 @@ def check_warmup(
     if newest is not None:
         detail = f"{detail}, newest {newest.date().isoformat()}"
     return Check(f"history {symbol}", Status.PASS, detail)
+
+
+def check_ingest_timeframe(saved: Timeframe) -> Check:
+    """Whether anything writes the configured series while the market is open.
+
+    `check_timeframe` below says which series the rest of this report was
+    measured on. This says whether that series exists to be measured.
+
+    The realtime feed delivers `STREAMED_BAR_TIMEFRAME` and takes no argument
+    asking for anything else, so a worker configured for a coarser series has an
+    ingestor writing one column and a runner reading another. `_refresh_bars`
+    filters strictly, the newest stored bar never advances past the one warmup
+    loaded, and `on_bar` is never called — a full session of evaluations that
+    decide nothing, on a process reporting itself healthy. `trading
+    .require_deliverable_timeframe` refuses to start on it; this is the same
+    refusal half an hour earlier, where it is cheap.
+
+    FAIL rather than WARN, for `check_warmup`'s reason and more sharply: what it
+    produces is not an error but *no signals*, which is also what a correct week
+    of a crossover strategy looks like. A result nobody can interpret is worse
+    than a refusal — and this one is reachable from a browser, because the
+    timeframe is a row the dashboard writes (ADR 0023).
+    """
+    if saved is STREAMED_BAR_TIMEFRAME:
+        return Check(
+            "ingest",
+            Status.PASS,
+            f"{saved.value} — the series the realtime feed writes, so bars close during "
+            f"the session and the strategy is asked",
+        )
+    return Check(
+        "ingest",
+        Status.FAIL,
+        f"nothing writes {saved.value} bars while the market is open — the feed delivers "
+        f"{STREAMED_BAR_TIMEFRAME.value} and the runner reads {saved.value}, so no bar would "
+        f"close, the strategy would never be asked, and the session would report silence",
+        fix=f"set the worker's timeframe to {STREAMED_BAR_TIMEFRAME.value} on the Config tab; "
+        f"a coarser series needs a job writing those bars during a session "
+        f"(docs/paper-week/day-5-readiness.md, §3.2)",
+    )
 
 
 def check_timeframe(timeframe: Timeframe, *, saved: Timeframe) -> Check:

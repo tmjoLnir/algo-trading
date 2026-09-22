@@ -174,6 +174,24 @@ A line they can be ticked against is proposed below.
   completed bar)` before handling anything from the new connection. A gap it
   cannot close engages the kill switch instead of trading across the hole.
 
+  **It ingests one series and only one** (#163). `MarketDataFeed.subscribe`
+  takes no timeframe, Alpaca's websocket carries minute bars, and the adapter
+  decodes every streamed bar at `STREAMED_BAR_TIMEFRAME` — so the "one series a
+  worker holds" that day 1's blocker established is `1m`, not whatever the
+  config row says. Any other value puts the ingestor back on a different column
+  from the runner: no bar closes, `on_bar` is never called, and the session
+  reports health while deciding nothing. `trading.require_deliverable_timeframe`
+  and `preflight.check_ingest_timeframe` now refuse it rather than running it,
+  and the two fix lines that used to recommend it no longer do
+  (docs/paper-week/day-5-readiness.md, §3.2).
+
+  Which means **this platform cannot yet trade a daily strategy**, and
+  `sma_crossover` is one. Running a series coarser than the feed's needs a job
+  writing those bars during or after a session, or an evaluation trigger that is
+  not "a bar just closed" — an item this phase does not have and should, since
+  #159 measured every intraday configuration of the shipped strategy as a loser
+  and every daily one as a winner.
+
   A socket has now been held open to Alpaca *during the session*, and live data
   parsed from it: 5,284 SPY quotes and a complete one-minute bar over ~80s on
   2026-08-17, plus a second bar in a follow-up capture. Every price and size

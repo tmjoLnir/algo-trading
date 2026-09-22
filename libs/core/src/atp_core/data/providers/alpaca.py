@@ -24,7 +24,7 @@ import json
 import random
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 import httpx
 
@@ -55,6 +55,25 @@ _TIMEFRAME_PARAM: dict[Timeframe, str] = {
     Timeframe.H4: "4Hour",
     Timeframe.D1: "1Day",
 }
+
+#: **The only series the realtime feed can deliver.** `MarketDataFeed.subscribe`
+#: takes no timeframe — Alpaca's websocket `bars` channel carries minute bars and
+#: nothing else — so every streamed bar is decoded at this timeframe whatever
+#: `WorkerConfig.timeframe` says.
+#:
+#: It is a name rather than a literal at the decode site because something has to
+#: be able to *ask*. A worker configured for any other series reads a column the
+#: ingestor never writes: `_refresh_bars` filters strictly on the timeframe, the
+#: newest stored bar never advances, `on_bar` fires zero times, and the process
+#: reports itself healthy the whole way. That is day 1 of the paper week, and the
+#: config row that produces it is editable from a browser — so
+#: `trading.require_deliverable_timeframe` refuses it at assembly and
+#: `preflight.check_ingest_timeframe` refuses it before that
+#: (docs/paper-week/day-5-readiness.md, §3.2).
+#:
+#: When a second feed lands, or a job starts writing daily bars during a session,
+#: this stops being one value and becomes a question to ask the ingest path.
+STREAMED_BAR_TIMEFRAME: Final = Timeframe.M1
 
 #: Alpaca's per-page ceiling. Asking for the maximum minimises both round trips
 #: and rate-limit consumption on a multi-year backfill.
@@ -920,7 +939,7 @@ class AlpacaRealtimeFeed:
                 #: empty: adjustment is a corporate-action fact that does not
                 #: exist yet for a bar that closed a second ago.
                 ts=ts,
-                timeframe=Timeframe.M1,
+                timeframe=STREAMED_BAR_TIMEFRAME,
                 open=_as_decimal(message["o"]),
                 high=_as_decimal(message["h"]),
                 low=_as_decimal(message["l"]),

@@ -45,7 +45,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from atp_core.config import config_problem_summary, get_settings
-from atp_core.domain import Timeframe
+from atp_core.domain import Bar, Timeframe
 from atp_core.errors import ATPError
 from atp_core.indicators import dispatch
 from atp_core.persistence.bars import PostgresBarRepository
@@ -140,6 +140,9 @@ async def main(argv: list[str] | None = None) -> int:
         preflight.check_credentials(settings),
         preflight.check_locks(trading.decide(settings, config)),
         preflight.check_strategy(config),
+        # Before `check_timeframe`, which says which series the report was
+        # measured on: this says whether anything writes that series at all.
+        preflight.check_ingest_timeframe(saved),
         preflight.check_timeframe(config.bar_timeframe, saved=saved),
         preflight.check_stop_config(config),
         preflight.check_alert_transport(settings),
@@ -419,7 +422,7 @@ async def _sizing_check(settings: Settings, config: WorkerConfig, *, equity: Dec
     )
 
 
-def _derived_stop(config: WorkerConfig, series: list, price: Decimal) -> Decimal | None:
+def _derived_stop(config: WorkerConfig, series: list[Bar], price: Decimal) -> Decimal | None:
     from atp_core.domain import Side
 
     try:

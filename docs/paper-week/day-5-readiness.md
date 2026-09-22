@@ -319,6 +319,16 @@ run".
 >
 > The rest of this section stands as written and is why that work is worth doing: the stop width,
 > the trade rate, and §3.3's warmup gate all resolve at `1d`. What was wrong was the price.
+>
+> **A guard landed with this correction** (#163), because the bad row is one click away on a
+> screen and the advice pointing at it was in this document. `trading.require_deliverable_timeframe`
+> refuses to start a worker on a series the live ingest path does not write, and
+> `preflight.check_ingest_timeframe` FAILs on it half an hour earlier. `STREAMED_BAR_TIMEFRAME`
+> names the fact in the adapter that decides it, so the guard and the decoder cannot drift apart,
+> and the two places that used to end their advice with *"or set the worker's timeframe to
+> `1d`"* — `require_matching_timeframe` and `preflight.check_strategy` — now offer that remedy
+> only when it is deliverable. It is a floor, not a preference: the diff that writes daily bars
+> during a session is the one that widens it.
 
 **What the `1d` configuration would fix, once it can run at all.** `_warmup_floor` returns `None`
 for daily and coarser (`runner.py:536`), so warmup loads 51 real daily bars from Postgres and

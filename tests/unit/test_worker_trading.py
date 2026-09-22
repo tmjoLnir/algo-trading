@@ -372,3 +372,75 @@ class TestTheStrategyGetsTheSeriesItAskedFor:
         that let day 2 happen."""
         assert SmaCrossover().declared_timeframe is Timeframe.D1
         assert SmaCrossover({"timeframe": "1m"}).declared_timeframe is Timeframe.M1
+
+
+class TestTheWorkerRefusesASeriesNobodyWrites:
+    """Day 5's near miss, as assertions.
+
+    `require_matching_timeframe` settles which series the strategy and the
+    worker agree on. It cannot settle whether that series is written at all, and
+    for every timeframe but `STREAMED_BAR_TIMEFRAME` it is not: the realtime
+    feed carries minute bars, `MarketDataFeed.subscribe` takes no timeframe to
+    ask otherwise, and the adapter decodes every streamed bar at that one
+    timeframe. A worker configured for `1d` therefore has an ingestor writing
+    `1m`, `_refresh_bars` reading `1d`, and no bar ever closing — `on_bar` is
+    never called, all session, on a process reporting healthy.
+
+    The pairing is reachable and was nearly recommended: `sma_crossover`
+    declares `1d`, #159 measured `1m` as the reason day 4 could not mean
+    anything, and the timeframe is a row the dashboard writes (ADR 0023). An
+    operator following that advice would have got day 1 back
+    (docs/paper-week/day-5-readiness.md, §3.2).
+    """
+
+    def test_a_series_the_feed_does_not_write_refuses_to_start(self) -> None:
+        with pytest.raises(ConfigError, match="nothing writes them while the market is open"):
+            trading.require_deliverable_timeframe(Timeframe.D1)
+
+    def test_the_series_the_feed_writes_starts(self) -> None:
+        trading.require_deliverable_timeframe(Timeframe.M1)
+
+    def test_every_coarser_series_is_refused_not_just_daily(self) -> None:
+        """The hole is not `1d`-shaped. Any timeframe the decoder does not stamp
+        reads a column the ingestor never writes."""
+        for timeframe in (Timeframe.M5, Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.D1):
+            with pytest.raises(ConfigError):
+                trading.require_deliverable_timeframe(timeframe)
+
+    def test_the_refusal_says_what_would_have_happened(self) -> None:
+        """ "Refusing to start" is not enough on its own: the operator set this
+        row deliberately, on advice, and needs to know the failure it buys is
+        silence rather than an error."""
+        with pytest.raises(ConfigError) as caught:
+            trading.require_deliverable_timeframe(Timeframe.D1)
+
+        message = str(caught.value)
+        assert "no bar would ever close" in message
+        assert "reporting healthy" in message
+        assert Timeframe.M1.value in message, "and which series to set instead"
+
+    def test_it_is_checked_where_the_runner_is_built(self) -> None:
+        """At assembly, beside the match check and before it — a series nothing
+        writes is a prior question to which series was agreed."""
+        source = inspect.getsource(trading.build_runner)
+        assert "require_deliverable_timeframe(config.bar_timeframe)" in source
+        assert source.index("require_deliverable_timeframe") < source.index(
+            "require_matching_timeframe"
+        )
+
+    def test_the_mismatch_refusal_stops_offering_a_series_nobody_writes(self) -> None:
+        """`require_matching_timeframe`'s own remedy used to end "or set the
+        worker's timeframe to '1d'" — which is this guard's failure, arrived at
+        by following the advice of the check next door."""
+        with pytest.raises(ConfigError) as caught:
+            trading.require_matching_timeframe(SmaCrossover(), Timeframe.M1)
+
+        assert "set the worker's timeframe" not in str(caught.value).lower()
+
+    def test_it_still_offers_the_remedy_when_that_remedy_is_deliverable(self) -> None:
+        """A strategy declaring `1m` against a `1d` worker is the mirror case,
+        and there the second knob is the right one to turn."""
+        with pytest.raises(ConfigError) as caught:
+            trading.require_matching_timeframe(SmaCrossover({"timeframe": "1m"}), Timeframe.D1)
+
+        assert "or set the worker's timeframe to '1m'" in str(caught.value).lower()
