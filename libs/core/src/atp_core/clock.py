@@ -222,6 +222,46 @@ class TradingCalendar:
             f"no {self.exchange} session opens within {_MAX_LOOKAHEAD_DAYS} days of {after}"
         )
 
+    def previous_session(self, before: datetime) -> Session | None:
+        """The last session to have **closed** at or before `before`.
+
+        The session whose bar a decision taken at `before` is allowed to be
+        about. On a daily series that is yesterday's bar at this morning's open,
+        and naming it this way is what keeps the live runner on the right side
+        of CLAUDE.md §5: a bar whose session has not closed is not a bar to
+        decide on, however much of it a vendor is willing to serve.
+
+        At or before, not strictly before, because a session's close is the
+        instant its bar becomes complete — a decision taken exactly at the bell
+        is about the bar that just ended. `next_open` is strictly after for the
+        opposite and equally deliberate reason, so that a sleep loop cannot spin
+        on the boundary.
+
+        `None` when nothing closed inside `_MAX_LOOKAHEAD_DAYS`, which for an
+        equity calendar means the argument is outside the data rather than that
+        the market has been shut for a year. The caller decides what to do about
+        it; it must not be read as "no bar yet" and silently skipped.
+        """
+        before = _to_utc(before, "before")
+        day = self._local_date(before)
+        for _ in range(_MAX_LOOKAHEAD_DAYS):
+            session = self.session_on(day)
+            if session is not None and session.close_at <= before:
+                return session
+            day -= timedelta(days=1)
+        return None
+
+    def local_date(self, ts: datetime) -> date:
+        """The exchange-local date `ts` falls on.
+
+        Public because *which session a bar belongs to* is a question callers
+        outside this module have to ask. A daily bar is stamped at exchange-local
+        midnight (docs/DATA.md), so comparing its `ts` to a UTC date is wrong by
+        a day for part of every day, and comparing two bars' `ts` values directly
+        says nothing about whether they are the same session.
+        """
+        return self._local_date(_to_utc(ts, "ts"))
+
     def minutes_to_close(self, ts: datetime) -> int | None:
         """Whole minutes left in the session, or None if the market is shut.
 

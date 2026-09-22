@@ -185,12 +185,18 @@ A line they can be ticked against is proposed below.
   and the two fix lines that used to recommend it no longer do
   (docs/paper-week/day-5-readiness.md, §3.2).
 
-  Which means **this platform cannot yet trade a daily strategy**, and
-  `sma_crossover` is one. Running a series coarser than the feed's needs a job
-  writing those bars during or after a session, or an evaluation trigger that is
-  not "a bar just closed" — an item this phase does not have and should, since
-  #159 measured every intraday configuration of the shipped strategy as a loser
-  and every daily one as a winner.
+  Which meant **this platform could not trade a daily strategy**, and
+  `sma_crossover` is one. That is now built (ADR 0034): `refresh_session_bars`
+  fetches the previous session's bar at open−30, and a session-open warmup
+  withholds it so the existing trigger closes it into the loop — one decision per
+  symbol per session, on the bar the backtest would have decided on, filling
+  during today's session. `1d` joins `1m` in `DELIVERABLE_TIMEFRAMES`; `5m`
+  through `4h` are still refused, because nothing aggregates them.
+
+  Unticked, and the phase line is why: this is code, and Phase 4 asks for a
+  strategy that *trades the paper account for a week and reconciles clean*. What
+  it changes is that the week can now be run on the series #159 measured as the
+  only one worth running.
 
   A socket has now been held open to Alpaca *during the session*, and live data
   parsed from it: 5,284 SPY quotes and a complete one-minute bar over ~80s on

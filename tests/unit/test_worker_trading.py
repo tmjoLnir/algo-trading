@@ -393,17 +393,24 @@ class TestTheWorkerRefusesASeriesNobodyWrites:
     (docs/paper-week/day-5-readiness.md, §3.2).
     """
 
-    def test_a_series_the_feed_does_not_write_refuses_to_start(self) -> None:
+    def test_a_series_nothing_writes_refuses_to_start(self) -> None:
         with pytest.raises(ConfigError, match="nothing writes them while the market is open"):
-            trading.require_deliverable_timeframe(Timeframe.D1)
+            trading.require_deliverable_timeframe(Timeframe.H4)
 
     def test_the_series_the_feed_writes_starts(self) -> None:
         trading.require_deliverable_timeframe(Timeframe.M1)
 
-    def test_every_coarser_series_is_refused_not_just_daily(self) -> None:
-        """The hole is not `1d`-shaped. Any timeframe the decoder does not stamp
-        reads a column the ingestor never writes."""
-        for timeframe in (Timeframe.M5, Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.D1):
+    def test_the_series_the_pre_open_pull_writes_starts(self) -> None:
+        """`1d` was refused until ADR 0034 gave it a writer. The guard's own
+        docstring said the diff that writes those bars is the one that widens
+        it, and this asserts it was widened *there* rather than drifting open."""
+        trading.require_deliverable_timeframe(Timeframe.D1)
+
+    def test_every_aggregated_series_is_still_refused(self) -> None:
+        """The hole was never `1d`-shaped. `5m` through `4h` would each have to
+        be aggregated from stored minutes, and nothing aggregates them — so a
+        worker set to one still reads a column no writer fills."""
+        for timeframe in (Timeframe.M5, Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4):
             with pytest.raises(ConfigError):
                 trading.require_deliverable_timeframe(timeframe)
 
@@ -412,12 +419,13 @@ class TestTheWorkerRefusesASeriesNobodyWrites:
         row deliberately, on advice, and needs to know the failure it buys is
         silence rather than an error."""
         with pytest.raises(ConfigError) as caught:
-            trading.require_deliverable_timeframe(Timeframe.D1)
+            trading.require_deliverable_timeframe(Timeframe.H4)
 
         message = str(caught.value)
         assert "no bar would ever close" in message
         assert "reporting healthy" in message
         assert Timeframe.M1.value in message, "and which series to set instead"
+        assert Timeframe.D1.value in message, "both of them, now that there are two"
 
     def test_it_is_checked_where_the_runner_is_built(self) -> None:
         """At assembly, beside the match check and before it — a series nothing

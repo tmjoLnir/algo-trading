@@ -216,35 +216,37 @@ TIMEFRAMES: tuple[SelectOption, ...] = (
     SelectOption(
         "5m",
         "5 minutes",
-        "Slower than the feed writes, so bars are aggregated from stored minutes rather "
-        "than streamed. Needs the aggregation job that produces them.",
+        "Slower than the feed writes, so bars would have to be aggregated from stored "
+        "minutes. **Nothing aggregates them**, so a worker set to this is refused at "
+        "startup rather than running silently — see docs/adr/0034.",
     ),
     SelectOption(
         "15m",
         "15 minutes",
-        "As 5 minutes: aggregated, not streamed.",
+        "As 5 minutes: no writer, so it is refused at startup.",
     ),
     SelectOption(
         "30m",
         "30 minutes",
-        "As 5 minutes: aggregated, not streamed.",
+        "As 5 minutes: no writer, so it is refused at startup.",
     ),
     SelectOption(
         "1h",
         "1 hour",
-        "As 5 minutes: aggregated, not streamed.",
+        "As 5 minutes: no writer, so it is refused at startup.",
     ),
     SelectOption(
         "4h",
         "4 hours",
-        "As 5 minutes: aggregated, not streamed.",
+        "As 5 minutes: no writer, so it is refused at startup.",
     ),
     SelectOption(
         "1d",
         "1 day",
-        "One bar per session, and it does not complete until the close — so a daily "
-        "strategy decides once a day, after the fact, and places nothing intraday. "
-        "Correct for a swing strategy; a silent no-op for anything meant to trade today.",
+        "One bar per session. The decision is taken at the open on the previous "
+        "session's closed bar and fills during today's session — once per symbol "
+        "per day (ADR 0034). Correct for a swing strategy; engine-side trailing "
+        "stops are evaluated once a session on it, so read docs/SAFETY.md first.",
     ),
 )
 
@@ -338,8 +340,12 @@ class WorkerConfig:
     #: 1 exactly (docs/paper-week/day-5-readiness.md, §3.2).
     #:
     #: `trading.require_deliverable_timeframe` refuses to start on such a value
-    #: and `preflight.check_ingest_timeframe` FAILs on it first, so this field is
-    #: effectively pinned until something writes a coarser bar during a session.
+    #: and `preflight.check_ingest_timeframe` FAILs on it first. Two values are
+    #: admissible and they are fed by different writers: `1m` by the realtime
+    #: ingestor, and `1d` by `scheduler.refresh_session_bars`, which fetches the
+    #: previous session's bar before the open for the runner to decide on at the
+    #: open (ADR 0034). The aggregated series between them — `5m` through `4h` —
+    #: have no writer and are refused.
     #:
     #: Defaults to `1m`, which is what the realtime feed subscribes to.
     timeframe: TimeframeName = "1m"

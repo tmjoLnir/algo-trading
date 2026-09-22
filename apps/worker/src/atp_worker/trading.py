@@ -38,10 +38,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from atp_core.data.providers.alpaca import STREAMED_BAR_TIMEFRAME
-from atp_core.domain import Portfolio, RunMode, StopType
+from atp_core.domain import Portfolio, RunMode, StopType, Timeframe
 from atp_core.errors import ConfigError
 from atp_core.execution.reconciliation import Reconciler
 from atp_core.execution.router import OrderRouter
@@ -64,7 +64,6 @@ if TYPE_CHECKING:
     from atp_core.config import Settings
     from atp_core.dashboard.ports import SnapshotStore
     from atp_core.data.ports import BarRepository, EventPublisher, QuoteCache
-    from atp_core.domain import Timeframe
     from atp_core.execution.ports import FeeLedger, OrderRepository, PortfolioRepository
     from atp_core.risk.killswitch import KillSwitch
     from atp_core.strategy.base import Strategy
@@ -158,6 +157,15 @@ def decide(settings: Settings, config: WorkerConfig) -> TradingDecision:
     )
 
 
+#: The series a worker may actually be configured for, because something in this
+#: platform writes each of them while the market is open: `1m` arrives on the
+#: realtime feed, `1d` is fetched before the open by
+#: `scheduler.refresh_session_bars` (ADR 0034). Every other member of `Timeframe`
+#: would have to be aggregated from stored minutes and nothing aggregates them,
+#: so a worker set to one reads a column no writer fills.
+DELIVERABLE_TIMEFRAMES: Final = frozenset({STREAMED_BAR_TIMEFRAME, Timeframe.D1})
+
+
 def require_deliverable_timeframe(serving: Timeframe) -> None:
     """Refuse a series nothing will write while the session is open.
 
@@ -185,23 +193,25 @@ def require_deliverable_timeframe(serving: Timeframe) -> None:
     Raising here, at assembly, is what day 1 earned. The alternative is not a
     warning — it is a week of results that mean nothing and read like caution.
 
-    **This is a floor, not a preference.** `1m` is a bad series to trade
-    `sma_crossover` on and #159 measured how bad; the answer to that is a daily
-    bar somebody writes during a session, not a config row pointing at one that
-    nobody does (docs/paper-week/day-5-readiness.md, §3.2). When that job exists,
-    this guard is what has to be widened to let it through — deliberately, in the
-    diff that makes the claim true.
+    **`1d` was added by the diff this paragraph asked for** (ADR 0034).
+    `scheduler.refresh_session_bars` fetches the previous session's bar before the
+    open and `StrategyRunner.warmup` withholds it, so the existing trigger fires
+    it once, at the open, on the bar the backtest would have decided on. The guard
+    is still a floor rather than a preference: every aggregated series — `5m`
+    through `4h` — remains refused, because nothing produces those bars either.
+    Widening it again means writing the writer first.
     """
-    if serving is STREAMED_BAR_TIMEFRAME:
+    if serving in DELIVERABLE_TIMEFRAMES:
         return
     raise ConfigError(
         f"this worker is configured for {serving.value} bars and nothing writes them while the "
-        f"market is open: the realtime feed delivers {STREAMED_BAR_TIMEFRAME.value} and the "
-        f"runner reads {serving.value}, so no bar would ever close and the strategy would be "
-        f"asked to decide nothing, all session, while reporting healthy. Refusing to start. Set "
-        f"the worker's timeframe to {STREAMED_BAR_TIMEFRAME.value!r} on the dashboard's Config "
-        f"tab. Running a coarser series needs a job that writes those bars during a session — "
-        f"see docs/paper-week/day-5-readiness.md, §3.2."
+        f"market is open: the realtime feed delivers {STREAMED_BAR_TIMEFRAME.value}, the pre-open "
+        f"pull fetches {Timeframe.D1.value}, and the runner reads {serving.value} — so no bar "
+        f"would ever close and the strategy would be asked to decide nothing, all session, while "
+        f"reporting healthy. Refusing to start. Set the worker's timeframe to "
+        f"{' or '.join(sorted(t.value for t in DELIVERABLE_TIMEFRAMES))} on the dashboard's "
+        f"Config tab. An aggregated series needs a job that produces those bars — see "
+        f"docs/adr/0034-the-daily-decision-is-taken-at-the-open.md."
     )
 
 
