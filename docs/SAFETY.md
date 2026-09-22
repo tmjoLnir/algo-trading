@@ -44,6 +44,17 @@ it, arming it demands the operator's password with the request, and every change
 is written to the audit log with its before and after. Turning it **off** asks
 for nothing — the same asymmetry `/risk/halt` has, and for the same reason.
 
+**At `1d`, layer 5 is the *only* intraday protection, and that is a deliberate
+consequence rather than an oversight.** A daily worker takes one decision per
+session (ADR 0034), and the engine-side checks — trailing ratchets, time exits,
+the fallback stop — are fed by the same list of newly closed bars. So on a daily
+series they are evaluated once a day, at the open, while the venue-side GTC stop
+watches the position continuously as it always has. That is fine for the `atr`
+stop the paper week runs, which does not move intraday. **A strategy whose
+protection depends on an engine-side trailing stop should not be configured at
+`1d`** until the ratchet has somewhere else to live: it would compute correctly
+and act a session late.
+
 **Layer 6 stops new risk; it does not trap a position.** The kill switch refuses
 every order *except* one that can only make an existing holding smaller — a
 flatten, a take-profit exit, a protective stop. It refused those too until the

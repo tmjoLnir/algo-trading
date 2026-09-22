@@ -315,3 +315,28 @@ costs, which is what "nothing to find" looks like. Real history comes from
 - [ ] Volume plausible (a 100× spike is usually a bad print, occasionally news)
 - [ ] Adjusted and raw both present
 - [ ] Timestamps UTC and aligned to the timeframe
+
+## The decision bar
+
+**A `1d` worker decides on the previous session's bar, and that bar is named by
+its exchange-local date rather than by timestamp arithmetic** (ADR 0034).
+`TradingCalendar.previous_session` answers which session has closed; `now - 1
+day` lands on a Sunday one week in five, and on a holiday more often than that.
+
+`scheduler.refresh_session_bars` fetches it at open−30, with a second attempt at
+open−15. Unlike `apply_corporate_actions` and `backfill_missing_bars`, which
+sweep whatever `stored_series()` already holds, this one is scoped to the
+runner's own watchlist — so it can bootstrap a symbol with no daily history,
+which neither of the others can.
+
+**Its window ends at the previous session's close, not at `now`.** Alpaca serves
+a partial daily bar for the session in progress, and a half-formed bar for today
+in the store is a bar the runner could decide on — lookahead, in the direction
+that invents profit (CLAUDE.md §5). The same bound is applied again on the read
+side, in `warmup` and `_refresh_bars`, so neither is the only thing preventing it.
+
+The bar is fetched `adjusted=True`, which does **not** mean the OHLCV is
+adjusted: the provider makes a raw pass for OHLCV and a second pass only to fill
+`adj_close` (see "Adjusted closes" above). So a daily strategy decides and sizes
+on raw prices — CLAUDE.md §5's "trade on raw" — while a backtest of the same
+series prices off `adj_close` (ADR 0017).

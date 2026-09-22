@@ -65,7 +65,13 @@ from atp_core.worker.config import DEFAULT_WORKER_CONFIG
 from atp_core.worker.ports import RunningWorkerConfig
 from atp_worker import trading
 from atp_worker.metrics_server import start_metrics_server
-from atp_worker.scheduler import SessionJobs, SessionWatch, build_schedule, run_scheduler
+from atp_worker.scheduler import (
+    BarPull,
+    SessionJobs,
+    SessionWatch,
+    build_schedule,
+    run_scheduler,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine, Mapping
@@ -240,6 +246,7 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
         #: runs depends on it: reconciliation needs the runner's live book, and
         #: a worker that is not trading has none.
         session_jobs: SessionJobs | None = None
+        bar_pull: BarPull | None = None
         #: How the session summary reads the day's numbers, or None when no
         #: strategy ran. Set beside `session_jobs` and for the same reason.
         session_stats: Callable[[], RunnerStats] | None = None
@@ -335,6 +342,19 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
             )
             session_stats = lambda: runner.stats  # noqa: E731
 
+            # The pre-open pull, scoped to what this runner actually reads.
+            # `runner.bars_to_load + 1` rather than a number derived here: the
+            # fetch and the warmup must agree about how much history the strategy
+            # needs, and the extra row is the decision bar warmup withholds
+            # (ADR 0034). Two places computing it from `strategy.warmup_bars` is
+            # how they come to disagree.
+            bar_pull = BarPull(
+                symbols=tuple(config.symbols),
+                timeframe=config.bar_timeframe,
+                sessions=runner.bars_to_load + 1,
+                alerts=alerts,
+            )
+
         # Bound whether or not this worker trades: a data-only worker on a
         # halted platform is precisely the one that owed somebody a message on
         # day 1 and sent none (docs/paper-week/day-1-review.md, F8).
@@ -344,7 +364,7 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
             stats=session_stats,
         )
         responsibilities["scheduler"] = lambda: run_scheduler(
-            schedule=build_schedule(session_jobs, session_watch)
+            schedule=build_schedule(session_jobs, session_watch, bar_pull)
         )
 
         if decision.enabled and settings.is_live:

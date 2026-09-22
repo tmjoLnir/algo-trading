@@ -164,10 +164,10 @@ class TestTheConfigurationItself:
         row the dashboard writes, so an operator acting on that advice reaches a
         session that evaluates nothing and reports healthy
         (docs/paper-week/day-5-readiness.md, §3.2)."""
-        check = preflight.check_ingest_timeframe(Timeframe.D1)
+        check = preflight.check_ingest_timeframe(Timeframe.H4)
 
         assert check.status is Status.FAIL
-        assert "nothing writes 1d bars while the market is open" in check.detail
+        assert "nothing writes 4h bars while the market is open" in check.detail
         # What it buys, which is silence rather than an error — the reason a
         # WARN would not do.
         assert "report silence" in check.detail
@@ -178,6 +178,16 @@ class TestTheConfigurationItself:
 
         assert check.status is Status.PASS
         assert "1m" in check.detail
+
+    def test_the_series_the_pre_open_pull_writes_passes(self) -> None:
+        """`1d` FAILed here until ADR 0034 gave it a writer, and the operator
+        reading this line needs to know *which* writer — the answer to "why is
+        my daily worker allowed now" is a job name, not a shrug."""
+        check = preflight.check_ingest_timeframe(Timeframe.D1)
+
+        assert check.status is Status.PASS
+        assert "refresh_session_bars" in check.detail
+        assert "at the open" in check.detail
 
     def test_the_mismatch_fix_no_longer_points_at_a_series_nobody_writes(self) -> None:
         """`check_strategy`'s remedy used to end "or set the worker's timeframe

@@ -21,15 +21,15 @@ dependence on how fast the machine is.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pytest
 from structlog.testing import capture_logs
 
 from atp_core.alerts.ports import Alert, Severity
-from atp_core.clock import SimulatedClock, TradingCalendar
+from atp_core.clock import Session, SimulatedClock, TradingCalendar
 from atp_core.data.corporate_actions import Adjustment
 from atp_core.data.gaps import SUPPORTED_TIMEFRAMES
 from atp_core.domain import Order, OrderType, Portfolio, Position, Side, Timeframe
@@ -44,12 +44,16 @@ from atp_core.risk.killswitch import (
 from atp_core.risk.rules import DAILY_LOSS_RULE
 from atp_worker.runner import RunnerStats
 from atp_worker.scheduler import (
+    DECISION_BAR_OFFSET_MINUTES,
+    DECISION_BAR_RETRY_OFFSET_MINUTES,
     MAX_SLEEP_SECONDS,
     ROLLOVER_ACTOR,
     SCHEDULE,
     SESSION_SCAN_DAYS,
+    BarPull,
     SessionJobs,
     SessionWatch,
+    _announce_missing_session_bars,
     _job_name,
     _report_adjustment,
     build_schedule,
@@ -62,9 +66,6 @@ from atp_worker.scheduler import (
     sweepable_series,
 )
 from tests.fakes import FakeBroker, FakeKillSwitch
-
-if TYPE_CHECKING:
-    from datetime import date
 
 CAL = TradingCalendar("NYSE")
 
@@ -1003,3 +1004,161 @@ class TestTheCorporateActionsSweepSurvivesOneDeadSymbol:
         # Deduplicated: one symbol stored at two timeframes is one symbol an
         # operator needs told about, not two.
         assert skipped == ["ZJZZT"]
+
+
+class TestTheDecisionBarIsFetchedBeforeTheOpen:
+    """ADR 0034's ingestion half.
+
+    A daily strategy is asked once a session, on the previous session's bar, and
+    nothing else in this platform writes that bar while a worker runs: the
+    realtime feed carries minute bars and takes no timeframe. The two jobs
+    either side of this one sweep *what the store already holds*
+    (`stored_series()`), which is right for their purposes and can never
+    bootstrap a symbol that has no daily history — the hole that left
+    `scripts/backfill_bars.py` as the only way a daily series came into being.
+    """
+
+    @staticmethod
+    def _pull(timeframe: Timeframe = Timeframe.D1) -> BarPull:
+        return BarPull(symbols=("SPY", "QQQ"), timeframe=timeframe, sessions=52)
+
+    def test_it_runs_before_the_open_with_time_to_act(self) -> None:
+        jobs = [
+            e
+            for e in build_schedule(None, None, self._pull())
+            if _job_name(e) == "refresh_session_bars"
+        ]
+
+        assert [e["offset_minutes"] for e in jobs] == [
+            DECISION_BAR_OFFSET_MINUTES,
+            DECISION_BAR_RETRY_OFFSET_MINUTES,
+        ]
+        assert all(e["trigger"] == "market_open" for e in jobs)
+        assert all(e["offset_minutes"] < 0 for e in jobs), "before the bell, not after it"
+
+    def test_it_runs_after_the_corporate_actions_sweep(self) -> None:
+        """Ordering, and it is not arbitrary: that job refreshes whatever is
+        already stored, this one fetches what today needs. Running first would
+        mean the sweep re-adjusting a bar this job had not written yet."""
+        watch, _ = _watch()
+        schedule = build_schedule(None, watch, self._pull())
+        sweep = next(e for e in schedule if _job_name(e) == "apply_corporate_actions")
+        pull = next(e for e in schedule if _job_name(e) == "refresh_session_bars")
+
+        assert sweep["offset_minutes"] < pull["offset_minutes"]
+
+    def test_an_intraday_worker_does_not_get_it(self) -> None:
+        """At `1m` the ingestor already writes every bar, and a job fetching what
+        is already arriving is a request against the rate limit for nothing."""
+        schedule = build_schedule(None, None, self._pull(Timeframe.M1))
+
+        assert not [e for e in schedule if _job_name(e) == "refresh_session_bars"]
+
+    def test_a_worker_with_no_strategy_does_not_get_it(self) -> None:
+        """No strategy means no watchlist and no series to fetch — the same
+        condition the other two conditional groups are added on."""
+        assert not [
+            e for e in build_schedule(None, None, None) if _job_name(e) == "refresh_session_bars"
+        ]
+
+    def test_a_symbol_the_vendor_would_not_serve_reaches_a_human(self) -> None:
+        """There is time to backfill by hand between this alert and the bell,
+        which is the only reason running it early is worth anything."""
+        alerts = RecordingAlerts()
+        pull = BarPull(symbols=("SPY", "QQQ"), timeframe=Timeframe.D1, sessions=52, alerts=alerts)
+        session = Session(
+            day=date(2026, 9, 21),
+            open_at=datetime(2026, 9, 21, 13, 30, tzinfo=UTC),
+            close_at=datetime(2026, 9, 21, 20, 0, tzinfo=UTC),
+        )
+
+        _announce_missing_session_bars(pull, session, ["QQQ"])
+
+        assert [a.key for a in alerts.sent] == ["worker.session_bars.missing"]
+        body = alerts.sent[0].body
+        assert "QQQ" in body and "SPY" not in body, "only the ones actually missing"
+        assert "backfill_bars.py --symbols QQQ" in body, "the command, ready to run"
+        assert "--timeframe 1d" in body, "on the series that is missing, not the default"
+
+    def test_it_says_nothing_when_every_symbol_came_back(self) -> None:
+        alerts = RecordingAlerts()
+        pull = BarPull(symbols=("SPY",), timeframe=Timeframe.D1, sessions=52, alerts=alerts)
+        session = Session(
+            day=date(2026, 9, 21),
+            open_at=datetime(2026, 9, 21, 13, 30, tzinfo=UTC),
+            close_at=datetime(2026, 9, 21, 20, 0, tzinfo=UTC),
+        )
+
+        _announce_missing_session_bars(pull, session, [])
+
+        assert alerts.sent == []
+
+
+class TestWhichSessionADecisionIsAbout:
+    """`TradingCalendar.previous_session` — the one core addition ADR 0034 needs.
+
+    It names *which* bar a decision taken at an instant is allowed to be about,
+    and naming it by session rather than by timestamp arithmetic is what keeps
+    the live runner on the right side of CLAUDE.md §5. `now - 1 day` lands on a
+    Sunday one week in five.
+    """
+
+    def test_at_the_open_it_is_the_previous_trading_day(self) -> None:
+        # Tuesday 2026-09-22, 13:30Z — the open.
+        got = CAL.previous_session(datetime(2026, 9, 22, 13, 30, tzinfo=UTC))
+
+        assert got is not None
+        assert got.day == date(2026, 9, 21), "Monday, whose bar closed last night"
+
+    def test_over_a_weekend_it_skips_the_days_that_did_not_trade(self) -> None:
+        """The reason this is a calendar question and not arithmetic."""
+        got = CAL.previous_session(datetime(2026, 9, 21, 13, 30, tzinfo=UTC))
+
+        assert got is not None
+        assert got.day == date(2026, 9, 18), "Friday, not Sunday"
+
+    def test_a_session_is_its_own_previous_one_once_it_has_closed(self) -> None:
+        """At or before, not strictly before: a session's close is the instant
+        its bar becomes complete, so a decision taken at the bell is about the
+        bar that just ended. `next_open` is strictly after for the opposite and
+        equally deliberate reason."""
+        close = datetime(2026, 9, 21, 20, 0, tzinfo=UTC)
+
+        at_the_bell = CAL.previous_session(close)
+        a_second_early = CAL.previous_session(close - timedelta(seconds=1))
+
+        assert at_the_bell is not None and at_the_bell.day == date(2026, 9, 21)
+        assert a_second_early is not None and a_second_early.day == date(2026, 9, 18)
+
+    def test_mid_session_it_is_yesterday_not_today(self) -> None:
+        """Today's bar has not closed, so a decision at noon is still about
+        yesterday's. This is the property that stops an intraday restart
+        deciding on a bar that is still forming."""
+        got = CAL.previous_session(datetime(2026, 9, 22, 16, 0, tzinfo=UTC))
+
+        assert got is not None
+        assert got.day == date(2026, 9, 21)
+
+    def test_it_refuses_a_naive_datetime(self) -> None:
+        """CLAUDE.md §1.2, at the domain boundary."""
+        with pytest.raises(ValueError, match="timezone-aware"):
+            CAL.previous_session(datetime(2026, 9, 22, 13, 30))  # noqa: DTZ001
+
+
+class TestWhichSessionABarBelongsTo:
+    """`TradingCalendar.local_date` — public because callers outside the clock
+    have to ask it. A daily bar is stamped at exchange-local midnight, so its
+    UTC date is the previous day for part of every year."""
+
+    def test_a_daily_bar_stamped_at_exchange_midnight_belongs_to_its_own_day(self) -> None:
+        # 2026-09-21 00:00 New York is 04:00Z in summer.
+        assert CAL.local_date(datetime(2026, 9, 21, 4, 0, tzinfo=UTC)) == date(2026, 9, 21)
+
+    def test_late_utc_is_still_the_same_exchange_day(self) -> None:
+        """23:00Z on the 21st is 19:00 New York — during the session, same day.
+        Taking `.date()` on the UTC instant would agree here and disagree at
+        01:00Z, which is why this is a method rather than an attribute read."""
+        assert CAL.local_date(datetime(2026, 9, 21, 23, 0, tzinfo=UTC)) == date(2026, 9, 21)
+
+    def test_early_utc_belongs_to_the_previous_exchange_day(self) -> None:
+        assert CAL.local_date(datetime(2026, 9, 22, 1, 0, tzinfo=UTC)) == date(2026, 9, 21)

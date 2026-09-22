@@ -437,15 +437,24 @@ def check_ingest_timeframe(saved: Timeframe) -> Check:
             f"{saved.value} — the series the realtime feed writes, so bars close during "
             f"the session and the strategy is asked",
         )
+    if saved is Timeframe.D1:
+        return Check(
+            "ingest",
+            Status.PASS,
+            f"{saved.value} — `refresh_session_bars` fetches the previous session's bar before "
+            f"the open and warmup withholds it, so the strategy is asked once, at the open, "
+            f"on the bar the backtest would have decided on (ADR 0034)",
+        )
     return Check(
         "ingest",
         Status.FAIL,
         f"nothing writes {saved.value} bars while the market is open — the feed delivers "
-        f"{STREAMED_BAR_TIMEFRAME.value} and the runner reads {saved.value}, so no bar would "
-        f"close, the strategy would never be asked, and the session would report silence",
-        fix=f"set the worker's timeframe to {STREAMED_BAR_TIMEFRAME.value} on the Config tab; "
-        f"a coarser series needs a job writing those bars during a session "
-        f"(docs/paper-week/day-5-readiness.md, §3.2)",
+        f"{STREAMED_BAR_TIMEFRAME.value}, the pre-open pull fetches {Timeframe.D1.value}, and "
+        f"the runner reads {saved.value}, so no bar would close, the strategy would never be "
+        f"asked, and the session would report silence",
+        fix=f"set the worker's timeframe to {STREAMED_BAR_TIMEFRAME.value} or "
+        f"{Timeframe.D1.value} on the Config tab; an aggregated series needs a job producing "
+        f"those bars (docs/adr/0034-the-daily-decision-is-taken-at-the-open.md)",
     )
 
 

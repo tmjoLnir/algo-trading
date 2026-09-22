@@ -74,7 +74,7 @@ if TYPE_CHECKING:
 
     from atp_core.alerts.ports import AlertSink
     from atp_core.brokers.ports import TradeUpdate
-    from atp_core.clock import Clock, TradingCalendar
+    from atp_core.clock import Clock, Session, TradingCalendar
     from atp_core.dashboard.ports import SnapshotStore
     from atp_core.data.ports import BarRepository, EventPublisher, QuoteCache
     from atp_core.domain import Bar, Fill, Position, Quote, Signal, Timeframe
@@ -98,6 +98,12 @@ MAX_CONSECUTIVE_ERRORS = 3
 
 #: A bar at or above this is a session in itself, so its series is contiguous
 #: across closures by construction and `_warmup_floor` must not bound it.
+
+#: How many bars at the newest end of a session series may belong to a
+#: session that has not closed. One: the session in progress. A vendor that
+#: served more than that would be publishing bars for days that have not
+#: happened, which is a data fault rather than a window to widen for.
+_IN_PROGRESS_BARS = 1
 _ONE_DAY_SECONDS = 86_400
 
 #: Consecutive rate-limit refusals that count as a *storm* rather than as one
@@ -421,6 +427,11 @@ class StrategyRunner:
         self.stats = RunnerStats()
 
         self._bars: dict[str, list[Bar]] = {symbol: [] for symbol in symbols}
+        #: The session whose bar this runner's next decision is about, set by a
+        #: session-open `warmup` and `None` for every other caller. It is the one
+        #: switch behind withholding the decision bar, refusing a bar whose own
+        #: session has not closed, and stamping a signal from its bar (ADR 0034).
+        self._decision_session: Session | None = None
         self._quotes: dict[str, Quote] = {}
         #: Bound for real by `warmup`, which is the only thing that knows the
         #: portfolio. Empty rather than `None` so every accessor can be typed
@@ -500,6 +511,79 @@ class StrategyRunner:
         """
         return self.strategy.warmup_bars
 
+    def _announce_decision_bar(
+        self, decision: Session, withheld: list[str], missing: list[str]
+    ) -> None:
+        """Say which bar today's decision is about, and name every symbol that
+        has not got one.
+
+        A daily runner asks the strategy **once** per session. If the bar is not
+        there the session produces nothing, and "produced nothing" is also what a
+        correct week of a crossover strategy looks like — the ambiguity this
+        platform has been caught by at every level (day 1's series mismatch, day
+        4's warmup warnings, PR #163's timeframe guard). So the absence is stated
+        per symbol and reaches a human, rather than being inferable from a bar
+        count nobody reads.
+
+        `WARNING` and not `CRITICAL`: no position is endangered by it — venue-side
+        stops are live and `_check_stops` still runs — and a symbol newly added to
+        the watchlist has no history yet, which is ordinary rather than alarming.
+        What it costs is the day's decision, which is the whole point of the
+        session, so it is not merely logged.
+        """
+        log.info(
+            "runner.decision_bar",
+            session=decision.day.isoformat(),
+            closed_at=decision.close_at.isoformat(),
+            withheld=len(withheld),
+            missing=len(missing),
+            detail="the bar this session's decision is about, held back so it can close into the loop",
+        )
+        if not missing:
+            return
+        log.error(
+            "runner.decision_bar_missing",
+            symbols=sorted(missing),
+            session=decision.day.isoformat(),
+            detail=(
+                "no bar for the previous session — these symbols cannot be decided on today, "
+                "and a session that decides nothing looks exactly like one with no crossing"
+            ),
+        )
+        if self.alerts is None:
+            return
+        self.alerts.send(
+            Alert(
+                severity=Severity.WARNING,
+                title=f"{len(missing)} symbol(s) have no bar to decide on today",
+                body=(
+                    f"The {decision.day.isoformat()} session's bar is missing for "
+                    f"{', '.join(sorted(missing))}.\n"
+                    "A daily strategy is asked once a session; these names will not be asked "
+                    "at all, and the session will look like one that simply found no signal.\n"
+                    "docs/RUNBOOK.md, 'No decision bar at the open'."
+                ),
+                key="runner.decision_bar_missing",
+            )
+        )
+
+    @property
+    def is_session_series(self) -> bool:
+        """Does one bar of this series span a whole session?
+
+        True only for `1d` — the sole member of `Timeframe` at or beyond a day.
+        It is the question that separates a runner fed by the realtime stream
+        from one fed by a pre-open pull, and it decides three things below: that
+        warmup withholds the bar it is about to decide on, that `_refresh_bars`
+        refuses a bar whose session has not closed, and that a signal is stamped
+        from its bar rather than from the wall clock.
+
+        A property rather than the comparison inline, because those three must
+        agree. They were one condition written three times in the first draft,
+        and two of them said `> _ONE_DAY_SECONDS` while the third said `>=`.
+        """
+        return self.timeframe.seconds >= _ONE_DAY_SECONDS
+
     def _warmup_floor(self, now: datetime) -> datetime | None:
         """The earliest bar this warmup may use, or `None` for no bound.
 
@@ -542,7 +626,7 @@ class StrategyRunner:
                 return session.open_at
         return self.calendar.next_open(now)
 
-    async def warmup(self, portfolio: Portfolio) -> None:
+    async def warmup(self, portfolio: Portfolio, *, at_session_open: bool = False) -> None:
         """Load history and rebuild state before the first evaluation.
 
         Two things must happen here, and skipping either produces a runner that
@@ -574,12 +658,60 @@ class StrategyRunner:
         needed = self.bars_to_load
         floor = self._warmup_floor(self.clock.now())
 
+        # **On a session series, warmup deliberately stops one bar short.**
+        #
+        # `on_bar` is reachable only through `_refresh_bars`, which yields a bar
+        # that newly closed *since the last pass*. A daily bar closes when the
+        # session ends, so if warmup loads it there is nothing left to newly
+        # close and the strategy is never asked — a full session of evaluations
+        # deciding nothing, on a process reporting healthy
+        # (docs/paper-week/day-5-readiness.md, §3.2). Holding it back is what
+        # makes the existing trigger fire it, once, on the first evaluation.
+        #
+        # The arithmetic is the part that has to be right. `_poll_strategy`
+        # admits a signal at `have > warm_after`, measured *after* the bar is
+        # appended, so the window must hold `bars_to_load` bars **before** the
+        # decision bar arrives. Hence one row more is fetched than is kept. For
+        # `sma_crossover`: fetch 52, keep 51, decide at 52 > 51 — the same two
+        # numbers the code produces today when a 52nd bar closes. The only thing
+        # that changes is where the 52nd bar comes from.
+        decision = (
+            self.calendar.previous_session(self.clock.now())
+            if at_session_open and self.is_session_series
+            else None
+        )
+        # Remembered, because `_refresh_bars` applies the same bound on every
+        # pass and has no flag to be told by. `None` means this runner is not
+        # taking session-open decisions, and every bound below is off — which is
+        # what keeps a caller that only wants history out of all of it.
+        self._decision_session = decision
+
         short: list[str] = []
+        withheld: list[str] = []
+        no_decision_bar: list[str] = []
         for symbol in self.symbols:
-            bars = await self.bar_repo.get_last_n_bars(
-                symbol, self.timeframe, needed, not_before=floor
+            bars = list(
+                await self.bar_repo.get_last_n_bars(
+                    symbol,
+                    self.timeframe,
+                    needed + (1 if decision is not None else 0),
+                    not_before=floor,
+                )
             )
-            self._bars[symbol] = list(bars)
+            if decision is not None:
+                # A bar for a session that has not closed is not a bar to decide
+                # on, however much of it a vendor is willing to serve. Alpaca
+                # publishes a partial daily bar for the session in progress, and
+                # `apply_corporate_actions` fetches with `end = now` an hour
+                # before the open, so this is reachable rather than theoretical —
+                # and deciding on it is lookahead (CLAUDE.md §5).
+                bars = [b for b in bars if self.calendar.local_date(b.ts) <= decision.day]
+                if bars and self.calendar.local_date(bars[-1].ts) == decision.day:
+                    bars.pop()
+                    withheld.append(symbol)
+                else:
+                    no_decision_bar.append(symbol)
+            self._bars[symbol] = bars
             if len(bars) < needed:
                 # Loud, and not fatal on its own: `LiveContext.history` refuses
                 # for whoever actually needs the missing bars, while a strategy
@@ -648,6 +780,14 @@ class StrategyRunner:
         # re-anchor to a drawn-down number and grant the day a second allowance.
         # After reconciliation, so the anchor is the book the broker agrees we
         # hold rather than the one we believed before checking.
+        # After reconciliation, deliberately. A runner whose book does not match
+        # the broker's is about to quarantine, and a note about which bar it
+        # would have decided on is noise on top of a halt — the alert budget
+        # this platform has twice exhausted on the wrong message
+        # (docs/paper-week/day-4-review.md, F1).
+        if decision is not None:
+            self._announce_decision_bar(decision, withheld, no_decision_bar)
+
         anchored = self.router.risk_engine.anchor_session(portfolio.equity)
         log.info("runner.session_anchored", equity=str(portfolio.equity), rules=anchored)
 
@@ -941,7 +1081,7 @@ class StrategyRunner:
 
     async def _loop(self, portfolio: Portfolio) -> None:
         """`run`'s body, split out so one `except` covers both `warmup` calls."""
-        await self.warmup(portfolio)
+        await self.warmup(portfolio, at_session_open=True)
 
         while self._running:
             now = self.clock.now()
@@ -953,7 +1093,7 @@ class StrategyRunner:
                 # adjusted for a split overnight, and fills can land after the
                 # close. Re-reconciling here is what stops the first order of
                 # the day being sized against yesterday's book.
-                await self.warmup(portfolio)
+                await self.warmup(portfolio, at_session_open=True)
                 continue
 
             await self.evaluate(portfolio)
@@ -1319,9 +1459,27 @@ class StrategyRunner:
         re-serves the same bar — an idempotent upsert re-running, a restatement
         landing — must not read as a fresh close and re-trigger a strategy.
         """
+        # The same bound `warmup` applies, and it has to be applied twice. A
+        # partial bar for the session in progress can land in the store at any
+        # moment — `apply_corporate_actions` upserts whatever the vendor serves —
+        # and without this the decision bar fires correctly at the open and then
+        # a half-formed bar for *today* fires again an hour later, which is
+        # lookahead and a second order (CLAUDE.md §5).
+        decision = self._decision_session
+
+        # One row is enough when every stored bar is decidable, which is the
+        # intraday case. On a session series the newest row may be the session
+        # *in progress* — so asking for one and refusing it would step over the
+        # decision bar sitting directly behind it and the strategy would never
+        # be asked. `_IN_PROGRESS_BARS + 1` is the smallest window that always
+        # reaches past it.
+        wanted = 1 if decision is None else _IN_PROGRESS_BARS + 1
+
         just_closed: list[Bar] = []
         for symbol in self.symbols:
-            latest = await self.bar_repo.get_last_n_bars(symbol, self.timeframe, 1)
+            latest = await self.bar_repo.get_last_n_bars(symbol, self.timeframe, wanted)
+            if decision is not None:
+                latest = [b for b in latest if self.calendar.local_date(b.ts) <= decision.day]
             if not latest:
                 continue
             bar = latest[-1]
@@ -1595,6 +1753,7 @@ class StrategyRunner:
         signals: list[Signal] = []
         for bar in closed:
             produced = self.strategy.on_bar(self._context, bar) or []
+            produced = [self._stamp(signal, bar) for signal in produced]
             have = len(self._bars.get(bar.symbol) or ())
             if have > self.warm_after:
                 signals.extend(produced)
@@ -1615,6 +1774,44 @@ class StrategyRunner:
                     ),
                 )
         return signals
+
+    def _stamp(self, signal: Signal, bar: Bar) -> Signal:
+        """Date a session series' decision by its bar, not by the wall clock.
+
+        `Signal.ts` becomes `OrderRequest.decided_at` (`router.py`) and from
+        there part of `client_order_id`, which is rule §1.4's whole mechanism:
+        the same decision, retried, must re-derive the same key and become one
+        order at the venue rather than two positions.
+
+        A strategy stamps `ctx.now`. In a backtest that *is* the bar's close —
+        `BacktestEngine.run` sets the clock to `ts + step` before calling
+        `on_bar` — so the key is a function of the bar and replaying a run
+        reproduces it. Live, `ctx.now` is wall-clock, so the same bar decided
+        twice yields two keys.
+
+        On an intraday series that is nearly harmless: the second decision needs
+        a second bar, and a bar does not close twice. **On a session series it is
+        a duplicate position.** The daily decision is taken at the open from a
+        bar warmup withheld, and a worker restarted mid-session warms up again,
+        withholds the same bar, and decides on it again — correctly, because it
+        has no memory that it already did. Stamping from the bar is what makes
+        that second decision the *same* decision: same key, and the venue returns
+        the order it already holds (`BrokerPort.submit_order` is idempotent on
+        `client_order_id`).
+
+        `bar.ts + timeframe` rather than `bar.ts`, because `Bar.ts` is the bar's
+        open and a decision is taken once the bar has ended — the same instant
+        the backtest's clock stands at, so live and backtest derive the same key
+        for the same bar.
+
+        Scoped to a session series on purpose. Applying it at `1m` would be
+        defensible and is probably right, but it would change the key of every
+        order the platform currently places, and that is a separate change with
+        its own blast radius rather than a rider on this one.
+        """
+        if self._decision_session is None:
+            return signal
+        return replace(signal, ts=bar.ts + timedelta(seconds=self.timeframe.seconds))
 
     def _cold_symbols(self) -> int:
         """How many of the watchlist cannot trade yet for want of history.

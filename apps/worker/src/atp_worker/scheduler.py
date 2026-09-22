@@ -21,7 +21,7 @@ from atp_core.config import get_settings
 from atp_core.data.backfill import GapBackfillResult, backfill_gaps
 from atp_core.data.corporate_actions import Adjustment, detect_adjustment
 from atp_core.data.gaps import SUPPORTED_TIMEFRAMES
-from atp_core.data.providers.alpaca import AlpacaHistoricalProvider
+from atp_core.data.providers.alpaca import STREAMED_BAR_TIMEFRAME, AlpacaHistoricalProvider
 from atp_core.data.seed import RESERVED_TEST_SYMBOLS
 from atp_core.logging import correlation_id, get_logger
 from atp_core.persistence.audit import PostgresAuditLog
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
     from atp_core.alerts.ports import AlertSink
     from atp_core.audit.ports import AuditEntry
-    from atp_core.clock import Clock
+    from atp_core.clock import Clock, Session
     from atp_core.domain import Order, Portfolio, Timeframe
     from atp_core.execution.reconciliation import Reconciler
     from atp_core.risk.killswitch import HaltRecord, KillSwitch
@@ -318,6 +318,170 @@ async def reconcile_with_broker(session: SessionJobs) -> None:
         discrepancies=len(report.discrepancies),
         orphan_orders=len(report.orphan_order_ids),
         msg="trading is halted — see docs/RUNBOOK.md 'Reconciliation mismatch'",
+    )
+
+
+#: How long before the open the decision bar is fetched. Far enough out that a
+#: vendor that has not published yet, or a request that fails, still leaves time
+#: for the -15 retry and for a human to see the alert before the bell; close
+#: enough that the previous session has long since settled. `apply_corporate_actions`
+#: sits at -60 and this deliberately runs after it: that job refreshes whatever is
+#: already stored, this one fetches what today needs.
+DECISION_BAR_OFFSET_MINUTES = -30
+DECISION_BAR_RETRY_OFFSET_MINUTES = -15
+
+
+@dataclass(frozen=True, slots=True)
+class BarPull:
+    """What the pre-open pull needs, supplied by `main.py`.
+
+    The runner's own watchlist and series rather than `stored_series()`, and that
+    is the whole difference between this job and the two that surround it.
+    `apply_corporate_actions` and `backfill_missing_bars` both sweep *what the
+    store already holds*, which is right for their purposes and useless for this
+    one: a symbol with no daily history is exactly the symbol whose bar is
+    missing, and a job scoped to what exists can never fetch it. That bootstrap
+    hole is why `scripts/backfill_bars.py` has been the only way a daily series
+    comes into being.
+
+    `sessions` is `StrategyRunner.bars_to_load + 1`, passed rather than
+    re-derived: the runner's warmup and this fetch must agree about how much
+    history the strategy needs, and two places computing it from
+    `strategy.warmup_bars` is how they come to disagree.
+    """
+
+    symbols: tuple[str, ...]
+    timeframe: Timeframe
+    sessions: int
+    alerts: AlertSink | None = None
+
+
+async def refresh_session_bars(pull: BarPull) -> int:
+    """Pre-open. Fetch the bar the session's decision will be taken on.
+
+    A daily strategy is asked **once** per session, on the previous session's
+    closed bar, and nothing else in this platform writes that bar while a worker
+    is running: the realtime feed carries minute bars and takes no timeframe, so
+    the ingestor cannot produce one (`STREAMED_BAR_TIMEFRAME`). Without this job
+    a daily worker is fed only by whatever a human last backfilled
+    (docs/paper-week/day-5-readiness.md, §3.2).
+
+    **The window ends at the previous session's close, not at `now`.** Alpaca
+    serves a partial daily bar for the session in progress, and writing one here
+    would put a half-formed bar for *today* in the store where `_refresh_bars`
+    could fire it — lookahead, in the direction that invents profit (CLAUDE.md
+    §5). `StrategyRunner` refuses such a bar on the read side as well; this is
+    the same bound applied where the bar is written, so neither side is the only
+    thing standing between the platform and a bar that has not happened yet.
+
+    **A failure here is not this module's usual failure.** `_run_job` logs,
+    reschedules for tomorrow and moves on, which is right for a corporate-actions
+    sweep and wrong for this: a failure means today's session cannot decide, and
+    tomorrow is too late. It raises, so the scheduler's own handler records it,
+    and it alerts, because the operator has until the bell to backfill by hand.
+
+    Returns how many bars were written, so a caller — and a test — can see the
+    work rather than infer it from a log line.
+    """
+    if not pull.symbols:
+        return 0
+
+    settings = get_settings()
+    calendar = TradingCalendar()
+    now = SystemClock().now()
+
+    decision = calendar.previous_session(now)
+    if decision is None:
+        log.error(
+            "worker.session_bars.no_previous_session",
+            detail="the calendar names no closed session before now — refusing to guess a window",
+        )
+        return 0
+
+    # `sessions` calendar sessions back, converted to days with room for
+    # weekends and holidays. Generous on purpose: over-fetching costs one
+    # request and under-fetching costs the strategy its warmup.
+    start = decision.close_at - timedelta(days=pull.sessions * 2 + 10)
+
+    engine = create_engine(settings.database_url)
+    provider = AlpacaHistoricalProvider(
+        settings, min_request_interval_seconds=60.0 / NIGHTLY_REQUESTS_PER_MINUTE
+    )
+    repository = PostgresBarRepository(create_session_factory(engine))
+    written = 0
+    try:
+        fresh = await provider.get_bars(
+            list(pull.symbols),
+            pull.timeframe,
+            start,
+            decision.close_at,
+            adjusted=True,
+            skip_empty=True,
+        )
+        missing = sorted(set(pull.symbols) - fresh.keys())
+        for symbol in pull.symbols:
+            incoming = fresh.get(symbol, [])
+            # Belt and braces against a vendor that serves the in-progress
+            # session despite the window: the bound is cheap to apply twice and
+            # a partial bar in the store is expensive once.
+            incoming = [b for b in incoming if calendar.local_date(b.ts) <= decision.day]
+            if not incoming:
+                if symbol not in missing:
+                    missing.append(symbol)
+                continue
+            await repository.upsert_bars(incoming)
+            written += len(incoming)
+        missing.sort()
+        log.info(
+            "worker.session_bars.refreshed",
+            session=decision.day.isoformat(),
+            timeframe=pull.timeframe.value,
+            symbols=len(pull.symbols),
+            bars=written,
+            missing=missing,
+        )
+        if missing:
+            _announce_missing_session_bars(pull, decision, missing)
+        return written
+    finally:
+        await provider.aclose()
+        await engine.dispose()
+
+
+def _announce_missing_session_bars(pull: BarPull, decision: Session, missing: list[str]) -> None:
+    """A symbol the vendor would not serve before the open.
+
+    Separated from the job for `sweepable_series`' reason: the decision about
+    what to say is testable without a network, an engine and a clock.
+
+    Returns early on an empty list rather than trusting its caller to check.
+    "No bar for 0 symbol(s)" is the shape of alert that teaches an operator to
+    stop reading them, and the guard costs one line.
+    """
+    if not missing:
+        return
+    log.error(
+        "worker.session_bars.missing",
+        symbols=missing,
+        session=decision.day.isoformat(),
+        detail="no bar for the previous session — these symbols cannot be decided on today",
+    )
+    if pull.alerts is None:
+        return
+    pull.alerts.send(
+        Alert(
+            severity=Severity.WARNING,
+            title=f"No {decision.day.isoformat()} bar for {len(missing)} symbol(s)",
+            body=(
+                f"{', '.join(missing)} have no bar for the previous session, so today's "
+                "decision cannot be taken on them.\n"
+                "There is time to backfill by hand before the open:\n"
+                f"  uv run python scripts/backfill_bars.py --symbols {','.join(missing)} "
+                f"--timeframe {pull.timeframe.value} --verify\n"
+                "docs/RUNBOOK.md, 'No decision bar at the open'."
+            ),
+            key="worker.session_bars.missing",
+        )
     )
 
 
@@ -835,7 +999,9 @@ SCHEDULE: list[dict[str, Any]] = [
 
 
 def build_schedule(
-    session: SessionJobs | None = None, watch: SessionWatch | None = None
+    session: SessionJobs | None = None,
+    watch: SessionWatch | None = None,
+    pull: BarPull | None = None,
 ) -> list[dict[str, Any]]:
     """The schedule this worker will actually run.
 
@@ -851,6 +1017,31 @@ def build_schedule(
     somebody both messages, and on day 1 it was exactly that worker which sent
     neither (docs/paper-week/day-1-review.md, F8).
     """
+    # A third condition, and a third reason. This one needs neither a book nor a
+    # kill switch — it needs to know which series the runner reads and how much
+    # of it, which only a worker with a strategy has. It is added only for a
+    # series the realtime feed cannot deliver: at `1m` the ingestor already
+    # writes every bar and this job would fetch what is already arriving.
+    pulling: list[dict[str, Any]] = []
+    if pull is not None and pull.timeframe is not STREAMED_BAR_TIMEFRAME:
+        pulling = [
+            {
+                "job": partial(refresh_session_bars, pull),
+                "trigger": "market_open",
+                "offset_minutes": DECISION_BAR_OFFSET_MINUTES,
+            },
+            {
+                # A second attempt, not a retry loop. A vendor that has not
+                # published at -30 has usually published by -15, and the cost of
+                # asking twice is one request against a 120/min budget. Anything
+                # still missing then has fifteen minutes of human time left,
+                # which is what the alert is for.
+                "job": partial(refresh_session_bars, pull),
+                "trigger": "market_open",
+                "offset_minutes": DECISION_BAR_RETRY_OFFSET_MINUTES,
+            },
+        ]
+
     watching: list[dict[str, Any]] = []
     if watch is not None:
         watching = [
@@ -895,7 +1086,7 @@ def build_schedule(
         ]
 
     if session is None:
-        return [*watching, *SCHEDULE]
+        return [*pulling, *watching, *SCHEDULE]
     return [
         {
             "job": partial(reconcile_with_broker, session),
@@ -903,6 +1094,7 @@ def build_schedule(
             "minutes": 5,
             "market_hours_only": True,
         },
+        *pulling,
         *watching,
         *SCHEDULE,
     ]

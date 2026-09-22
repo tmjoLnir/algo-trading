@@ -13,6 +13,7 @@ repositories and the clock are all fakes (CLAUDE.md §1.7).
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
 from decimal import Decimal
@@ -407,6 +408,12 @@ class FakeReconciler:
         return report
 
 
+#: How far `FakeCalendar.previous_session` walks back. Ten days covers a
+#: four-day weekend and the closures these tests express, and bounds the
+#: search the way the real calendar's `_MAX_LOOKAHEAD_DAYS` does.
+_FAKE_CALENDAR_SCAN_DAYS = 10
+
+
 class FakeCalendar:
     """One session a day, 13:30-20:00 UTC, on whatever days it is given.
 
@@ -431,15 +438,41 @@ class FakeCalendar:
         day = first
         while day <= last:
             if self.days is None or day in self.days:
-                out.append(
-                    Session(
-                        day=day,
-                        open_at=datetime.combine(day, dt_time(13, 30), tzinfo=UTC),
-                        close_at=datetime.combine(day, dt_time(20, 0), tzinfo=UTC),
-                    )
-                )
+                out.append(self._session(day))
             day += timedelta(days=1)
         return out
+
+    def local_date(self, ts: datetime) -> date:
+        """UTC, because this fake's sessions are defined in UTC. The real
+        calendar converts to exchange-local first, and the difference is exactly
+        why `local_date` exists rather than callers taking `.date()` — a daily
+        bar stamped at exchange-local midnight is on the previous UTC day for
+        part of the year."""
+        return ts.astimezone(UTC).date()
+
+    def previous_session(self, before: datetime) -> Session | None:
+        """The last session to have closed at or before `before`.
+
+        Faithful to the real one rather than convenient: it walks back through
+        `days` so a closure is skipped, and it returns `None` rather than
+        inventing a session, because "there is no previous session" is a state
+        the runner has to handle and a fake that never produces it would hide
+        the handling."""
+        day = self.local_date(before)
+        for _ in range(_FAKE_CALENDAR_SCAN_DAYS):
+            if self.days is None or day in self.days:
+                session = self._session(day)
+                if session.close_at <= before:
+                    return session
+            day -= timedelta(days=1)
+        return None
+
+    def _session(self, day: date) -> Session:
+        return Session(
+            day=day,
+            open_at=datetime.combine(day, dt_time(13, 30), tzinfo=UTC),
+            close_at=datetime.combine(day, dt_time(20, 0), tzinfo=UTC),
+        )
 
 
 class RecordingAlertSink:
@@ -477,6 +510,7 @@ def build(
     publisher: FakePublisher | None = None,
     alerts: RecordingAlertSink | None = None,
     signal_limit: int = DEFAULT_SIGNAL_LIMIT,
+    timeframe: Timeframe = Timeframe.D1,
 ) -> tuple[StrategyRunner, FakeRouter, FakeKillSwitch, FakeReconciler, Portfolio, list[float]]:
     router = FakeRouter()
     switch = FakeKillSwitch()
@@ -492,14 +526,14 @@ def build(
         router=router,  # type: ignore[arg-type]
         stop_manager=StopManager(),
         kill_switch=switch,
-        bar_repo=FakeBarRepo({SYMBOL: bars or [bar(0)]}),
+        bar_repo=FakeBarRepo({SYMBOL: bars or [bar(0)]}, timeframe=timeframe),
         quote_cache=FakeQuoteCache(),
         clock=SimulatedClock(START),
         calendar=FakeCalendar(),  # type: ignore[arg-type]
         reconciler=reconciler,  # type: ignore[arg-type]
         sizing=PositionSizeSpec(type="fixed_qty", value=Decimal("10")),
         stop_config=stop_config or StopConfig(stop_type=StopType.FIXED_PCT, value=Decimal("0.02")),
-        timeframe=Timeframe.D1,
+        timeframe=timeframe,
         run_mode=RunMode.PAPER,
         order_repo=order_repo or FakeOrderRepository(),  # type: ignore[arg-type]
         portfolio_repo=portfolio_repo or FakePortfolioRepository(),
@@ -3028,3 +3062,166 @@ class TestTheConfiguredStopHasAWidth:
         await runner.evaluate(portfolio)
 
         assert runner._stop_width_bps() is None
+
+
+class TestTheDailyDecisionIsTakenAtTheOpen:
+    """ADR 0034, as assertions.
+
+    `on_bar` is reached only through `_refresh_bars`, which yields a bar that
+    newly closed *since the last pass*. A daily bar closes when the session
+    ends, so a runner that loads it during warmup has nothing left to close and
+    the strategy is never asked — a full session of evaluations deciding
+    nothing, on a process reporting healthy
+    (docs/paper-week/day-5-readiness.md, §3.2).
+
+    A session-open warmup therefore stops one bar short. The bar it holds back
+    is the previous session's, and the first evaluation closes it into the loop
+    — which is `BacktestEngine.run` exactly: decide on the close of bar N, fill
+    at bar N+1.
+    """
+
+    @staticmethod
+    def _daily(strategy: ScriptedStrategy, bars: list[Bar]) -> tuple[StrategyRunner, Portfolio]:
+        """A runner whose clock stands at an open, with `bars` behind it.
+
+        `START` is 2024-06-03 13:30Z — a session open — so the previous session
+        is 06-02 and a bar dated 06-03 is the one in progress.
+        """
+        runner, _, _, _, portfolio, _ = build(strategy, bars=bars)
+        return runner, portfolio
+
+    @pytest.mark.asyncio
+    async def test_the_previous_sessions_bar_is_withheld_so_it_can_close_into_the_loop(
+        self,
+    ) -> None:
+        """The whole mechanism in one assertion. Without the withhold the newest
+        bar is already held, `bar.ts <= held[-1].ts` on every pass, and the
+        strategy is never asked."""
+        strategy = ScriptedStrategy(warmup=0)
+        # Bars for 06-01 and 06-02; the clock stands at 06-03's open, so 06-02
+        # is the session to decide on.
+        runner, portfolio = self._daily(strategy, [bar(-2), bar(-1)])
+
+        await runner.warmup(portfolio, at_session_open=True)
+        held_after_warmup = list(runner._bars[SYMBOL])
+        await runner.evaluate(portfolio)
+
+        assert [b.ts for b in held_after_warmup] == [bar(-2).ts], (
+            "warmup keeps everything up to but excluding the decision bar"
+        )
+        assert [b.ts for b in strategy.bars_seen] == [bar(-1).ts], (
+            "and the first evaluation hands the strategy exactly that bar, once"
+        )
+
+    @pytest.mark.asyncio
+    async def test_it_is_asked_once_a_session_and_not_again(self) -> None:
+        """A daily runner evaluates every tick like any other. The decision is
+        the *bar*, not the tick, so the second pass must find nothing new."""
+        strategy = ScriptedStrategy(warmup=0)
+        runner, portfolio = self._daily(strategy, [bar(-2), bar(-1)])
+
+        await runner.warmup(portfolio, at_session_open=True)
+        await runner.evaluate(portfolio)
+        await runner.evaluate(portfolio)
+        await runner.evaluate(portfolio)
+
+        assert len(strategy.bars_seen) == 1, "one decision a session, not one a tick"
+
+    @pytest.mark.asyncio
+    async def test_a_bar_for_the_session_in_progress_is_refused(self) -> None:
+        """**The lookahead guard.** Alpaca serves a partial daily bar for the
+        session in progress, and `apply_corporate_actions` upserts whatever the
+        vendor returns an hour before the open. Deciding on it would be deciding
+        on a bar that has not happened yet (CLAUDE.md §5)."""
+        strategy = ScriptedStrategy(warmup=0)
+        # bar(0) is dated 06-03 — today, in progress.
+        runner, portfolio = self._daily(strategy, [bar(-2), bar(-1), bar(0)])
+
+        await runner.warmup(portfolio, at_session_open=True)
+        await runner.evaluate(portfolio)
+
+        seen = [b.ts for b in strategy.bars_seen]
+        assert bar(0).ts not in seen, "today's bar has not closed and is not decidable"
+        assert seen == [bar(-1).ts], "the previous session's bar is, and is the only one"
+
+    @pytest.mark.asyncio
+    async def test_the_window_admits_the_decision_rather_than_discarding_it_as_cold(self) -> None:
+        """**The arithmetic that has to be right.** `_poll_strategy` admits a
+        signal at `have > warm_after`, measured after the bar is appended, so
+        warmup must hold `warmup_bars` bars *before* the decision bar arrives.
+        Load one too few and the daily runner asks the strategy every session,
+        gets a real signal, and discards every one of them as cold — which is
+        the healthy-looking zero-trade session all over again."""
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG}, warmup=3)
+        runner, portfolio = self._daily(strategy, [bar(i) for i in range(-4, 0)])
+
+        await runner.warmup(portfolio, at_session_open=True)
+        await runner.evaluate(portfolio)
+
+        assert len(runner._bars[SYMBOL]) == 4, "3 warmup bars plus the one decided on"
+        assert runner.stats.signals_discarded_cold == 0
+        assert strategy.bars_seen, "the strategy was asked"
+
+    @pytest.mark.asyncio
+    async def test_a_symbol_with_no_bar_for_the_previous_session_is_named(self) -> None:
+        """A session that decides nothing looks exactly like one that found no
+        crossing. The difference has to reach a human, per symbol."""
+        strategy = ScriptedStrategy(warmup=0)
+        alerts = RecordingAlertSink()
+        # Only a stale bar, well before the previous session.
+        runner, _, _, _, portfolio, _ = build(strategy, bars=[bar(-30)], alerts=alerts)
+
+        await runner.warmup(portfolio, at_session_open=True)
+
+        assert [a.key for a in alerts.sent] == ["runner.decision_bar_missing"]
+        assert SYMBOL in alerts.sent[0].body, "named, so the operator knows which"
+        assert "once a session" in alerts.sent[0].body, "and what the absence costs"
+
+    @pytest.mark.asyncio
+    async def test_a_signal_is_dated_by_its_bar_so_a_restart_cannot_double_it(self) -> None:
+        """**The duplicate-position guard.** A worker restarted mid-session warms
+        up again, withholds the same bar and decides on it again — correctly,
+        having no memory that it already did. `Signal.ts` becomes
+        `OrderRequest.decided_at` and from there `client_order_id`, so the second
+        decision is only the *same* decision if it carries the same timestamp.
+        A strategy stamps `ctx.now`, which is wall-clock live."""
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG, 1: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(-2), bar(-1)])
+
+        await runner.warmup(portfolio, at_session_open=True)
+        await runner.evaluate(portfolio)
+        first = [s.ts for s in router.signals]
+
+        # The restart: a new warmup over the same store, with the clock moved on
+        # into the session as it would be.
+        runner.clock.set(START + timedelta(hours=2))  # type: ignore[attr-defined]
+        await runner.warmup(portfolio, at_session_open=True)
+        await runner.evaluate(portfolio)
+        second = [s.ts for s in router.signals][len(first) :]
+
+        assert first and second, "both passes decided"
+        assert first == second, (
+            "the same bar decided twice must carry the same decided_at, or the "
+            "idempotency key differs and the venue opens a second position"
+        )
+        assert first[0] == bar(-1).ts + timedelta(days=1), "stamped at the bar's close"
+
+    @pytest.mark.asyncio
+    async def test_an_intraday_runner_is_untouched_by_any_of_this(self) -> None:
+        """The blast-radius assertion. A `1m` runner is fed by the stream, holds
+        its newest bar, and none of the bounds above apply to it."""
+        strategy = ScriptedStrategy(warmup=2)
+        # Inside the session, because `_warmup_floor` bounds an intraday window
+        # at the open — which is itself part of what "untouched" means here.
+        minutes = [
+            replace(bar(0), timeframe=Timeframe.M1),
+            replace(bar(0), timeframe=Timeframe.M1, ts=START + timedelta(minutes=1)),
+        ]
+        runner, _, _, _, portfolio, _ = build(strategy, bars=minutes, timeframe=Timeframe.M1)
+
+        await runner.warmup(portfolio, at_session_open=True)
+
+        assert runner._decision_session is None, "no session bound is taken at all"
+        assert [b.ts for b in runner._bars[SYMBOL]] == [m.ts for m in minutes], (
+            "and the newest bar is kept rather than withheld"
+        )

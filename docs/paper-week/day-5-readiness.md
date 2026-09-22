@@ -320,6 +320,13 @@ run".
 > The rest of this section stands as written and is why that work is worth doing: the stop width,
 > the trade rate, and §3.3's warmup gate all resolve at `1d`. What was wrong was the price.
 >
+> **Resolved by ADR 0034.** The price has been paid: `refresh_session_bars` fetches the previous
+> session's bar at open−30, a session-open warmup withholds it so the existing trigger closes it
+> into the loop, and a bar whose own session has not closed is refused on both the write and the
+> read side. `1d` is now a deliverable timeframe and the flip this section wrongly called free is
+> a configuration change an operator can actually make. The correction above stands as the record
+> of what it cost to find that out.
+>
 > **A guard landed with this correction** (#163), because the bad row is one click away on a
 > screen and the advice pointing at it was in this document. `trading.require_deliverable_timeframe`
 > refuses to start a worker on a series the live ingest path does not write, and

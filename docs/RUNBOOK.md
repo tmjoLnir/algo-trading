@@ -1126,6 +1126,38 @@ protected. The close is refused for exactly that reason, which is the correct
 outcome. Work it as a broker problem (see "Broker unreachable"), not as an
 uncovered position.
 
+### No decision bar at the open
+
+**Only reachable on a `1d` worker.** A daily strategy is asked once per session,
+on the previous session's closed bar (ADR 0034). This says that bar is not in the
+store for the named symbols, so those names will not be decided on today — and a
+session that decides nothing looks exactly like one in which the strategy found
+no crossing, which is why it alerts rather than only logging.
+
+Two lines carry it, and the first one gives you time:
+
+- `worker.session_bars.missing`, at open−30 or open−15, from the pre-open pull.
+  The vendor would not serve the bar. **There is still time to fix it**, and the
+  alert carries the command:
+  `uv run python scripts/backfill_bars.py --symbols <names> --timeframe 1d --verify`.
+  Re-run it, then check `scripts/status.py` for the newest stored bar per symbol.
+- `runner.decision_bar_missing`, at the open, from warmup. The bar was still not
+  there when the runner warmed up. Today's decision on those names is lost; the
+  rest of the watchlist is unaffected and the session continues.
+
+**Neither endangers a position.** Venue-side GTC stops are live and unaffected,
+and `_check_stops` still runs. What is lost is the day's decision.
+
+**A newly added symbol will do this once**, legitimately: it has no daily history
+until something backfills it. The pre-open pull fetches the window the strategy
+needs, so the second session is usually clean — if a name is missing on two
+consecutive mornings, the vendor does not serve it and the watchlist is wrong.
+
+**If every symbol is missing**, suspect the pull rather than the vendor: check
+for `worker.session_bars.refreshed` in the worker log around open−30. No line at
+all means the job did not run — a worker with no strategy configured does not
+schedule it, and neither does one on `1m`.
+
 ## Emergency flatten
 
 **Halt first.** This does not halt, and the runner can re-enter within a tick of
