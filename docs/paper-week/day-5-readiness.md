@@ -249,6 +249,25 @@ not place.**
 a stale cache would leave precisely the orders it did not know about — which, after a restart,
 are the ones most likely to be there"*). The test the suite is missing writes itself.
 
+> **Closed by #163**, recorded here rather than by editing the finding above. It landed as a
+> union rather than a fallback: a tranche opened after the restart puts one stop in the map and
+> leaves the inherited one beside it at the venue, so releasing only what is tracked frees half
+> the inventory and the close is refused again. `cancel_protection` reads the venue in the same
+> diff, because the map has three readers and fixing one of them is how this defect survived
+> #157 — but **§4.5's `_cancel_stale_protection` was deliberately left alone**, a correction to
+> the order of work below: it runs on every fill, ahead of the stop, so a round trip there
+> widens the unprotected window on every entry the platform makes, to buy a case §4.5 itself
+> establishes is unreachable without a strategy that reverses. That one belongs with boot-time
+> adoption, which is also what §3.4 needs. `_rearm` keys an inherited stop's
+> replacement off that stop's own `client_order_id`, since the cover it was minted from died
+> with the process that minted it — refusing to re-arm on that basis would have let a restart
+> release a stop and never put it back. Nine tests; seven fail without the change, and the two
+> that do not are the guards against it reaching too far.
+>
+> **§3.4 is not closed by it.** `_mark_broker_protection` reads the same map and still counts
+> every inherited position as naked, so the false CRITICAL at the first evaluation stands. That
+> needs the map populated at boot, which is a different change from a lookup at cancel time.
+
 ### 3.2 The timeframe row still says `1m`, and two operator pages disagree about it `blocker for measurability`
 
 `docs/paper-week/f8-timeframe-and-stop-sizing.md` ("What to do") says: set the live
@@ -605,9 +624,10 @@ Before the open, in the session itself — no code:
 
 Then, as code, in this order:
 
-3. **`_release_protection` falls back to the venue when its map is empty** (§3.1) — and the same
-   fallback must cover `_cancel_stale_protection` (§4.5) and `cancel_protection`, or it will be
-   fixed in one place of three. Ships with the test the suite is missing.
+3. **`_release_protection` falls back to the venue when its map is empty** (§3.1), and so does
+   `cancel_protection`, or it is fixed in one place of two. Ships with the tests the suite is
+   missing. *(Done, #163. `_cancel_stale_protection` is the third reader and is deliberately not
+   in it — see §3.1's note. It wants boot-time adoption, together with item 7.)*
 4. **Exempt `EXIT` from the cold gate, or bound it** (§3.3). A position already held is not a
    cold-start decision; discarding its exit is strictly worse than letting it through.
 5. **Mark the book before anchoring the session** (§3.5), or anchor from fresh quotes. And

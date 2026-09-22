@@ -1044,6 +1044,20 @@ above.
   deadlock does not. `FakeBroker` reserves inventory now too; nothing in the
   suite could fail on this before, because the fake said yes to both orders.
 
+  **And that fix reached every position but the ones a session opens holding**
+  (#163). It released from the router's own map of protective orders, which is in
+  memory and empty at every boot, so a stop placed before a restart was invisible
+  to it: the close was refused, the release found nothing to free, and day 4's
+  result recurred unchanged on a tree that had supposedly fixed it
+  (docs/paper-week/day-5-readiness.md, §3.1). The release and `cancel_protection`
+  now read the venue's open orders as well as the map — the move `cancel_all`
+  already made, narrowed to the symbol, the side and an order carrying a stop
+  price — and a released stop with no cover to re-key from is re-armed off its
+  own id. The stale-side cancel is left on the map alone on purpose: it runs on
+  every fill, ahead of the stop, and the case it would buy needs a strategy that
+  reverses. Unticked either way: this item waits on the phase's
+  *Verifiable:* line, not on code.
+
   Three deliberate refusals. A submit that fails in transport gets one lookup
   and then stops — it does not resubmit, because the venue may already hold the
   order, and it halts on `BROKER_UNREACHABLE` (the second auto-engage trigger to

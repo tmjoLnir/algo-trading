@@ -120,6 +120,23 @@ ATR(14).
   ends naked by a path that did not previously exist. A close the venue accepts,
   or refuses for any other reason, leaves protection exactly where it was.
 
+  **"Our own order" means the venue's book, not this process's memory.** The
+  router's record of the protective orders it placed is in memory and starts
+  every boot empty, so a release driven from it alone was blind to exactly one
+  case: a stop placed before a restart, over a position still held. That is the
+  case a session *opens* in, and day 4's result recurred unchanged on it ten days
+  later (docs/paper-week/day-5-readiness.md, §3.1). The release and
+  `cancel_protection` read the venue's open orders as well, which is the move
+  `cancel_all` already made for the same reason, narrowed to the symbol, the side,
+  and an order carrying a stop price. The stale-side cancel does not, and that is
+  a decision rather than an omission: it runs on every fill before the stop goes
+  on, so a round trip there widens the unprotected window on every entry, and the
+  case it would buy needs a strategy that reverses through zero. A resting reducing-side
+  order with no level on it is left alone and the close stays refused
+  (`order.protection_release_found_nothing`): it could not be re-armed, so
+  freeing it would buy the close at the price of the protection, which is the
+  trade this whole ordering exists to refuse.
+
   **The residual, named rather than hidden.** Between the cancel and the fill
   the venue holds no stop: the armed engine-side level is the only one, and it
   dies with the process. It is bounded by the fill of a market order, the close
@@ -127,9 +144,15 @@ ATR(14).
   exit, and it is the same reduced guarantee this chain already accepts for a
   protective child a rule refused. It closes on the `BrokerPort` bracket item.
   A re-arm the chain refuses logs `order.position_unprotected`, the same
-  `CRITICAL` as a stop refused at entry; a re-arm the router cannot rebuild logs
+  `CRITICAL` as a stop refused at entry; a stop with no level to re-arm at logs
   `order.protection_not_rearmed`. Both are docs/RUNBOOK.md, "Position open with
   no stop".
+
+  An inherited stop has no recorded cover — `protective_client_order_id` is a
+  one-way digest and the range it was minted from is gone — so its replacement is
+  keyed off the inherited order's own `client_order_id`. Deterministic under
+  retry, and necessarily distinct from the key the cancelled order still holds at
+  the venue, which was minted from the entry's id rather than its own.
 - **A protective stop can be refused.** Three of the nine rules judge the order
   rather than whether it reduces a position, so trading hours, the rate limit and
   stale data can each block one. The list is `rules.EXIT_BLIND_RULES`, and a
