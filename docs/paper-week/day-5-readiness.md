@@ -284,16 +284,49 @@ Config tab if a minute series is what you want"*. Two pages in `docs/`, landed f
 give contradictory configuration advice, and the stale one is the one named "The first paper
 run".
 
-**This is the single highest-leverage change available before the open, and it costs no code.**
-It also dissolves three other problems: `_warmup_floor` returns `None` for daily and coarser
-(`runner.py:536`), so warmup loads 51 real daily bars from Postgres and every symbol is warm at
-the open — §3.3 never bites; the stop widens from ~12bp to ~4.08%, wide enough for a position to
-survive to its exit signal; and the trade rate drops to about one decision per symbol per day,
-which is what the engine was validated against.
+> **CORRECTION — this section was wrong, and the error was mine.** It said the `1d` flip was
+> "the single highest-leverage change available before the open, and it costs no code", and that
+> the only precondition was backfilling daily bars first. **Setting the row to `1d` would produce
+> a session with zero evaluations**, which is worse than running at `1m`: at least `1m` trades.
+> Found by trying to implement it, in the same session that wrote this document.
+>
+> **The live runner is architecturally intraday.** `on_bar` is reached only from
+> `_poll_strategy(closed)`, and `closed` is what `_refresh_bars` returns — bars that *newly
+> closed since the last pass*. A daily bar closes when the session ends, so during RTH nothing
+> newly closes and `on_bar` fires **zero times**. The bar warmup loaded at 13:30 is the newest
+> one there is, so `bar.ts <= held[-1].ts` and every pass `continue`s.
+>
+> Nothing can supply the missing bar, either. `MarketDataFeed.subscribe(symbols, *, bars, quotes,
+> trades)` takes **no timeframe** — the realtime feed is minute-only — and
+> `data/providers/alpaca.py:923` stamps every streamed bar `Timeframe.M1` regardless of
+> configuration, which `stream._handle_bar` then persists verbatim. So at `1d` the ingestor
+> writes M1 and `_refresh_bars` reads D1, which is the exact disagreement
+> `WorkerConfig.timeframe`'s own docstring claims is "not expressible" — it is not expressible
+> only at `1m`. The only D1 writers in the tree are `data/seed.py`, `data/backfill.py`,
+> `scripts/backfill_bars.py` and `apply_corporate_actions` (open−60), every one of them a
+> REST/batch path and none of them running during a session.
+>
+> This is day 1 of the paper week, which the same docstring describes: *"the runner is handed
+> nothing, forever. Nothing raises... That is not a hypothetical: it is what day 1 of the paper
+> week did for ten hours, with the worker reporting itself healthy throughout."*
+>
+> **So #159's "set the live WorkerConfig timeframe back to `1d`" is not executable on this
+> tree**, and the F8 document should say so. Running the strategy on the timeframe it declares
+> needs either a daily-bar pull during or after the session, or an evaluation trigger that is not
+> "a bar just closed" — a real change with an ADR in it, not a dashboard edit. Until then day 5's
+> only options are `1m`, whose result #159 has already measured as meaningless, or not running a
+> measured session.
+>
+> The rest of this section stands as written and is why that work is worth doing: the stop width,
+> the trade rate, and §3.3's warmup gate all resolve at `1d`. What was wrong was the price.
 
-**With one precondition that will otherwise produce a silent session.** §3.3's gate is real now.
-Switching to `1d` with no daily bars in the store makes every symbol cold and discards every
-signal, including every exit, all session. **Backfill before saving the row**, not after.
+**What the `1d` configuration would fix, once it can run at all.** `_warmup_floor` returns `None`
+for daily and coarser (`runner.py:536`), so warmup loads 51 real daily bars from Postgres and
+every symbol is warm at the open — §3.3 never bites; the stop widens from ~12bp to ~4.08%, wide
+enough for a position to survive to its exit signal; and the trade rate drops to about one
+decision per symbol per day, which is what the engine was validated against. Daily bars must be
+in the store first either way: §3.3's gate discards every signal, exits included, on a cold
+symbol.
 
 The honest caveat, which #159 states: one daily session is one bar per symbol. A week of `1d` is
 five decisions per symbol, not two thousand. This does not make day 5 conclusive. It makes day 5
@@ -564,11 +597,10 @@ Today is a trading day: **13:30–20:00Z**. These are ordered, and the first is 
    Halt first in every case (`scripts/halt.py engage`), and re-run `status.py` afterwards to
    confirm both positions *and* working orders are gone.
 
-4. **Set the timeframe to `1d` (§3.2) — and backfill before saving the row, not after.**
-   `uv run python scripts/backfill_bars.py --symbols <the saved watchlist> --timeframe 1d
-   --start 2021-01-01 --verify`. `sma_crossover` needs 51 bars and the gate is unforgiving. Then
-   save on the dashboard's Config tab and check for `worker_config.unchanged` at WARNING, which
-   means the save did nothing.
+4. **Do not set the timeframe to `1d`.** See §3.2's correction: the live runner only evaluates
+   on a bar that closed during the session, nothing writes a daily bar during one, and the flip
+   would produce zero evaluations rather than better ones. Leave the row at `1m` and treat day 5
+   as a shakedown, or do not run it — those are the two options until daily ingestion exists.
 
 5. **`docker compose restart worker`** — the worker reads its configuration once, at start.
    Pre-market, never mid-session.
@@ -619,8 +651,11 @@ exists to prevent.
 Before the open, in the session itself — no code:
 
 1. `scripts/status.py`, and decide about whatever it shows (§7.1–3).
-2. Backfill daily bars and set the timeframe to `1d` (§7.4). **This is the highest-leverage
-   change available and it costs nothing.**
+2. ~~Backfill daily bars and set the timeframe to `1d`.~~ **Withdrawn — see §3.2's correction.**
+   The flip produces a silent session on this tree. What replaces it is a real change: a
+   daily-bar pull during or after the session, or an evaluation trigger that is not "a bar just
+   closed". Until one of those exists, no configuration of this platform can run the strategy on
+   the timeframe it declares.
 
 Then, as code, in this order:
 
