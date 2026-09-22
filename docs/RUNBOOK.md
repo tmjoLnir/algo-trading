@@ -1036,6 +1036,12 @@ the guarantee a broker-side stop gives.
   those stops only once the venue names one of our own orders as the holder,
   then retries the close once and re-arms on the way out if that retry is
   refused (docs/RISK.md, "A close is the one thing that may take a stop off").
+  **"Ours" includes a stop placed before a restart**, which it did not until
+  #163: the router's own record of its protective orders is in memory and empty
+  at every boot, so the release read the venue as well. Without that, a position
+  carried across a restart could be exited only at its stop — which is what day
+  4 of the paper week measured, 38 refused exits out of 39
+  (docs/paper-week/day-5-readiness.md, §3.1).
   A re-arm that does not land is `order.protection_not_rearmed` when the router
   could not rebuild the order, and `order.position_unprotected` when the risk
   chain refused the replacement. Either way **the exit did not happen either** —
@@ -1095,10 +1101,24 @@ When it does *not* go back:
    runner can re-enter within a tick of the book going flat.
 
 `order.protection_not_rearmed` carries
-`detail="no cover recorded for this stop — it cannot be re-keyed"`: the router
-lost the record of what the stop covered, so it did not attempt a replacement at
-all. Same remedy, and it is a bug worth an issue — the cover is meant to outlive
-the release.
+`detail="this stop carries no level — there is nothing to re-arm at"`: the stop
+that came off had no price on it, so there was nothing to put back and the router
+did not try. Same remedy, and it is a bug worth an issue — every protective child
+this platform places carries a level.
+
+A stop the router *inherited* has no recorded cover, because the key it was
+minted from died with the process that minted it. That is not this line: the
+replacement is keyed off the inherited order's own id instead, so it re-arms
+normally and you get `order.protection_rearmed` like any other.
+
+**`order.protection_release_found_nothing` is the other new one**, at `WARNING`,
+and it means the venue is holding this inventory and none of it is ours to free —
+so the close stands refused and no cancel was sent. The usual cause is a resting
+order with no stop price on it, which the release deliberately will not touch:
+there would be nothing to re-arm at, and freeing it would leave the position with
+no protection and no way back. Read the venue's open orders for the symbol, decide
+whether that order should still be there, and cancel it by hand
+(`POST /api/v1/orders/cancel-all?symbol=X` reads the venue) if it should not.
 
 **`order.protection_not_released` is not this.** It is also `CRITICAL`, and it
 means a *cancel* failed — so the stop is still working and the position is still

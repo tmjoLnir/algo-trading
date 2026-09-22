@@ -23,6 +23,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from structlog.testing import capture_logs
 
 from atp_core.clock import SimulatedClock, TradingCalendar
 from atp_core.domain import (
@@ -45,6 +46,7 @@ from atp_core.errors import (
     BrokerError,
     ExecutionError,
     InsufficientFundsError,
+    OrderRejectedError,
 )
 from atp_core.execution.router import NO_ACTION, ROUTING, SIZING, OrderRouter
 from atp_core.risk.engine import RiskBooks, RiskDecision, RiskEngine, RiskRule, default_rules
@@ -1704,3 +1706,238 @@ class TestClosingReleasesProtection:
         assert result.submitted
         assert broker.cancelled == []
         assert broker.open_stops("SPY") == 1
+
+
+class TestClosingReleasesInheritedProtection:
+    """Day 5 of the paper week, as assertions.
+
+    `TestClosingReleasesProtection` above proves a router can close through a
+    stop **it placed**. Every one of its cases builds that stop through
+    `_open_protected`, on the same router instance, so the suite was blind to the
+    one that matters at an open: a stop placed by the process that ran
+    *yesterday*. `_protective` is in-memory and empty at every boot, so the
+    release found nothing to release and the close stayed refused — day 4's
+    result, reproduced at HEAD ten days later against the nine positions day 5
+    opened holding (docs/paper-week/day-5-readiness.md, §3.1).
+
+    The restart is modelled the only way that matters here: **a second
+    `OrderRouter` over the same `FakeBroker`**. The venue keeps its orders and
+    its position; the new router keeps nothing.
+    """
+
+    async def _inherited(
+        self, broker: FakeBroker, portfolio: Portfolio, *, qty: int = 100
+    ) -> OrderRouter:
+        """A protected long placed by a process that is now gone.
+
+        Returns a *fresh* router — one that never saw the stop go on.
+        """
+        dead = router(broker, chain())
+        entry_result = await dead.submit(request(qty=qty, stop_loss_price=Decimal(95)), portfolio)
+        entry = entry_result.order
+        assert entry is not None
+        fill(entry, portfolio, qty, 100)
+        portfolio.position("SPY").last_price = Decimal(100)
+        venue = broker.positions.setdefault("SPY", Position(symbol="SPY"))
+        venue.qty = Decimal(qty)
+        venue.avg_entry_price = Decimal(100)
+        assert (await dead.submit_protective_orders(entry, portfolio)).stop_order is not None
+        assert broker.open_stops("SPY") == 1
+        return router(broker, chain())
+
+    async def test_an_exit_reaches_the_venue_through_a_stop_this_process_did_not_place(
+        self,
+    ) -> None:
+        """**The day-5 blocker.** Without the venue read this is
+        `submitted=False`, `cancelled=[]`, and the position leaves only at its
+        stop — all day, on every symbol carried in."""
+        broker, portfolio = FakeBroker(), book()
+        reborn = await self._inherited(broker, portfolio)
+        assert reborn._protective == {}, "the premise: a new process tracks nothing"
+
+        result = await reborn.submit_signal(
+            signal(SignalAction.EXIT, ts=OPEN_HOURS + timedelta(minutes=1)),
+            portfolio,
+            sizing(),
+            pending=(),
+        )
+
+        assert result.submitted, "the close must reach the venue"
+        assert len(broker.cancelled) == 1, "the inherited stop is what was holding the shares"
+        assert broker.open_stops("SPY") == 0
+
+    async def test_a_flatten_reaches_the_venue_through_an_inherited_stop(self) -> None:
+        """The operator's path, and the API's. `apps/api` builds a fresh
+        `OrderRouter` per request, so every close it makes is this case."""
+        broker, portfolio = FakeBroker(), book()
+        reborn = await self._inherited(broker, portfolio)
+
+        result = await reborn.flatten("SPY", portfolio)
+
+        assert result.submitted
+        assert len(broker.cancelled) == 1
+        assert broker.open_stops("SPY") == 0
+
+    async def test_a_tracked_stop_and_an_inherited_one_are_both_released(self) -> None:
+        """A tranche opened after the restart puts one stop in the map and
+        leaves the inherited one beside it at the venue. Releasing only what is
+        tracked frees half the inventory and the close is refused again — which
+        is why this is a union and not a fallback."""
+        broker, portfolio = FakeBroker(), book()
+        reborn = await self._inherited(broker, portfolio)
+        # A second tranche, protected by *this* process.
+        second = (
+            await reborn.submit(request(qty=50, stop_loss_price=Decimal(95)), portfolio)
+        ).order
+        assert second is not None
+        fill(second, portfolio, 50, 100)
+        broker.positions["SPY"].qty = Decimal(150)
+        assert (await reborn.submit_protective_orders(second, portfolio)).stop_order is not None
+        assert broker.open_stops("SPY") == 2
+        assert len(reborn._protective["SPY"]) == 1, "one tracked, one inherited"
+
+        result = await reborn.flatten("SPY", portfolio)
+
+        assert result.submitted
+        assert broker.open_stops("SPY") == 0, "both stops, or the close is refused again"
+
+    async def test_an_inherited_stop_goes_back_on_when_the_retry_is_refused(self) -> None:
+        """A released stop whose close then fails must be re-armed, and an
+        inherited one has no recorded cover to re-key from. Refusing on that
+        basis would leave the position naked — the trade `_close` exists to
+        refuse — so the replacement is keyed off the inherited order's own id."""
+        broker, portfolio = FakeBroker(), book()
+        reborn = await self._inherited(broker, portfolio)
+        inherited_key = next(
+            o.client_order_id
+            for o in await broker.get_open_orders()
+            if o.order_type is OrderType.STOP
+        )
+
+        # The *retry* is what must fail, not the first attempt: the first is
+        # refused by the inventory hold, which is what triggers the release at
+        # all. `reject_next` cannot express that — it fires on whichever submit
+        # comes next — so the second close is refused directly.
+        real_submit = broker.submit_order
+        closes: list[str] = []
+
+        async def refuse_the_retry(order: Order) -> Order:
+            if order.order_type is OrderType.MARKET and order.side is Side.SELL:
+                closes.append(order.client_order_id)
+                if len(closes) == 2:
+                    raise OrderRejectedError("account is restricted from trading")
+            return await real_submit(order)
+
+        broker.submit_order = refuse_the_retry  # type: ignore[method-assign]
+
+        result = await reborn.flatten("SPY", portfolio)
+
+        assert not result.submitted
+        assert broker.open_stops("SPY") == 1, "the stop the close displaced is back on"
+        replacement = next(
+            o for o in await broker.get_open_orders() if o.order_type is OrderType.STOP
+        )
+        assert replacement.client_order_id != inherited_key, (
+            "the venue holds the old key against a cancelled order; re-using it "
+            "returns that order and the position is naked while we book it covered"
+        )
+        assert replacement.stop_price == Decimal(95), "at the level it was carrying"
+
+    async def test_a_resting_order_with_no_stop_on_it_is_left_alone(self) -> None:
+        """Deliberately conservative. A reducing order with no level cannot be
+        handed to `_rearm` — there is nothing to re-arm *at* — so releasing it
+        would trade a refused close for a position with no protection and no way
+        back. The close stays refused, which is honest."""
+        broker, portfolio = FakeBroker(), book(SPY=(100, 100))
+        venue = broker.positions.setdefault("SPY", Position(symbol="SPY"))
+        venue.qty, venue.avg_entry_price = Decimal(100), Decimal(100)
+        # Somebody's resting limit exit, holding the whole position.
+        resting = await broker.submit_order(
+            Order(
+                symbol="SPY",
+                side=Side.SELL,
+                qty=Decimal(100),
+                order_type=OrderType.LIMIT,
+                limit_price=Decimal(110),
+                time_in_force=TimeInForce.GTC,
+                client_order_id="atp-somebody-elses-exit",
+                purpose="exit",
+            )
+        )
+        assert resting.broker_order_id is not None
+
+        result = await router(broker, chain()).flatten("SPY", portfolio)
+
+        assert not result.submitted, "the venue is still holding the inventory"
+        assert result.inventory_held
+        assert broker.cancelled == [], "nothing of ours to free, so nothing is touched"
+
+    async def test_a_broker_that_will_not_answer_degrades_to_the_tracked_set(self) -> None:
+        """A read that fails must not lose the path that works. The tracked stop
+        is still released; the close still goes through."""
+        broker, portfolio = FakeBroker(), book()
+        routed = router(broker, chain())
+        entry = (await routed.submit(request(stop_loss_price=Decimal(95)), portfolio)).order
+        assert entry is not None
+        fill(entry, portfolio, 100, 100)
+        portfolio.position("SPY").last_price = Decimal(100)
+        venue = broker.positions.setdefault("SPY", Position(symbol="SPY"))
+        venue.qty, venue.avg_entry_price = Decimal(100), Decimal(100)
+        assert (await routed.submit_protective_orders(entry, portfolio)).stop_order is not None
+
+        # Only the venue *read* fails. `reads_fail` would take `cancel_order`
+        # with it and prove nothing about degrading, because there would be no
+        # cancel left to make.
+        async def unreadable() -> list[Order]:
+            raise BrokerConnectionError("the venue will not answer")
+
+        broker.get_open_orders = unreadable  # type: ignore[method-assign]
+
+        result = await routed.flatten("SPY", portfolio)
+
+        assert result.submitted, "the tracked stop is still ours to release"
+        assert len(broker.cancelled) == 1
+
+    async def test_an_inherited_stop_is_cancelled_once_the_position_is_flat(self) -> None:
+        """`cancel_protection`'s own case, and the reason it had to reach the
+        venue too. A stop left working against a position that has gone flat
+        *opens* one when it fires — and after a restart it is exactly the stop
+        this router never recorded."""
+        broker, portfolio = FakeBroker(), book()
+        reborn = await self._inherited(broker, portfolio)
+
+        cancelled = await reborn.cancel_protection("SPY")
+
+        assert cancelled == 1
+        assert broker.open_stops("SPY") == 0
+
+    async def test_the_release_says_so_when_it_finds_nothing(self) -> None:
+        """Day 4's silence: a close blocked by a stop nobody could find left no
+        line saying anybody had looked. The only trace was the venue's own
+        rejection, which reads like any other, and the early return sat above
+        the log that would have said otherwise."""
+        broker, portfolio = FakeBroker(), book(SPY=(100, 100))
+        venue = broker.positions.setdefault("SPY", Position(symbol="SPY"))
+        venue.qty, venue.avg_entry_price = Decimal(100), Decimal(100)
+        # Something reducing-side is holding the inventory and none of it is
+        # ours: a resting limit exit with no level to re-arm at.
+        await broker.submit_order(
+            Order(
+                symbol="SPY",
+                side=Side.SELL,
+                qty=Decimal(100),
+                order_type=OrderType.LIMIT,
+                limit_price=Decimal(110),
+                time_in_force=TimeInForce.GTC,
+                client_order_id="atp-somebody-elses-exit",
+                purpose="exit",
+            )
+        )
+
+        with capture_logs() as logs:
+            result = await router(broker, chain()).flatten("SPY", portfolio)
+
+        assert not result.submitted
+        assert any(e["event"] == "order.protection_release_found_nothing" for e in logs), (
+            "a close refused for shares nobody can free must say so"
+        )

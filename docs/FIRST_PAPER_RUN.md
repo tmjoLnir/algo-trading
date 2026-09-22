@@ -302,10 +302,29 @@ the same mismatch as a `FAIL` before you get there.
 
 `sma_crossover` declares `1d` and the worker defaults to `1m`, so the shipped
 pairing is a mismatch: set `strategy_params` to `{"timeframe": "1m"}` on the
-Config tab if a minute series is what you want — **and re-tune the periods for
-it**. A 20/50 pair means twenty and fifty *days* on a daily series and twenty and
-fifty *minutes* on a minute one. Those are different strategies, and day 2 traded
-the second while its configuration described the first.
+Config tab — **and re-tune the periods for it**. A 20/50 pair means twenty and
+fifty *days* on a daily series and twenty and fifty *minutes* on a minute one.
+Those are different strategies, and day 2 traded the second while its
+configuration described the first.
+
+**Resolve it on the strategy's side, not the worker's, because the worker's side
+is not available.** `1m` is the only series this platform can trade today: the
+realtime feed carries minute bars and takes no argument asking for anything else,
+and nothing writes a coarser bar while the market is open. A worker set to `1d`
+would read a column the ingestor never writes — no bar would close, `on_bar`
+would never be called, and the session would report health and decide nothing,
+which is what day 1 did for ten hours. `trading.require_deliverable_timeframe`
+now refuses to start on it and `make preflight` FAILs on it first, so the mistake
+is loud rather than silent — but it is still a mistake, and the remedy is the
+strategy's parameter.
+
+**Be clear-eyed about what that costs.** `docs/paper-week/f8-timeframe-and-stop-sizing.md`
+measured 26 configurations over 346,643 real bars: every intraday cell loses money
+and every daily one makes it, and the shipped 20/50 ×2 at `1m` returns −58.23%
+with a 0.86% win rate. So a session run this way exercises the platform, not the
+strategy. Running `sma_crossover` on the series it was written for needs a job
+that writes daily bars during or after a session — see
+`docs/paper-week/day-5-readiness.md`, §3.2.
 
 ---
 

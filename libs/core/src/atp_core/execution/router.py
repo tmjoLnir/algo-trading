@@ -783,10 +783,18 @@ class OrderRouter:
         cancels were sent.
 
         Deliberately not `cancel_all(symbol)`: that would take another
-        strategy's resting orders in the same name. Deliberately narrower than
-        the venue's truth, too — protective orders placed before a restart are
-        not in here, and adopting them is `Reconciler`'s job rather than
-        something to guess at from a symbol.
+        strategy's resting orders in the same name.
+
+        **It does now reach past this router's own map**, which it did not
+        before, and the reason is the state it exists to prevent. Called after an
+        accepted close and from `_disarm_if_flat`, its job is that no stop is
+        left working against a position about to be flat — and a stop placed
+        before a restart is precisely one this router never recorded, so the
+        leak it guards against was the one case it could not see. Such a stop
+        fires into a flat book and *opens* a position, which is the hazard
+        `_cancel_stale_protection` states in as many words. `_inherited_protection`
+        keeps the narrowing that matters — symbol, and a stop price — so the
+        promise in the paragraph above still holds.
 
         Counts cancels *sent*, and does not move the order to `CANCELLED`
         locally. Cancelling an order the venue has already filled is a race we
@@ -807,20 +815,31 @@ class OrderRouter:
         be the wrong trade. The failure is `CRITICAL` instead.
         """
         children = self._protective.get(symbol, [])
+        inherited = await self._inherited_protection(
+            symbol, None, known=self._tracked_broker_ids(symbol)
+        )
+        ours = {c.id for c in children}
         survivors: list[Order] = []
         cancelled = 0
-        for child in children:
+        for child in [*children, *inherited]:
             if child.is_complete or child.broker_order_id is None:
                 continue
             try:
                 await self.broker.cancel_order(child.broker_order_id)
             except BrokerError as exc:
-                survivors.append(child)
+                # Only a child of ours goes back in the map. An inherited stop
+                # that would not cancel is not adopted by having failed —
+                # `_protected_qty` would start counting it as protection this
+                # router placed — and it does not need to be: the next call
+                # reads the venue and finds it again.
+                if child.id in ours:
+                    survivors.append(child)
                 log.critical(
                     "order.protection_still_live",
                     symbol=symbol,
                     broker_order_id=child.broker_order_id,
                     error=str(exc),
+                    inherited=child.id not in ours,
                     detail="a working stop against a position being closed",
                 )
                 continue
@@ -985,11 +1004,91 @@ class OrderRouter:
             Decimal(0),
         )
 
+    async def _inherited_protection(
+        self, symbol: str, side: Side | None, *, known: Iterable[str]
+    ) -> list[Order]:
+        """Protective stops resting at the venue that **this process did not place**.
+
+        `_protective` is in-memory and empty at every boot, so the three callers
+        that read it — release, stale-cancel and `cancel_protection` — were each
+        blind to a stop placed before a restart. Day 4 of the paper week is what
+        that costs: the venue reserves the shares a working stop covers, so a
+        close is refused `insufficient qty available`, and the release that
+        exists to free them found nothing to free because the stop belonged to
+        the previous process (docs/paper-week/day-5-readiness.md, §3.1).
+
+        **Asking the venue is the same move `cancel_all` already makes, for the
+        same stated reason** — *"a cancel-all driven from a stale cache would
+        leave precisely the orders it did not know about, which, after a
+        restart, are the ones most likely to be there"*. The narrowing this adds
+        over `cancel_all` is what keeps `cancel_protection`'s promise not to take
+        another strategy's resting orders: symbol, side, and **a stop price**.
+
+        That last filter is the load-bearing one and it is deliberately
+        conservative. A resting order with no stop on it cannot be handed to
+        `_rearm` — it has nothing to re-arm *at* — so releasing one would trade a
+        refused close for a position with no protection and no way back, which is
+        the state `_close` refuses to create. Something reducing-side and
+        stopless holding the inventory therefore leaves the close refused, which
+        is honest, rather than naked, which is not.
+
+        A `known` id is one the caller already tracks; returning it would cancel
+        it twice and count it twice.
+
+        **A broker that will not answer degrades to the tracked set**, loudly.
+        The caller's own path is unchanged by that, and a release that cancels
+        what it knows about is strictly better than one that raises.
+        """
+        seen = set(known)
+        wanted = symbol.upper()
+        try:
+            open_orders = await self.broker.get_open_orders()
+        except BrokerError as exc:
+            log.warning(
+                "order.inherited_protection_unreadable",
+                symbol=symbol,
+                error=str(exc),
+                detail="falling back to this process's own protective orders",
+            )
+            return []
+        return [
+            o
+            for o in open_orders
+            if o.symbol == wanted
+            and (side is None or o.side is side)
+            and not o.is_complete
+            and o.stop_price is not None
+            and o.broker_order_id is not None
+            and o.broker_order_id not in seen
+        ]
+
+    def _tracked_broker_ids(self, symbol: str) -> list[str]:
+        """Venue ids of every protective child this router placed for `symbol`."""
+        return [c.broker_order_id for c in self._protective.get(symbol, []) if c.broker_order_id]
+
     async def _cancel_stale_protection(self, symbol: str, closing_side: Side) -> int:
         """Cancel protective orders left facing the wrong way by a flip.
 
         Best-effort, and loud when it fails: a stop we could not cancel is a
         live order that will *open* a position rather than close one.
+
+        **This one deliberately does not read the venue**, unlike the other two
+        readers of `_protective`, and the asymmetry is about where it is called
+        from. `submit_protective_orders` calls it on **every fill**, before the
+        stop goes on, so a round trip here widens the unprotected window on every
+        entry the platform makes — the window this module's own docstring calls
+        "exactly when a fat-finger or a gap will find you". The case it would buy
+        is an inherited stop left facing the wrong way by a flip, which needs a
+        strategy that reverses: `sma_crossover` emits `ENTER_LONG` and `EXIT` and
+        never passes through zero, so on the configuration the paper week runs it
+        is unreachable (docs/paper-week/day-5-readiness.md, §4.5). Paying a
+        network call per fill for it is the wrong trade.
+
+        It becomes reachable the moment a shorting strategy is configured, and
+        the fix then is not a lookup here — it is adopting inherited protection
+        into `_protective` at boot, which also stops `_mark_broker_protection`
+        reporting every inherited position as naked (§3.4). Recorded so the
+        omission is a decision rather than the same oversight a third time.
         """
         children = self._protective.get(symbol, [])
         stale = [
@@ -1038,6 +1137,22 @@ class OrderRouter:
         holds those shares — and the refusal is the correct outcome, because
         something is still protecting the position. Reporting it as released
         would let `_rearm` place a second stop over shares that already have one.
+
+        **The venue is consulted as well as this router's own map, and that is
+        the whole of what makes this work after a restart.** `_protective` is
+        empty at every boot, so on day 4 of the paper week this method found
+        nothing to release for a position whose stop the *previous* process had
+        placed, and returned an empty list into a close the venue had already
+        refused for those very shares — 38 of 39 exit signals, all day
+        (docs/paper-week/day-5-readiness.md, §3.1). It is a union rather than a
+        fallback on purpose: a second tranche opened after the restart puts one
+        stop in the map and leaves the inherited one beside it at the venue, and
+        releasing only the tracked one frees half the inventory and refuses the
+        close again.
+
+        This runs only once the venue has itself named the reservation
+        (`InventoryHeldError`), so the extra read is on an already-degraded path
+        and never on an accepted close.
         """
         children = self._protective.get(symbol, [])
         holding = [
@@ -1045,7 +1160,23 @@ class OrderRouter:
             for c in children
             if not c.is_complete and c.side is closing_side and c.broker_order_id is not None
         ]
+        ours = {c.id for c in children}
+        holding += await self._inherited_protection(
+            symbol, closing_side, known=self._tracked_broker_ids(symbol)
+        )
         if not holding:
+            # Said out loud, because the silence here is what made day 4 hard to
+            # read: the only trace of a close blocked by a stop nobody could find
+            # was the venue's own rejection, indistinguishable from any other.
+            log.warning(
+                "order.protection_release_found_nothing",
+                symbol=symbol,
+                side=closing_side.value,
+                detail=(
+                    "the venue is holding this inventory and none of it is ours to free — "
+                    "the close stands refused"
+                ),
+            )
             return []
 
         released: list[Order] = []
@@ -1063,18 +1194,24 @@ class OrderRouter:
                 )
                 continue
             released.append(child)
-            children.remove(child)
             cover = self._cover.get(child.id)
             if cover is not None:
                 self._cover[child.id] = replace(cover, released=cover.released + 1)
 
-        if not children:
+        # By id, and not `children.remove` inside the loop: an inherited stop was
+        # never in this list to be removed from it.
+        gone = {c.id for c in released}
+        survivors = [c for c in children if c.id not in gone]
+        if survivors:
+            self._protective[symbol] = survivors
+        else:
             self._protective.pop(symbol, None)
         log.info(
             "order.protection_released",
             symbol=symbol,
             released=len(released),
             still_live=len(holding) - len(released),
+            inherited=sum(1 for c in released if c.id not in ours),
             detail="freeing the shares the close needs — the armed level covers the gap",
         )
         return released
@@ -1098,25 +1235,40 @@ class OrderRouter:
         A close refused after a partial fill leaves less than the stop was
         written for, and a stop for the original quantity would sell shares the
         position no longer has.
+
+        **A stop this process inherited has no recorded cover**, because
+        `protective_client_order_id` is a one-way digest and the range it was
+        minted from died with the process that minted it. Refusing to re-arm on
+        that basis would mean a restart could release an inherited stop and never
+        put it back — the release fixed for its own sake and the position left
+        naked, which is the trade `_close` exists to refuse. So the replacement
+        is keyed off **the inherited order's own `client_order_id`** instead: a
+        stable string the venue hands back on every read, deterministic under
+        retry, and necessarily distinct from the key the cancelled order holds,
+        because that one was minted from the entry's id rather than its own.
         """
         position = portfolio.positions.get(symbol)
         if position is None or position.is_flat:
             return
         closing = Side.SELL if position.is_long else Side.BUY
         for child in released:
-            cover = self._cover.get(child.id)
-            if cover is None or child.stop_price is None:
+            if child.stop_price is None:
                 log.critical(
                     "order.protection_not_rearmed",
                     symbol=symbol,
                     order_id=child.id,
-                    detail="no cover recorded for this stop — it cannot be re-keyed",
+                    detail="this stop carries no level — there is nothing to re-arm at",
                 )
                 continue
             room = abs(position.qty) - self._protected_qty(symbol, closing)
             qty = min(child.remaining_qty, room)
             if qty <= 0:
                 continue
+            cover = self._cover.get(child.id) or _Cover(
+                parent_client_order_id=child.client_order_id,
+                covered_from=Decimal(0),
+                covered_to=qty,
+            )
             replacement = Order(
                 symbol=symbol,
                 side=closing,

@@ -157,6 +157,49 @@ class TestTheConfigurationItself:
         assert "strategy_params.timeframe" in check.fix
         assert "re-tune" in check.fix
 
+    def test_a_series_nothing_writes_fails_before_the_open(self) -> None:
+        """The refusal `trading.require_deliverable_timeframe` makes at assembly,
+        half an hour earlier where it is cheap. #159 measured `1m` as the reason
+        day 4 could not mean anything and recommended `1d`; the timeframe is a
+        row the dashboard writes, so an operator acting on that advice reaches a
+        session that evaluates nothing and reports healthy
+        (docs/paper-week/day-5-readiness.md, §3.2)."""
+        check = preflight.check_ingest_timeframe(Timeframe.D1)
+
+        assert check.status is Status.FAIL
+        assert "nothing writes 1d bars while the market is open" in check.detail
+        # What it buys, which is silence rather than an error — the reason a
+        # WARN would not do.
+        assert "report silence" in check.detail
+        assert "1m" in check.fix
+
+    def test_the_series_the_feed_writes_passes(self) -> None:
+        check = preflight.check_ingest_timeframe(Timeframe.M1)
+
+        assert check.status is Status.PASS
+        assert "1m" in check.detail
+
+    def test_the_mismatch_fix_no_longer_points_at_a_series_nobody_writes(self) -> None:
+        """`check_strategy`'s remedy used to end "or set the worker's timeframe
+        to \"1d\"" — which is the failure above, reached by following the advice
+        of the check next door."""
+        check = preflight.check_strategy(config(strategy_params={}, timeframe="1m"))
+
+        assert check.status is Status.FAIL
+        assert "set the worker's timeframe" not in check.fix.lower()
+
+    def test_it_runs_before_the_series_the_report_was_measured_on(self) -> None:
+        """Ordering is the message: whether the series exists is prior to which
+        series the numbers below were computed against."""
+        import inspect
+
+        import scripts.preflight as entry
+
+        source = inspect.getsource(entry)
+        assert source.index("check_ingest_timeframe") < source.index(
+            "check_timeframe(config.bar_timeframe"
+        )
+
     def test_a_time_stop_warns_that_layer_5_is_not_exercised(self) -> None:
         """A real stop type that places no level. The run is valid and it does
         not demonstrate the thing SAFETY.md's layer 5 is about, which is worth

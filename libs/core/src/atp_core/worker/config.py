@@ -330,7 +330,16 @@ class WorkerConfig:
     #: hypothetical: it is what day 1 of the paper week did for ten hours, with
     #: the worker reporting itself healthy throughout
     #: (docs/paper-week/day-1-review.md). Both call sites now read this field,
-    #: so the disagreement is not expressible.
+    #: so the disagreement is not expressible **at `1m`** — and only there. The
+    #: decoder does not read it: `data.providers.alpaca` stamps every streamed
+    #: bar `STREAMED_BAR_TIMEFRAME`, because `MarketDataFeed.subscribe` takes no
+    #: timeframe and the feed carries minute bars. So any other value here puts
+    #: the ingestor back on a different column from the runner and reproduces day
+    #: 1 exactly (docs/paper-week/day-5-readiness.md, §3.2).
+    #:
+    #: `trading.require_deliverable_timeframe` refuses to start on such a value
+    #: and `preflight.check_ingest_timeframe` FAILs on it first, so this field is
+    #: effectively pinned until something writes a coarser bar during a session.
     #:
     #: Defaults to `1m`, which is what the realtime feed subscribes to.
     timeframe: TimeframeName = "1m"

@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
+from atp_core.data.providers.alpaca import STREAMED_BAR_TIMEFRAME
 from atp_core.domain import Portfolio, RunMode, StopType
 from atp_core.errors import ConfigError
 from atp_core.execution.reconciliation import Reconciler
@@ -157,6 +158,53 @@ def decide(settings: Settings, config: WorkerConfig) -> TradingDecision:
     )
 
 
+def require_deliverable_timeframe(serving: Timeframe) -> None:
+    """Refuse a series nothing will write while the session is open.
+
+    `require_matching_timeframe` below settles *which* series the strategy and
+    the worker agree on. This settles a prior question neither of them asks:
+    whether the live ingest path can produce that series at all.
+
+    It cannot, for anything but `STREAMED_BAR_TIMEFRAME`. `MarketDataFeed
+    .subscribe` takes no timeframe, Alpaca's websocket carries minute bars, and
+    the adapter decodes every streamed bar at that one timeframe — so a worker
+    configured for `1d` has an ingestor writing `1m`. `StrategyRunner
+    ._refresh_bars` filters strictly on the configured column, so the newest
+    stored bar is the one warmup already loaded, `bar.ts <= held[-1].ts` on every
+    pass, and `on_bar` is never called. Not once, all session.
+
+    **Nothing raises, which is the reason this does.** The worker logs its boot,
+    reconciles clean, marks the book, reports healthy, and decides nothing —
+    a session indistinguishable from a strategy that simply found no crossing.
+    Day 1 of the paper week spent ten hours in exactly that state
+    (docs/paper-week/day-1-review.md), and `WorkerConfig.timeframe`'s own
+    docstring says the disagreement is "not expressible" because both the reader
+    and the writer consult the field. The decoder does not, so it is expressible
+    again the moment the field is anything but `1m`.
+
+    Raising here, at assembly, is what day 1 earned. The alternative is not a
+    warning — it is a week of results that mean nothing and read like caution.
+
+    **This is a floor, not a preference.** `1m` is a bad series to trade
+    `sma_crossover` on and #159 measured how bad; the answer to that is a daily
+    bar somebody writes during a session, not a config row pointing at one that
+    nobody does (docs/paper-week/day-5-readiness.md, §3.2). When that job exists,
+    this guard is what has to be widened to let it through — deliberately, in the
+    diff that makes the claim true.
+    """
+    if serving is STREAMED_BAR_TIMEFRAME:
+        return
+    raise ConfigError(
+        f"this worker is configured for {serving.value} bars and nothing writes them while the "
+        f"market is open: the realtime feed delivers {STREAMED_BAR_TIMEFRAME.value} and the "
+        f"runner reads {serving.value}, so no bar would ever close and the strategy would be "
+        f"asked to decide nothing, all session, while reporting healthy. Refusing to start. Set "
+        f"the worker's timeframe to {STREAMED_BAR_TIMEFRAME.value!r} on the dashboard's Config "
+        f"tab. Running a coarser series needs a job that writes those bars during a session — "
+        f"see docs/paper-week/day-5-readiness.md, §3.2."
+    )
+
+
 def require_matching_timeframe(strategy: Strategy, serving: Timeframe) -> None:
     """Refuse to start a strategy against a series it did not ask for.
 
@@ -190,8 +238,13 @@ def require_matching_timeframe(strategy: Strategy, serving: Timeframe) -> None:
         f"{strategy.name or type(strategy).__name__} is written for {declared.value} bars and "
         f"this worker trades {serving.value}. Refusing to start: served the wrong series a "
         f"strategy silently becomes a different one — the periods mean a different span of "
-        f"time. Set strategy_params.timeframe to {serving.value!r} if that is what you want "
-        f"(and re-tune its periods for it), or set the worker's timeframe to {declared.value!r}."
+        f"time. Set strategy_params.timeframe to {serving.value!r} and re-tune its periods for "
+        f"it."
+        + (
+            ""
+            if declared is not STREAMED_BAR_TIMEFRAME
+            else f" Or set the worker's timeframe to {declared.value!r}."
+        )
     )
 
 
@@ -223,6 +276,7 @@ def build_runner(
     """
     strategy_cls = registry.get(config.strategy)
     strategy = strategy_cls(dict(config.strategy_params) or None)
+    require_deliverable_timeframe(config.bar_timeframe)
     require_matching_timeframe(strategy, config.bar_timeframe)
 
     stop_manager = StopManager()
