@@ -1463,6 +1463,11 @@ above.
     floors at one because a read for zero rows is not a read, while `warm_after`
     is the declaration unfloored, because flooring it would make a strategy
     declaring no warmup skip its first bar live and trade it in a backtest.
+    **An `EXIT` on a held position passes the gate** (PR_NUMBER). A backtest
+    starts flat, so its gate never judges an exit. Live, the session floor
+    makes the gate judge every position carried in overnight, and discarding
+    that exit only kept exposure (docs/paper-week/day-5-readiness.md, §3.3).
+    Entries, and exits while flat, are still discarded.
   - **The strategy decides on bars; the book is marked on quotes.** `LiveContext
     .last_price` is the last *completed* bar's close, because a decision taken
     on a mid-quote inside an unfinished bar is one the backtest can never
