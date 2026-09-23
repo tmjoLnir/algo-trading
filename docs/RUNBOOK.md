@@ -1071,6 +1071,25 @@ the guarantee a broker-side stop gives.
    configuration bug, not an incident: the strategy is trading without a stop.
    docs/SAFETY.md makes that a go-live blocker.
 
+### The page: "N position(s) with NO stop at the broker"
+
+This is the phone-side view of the same condition, sampled once per evaluation
+from what the router counts as working at the venue (`protection.unprotected`,
+`CRITICAL`). It pages **at once** when a symbol goes naked that the last page did
+not name. While anything stays naked it repeats as **"Still N position(s)…"**
+once per cooldown (`unprotected_alert_cooldown_seconds`, 900 s by default), with
+how long the oldest has gone without a stop. `protection.restored` at `INFO` is
+the all-clear.
+
+**Read the venue's open orders for the symbol before placing a stop by hand.**
+A stop placed before a restart counts only because `warmup` adopts the stops it
+restored into the router (`OrderRouter.adopt_protection`). Until that existed,
+every position carried across a restart paged here at the first evaluation,
+over a live GTC stop, and following step 2 above placed a second stop over
+shares that already had one (docs/paper-week/day-5-readiness.md, §3.4). If the
+venue does show a working stop that closes the position, the page is wrong, and
+that is a bug worth an issue. Do not add another stop.
+
 ### A stop released for a close
 
 Expect `order.protection_released` immediately before any of this. On the

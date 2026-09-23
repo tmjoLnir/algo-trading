@@ -42,6 +42,7 @@ from atp_core.domain import (
     SignalAction,
     StopType,
     Timeframe,
+    TimeInForce,
 )
 from atp_core.errors import (
     BrokerConnectionError,
@@ -50,7 +51,7 @@ from atp_core.errors import (
 )
 from atp_core.execution.idempotency import FLATTEN, STOP_LOSS, TAKE_PROFIT, TIME_EXIT
 from atp_core.execution.reconciliation import ReconciliationReport
-from atp_core.execution.router import ProtectionResult, SubmitResult
+from atp_core.execution.router import OrderRouter, ProtectionResult, SubmitResult
 from atp_core.risk.engine import RiskDecision, RiskEngine, backtest_rules
 from atp_core.risk.killswitch import HaltReason, HaltScope
 from atp_core.risk.limits import DEFAULT_RISK_LIMITS
@@ -65,6 +66,7 @@ from atp_worker.runner import (
     StrategyRunner,
 )
 from tests.fakes import (
+    FakeBroker,
     FakeKillSwitch,
     FakeOrderRepository,
     FakePortfolioRepository,
@@ -260,6 +262,8 @@ class FakeRouter:
         #: Refuse *before* an order is composed — sizing, routing. The refusal
         #: is then real and there is no order to store.
         self.refuse_before_building = False
+        #: What `warmup` handed to `adopt_protection`, one list per call.
+        self.adopted: list[list[Order]] = []
         self._next_id = 0
 
     def _refused(self, symbol: str, side: Side, rule: str, reason: str) -> SubmitResult:
@@ -289,6 +293,12 @@ class FakeRouter:
             broker_order_id=f"brk-{self._next_id}",
             status=OrderStatus.SUBMITTED,
         )
+
+    def adopt_protection(self, orders: Any) -> list[Order]:
+        """Recorded only: which orders count as protection is the real
+        router's decision, and `TestARestartInheritsItsStops` runs that one."""
+        self.adopted.append(list(orders))
+        return []
 
     def broker_side_protected_qty(self, symbol: str, position: Position) -> Decimal:
         """How much of `position` this fake says is covered at the venue.
@@ -2685,24 +2695,62 @@ class TestAPositionWithNoVenueStopReachesAHuman:
 
         assert len(alerts.sent) == 1
 
-    def test_a_growing_naked_set_re_pages_once_the_cooldown_passes(self) -> None:
-        """A second symbol going naked is news, but not news worth a page every
-        minute. Day 2 accumulated 20 of them over three hours."""
+    def test_a_newly_naked_symbol_pages_at_once_even_inside_the_cooldown(self) -> None:
+        """**Day 4's F1.** A set that grew inside the cooldown was dropped on the
+        promise of a later pass, and 68 of 70 unprotected events that session
+        reached nobody. A position that has just gone naked is the one thing
+        this alert exists to say, so a symbol not in the last page is a floor
+        the cooldown does not get to suppress."""
+        alerts = RecordingAlertSink()
+        runner, _router, _switch, _rec, portfolio, _slept = build(alerts=alerts)
+        self._naked(portfolio, "KO")
+        runner._mark_broker_protection(portfolio)
+
+        self._naked(portfolio, "PEP")
+        runner._mark_broker_protection(portfolio)
+
+        assert len(alerts.sent) == 2
+        assert "KO, PEP" in alerts.sent[1].body
+        assert "Newly unprotected: PEP" in alerts.sent[1].body
+
+    def test_a_set_that_stays_naked_is_rolled_up_once_per_cooldown(self) -> None:
+        """**§3.4's silence.** An unchanged set was paged once and then never
+        again, all session — so a page that was missed or dismissed was the last
+        word. While anything is naked, it is repeated once per cooldown, and
+        says how long the oldest has gone without a stop."""
         alerts = RecordingAlertSink()
         runner, _router, _switch, _rec, portfolio, _slept = build(alerts=alerts)
         clock = runner.clock
         self._naked(portfolio, "KO")
         runner._mark_broker_protection(portfolio)
 
-        self._naked(portfolio, "PEP")
+        clock.set(clock.now() + timedelta(seconds=600))  # type: ignore[attr-defined]
         runner._mark_broker_protection(portfolio)
         assert len(alerts.sent) == 1, "inside the cooldown, so still one page"
 
-        clock.set(clock.now() + timedelta(seconds=901))  # type: ignore[attr-defined]
+        clock.set(clock.now() + timedelta(seconds=301))  # type: ignore[attr-defined]
         runner._mark_broker_protection(portfolio)
 
         assert len(alerts.sent) == 2
-        assert "KO, PEP" in alerts.sent[1].body
+        rollup = alerts.sent[1]
+        assert rollup.severity is Severity.CRITICAL
+        assert rollup.title.startswith("Still 1 position(s)")
+        assert "Longest without a stop: 15 min" in rollup.body
+        assert "Newly unprotected" not in rollup.body
+
+    def test_a_shrinking_set_waits_for_the_rollup(self) -> None:
+        """Fewer naked positions is better news, not new news: it rides the next
+        rollup rather than paging on its own, which is the ceiling day 3's 129
+        pages were about."""
+        alerts = RecordingAlertSink()
+        runner, _router, _switch, _rec, portfolio, _slept = build(alerts=alerts)
+        self._naked(portfolio, "KO", "PEP")
+        runner._mark_broker_protection(portfolio)
+
+        runner.router.protected_qty["PEP"] = Decimal(10)  # type: ignore[attr-defined]
+        runner._mark_broker_protection(portfolio)
+
+        assert len(alerts.sent) == 1
 
     def test_the_all_clear_is_sent_too(self) -> None:
         """An operator who was paged is owed the sentence that says it is over.
@@ -3225,3 +3273,143 @@ class TestTheDailyDecisionIsTakenAtTheOpen:
         assert [b.ts for b in runner._bars[SYMBOL]] == [m.ts for m in minutes], (
             "and the newest bar is kept rather than withheld"
         )
+
+
+class TestARestartInheritsItsStops:
+    """§3.4 of docs/paper-week/day-5-readiness.md, as assertions.
+
+    `_mark_broker_protection` reads the router's protective map, and that map
+    was empty at every boot. So every position carried across a restart read as
+    naked while its GTC stop rested at the venue, and the first evaluation paged
+    *"N position(s) with NO stop at the broker"* — a false CRITICAL whose runbook
+    procedure is to place a stop by hand, over shares that already have one.
+
+    These run the **real** `OrderRouter`: whether a restored stop counts as
+    protection is its decision, and a fake that answered for it would pass
+    whatever the router did.
+    """
+
+    def _restarted(
+        self, *, restored: list[Order]
+    ) -> tuple[StrategyRunner, OrderRouter, Portfolio, RecordingAlertSink]:
+        alerts = RecordingAlertSink()
+        order_repo = FakeOrderRepository()
+        order_repo.restorable = restored
+        runner, _fake, _switch, _rec, portfolio, _slept = build(
+            alerts=alerts, order_repo=order_repo
+        )
+        real = OrderRouter(
+            FakeBroker(),
+            RiskEngine(DEFAULT_RISK_LIMITS, rules=backtest_rules()),
+            StopManager(),
+            runner.clock,
+        )
+        runner.router = real
+        position = portfolio.position(SYMBOL)
+        position.qty = Decimal(10)
+        position.avg_entry_price = Decimal(100)
+        position.last_price = Decimal(100)
+        return runner, real, portfolio, alerts
+
+    @staticmethod
+    def _inherited_stop() -> Order:
+        """A GTC stop a previous process placed, as the order table restores it."""
+        return Order(
+            symbol=SYMBOL,
+            side=Side.SELL,
+            qty=Decimal(10),
+            order_type=OrderType.STOP,
+            time_in_force=TimeInForce.GTC,
+            stop_price=Decimal(95),
+            broker_order_id="brk-yesterday",
+            purpose=STOP_LOSS,
+            status=OrderStatus.SUBMITTED,
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_inherited_stop_is_not_paged_as_missing(self) -> None:
+        """**The false CRITICAL.** Fails at HEAD~ with one page naming SPY."""
+        runner, _router, portfolio, alerts = self._restarted(restored=[self._inherited_stop()])
+        await runner.warmup(portfolio)
+
+        runner._mark_broker_protection(portfolio)
+
+        assert portfolio.position(SYMBOL).broker_protected_qty == Decimal(10)
+        assert alerts.sent == []
+
+    @pytest.mark.asyncio
+    async def test_a_position_with_nothing_restored_still_pages(self) -> None:
+        """The control. Adoption must not turn *every* inherited position into a
+        protected one — only those whose stop the book actually restored."""
+        runner, _router, portfolio, alerts = self._restarted(restored=[])
+        await runner.warmup(portfolio)
+
+        runner._mark_broker_protection(portfolio)
+
+        assert len(alerts.sent) == 1
+        assert alerts.sent[0].severity is Severity.CRITICAL
+
+    @pytest.mark.asyncio
+    async def test_the_router_holds_the_runners_own_instance(self) -> None:
+        """So a trade update that fills or cancels the stop — which mutates the
+        runner's object — takes it out of the router's count as well."""
+        stop = self._inherited_stop()
+        runner, router, portfolio, _alerts = self._restarted(restored=[stop])
+        await runner.warmup(portfolio)
+
+        assert router._protective[SYMBOL][0] is runner._open_orders[stop.client_order_id]
+
+        stop.status = OrderStatus.CANCELLED
+        runner._mark_broker_protection(portfolio)
+        assert portfolio.position(SYMBOL).unprotected_qty == Decimal(10)
+
+    @pytest.mark.asyncio
+    async def test_adoption_happens_before_catching_up(self) -> None:
+        """A fill booked during catch-up places a stop, and the stale-side
+        cancel ahead of it reads only the router's map — so an inherited stop
+        a flip left facing the wrong way must be in it by then (§4.5)."""
+        runner, fake, _switch, reconciler, portfolio, _slept = build()
+        fake.adopted.clear()
+        adopted_before_catch_up: list[int] = []
+        real_missed = reconciler.missed_order_updates
+
+        async def missed(known_orders: Any) -> list[TradeUpdate]:
+            adopted_before_catch_up.append(len(fake.adopted))
+            return await real_missed(known_orders)
+
+        reconciler.missed_order_updates = missed  # type: ignore[method-assign]
+        runner.order_repo.restorable = [self._inherited_stop()]  # type: ignore[attr-defined]
+
+        await runner.warmup(portfolio)
+
+        assert adopted_before_catch_up == [1]
+
+
+class TestTheUnprotectedLineSaysWhy:
+    """F2: `runner.position_unprotected` said `refusals=['']` on every one of
+    day 4's 69 wash-trade rejections, while the router's line two microseconds
+    earlier carried the venue's exact words (docs/paper-week/day-4-review.md).
+    A venue refusal comes back with the chain's *approving* decision, whose
+    reason is empty; the words are on the order."""
+
+    @pytest.mark.asyncio
+    async def test_a_venue_refusal_reaches_the_log_line(self) -> None:
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+        await runner.evaluate(portfolio)
+
+        async def venue_refuses(entry_order: Order, *_: Any, **__: Any) -> ProtectionResult:
+            stop = Order(symbol=SYMBOL, side=Side.SELL, qty=Decimal(10))
+            stop.status = OrderStatus.REJECTED
+            stop.reject_reason = "potential wash trade detected. use complex orders"
+            refused = SubmitResult(order=stop, decision=RiskDecision.allow(), submitted=False)
+            return ProtectionResult(refused=[refused], unprotected_qty=Decimal(10))
+
+        router.submit_protective_orders = venue_refuses  # type: ignore[method-assign]
+        with capture_logs() as logs:
+            await runner.on_fill_event(TestFills.a_fill_update("atp-1"), portfolio)
+
+        line = next(e for e in logs if e["event"] == "runner.position_unprotected")
+        assert line["refusals"] == ["potential wash trade detected. use complex orders"]

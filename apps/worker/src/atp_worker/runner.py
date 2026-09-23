@@ -416,10 +416,13 @@ class StrategyRunner:
         self.unprotected_alert_cooldown_seconds = unprotected_alert_cooldown_seconds
         #: The unprotected set as last paged, and when. Together they are the
         #: deduplication: 85 fill-level events collapse to one page naming every
-        #: affected symbol, and the page repeats only when the set changes and
-        #: the cooldown has passed.
+        #: affected symbol. A symbol not in the last page pages at once; an
+        #: unchanged or shrinking set repeats as a rollup once per cooldown.
         self._alerted_unprotected: frozenset[str] = frozenset()
         self._unprotected_alerted_at: datetime | None = None
+        #: When each currently naked symbol was first seen naked, so the rollup
+        #: can say how long the worst of them has been running without a stop.
+        self._unprotected_since: dict[str, datetime] = {}
         self.tick_interval_seconds = tick_interval_seconds
         self._sleep: Callable[[float], Awaitable[None]] = (
             sleep if sleep is not None else asyncio.sleep
@@ -450,12 +453,13 @@ class StrategyRunner:
         #:
         #: A *positive* record of a known gap rather than the absence of a
         #: record, and the distinction is the whole reason this exists. The
-        #: router's protective map is in-process and is not rebuilt at start
-        #: (`OrderRouter.cancel_protection`), so after a restart it is empty for
-        #: a position whose venue stop is still resting. Reading that emptiness
-        #: as "unprotected" would have the engine flatten a position the venue
-        #: also closes, and the second close opens a reversed one with nothing
-        #: on it. Only a refusal this process actually saw goes in here.
+        #: router's protective map is in-process and is rebuilt at start only
+        #: from what `warmup` restored (`OrderRouter.adopt_protection`), so an
+        #: empty answer there is weaker evidence than a refusal seen here.
+        #: Reading that emptiness as "unprotected" would have the engine flatten
+        #: a position the venue also closes, and the second close opens a
+        #: reversed one with nothing on it. Only a refusal this process actually
+        #: saw goes in here.
         self._unprotected: dict[str, Decimal] = {}
         #: Fills booked since the last pass, awaiting `strategy.on_fill`.
         self._pending_fills: list[_AppliedFill] = []
@@ -738,6 +742,20 @@ class StrategyRunner:
                 count=len(restored),
                 client_order_ids=[o.client_order_id for o in restored],
             )
+
+        # The stops among them are protection the venue is holding right now,
+        # and the router has to know that or it reports every inherited position
+        # as naked — one false CRITICAL at the first evaluation, whose runbook
+        # procedure places a second stop over shares that already have one
+        # (docs/paper-week/day-5-readiness.md, §3.4). **These instances**, not
+        # copies: they are what trade updates mutate, so a stop that fires or
+        # is cancelled goes terminal in the router as well.
+        #
+        # Before catching up, not after: a fill booked there runs
+        # `submit_protective_orders`, whose stale-side cancel reads only the
+        # router's map, and an inherited stop a flip left facing the wrong way
+        # has to be in it by then (§4.5).
+        self.router.adopt_protection(self._open_orders.values())
 
         # What the venue did to those orders while this process was not
         # running. **Before reconciling, not after**: a fill that landed during
@@ -1314,7 +1332,10 @@ class StrategyRunner:
         of refusals *this process* saw, which is the right input for
         `_stop_is_missing` and the wrong one for a screen. A stop cancelled by
         the venue, or one resting from before a restart, moves the router's
-        count and never touches the map.
+        count and never touches the map — the second only because `warmup`
+        adopts it into the router (`OrderRouter.adopt_protection`). Before that
+        existed this docstring claimed it anyway, and every inherited position
+        read as naked (docs/paper-week/day-5-readiness.md, §3.4).
         """
         naked: dict[str, Decimal] = {}
         for position in portfolio.open_positions:
@@ -1342,10 +1363,20 @@ class StrategyRunner:
 
         Deduplicated by *set*, not by event. One page naming every naked symbol
         is one thing an operator can act on; 85 pages naming one fill each is a
-        silenced phone. The page repeats only when the set changes and the
-        cooldown has passed, so a position that stays naked does not re-page
-        every minute — and a *new* episode pages immediately, because the first
-        naked position after a clean book is news.
+        silenced phone. But a dedup is a floor as well as a ceiling, and the
+        first version had only the ceiling: a set that grew inside the cooldown
+        was dropped on the promise of a later pass, and one that never changed
+        was paged once and then never again, all session
+        (docs/paper-week/day-4-review.md, F1; day-5-readiness.md, §3.4). So:
+
+        - **a symbol not in the last page pages now**, cooldown or not — a
+          position that has just gone naked is news, and it is the one thing
+          this alert exists to say;
+        - **anything still naked is re-paged as a rollup once per cooldown**,
+          naming the set and how long the oldest has been running without a
+          stop, so a page that was missed or dismissed is not the last word;
+        - an unchanged or shrinking set inside the cooldown stays quiet, which
+          is the ceiling day 3's 129 pages were about.
 
         The clear is sent too, at INFO. An operator who was paged is owed the
         sentence that says it is over; without it the only way to learn is to
@@ -1360,6 +1391,10 @@ class StrategyRunner:
             return
 
         current = frozenset(naked)
+        now = self.clock.now()
+        self._unprotected_since = {
+            symbol: self._unprotected_since.get(symbol, now) for symbol in current
+        }
         if not current:
             if self._alerted_unprotected:
                 self.alerts.send(
@@ -1378,29 +1413,35 @@ class StrategyRunner:
             self._unprotected_alerted_at = None
             return
 
-        now = self.clock.now()
-        fresh_episode = not self._alerted_unprotected
-        if not fresh_episode:
-            if current == self._alerted_unprotected:
-                return
+        newly_naked = current - self._alerted_unprotected
+        if not newly_naked:
             since = self._unprotected_alerted_at
             if (
                 since is not None
                 and (now - since).total_seconds() < self.unprotected_alert_cooldown_seconds
             ):
-                # The set grew, but somebody was told less than a cooldown ago
-                # and the next pass will tell them again. Recorded as unsent so
-                # the change is not lost — `_alerted_unprotected` is what was
-                # *paged*, and leaving it stale is what makes the retry happen.
                 return
 
         symbols = sorted(current)
+        oldest = min(self._unprotected_since.values())
+        minutes = int((now - oldest).total_seconds() // 60)
+        title = (
+            f"{len(symbols)} position(s) with NO stop at the broker"
+            if newly_naked
+            else f"Still {len(symbols)} position(s) with NO stop at the broker"
+        )
         self.alerts.send(
             Alert(
                 severity=Severity.CRITICAL,
-                title=f"{len(symbols)} position(s) with NO stop at the broker",
+                title=title,
                 body=(
                     f"No protective order is working at the venue for: {', '.join(symbols)}.\n"
+                    + (
+                        f"Newly unprotected: {', '.join(sorted(newly_naked))}.\n"
+                        if newly_naked
+                        else ""
+                    )
+                    + f"Longest without a stop: {minutes} min.\n"
                     "The engine-side stop only exists while this worker is running — it "
                     "does not survive a crash, a restart or the overnight gap.\n"
                     "docs/RUNBOOK.md, and check the broker's own UI."
@@ -2319,7 +2360,10 @@ class StrategyRunner:
                 "runner.position_unprotected",
                 symbol=order.symbol,
                 unprotected_qty=str(result.unprotected_qty),
-                refusals=[r.decision.reason for r in result.refused],
+                # `refusal_reason`, not `decision.reason`: the latter is empty
+                # for a venue refusal, which is what put `refusals=['']` on every
+                # one of day 4's 69 (docs/paper-week/day-4-review.md, F2).
+                refusals=[r.refusal_reason for r in result.refused],
             )
             # A list, because a position can be left unprotected by more than
             # one refused child. Each is its own row: "the stop was refused" and
