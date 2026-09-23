@@ -451,6 +451,11 @@ class StrategyRunner:
         #: portfolio. Empty rather than `None` so every accessor can be typed
         #: without an optional, and replaced rather than mutated.
         self._portfolio = Portfolio(cash=Decimal(0), starting_equity=Decimal(0))
+        #: Whether `_portfolio` is the real book yet. Until `warmup` binds it,
+        #: it is this empty placeholder, and a checkpoint written from it would
+        #: overwrite the stored book with nothing. Every write outside the
+        #: evaluate loop checks this first.
+        self._book_bound = False
         self._context = LiveContext(
             self._bars, self._quotes, self._portfolio, clock, tuple(symbols), timeframe
         )
@@ -659,6 +664,7 @@ class StrategyRunner:
         finding a process that is running and silently declining to trade.
         """
         self._portfolio = portfolio
+        self._book_bound = True
         self._context = LiveContext(
             self._bars, self._quotes, portfolio, self.clock, tuple(self.symbols), self.timeframe
         )
@@ -1147,6 +1153,11 @@ class StrategyRunner:
         self._running = False
         self.strategy.on_stop()
         if not close_positions:
+            # The last thing this process knows, written down for the next one
+            # (B2). Only as reliable as the shutdown path itself: day 4's
+            # worker logged nothing on SIGTERM, so whether this runs then is
+            # unproven (day-4-review.md, F10).
+            await self.checkpoint("shutdown")
             log.info("runner.stopped", positions_left_open=True)
             return
 
@@ -1164,6 +1175,7 @@ class StrategyRunner:
                 # The book is still open and the worker is going home. This is
                 # the row that says so tomorrow morning.
                 await self._record_refusal(result)
+        await self.checkpoint("shutdown")
         log.warning("runner.stopped", positions_left_open=False)
 
     # ── one pass ────────────────────────────────────────────────────────────
@@ -1308,11 +1320,65 @@ class StrategyRunner:
         snapshot is visible on the dashboard as an age that stops advancing.
         """
         self._mark_broker_protection(portfolio)
+        at = await self._save_book(portfolio)
+        await self._publish_snapshot(portfolio, at)
+
+    async def _save_book(self, portfolio: Portfolio) -> datetime:
+        """Write the working orders, then the book. Returns the snapshot's instant.
+
+        The durable half of `_persist`, and the only way the book is written.
+        Orders first, for the reason `_persist` gives. Raises: the evaluate loop
+        wants a failed write to count as a failed pass, and the out-of-loop
+        callers go through `_checkpoint`, which does not.
+        """
         for order in self._open_orders.values():
             await self.order_repo.save(order, run_mode=self.run_mode)
         at = self.clock.now()
         await self.portfolio_repo.snapshot(portfolio, at=at, run_mode=self.run_mode)
-        await self._publish_snapshot(portfolio, at)
+        return at
+
+    async def checkpoint(self, reason: str) -> None:
+        """Write the book now, from outside the evaluate loop. Never raises.
+
+        **B2 of the paper week.** The book was written only as step 6 of
+        `evaluate`, so a worker that was not evaluating (halted, pre-open,
+        parked, or between daily decisions) never wrote one. Day 4's restart
+        restored a book two days old, with a position and $4,932 of cash
+        movement missing, and the platform rebuilt the truth from the broker it
+        was about to check against. That made the restart's clean reconcile
+        worthless as evidence (docs/paper-week/day-4-review.md, B2). So the
+        book is also written on every fill, after every clean scheduled
+        reconcile, and at shutdown.
+
+        Takes the runner's lock, so a checkpoint cannot land halfway through an
+        evaluation or a fill. The fill path already holds it and calls
+        `_checkpoint` directly.
+        """
+        async with self._lock:
+            await self._checkpoint(self._portfolio, reason)
+
+    async def _checkpoint(self, portfolio: Portfolio, reason: str) -> None:
+        """`checkpoint`'s body, for a caller that already holds the lock.
+
+        Swallows a failed write and logs it at ERROR. Every caller is holding
+        an outcome of its own (a booked fill, a clean reconcile, a shutdown)
+        that a storage failure must not undo. The next write retries it: the
+        evaluate loop writes every pass.
+        """
+        if not self._book_bound:
+            return
+        try:
+            at = await self._save_book(portfolio)
+        except Exception as exc:
+            log.error(
+                "runner.book_unwritten",
+                reason=reason,
+                error=str(exc),
+                error_type=type(exc).__name__,
+                effect="the stored book is older than the one in memory until the next write",
+            )
+            return
+        log.info("runner.book_written", reason=reason, at=at.isoformat())
 
     def _mark_broker_protection(self, portfolio: Portfolio) -> None:
         """Record how much of each position the *venue* is holding a stop over.
@@ -2387,7 +2453,9 @@ class StrategyRunner:
                 return
 
             fill = order.fills[-1] if order.fills else None
-            if fill is not None and order.filled_qty > before:
+            booked = fill is not None and order.filled_qty > before
+            if booked:
+                assert fill is not None  # narrowed by `booked`
                 self._apply_to_portfolio(order, fill, portfolio)
                 self.stats.fills_applied += 1
                 self._pending_fills.append(_AppliedFill(order=order, fill=fill))
@@ -2406,6 +2474,11 @@ class StrategyRunner:
                 # otherwise never reach storage.
                 await self.order_repo.save(order, run_mode=self.run_mode)
                 self._open_orders.pop(order.client_order_id, None)
+
+            if booked:
+                # Last, so the orders this fill touched are written before the
+                # book that reflects them — `_persist`'s ordering (B2).
+                await self._checkpoint(portfolio, "fill")
 
     def _apply_to_portfolio(self, order: Order, fill: Fill, portfolio: Portfolio) -> None:
         """Fold a fill into cash and the position.

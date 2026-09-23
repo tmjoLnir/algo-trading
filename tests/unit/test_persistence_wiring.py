@@ -14,17 +14,20 @@ what narrow that caveat to a first boot.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
+from atp_core.clock import SimulatedClock
 from atp_core.domain import Order, OrderStatus, OrderType, Portfolio, Position, RunMode, Side
 from atp_worker import trading
 from tests.fakes import FakeBroker, FakeOrderRepository, FakePortfolioRepository
 
 NOW = datetime(2024, 6, 3, 14, 30, tzinfo=UTC)
+CLOCK = SimulatedClock(NOW)
 
 
 class Reconciler:
@@ -70,11 +73,27 @@ class TestRestoreOrAdopt:
         reconciler, repo, _ = build()
         repo.stored = a_stored_book()
 
-        portfolio = await trading.restore_or_adopt(reconciler, repo, RunMode.PAPER)  # type: ignore[arg-type]
+        portfolio = await trading.restore_or_adopt(reconciler, repo, RunMode.PAPER, clock=CLOCK)  # type: ignore[arg-type]
 
         assert portfolio.cash == Decimal("50000")
         assert portfolio.positions["SPY"].qty == Decimal("100")
         assert reconciler.adopted == 0, "must not adopt over a book we already have"
+
+    @pytest.mark.asyncio
+    async def test_the_restored_book_says_how_old_it_is(self) -> None:
+        """**B2.** Day 4 restored a book two days old in the same words as a
+        fresh one. The age is one field, so the next reviewer does not have to
+        subtract two cash figures to find it."""
+        reconciler, repo, _ = build()
+        repo.stored = a_stored_book()
+        repo.stored_at = CLOCK.now() - timedelta(hours=50)
+
+        with capture_logs() as logs:
+            await trading.restore_or_adopt(reconciler, repo, RunMode.PAPER, clock=CLOCK)  # type: ignore[arg-type]
+
+        line = next(e for e in logs if e["event"] == "worker.restored_book")
+        assert line["age_seconds"] == 50 * 3600
+        assert line["snapshot_at"] == repo.stored_at.isoformat()
 
     @pytest.mark.asyncio
     async def test_no_stored_book_adopts_the_brokers(self) -> None:
@@ -83,7 +102,7 @@ class TestRestoreOrAdopt:
         reconciler, repo, broker = build()
         broker.hold("SPY", Decimal("250"), Decimal("500"))
 
-        portfolio = await trading.restore_or_adopt(reconciler, repo, RunMode.PAPER)  # type: ignore[arg-type]
+        portfolio = await trading.restore_or_adopt(reconciler, repo, RunMode.PAPER, clock=CLOCK)  # type: ignore[arg-type]
 
         assert reconciler.adopted == 1
         assert portfolio.positions["SPY"].qty == Decimal("250")
@@ -96,7 +115,7 @@ class TestRestoreOrAdopt:
         repo.stored = a_stored_book()  # we think 100
         broker.hold("SPY", Decimal("999"), Decimal("500"))  # the venue says 999
 
-        portfolio = await trading.restore_or_adopt(reconciler, repo, RunMode.PAPER)  # type: ignore[arg-type]
+        portfolio = await trading.restore_or_adopt(reconciler, repo, RunMode.PAPER, clock=CLOCK)  # type: ignore[arg-type]
 
         assert portfolio.positions["SPY"].qty == Decimal("100")
         assert reconciler.adopted == 0
@@ -110,10 +129,13 @@ class TestRestoreOrAdopt:
             async def latest(self, run_mode: object) -> Portfolio | None:
                 raise ConnectionError("database is down")
 
+            async def latest_snapshot(self, run_mode: object) -> Any:
+                raise ConnectionError("database is down")
+
         reconciler, _, _ = build()
 
         with pytest.raises(ConnectionError):
-            await trading.restore_or_adopt(reconciler, Broken(), RunMode.PAPER)  # type: ignore[arg-type]
+            await trading.restore_or_adopt(reconciler, Broken(), RunMode.PAPER, clock=CLOCK)  # type: ignore[arg-type]
         assert reconciler.adopted == 0
 
 
@@ -150,6 +172,85 @@ class TestTheRunnerPersists:
         portfolio.cash = Decimal("1")
 
         assert repo.snapshots[0][1].cash != Decimal("1")
+
+    @staticmethod
+    def _working_buy() -> Order:
+        order = Order(
+            symbol="SPY",
+            side=Side.BUY,
+            qty=Decimal("10"),
+            order_type=OrderType.MARKET,
+            client_order_id="atp-from-before",
+        )
+        order.status = OrderStatus.SUBMITTED
+        return order
+
+    @pytest.mark.asyncio
+    async def test_a_fill_writes_the_book_without_an_evaluation(self) -> None:
+        """**B2.** Day 4's pre-restart worker held a position for two hours and
+        wrote zero snapshots, because it never evaluated. A fill is the event
+        that changes the book, so it is the event that writes it."""
+        from tests.unit.test_strategy_runner import TestFills
+
+        repo = FakePortfolioRepository()
+        orders = FakeOrderRepository()
+        orders.restorable = [self._working_buy()]
+        runner, _, _, _, portfolio, _ = self.runner(portfolio_repo=repo, order_repo=orders)
+        await runner.warmup(portfolio)
+        assert repo.snapshots == [], "the premise: nothing has evaluated"
+
+        await runner.on_fill_event(TestFills.a_fill_update("atp-from-before"), portfolio)
+
+        assert len(repo.snapshots) == 1
+        assert repo.snapshots[-1][1].positions["SPY"].qty == Decimal("10")
+        assert "atp-from-before" in orders.saved, "the order is written before the book"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_write_on_fill_does_not_unbook_the_fill(self) -> None:
+        """The fill happened at the venue. A storage failure must not undo it in
+        memory or fail the handler. The next write catches the book up."""
+        from tests.unit.test_strategy_runner import TestFills
+
+        class Refusing(FakePortfolioRepository):
+            async def snapshot(
+                self, portfolio: Portfolio, *, at: datetime, run_mode: object
+            ) -> None:
+                raise ConnectionError("database is down")
+
+        orders = FakeOrderRepository()
+        orders.restorable = [self._working_buy()]
+        runner, _, _, _, portfolio, _ = self.runner(portfolio_repo=Refusing(), order_repo=orders)
+        await runner.warmup(portfolio)
+
+        with capture_logs() as logs:
+            await runner.on_fill_event(TestFills.a_fill_update("atp-from-before"), portfolio)
+
+        assert portfolio.positions["SPY"].qty == Decimal("10")
+        assert any(e["event"] == "runner.book_unwritten" for e in logs)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_writes_the_book(self) -> None:
+        repo = FakePortfolioRepository()
+        runner, _, _, _, portfolio, _ = self.runner(portfolio_repo=repo)
+        await runner.warmup(portfolio)
+        portfolio.cash = Decimal("12345")
+
+        await runner.shutdown()
+
+        assert repo.snapshots[-1][1].cash == Decimal("12345")
+
+    @pytest.mark.asyncio
+    async def test_nothing_is_written_before_warmup_binds_the_book(self) -> None:
+        """Until `warmup` binds it, the runner's book is an empty placeholder.
+        Writing that on an early shutdown would replace the stored book with
+        nothing, which is worse than writing nothing at all."""
+        repo = FakePortfolioRepository()
+        runner, _, _, _, _, _ = self.runner(portfolio_repo=repo)
+
+        await runner.shutdown()
+        await runner.checkpoint("reconcile")
+
+        assert repo.snapshots == []
 
     @pytest.mark.asyncio
     async def test_working_orders_are_restored_before_reconciling(self) -> None:

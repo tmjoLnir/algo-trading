@@ -371,6 +371,8 @@ async def restore_or_adopt(
     reconciler: Reconciler,
     portfolio_repo: PortfolioRepository,
     run_mode: RunMode,
+    *,
+    clock: Clock,
 ) -> Portfolio:
     """The book this worker starts from: ours if we have one, else the broker's.
 
@@ -396,16 +398,25 @@ async def restore_or_adopt(
     A read failure raises rather than falling back to adoption. Adopting
     because the database was briefly unreachable would silently discard our own
     book, which is the one outcome worse than refusing to start.
+
+    **The restored book says how old it is.** Day 4's restart restored a book
+    two days old, announced in the same words as one ten seconds old; finding
+    that out took subtracting two cash figures across two reviews
+    (docs/paper-week/day-4-review.md, B2). `snapshot_at` and `age_seconds` make
+    it one field on the boot line.
     """
-    stored = await portfolio_repo.latest(run_mode)
+    stored = await portfolio_repo.latest_snapshot(run_mode)
     if stored is not None:
+        book = stored.portfolio
         log.info(
             "worker.restored_book",
-            positions=sorted(p.symbol for p in stored.open_positions),
-            cash=str(stored.cash),
+            positions=sorted(p.symbol for p in book.open_positions),
+            cash=str(book.cash),
+            snapshot_at=stored.at.isoformat(),
+            age_seconds=int((clock.now() - stored.at).total_seconds()),
             msg="starting from our own stored book — the broker is about to be asked to agree",
         )
-        return stored
+        return book
 
     portfolio = Portfolio(cash=Decimal(0), starting_equity=Decimal(0))
     await reconciler.adopt_broker_state(portfolio)

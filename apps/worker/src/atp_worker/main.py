@@ -323,7 +323,7 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
                 anchor_store=RedisSessionAnchorStore(redis),
             )
             portfolio = await trading.restore_or_adopt(
-                reconciler, portfolio_repo, settings.run_mode
+                reconciler, portfolio_repo, settings.run_mode, clock=clock
             )
 
             responsibilities["strategy_runner"] = lambda: runner.run(portfolio)
@@ -341,6 +341,7 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
                 reconciler=reconciler,
                 portfolio=portfolio,
                 open_orders=lambda: runner.open_orders,
+                checkpoint=lambda: runner.checkpoint("reconcile"),
             )
             session_stats = lambda: runner.stats  # noqa: E731
 

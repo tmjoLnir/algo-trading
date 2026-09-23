@@ -86,6 +86,10 @@ class SessionJobs:
     reconciler: Reconciler
     portfolio: Portfolio
     open_orders: Callable[[], list[Order]]
+    #: Writes the runner's book to storage (`StrategyRunner.checkpoint`). Called
+    #: after a clean reconcile, which runs every five minutes whether or not
+    #: the strategy is evaluating (B2). Optional so a test can omit it.
+    checkpoint: Callable[[], Awaitable[None]] | None = None
 
 
 #: Who the rollover's clear is attributed to. A process name and not a person,
@@ -306,6 +310,14 @@ async def reconcile_with_broker(session: SessionJobs) -> None:
     report = await session.reconciler.reconcile(session.portfolio, known_orders=session.open_orders)
     if report.is_clean:
         log.info("worker.reconcile.clean", checked_at=report.checked_at.isoformat())
+        # A book the venue has just agreed with is the best one to have on
+        # disk. Before this, only the evaluate loop wrote it, so a worker that
+        # was halted, parked or between daily decisions wrote nothing for hours
+        # and restored a stale book at the next boot (day-4-review.md, B2).
+        # Only when clean: a diverged book is already halted on, and the
+        # evaluate loop still writes it every pass.
+        if session.checkpoint is not None:
+            await session.checkpoint()
         return
 
     # The reconciler has already engaged the kill switch. Repeated here because

@@ -1704,6 +1704,16 @@ above.
   happen on a fill and from the reconcile job, not only from inside the
   strategy loop (docs/paper-week/day-4-review.md, B2).
 
+  **Now it does** (#167). `StrategyRunner.checkpoint` writes the book, orders
+  first, on every booked fill, after every clean scheduled reconcile, and at
+  shutdown. It never writes before `warmup` has bound the real book, so an early
+  shutdown cannot overwrite the stored book with an empty one. `worker.restored_book`
+  now carries `snapshot_at` and `age_seconds`, so a stale restore reads as one.
+  Still unticked, for the reason above rather than a new one: this is a fix to
+  what failed the demonstration, and the demonstration is a restart that
+  survives, which has not happened yet. The shutdown write is only as reliable
+  as the shutdown path, which F10 found no evidence of on day 4.
+
 *Verifiable:* a strategy trades the paper account for a week and reconciles clean.
 
 **Not shown, and the two tools that would let it be are built** — @claude (#83).

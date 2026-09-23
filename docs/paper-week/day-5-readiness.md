@@ -523,6 +523,25 @@ book may have been reconstructed from the broker it is being checked against.
 `docs/ROADMAP.md:1627-1644` states this correctly and in the same diff as the day-4 review,
 which is CLAUDE.md §6 working as intended.
 
+> **Closed by #167** (added to that PR after §3's fixes), recorded here rather than by editing
+> the finding above.
+>
+> - **On fill.** `on_fill_event` writes the book after every booked fill, last, so the orders
+>   the fill touched land first. Boot-time catch-up fills go through the same path, so a restart
+>   that books a missed fill writes the book too.
+> - **From the reconcile job.** `reconcile_with_broker` calls `StrategyRunner.checkpoint` after
+>   every clean run, which is every five minutes during market hours, whether or not the
+>   strategy is evaluating. It writes nothing on a divergence, because a disputed book is
+>   already halted on.
+> - **At shutdown.** `StrategyRunner.shutdown` writes it. This is only as reliable as the
+>   shutdown path, and F10 is still open.
+> - **The age.** `worker.restored_book` carries `snapshot_at` and `age_seconds`.
+>
+> Every out-of-loop write takes the runner's lock, swallows a storage failure
+> (`runner.book_unwritten`, ERROR), and refuses to write before `warmup` binds the real book.
+> Without that last guard, an early shutdown would overwrite the stored book with an empty
+> placeholder. Proven by unit tests only: no worker has yet been restarted on this code.
+
 ### 4.2 F4 and F11 — the only end-of-day artifact still prints four wrong numbers `high`
 
 `libs/core/src/atp_core/analytics/daily.py` and `paper_run.py` do not appear in
@@ -773,6 +792,7 @@ Then, as code, in this order:
    See §3.5's note.)*
 6. **B2: snapshot on fill and from the reconcile job, and put the snapshot's age in
    `restored_book`** (§4.1). The shutdown snapshot waits on F10's handler; the other two do not.
+   *(Done, #167: all three, plus a shutdown write that still depends on F10. See §4.1's note.)*
 7. **The unprotected alert in both directions, plus the refusal text** (§3.4, F1/F2) — and fix
    `_mark_broker_protection` so an inherited stop counts, which is the same fallback as item 3.
    *(Done, #165 — by boot-time adoption rather than a fallback, which also closes §4.5. See

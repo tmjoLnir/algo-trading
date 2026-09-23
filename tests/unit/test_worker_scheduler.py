@@ -21,6 +21,7 @@ dependence on how fast the machine is.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -417,6 +418,45 @@ class TestReconcileWithBroker:
 
         assert switch.is_engaged() is True
         assert switch.engagements[-1][1] == HaltReason.RECONCILIATION_MISMATCH.value
+
+    async def test_a_clean_reconcile_writes_the_book(self) -> None:
+        """**B2.** This job runs every five minutes whether or not the strategy
+        is evaluating, so it is what keeps the stored book current for a worker
+        that is halted, parked, or between daily decisions."""
+        broker = FakeBroker()
+        broker.positions["SPY"] = Position(
+            symbol="SPY", qty=Decimal(100), avg_entry_price=Decimal("100")
+        )
+        written: list[str] = []
+
+        async def checkpoint() -> None:
+            written.append("book")
+
+        session = dataclasses.replace(
+            _session(broker, FakeKillSwitch(), _book(SPY=100)), checkpoint=checkpoint
+        )
+        await reconcile_with_broker(session)
+
+        assert written == ["book"]
+
+    async def test_a_diverged_reconcile_writes_nothing(self) -> None:
+        """A book the venue disputes is already halted on. Writing it here would
+        put a disputed book on disk as though it had been checked."""
+        broker = FakeBroker()
+        broker.positions["SPY"] = Position(
+            symbol="SPY", qty=Decimal(1000), avg_entry_price=Decimal("100")
+        )
+        written: list[str] = []
+
+        async def checkpoint() -> None:
+            written.append("book")
+
+        session = dataclasses.replace(
+            _session(broker, FakeKillSwitch(), _book(SPY=100)), checkpoint=checkpoint
+        )
+        await reconcile_with_broker(session)
+
+        assert written == []
 
     async def test_it_does_not_raise_on_a_divergence(self) -> None:
         """The driver reschedules a job that raised, but it also logs it as a
