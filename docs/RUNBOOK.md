@@ -901,6 +901,14 @@ values, rather than migrating on a fallback nobody asked for.
 3. Positions are safe if broker-side stops are in place — verify.
 4. Fix, then restart. `warmup()` will reconcile and adopt open positions.
 
+**First tell a stop from a crash.** A stop logs `worker.stopping` (with the signal)
+when it begins and `worker.stopped` (with `drain_seconds`) after the book is written
+and every connection is closed. `worker.stopping` with no `worker.stopped` after it
+means the drain was killed partway, so the book may not have been written:
+compare `drain_seconds` on earlier stops with the service's `stop_grace_period` (30 s).
+`worker.slow_drain` warns when a drain uses more than half of it. No `worker.stopping`
+at all means nothing asked this process to stop, so read the lines before its last.
+
 `worker.config_unreadable` at CRITICAL is a specific and common shape of this:
 the worker reads what it trades from the `worker_config` row (ADR 0023) and
 **refuses to start rather than falling back to the defaults**, because a worker

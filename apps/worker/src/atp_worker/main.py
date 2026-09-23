@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import time
 from contextlib import AsyncExitStack
 from typing import TYPE_CHECKING, Any
 
@@ -119,11 +120,113 @@ async def main() -> None:
     build_info(__version__, settings.run_mode.value)
 
     stop_event = asyncio.Event()
+    shutdown = ShutdownSignal(stop_event)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop_event.set)
+        loop.add_signal_handler(sig, shutdown.received, sig)
 
-    await run(settings, stop_event)
+    try:
+        await run(settings, stop_event)
+    except BaseException:
+        shutdown.finished(clean=False)
+        raise
+    shutdown.finished(clean=True)
+
+
+#: How long the container runtime waits between SIGTERM and SIGKILL. The
+#: worker's `stop_grace_period` in docker-compose.yml, held here as well so the
+#: drain can be measured against it. `test_compose_shape` keeps the two equal.
+#:
+#: 30 s, not Docker's default of 10. The drain cancels the ingestor, the
+#: trade-updates socket and the runner, then unwinds the exit stack: the
+#: runner's shutdown writes the book (B2), the Alpaca sockets close, and the
+#: engine and Redis are disposed. The synchronous alert transport alone may
+#: block for its 5 s timeout. Day 4's worker logged nothing at all when it was
+#: stopped, which is what a SIGKILL partway through a drain looks like
+#: (docs/paper-week/day-4-review.md, F10).
+STOP_GRACE_SECONDS = 30.0
+
+#: The share of the grace period a drain may use before it is worth a warning.
+#: Past half, a slower day (a slow database, a broker that takes its time
+#: closing) is the one that gets killed.
+SLOW_DRAIN_FRACTION = 0.5
+
+
+class ShutdownSignal:
+    """The two ends of a shutdown, said out loud.
+
+    **Day 4's worker logged nothing when it was stopped.** Every other
+    container logged its shutdown, and the worker's last line was a reconcile
+    four minutes earlier, so nobody could tell a clean stop from a crash, and
+    whether the shutdown path ran at all was unknowable. B2's shutdown
+    snapshot depends on that path (docs/paper-week/day-4-review.md, F10).
+
+    So the receipt is logged in the signal handler itself (`worker.stopping`),
+    before anything is cancelled. The end is logged by `main` after `run` has
+    returned (`worker.stopped`), which is after the exit stack has unwound and
+    the last write has landed. The line `supervise` used to log under that name
+    came before the teardown, including before the book was written. The
+    drain's length is measured between the two, so the grace period can be
+    checked against the drain it has to cover.
+    """
+
+    def __init__(
+        self, stop_event: asyncio.Event, *, monotonic: Callable[[], float] = time.monotonic
+    ) -> None:
+        self._stop_event = stop_event
+        self._monotonic = monotonic
+        self.received_at: float | None = None
+        self.signal_name: str | None = None
+
+    def received(self, sig: signal.Signals) -> None:
+        """The signal handler. Logs, then asks everything to stop."""
+        if self.received_at is None:
+            self.received_at = self._monotonic()
+            self.signal_name = sig.name
+            log.info(
+                "worker.stopping",
+                signal=sig.name,
+                grace_seconds=STOP_GRACE_SECONDS,
+                msg=(
+                    "signal received — cancelling responsibilities, then writing the book and "
+                    "closing connections"
+                ),
+            )
+        else:
+            log.warning(
+                "worker.stopping_again",
+                signal=sig.name,
+                msg="already draining; a second signal does not skip the book write",
+            )
+        self._stop_event.set()
+
+    def finished(self, *, clean: bool) -> None:
+        """Called once `run` has unwound. Silent if no signal started this."""
+        if self.received_at is None:
+            return
+        drain = self._monotonic() - self.received_at
+        if not clean:
+            log.error(
+                "worker.stop_incomplete",
+                signal=self.signal_name,
+                drain_seconds=round(drain, 2),
+                msg="the teardown raised — the book may not have been written",
+            )
+            return
+        log.info(
+            "worker.stopped",
+            signal=self.signal_name,
+            drain_seconds=round(drain, 2),
+            grace_seconds=STOP_GRACE_SECONDS,
+            msg="shut down cleanly after the last write — nothing halted",
+        )
+        if drain > STOP_GRACE_SECONDS * SLOW_DRAIN_FRACTION:
+            log.warning(
+                "worker.slow_drain",
+                drain_seconds=round(drain, 2),
+                grace_seconds=STOP_GRACE_SECONDS,
+                msg="the drain used more than half the grace period; a slower one will be SIGKILLed",
+            )
 
 
 async def run(settings: Settings, stop_event: asyncio.Event) -> None:
@@ -489,10 +592,13 @@ async def supervise(
 
     ended = [task for task in done if task is not stopper]
     if not ended:
+        # Not `worker.stopped`: the exit stack has not unwound yet, so the book
+        # has not been written and nothing is closed. `main` logs that line
+        # once it has (`ShutdownSignal`, F10).
         log.info(
-            "worker.stopped",
+            "worker.responsibilities_cancelled",
             cancelled=sorted(tasks.values()),
-            msg="signal received — shut down cleanly, nothing halted",
+            msg="signal received — responsibilities cancelled, nothing halted; tearing down",
         )
         return
 

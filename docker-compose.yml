@@ -235,6 +235,14 @@ services:
       - ./libs:/app/libs
       - ./apps/worker:/app/apps/worker
     restart: unless-stopped
+    # Time between SIGTERM and SIGKILL. Docker's default is 10 s, and a drain
+    # cancels three responsibilities, writes the book and closes the broker's
+    # sockets. Day 4's worker logged nothing at all when it was stopped, which
+    # is what a kill partway through a drain looks like (day-4-review.md, F10).
+    # `worker.stopped` reports the measured `drain_seconds`, and
+    # `worker.slow_drain` warns past half of this. Kept equal to
+    # `atp_worker.main.STOP_GRACE_SECONDS` by test_compose_shape.
+    stop_grace_period: 30s
 
   queue:
     # The arq worker: backtests the API queued. A THIRD process, and the split

@@ -101,7 +101,7 @@ And the findings §8 did not enumerate:
 |---|---|---|
 | F3 | Venue rejection reported as a risk refusal, fields blank | **not fixed** — reproduced in the probe above: `approved=True rule='' reason=''` |
 | F9 | Boot-race refuses a recovered position's stop, never re-arms | **not fixed** — nothing in `risk/` or the recovery path changed |
-| F10 | Worker logs nothing on shutdown | **not fixed** — which is why B2's shutdown snapshot has no foundation |
+| F10 | Worker logs nothing on shutdown | **not fixed** — which is why B2's shutdown snapshot has no foundation. *(Fixed later by #167: `worker.stopping` / `worker.stopped` with `drain_seconds`, and a 30 s `stop_grace_period`.)* |
 | F12/F13 | Papercuts — fee double-settle, nginx `Date`, WS reconnects, bar-write amplification | **not fixed** |
 
 One verifiable summary of the six that did not start:
@@ -534,7 +534,9 @@ which is CLAUDE.md §6 working as intended.
 >   strategy is evaluating. It writes nothing on a divergence, because a disputed book is
 >   already halted on.
 > - **At shutdown.** `StrategyRunner.shutdown` writes it. This is only as reliable as the
->   shutdown path, and F10 is still open.
+>   shutdown path. F10 is now fixed in the same PR: `worker.stopping` is logged at the
+>   signal, and `worker.stopped` with `drain_seconds` once `run` has unwound, after this
+>   write. The grace period is 30 s instead of Docker's 10.
 > - **The age.** `worker.restored_book` carries `snapshot_at` and `age_seconds`.
 >
 > Every out-of-loop write takes the runner's lock, swallows a storage failure
@@ -817,7 +819,8 @@ Then, as code, in this order:
    See §3.5's note.)*
 6. **B2: snapshot on fill and from the reconcile job, and put the snapshot's age in
    `restored_book`** (§4.1). The shutdown snapshot waits on F10's handler; the other two do not.
-   *(Done, #167: all three, plus a shutdown write that still depends on F10. See §4.1's note.)*
+   *(Done, #167: all three, plus a shutdown write. F10's logging and grace period landed
+   in the same PR. See §4.1's note.)*
 7. **The unprotected alert in both directions, plus the refusal text** (§3.4, F1/F2) — and fix
    `_mark_broker_protection` so an inherited stop counts, which is the same fallback as item 3.
    *(Done, #165 — by boot-time adoption rather than a fallback, which also closes §4.5. See

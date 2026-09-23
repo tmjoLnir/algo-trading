@@ -1712,7 +1712,11 @@ above.
   Still unticked, for the reason above rather than a new one: this is a fix to
   what failed the demonstration, and the demonstration is a restart that
   survives, which has not happened yet. The shutdown write is only as reliable
-  as the shutdown path, which F10 found no evidence of on day 4.
+  as the shutdown path, which F10 found no evidence of on day 4. That path now
+  says so both ways: `worker.stopping` at the signal, and `worker.stopped` with
+  the measured `drain_seconds` after the last write. The worker's
+  `stop_grace_period` is 30 s instead of Docker's 10, so the drain has room to
+  finish (#167).
 
 *Verifiable:* a strategy trades the paper account for a week and reconciles clean.
 
