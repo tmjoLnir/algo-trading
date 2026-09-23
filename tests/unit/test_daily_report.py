@@ -12,7 +12,14 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
-from atp_core.analytics.daily import DailyReport, Section, render, summarise
+from atp_core.analytics.daily import (
+    Coverage,
+    DailyReport,
+    Section,
+    count_outcomes,
+    render,
+    summarise,
+)
 from atp_core.audit.ports import Action, AuditEntry
 from atp_core.domain import Order, OrderStatus, Side
 
@@ -121,7 +128,17 @@ class TestZeroIsNotAbsent:
     def test_the_absent_list_is_the_thing_to_read_first(self) -> None:
         """A report whose absent list is non-empty is a partial report, and
         saying so at the top is the difference between a summary and a claim."""
-        report = summarise(DAY, [order()], audit=[])
+        # Equity and coverage supplied, so feed incidents is the one store that
+        # does not exist. Without them those two are absent too, which
+        # `TestTheDayFourReport` asserts.
+        report = summarise(
+            DAY,
+            [order()],
+            audit=[],
+            starting_equity=Decimal(100_000),
+            ending_equity=Decimal(100_000),
+            coverage=Coverage(evaluated_minutes=390, session_minutes=390, open_at=T0),
+        )
 
         assert [s.name for s in report.absent] == ["feed incidents"]
 
@@ -204,3 +221,117 @@ class TestRendering:
         )
 
         assert "NOT MEASURED" not in render(report)
+
+
+def venue_rejected(reason: str) -> Order:
+    built = order(status=OrderStatus.REJECTED)
+    built.reject_reason = reason
+    return built
+
+
+class TestTheDayFourReport:
+    """docs/paper-week/day-4-review.md, F4: four of the five numbers were wrong.
+
+    `209 submitted` was every row; 102 reached the venue and were accepted and
+    107 were rejected by it. `0 refused` hid 38 exits the venue refused. There
+    was no P&L. And the window was the last 24 hours, not the trading day (that
+    one is the scheduler's, and is tested there).
+    """
+
+    def _day(self) -> list[Order]:
+        return (
+            [order() for _ in range(3)]
+            + [order(status=OrderStatus.CANCELLED) for _ in range(2)]
+            + [venue_rejected("insufficient qty available for order") for _ in range(4)]
+            + [venue_rejected("potential wash trade detected. use complex orders")]
+            + [order(status=OrderStatus.REJECTED_RISK, rejected_by="kill_switch")]
+        )
+
+    def test_submitted_means_reached_the_venue_not_has_a_row(self) -> None:
+        report = summarise(DAY, self._day())
+
+        assert report.orders_submitted == 10, "11 rows; one never left the risk chain"
+        assert report.orders_accepted == 5
+        assert report.orders_rejected_by_venue == 5
+        assert report.orders_refused == 1
+        assert report.orders_filled == 3
+
+    def test_a_venue_rejection_is_counted_and_named(self) -> None:
+        report = summarise(DAY, self._day())
+
+        venue = next(s for s in report.sections if s.name == "venue rejections")
+        assert venue.value == 5
+        assert venue.detail.startswith("x4 insufficient qty available")
+        assert report.rejections_by_reason == {
+            "insufficient qty available for order": 4,
+            "potential wash trade detected. use complex orders": 1,
+        }
+
+    def test_the_headline_says_what_the_venue_did(self) -> None:
+        headline = summarise(DAY, self._day()).headline()
+
+        assert headline == (
+            "10 submitted, 5 accepted, 3 filled, 5 rejected by the venue, 1 refused by risk"
+        )
+
+    def test_a_day_of_nothing_but_risk_refusals_is_not_silence(self) -> None:
+        """Every order refused before submission is not "no orders submitted"
+        in the sense that sentence is read: the strategy spoke."""
+        headline = summarise(DAY, [order(status=OrderStatus.REJECTED_RISK)]).headline()
+
+        assert "1 refused by risk" in headline
+
+    def test_missing_equity_is_an_absent_section_not_a_silent_one(self) -> None:
+        report = summarise(DAY, [order()], audit=[])
+
+        assert "equity" in [s.name for s in report.absent]
+        assert "NOT MEASURED" in render(report)
+
+    def test_there_is_no_realised_pnl_field_to_misread(self) -> None:
+        """It summed the day's fill cash flows, which is not a P&L."""
+        assert not hasattr(summarise(DAY, [order()]), "realised_pnl")
+
+
+class TestCoverage:
+    """F11: minutes of RTH with an evaluating runner, against minutes of RTH."""
+
+    def test_it_is_absent_when_nobody_could_count_it(self) -> None:
+        section = next(s for s in summarise(DAY, []).sections if s.name == "RTH coverage")
+
+        assert section.is_absent
+        assert section.how_to_check
+
+    def test_it_reports_minutes_against_the_session(self) -> None:
+        report = summarise(
+            DAY, [], coverage=Coverage(evaluated_minutes=355, session_minutes=390, open_at=T0)
+        )
+
+        section = next(s for s in report.sections if s.name == "RTH coverage")
+        assert section.value == 355
+        assert section.detail.startswith("355 of 390 regular-hours minutes")
+
+    def test_minutes_before_this_process_are_named_not_counted_as_gaps(self) -> None:
+        """Day 4's worker restarted at 14:04. The minutes before that belong to
+        a process this one cannot see, which is not the same as uncovered."""
+        report = summarise(
+            DAY,
+            [],
+            coverage=Coverage(
+                evaluated_minutes=355,
+                session_minutes=390,
+                open_at=T0,
+                visible_from=T0 + timedelta(minutes=34),
+            ),
+        )
+
+        section = next(s for s in report.sections if s.name == "RTH coverage")
+        assert "first 34 minute(s) belong to a process it cannot see" in section.detail
+
+
+class TestCountOutcomes:
+    def test_an_order_not_yet_sent_is_neither_accepted_nor_rejected(self) -> None:
+        pending = order(status=OrderStatus.PENDING_SUBMIT)
+
+        outcomes = count_outcomes([pending])
+
+        assert (outcomes.recorded, outcomes.sent, outcomes.accepted) == (1, 0, 0)

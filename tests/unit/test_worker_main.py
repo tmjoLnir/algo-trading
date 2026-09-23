@@ -26,6 +26,8 @@ from atp_core.worker import DEFAULT_WORKER_CONFIG, WorkerConfig
 from atp_core.worker.config import parse_symbol_list
 from atp_worker.main import (
     HALT_ACTOR,
+    STOP_GRACE_SECONDS,
+    ShutdownSignal,
     WorkerError,
     _active_halts,
     _announce_death,
@@ -342,3 +344,89 @@ class TestAnnouncingADeath:
         await supervise({"ingestor": Watcher().run}, stop_event=stop, alerts=alerts)
 
         assert alerts.sent == []
+
+
+class TestShutdownIsSaidOutLoud:
+    """docs/paper-week/day-4-review.md, F10: every other container logged its
+    shutdown; the worker logged nothing, so a stop and a crash were
+    indistinguishable, and B2's shutdown write had no evidence it ever ran."""
+
+    def test_receipt_is_logged_before_anything_is_cancelled(self) -> None:
+        import signal
+
+        from structlog.testing import capture_logs
+
+        stop = asyncio.Event()
+        with capture_logs() as logs:
+            ShutdownSignal(stop).received(signal.SIGTERM)
+
+        assert stop.is_set()
+        line = next(e for e in logs if e["event"] == "worker.stopping")
+        assert line["signal"] == "SIGTERM"
+
+    def test_the_end_carries_the_measured_drain(self) -> None:
+        import signal
+
+        from structlog.testing import capture_logs
+
+        ticks = iter([100.0, 104.5])
+        shutdown = ShutdownSignal(asyncio.Event(), monotonic=lambda: next(ticks))
+        shutdown.received(signal.SIGTERM)
+
+        with capture_logs() as logs:
+            shutdown.finished(clean=True)
+
+        line = next(e for e in logs if e["event"] == "worker.stopped")
+        assert line["drain_seconds"] == 4.5
+        assert not [e for e in logs if e["event"] == "worker.slow_drain"]
+
+    def test_a_drain_past_half_the_grace_period_warns(self) -> None:
+        import signal
+
+        from structlog.testing import capture_logs
+
+        ticks = iter([0.0, STOP_GRACE_SECONDS * 0.6])
+        shutdown = ShutdownSignal(asyncio.Event(), monotonic=lambda: next(ticks))
+        shutdown.received(signal.SIGTERM)
+
+        with capture_logs() as logs:
+            shutdown.finished(clean=True)
+
+        assert [e for e in logs if e["event"] == "worker.slow_drain"]
+
+    def test_a_teardown_that_raised_does_not_claim_a_clean_stop(self) -> None:
+        import signal
+
+        from structlog.testing import capture_logs
+
+        shutdown = ShutdownSignal(asyncio.Event())
+        shutdown.received(signal.SIGTERM)
+
+        with capture_logs() as logs:
+            shutdown.finished(clean=False)
+
+        events = [e["event"] for e in logs]
+        assert "worker.stop_incomplete" in events
+        assert "worker.stopped" not in events
+
+    def test_nothing_is_said_when_no_signal_started_it(self) -> None:
+        """A responsibility dying is `supervise`'s to report, loudly. This must
+        not add a line claiming a clean stop to it."""
+        from structlog.testing import capture_logs
+
+        with capture_logs() as logs:
+            ShutdownSignal(asyncio.Event()).finished(clean=False)
+
+        assert logs == []
+
+    async def test_supervise_no_longer_claims_the_stop_before_teardown(self) -> None:
+        from structlog.testing import capture_logs
+
+        stop = asyncio.Event()
+        stop.set()
+        with capture_logs() as logs:
+            await supervise({"ingestor": Watcher().run}, stop_event=stop)
+
+        events = [e["event"] for e in logs]
+        assert "worker.responsibilities_cancelled" in events
+        assert "worker.stopped" not in events, "the book has not been written yet"

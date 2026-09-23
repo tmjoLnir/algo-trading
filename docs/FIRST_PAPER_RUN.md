@@ -5,12 +5,14 @@ wrong. This is the deliberate act that Phase 4's *Verifiable:* line asks for:
 
 > a strategy trades the paper account for a week and reconciles clean
 
-Everything in Phase 4 is built and every test passes against fakes. **Nothing in
-it has met Alpaca.** That is the gap this closes, and the reason to expect
-surprises rather than a clean first attempt: #34 is the standing precedent —
-market-data fixtures written from the vendor's documentation disagreed with the
-real wire in three ways at once, and a parser that rejected every live quote
-still passed 648 unit tests.
+Everything in Phase 4 is built and every test passes against fakes. **It has met
+Alpaca, and the week has not been shown.** Days 1 to 4 of the paper week ran
+against the paper account: day 4 alone placed 209 venue orders, took 236 fills
+and reconciled clean 78 times (docs/paper-week/). Every one of those days was
+voided by a defect it found, which is the reason to expect surprises rather than
+a clean first attempt. #34 is the older precedent: market-data fixtures written
+from the vendor's documentation disagreed with the real wire in three ways at
+once, and a parser that rejected every live quote still passed 648 unit tests.
 
 ---
 
@@ -301,30 +303,46 @@ timeframe different from `WorkerConfig.timeframe`. `scripts/preflight.py` report
 the same mismatch as a `FAIL` before you get there.
 
 `sma_crossover` declares `1d` and the worker defaults to `1m`, so the shipped
-pairing is a mismatch: set `strategy_params` to `{"timeframe": "1m"}` on the
-Config tab — **and re-tune the periods for it**. A 20/50 pair means twenty and
-fifty *days* on a daily series and twenty and fifty *minutes* on a minute one.
-Those are different strategies, and day 2 traded the second while its
-configuration described the first.
+pairing is a mismatch. **Resolve it on the worker's side: set the worker to
+`1d`.** That is the series the strategy was written and backtested for, and
+since ADR 0034 it is one the live runner can trade. A daily worker is asked
+once per session, at the open, on the previous session's bar, which
+`refresh_session_bars` fetches half an hour before.
 
-**Resolve it on the strategy's side, not the worker's, because the worker's side
-is not available.** `1m` is the only series this platform can trade today: the
-realtime feed carries minute bars and takes no argument asking for anything else,
-and nothing writes a coarser bar while the market is open. A worker set to `1d`
-would read a column the ingestor never writes — no bar would close, `on_bar`
-would never be called, and the session would report health and decide nothing,
-which is what day 1 did for ten hours. `trading.require_deliverable_timeframe`
-now refuses to start on it and `make preflight` FAILs on it first, so the mistake
-is loud rather than silent — but it is still a mistake, and the remedy is the
-strategy's parameter.
+`docs/paper-week/f8-timeframe-and-stop-sizing.md` is why this is the only
+configuration worth a paper week. It measured 26 configurations over 346,643
+real bars: every intraday cell loses money and every daily one makes it. The
+shipped 20/50 ×2 at `1m` returns −58.23% with a 0.86% win rate, so a `1m`
+session exercises the platform and says nothing about the strategy.
 
-**Be clear-eyed about what that costs.** `docs/paper-week/f8-timeframe-and-stop-sizing.md`
-measured 26 configurations over 346,643 real bars: every intraday cell loses money
-and every daily one makes it, and the shipped 20/50 ×2 at `1m` returns −58.23%
-with a 0.86% win rate. So a session run this way exercises the platform, not the
-strategy. Running `sma_crossover` on the series it was written for needs a job
-that writes daily bars during or after a session — see
-`docs/paper-week/day-5-readiness.md`, §3.2.
+Before the open, in this order:
+
+1. **Backfill daily bars** for the whole watchlist. Warmup needs
+   `warmup_bars + 1` sessions (52 for the shipped 20/50), and `make preflight`
+   prints the exact command for any symbol that is short:
+   `uv run python scripts/backfill_bars.py --symbols <names> --start <date> --timeframe 1d --verify`.
+   `--start` is required. About 90 calendar days back covers 52 sessions with
+   room for holidays.
+2. **On the Config tab, set the worker's timeframe to `1d`**, and leave
+   `strategy_params` without a `timeframe` (the strategy's own default is `1d`),
+   or set it to `{"timeframe": "1d"}`. Save.
+3. **`make preflight`** must PASS `ingest`, `timeframe`, `strategy`, and every
+   `history` line.
+4. **At the open, read `runner.warmed_up`.** `stop_width_bps` should be in the
+   hundreds (~400 for `atr x2 period=14` on daily bars), not ~12. Also read
+   `runner.decision_bar_missing`: it must be absent, or name only symbols you
+   have chosen to lose for the day.
+
+What a daily worker costs: one decision per symbol per session, so a week is
+five decisions per symbol, not thousands. Engine-side checks (trailing
+ratchets, time exits) also run once per session. The venue-side GTC stop is
+unaffected and is the protection that matters (ADR 0034, *Consequences*).
+
+`1m` remains deliverable and remains the default. Run it only to exercise the
+platform, and re-tune the periods if you do: 20/50 means twenty and fifty
+*minutes* there, which is a different strategy from the one backtested. Every
+other timeframe is refused at start (`trading.require_deliverable_timeframe`)
+and FAILs preflight, because nothing writes those bars.
 
 ---
 

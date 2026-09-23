@@ -273,7 +273,10 @@ class RiskEngine:
         not: calling it twice in one session re-anchors to a possibly drawn-down
         number and silently grants the day a second allowance, which is the
         mistake `DailyLossLimitRule.day_start_equity` warns about. Call it on
-        the boundary, not on the loop.
+        the boundary, not on the loop. The live runner calls it once per
+        session, on the first evaluation's marks, and restores a stored anchor
+        rather than taking a fresh one after a restart
+        (`StrategyRunner._anchor_if_pending`).
         """
         anchored = 0
         for rule in self.rules:

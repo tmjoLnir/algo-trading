@@ -1983,22 +1983,34 @@ export interface components {
              * Format: date
              */
             day: string;
+            /** Ending Equity */
+            ending_equity: string | null;
             /** Headline */
             headline: string;
             /** Not Measured */
             not_measured: string[];
+            /** Orders Accepted */
+            orders_accepted: number;
             /** Orders Filled */
             orders_filled: number;
             /** Orders Refused */
             orders_refused: number;
+            /** Orders Rejected By Venue */
+            orders_rejected_by_venue: number;
             /** Orders Submitted */
             orders_submitted: number;
             /** Refusals By Rule */
             refusals_by_rule: {
                 [key: string]: number;
             };
+            /** Rejections By Reason */
+            rejections_by_reason: {
+                [key: string]: number;
+            };
             /** Sections */
             sections: components["schemas"]["DailySectionView"][];
+            /** Starting Equity */
+            starting_equity: string | null;
             /** Symbols */
             symbols: string[];
             /** Text */

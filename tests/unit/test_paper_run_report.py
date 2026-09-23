@@ -256,7 +256,10 @@ class TestTheVerdict:
             equity_over(5),
             strategy_id=STRATEGY,
         )
-        assert report.orders_submitted == 2
+        # 1, not 2: the refused order has a row and never reached the venue.
+        # Counting rows is day 4's "209 submitted" (day-4-review.md, F4).
+        assert report.orders_submitted == 1
+        assert report.orders_accepted == 1
         assert report.orders_filled == 1
         assert report.orders_refused == 1
         assert report.fills == 2

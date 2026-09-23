@@ -3509,3 +3509,414 @@ class TestTheUnprotectedLineSaysWhy:
 
         line = next(e for e in logs if e["event"] == "runner.position_unprotected")
         assert line["refusals"] == ["potential wash trade detected. use complex orders"]
+
+
+class FakeAnchorStore:
+    """In-memory `SessionAnchorStore`. `broken` makes every read raise."""
+
+    def __init__(self) -> None:
+        self.anchors: dict[tuple[RunMode, date], Decimal] = {}
+        self.broken = False
+        self.puts: list[tuple[RunMode, date, Decimal]] = []
+
+    async def get(self, run_mode: RunMode, day: date) -> Decimal | None:
+        if self.broken:
+            raise ConnectionError("redis is down")
+        return self.anchors.get((run_mode, day))
+
+    async def put(self, run_mode: RunMode, day: date, equity: Decimal) -> None:
+        self.puts.append((run_mode, day, equity))
+        self.anchors[(run_mode, day)] = equity
+
+
+class TestTheSessionIsAnchoredOnFreshMarks:
+    """§3.5 of docs/paper-week/day-5-readiness.md, found by reading the code.
+
+    `warmup` anchored the daily loss limit on `portfolio.equity` before anything
+    had marked the book. After a restart that is cash plus the inherited
+    positions at the prices restored from the snapshot. The first `_mark`
+    reprices them at today's quotes, and the rule would measure the gap as
+    today's loss. `_escalate` turns the first such refusal into a global halt
+    for the session.
+
+    And `day_start_equity`'s promise to survive a restart was implemented
+    nowhere, so a restart to clear that halt would grant a second allowance.
+    """
+
+    SESSION = START.date()
+
+    @staticmethod
+    def _rule(runner: StrategyRunner) -> Any:
+        return next(
+            r for r in runner.router.risk_engine.rules if getattr(r, "name", "") == DAILY_LOSS_RULE
+        )
+
+    def _inherited(
+        self, *, store: FakeAnchorStore | None = None, alerts: RecordingAlertSink | None = None
+    ) -> tuple[StrategyRunner, Portfolio]:
+        """100 SPY carried in, its restored mark stale at 50; today's quote is 60."""
+        runner, _router, _switch, _rec, portfolio, _slept = build(alerts=alerts)
+        runner.anchor_store = store
+        position = portfolio.position(SYMBOL)
+        position.qty = Decimal(100)
+        position.avg_entry_price = Decimal(50)
+        position.last_price = Decimal(50)
+        runner.quote_cache.quotes[SYMBOL] = Quote(  # type: ignore[attr-defined]
+            symbol=SYMBOL, ts=START, bid=Decimal("59.99"), ask=Decimal("60.01")
+        )
+        return runner, portfolio
+
+    @pytest.mark.asyncio
+    async def test_the_anchor_is_taken_on_the_first_passs_marks(self) -> None:
+        """**The finding.** Without the fix the anchor is 100,000 + 100 × 50,
+        the restored mark, and the first pass reads +1,000 as today's P&L on a
+        book that has not traded."""
+        runner, portfolio = self._inherited()
+        await runner.warmup(portfolio)
+        assert self._rule(runner).day_start_equity is None, "owed, not yet taken"
+
+        await runner.evaluate(portfolio)
+
+        assert self._rule(runner).day_start_equity == Decimal(100_000) + 100 * Decimal(60)
+        assert self._rule(runner).day_start_equity == portfolio.equity
+
+    @pytest.mark.asyncio
+    async def test_it_is_taken_once_per_session_not_per_pass(self) -> None:
+        """Re-anchoring each pass would follow a losing book down and never
+        trip. That is the second allowance, granted every minute."""
+        runner, portfolio = self._inherited()
+        await runner.warmup(portfolio)
+        await runner.evaluate(portfolio)
+        anchored = self._rule(runner).day_start_equity
+
+        runner.quote_cache.quotes[SYMBOL] = Quote(  # type: ignore[attr-defined]
+            symbol=SYMBOL, ts=START, bid=Decimal("39.99"), ask=Decimal("40.01")
+        )
+        await runner.evaluate(portfolio)
+
+        assert self._rule(runner).day_start_equity == anchored
+
+    @pytest.mark.asyncio
+    async def test_a_fresh_anchor_is_stored_under_the_session_date(self) -> None:
+        store = FakeAnchorStore()
+        runner, portfolio = self._inherited(store=store)
+        await runner.warmup(portfolio)
+
+        await runner.evaluate(portfolio)
+
+        assert store.puts == [(RunMode.PAPER, self.SESSION, Decimal(106_000))]
+
+    @pytest.mark.asyncio
+    async def test_a_restart_restores_the_sessions_anchor(self) -> None:
+        """**The promise nothing kept.** The book is down since the open, which
+        is why the worker was restarted. The day's start is still the open's
+        equity, so the allowance already spent stays spent."""
+        store = FakeAnchorStore()
+        store.anchors[(RunMode.PAPER, self.SESSION)] = Decimal(110_000)
+        runner, portfolio = self._inherited(store=store)
+        await runner.warmup(portfolio)
+
+        await runner.evaluate(portfolio)
+
+        assert self._rule(runner).day_start_equity == Decimal(110_000)
+        assert store.puts == [], "a restored anchor is not re-written"
+
+    @pytest.mark.asyncio
+    async def test_a_store_that_cannot_answer_leaves_the_rule_closed(self) -> None:
+        """ "Cannot tell" is not "not anchored yet". Anchoring fresh here is the
+        second allowance, so the rule stays default-closed (entries refused,
+        exits allowed), and a human is told."""
+        store = FakeAnchorStore()
+        store.broken = True
+        alerts = RecordingAlertSink()
+        runner, portfolio = self._inherited(store=store, alerts=alerts)
+        await runner.warmup(portfolio)
+
+        with capture_logs() as logs:
+            await runner.evaluate(portfolio)
+            await runner.evaluate(portfolio)
+
+        assert self._rule(runner).day_start_equity is None
+        unreadable = [e for e in logs if e["event"] == "runner.session_anchor_unreadable"]
+        assert len(unreadable) == 1, "said once, not every pass"
+        # Filtered by key: the held SPY has no stop in this fake, so the
+        # unprotected page rightly fires as well.
+        paged = [a for a in alerts.sent if a.key == "risk.session_anchor_unreadable"]
+        assert len(paged) == 1
+        assert paged[0].severity is Severity.CRITICAL
+
+    @pytest.mark.asyncio
+    async def test_an_unpriced_book_defers_the_anchor(self) -> None:
+        """An unmarked holding is worth zero in `equity`, so anchoring now would
+        set the day's start too low and widen the allowance once it is priced."""
+        runner, portfolio = self._inherited()
+        held = portfolio.position("XYZ")
+        held.qty = Decimal(10)
+        held.avg_entry_price = Decimal(20)
+        held.last_price = None
+        await runner.warmup(portfolio)
+
+        await runner.evaluate(portfolio)
+        assert self._rule(runner).day_start_equity is None
+
+        runner.quote_cache.quotes["XYZ"] = Quote(  # type: ignore[attr-defined]
+            symbol="XYZ", ts=START, bid=Decimal("19.99"), ask=Decimal("20.01")
+        )
+        await runner.evaluate(portfolio)
+        assert self._rule(runner).day_start_equity == Decimal(106_000) + 10 * Decimal(20)
+
+    @pytest.mark.asyncio
+    async def test_a_new_session_is_anchored_again(self) -> None:
+        """`warmup` re-runs at each open, and each open owes its own anchor."""
+        runner, portfolio = self._inherited()
+        await runner.warmup(portfolio)
+        await runner.evaluate(portfolio)
+
+        runner.quote_cache.quotes[SYMBOL] = Quote(  # type: ignore[attr-defined]
+            symbol=SYMBOL, ts=START, bid=Decimal("69.99"), ask=Decimal("70.01")
+        )
+        await runner.warmup(portfolio, at_session_open=True)
+        await runner.evaluate(portfolio)
+
+        assert self._rule(runner).day_start_equity == Decimal(107_000)
+
+
+class TestAVenueRefusalIsNotARiskRefusal:
+    """docs/paper-week/day-4-review.md, F3. Day 4 logged 38 refused exits as
+    `runner.signal_refused rule= reason=` and counted them against a risk chain
+    that had refused nothing. A venue refusal comes back with the chain's
+    approving decision; the venue's words are on the order."""
+
+    @pytest.mark.asyncio
+    async def test_it_is_counted_and_logged_as_the_venues(self) -> None:
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+
+        async def venue_refuses(signal: Signal, *_: Any, **__: Any) -> SubmitResult:
+            order = Order(symbol=SYMBOL, side=Side.BUY, qty=Decimal(10))
+            order.status = OrderStatus.REJECTED
+            order.reject_reason = "insufficient qty available for order"
+            return SubmitResult(order=order, decision=RiskDecision.allow(), submitted=False)
+
+        router.submit_signal = venue_refuses  # type: ignore[method-assign]
+        with capture_logs() as logs:
+            await runner.evaluate(portfolio)
+
+        assert runner.stats.orders_rejected_by_venue == 1
+        assert runner.stats.orders_rejected_by_risk == 0
+        line = next(e for e in logs if e["event"] == "runner.signal_rejected_by_venue")
+        assert line["reason"] == "insufficient qty available for order"
+        assert not [e for e in logs if e["event"] == "runner.signal_refused"]
+
+    @pytest.mark.asyncio
+    async def test_a_risk_refusal_is_still_a_risk_refusal(self) -> None:
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+        router.refuse_signals = True
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+
+        await runner.evaluate(portfolio)
+
+        assert runner.stats.orders_rejected_by_risk == 1
+        assert runner.stats.orders_rejected_by_venue == 0
+
+
+class TestTheEvaluatedMinutes:
+    """F11: what the daily report's RTH coverage is counted from."""
+
+    @pytest.mark.asyncio
+    async def test_a_successful_pass_records_its_minute_once(self) -> None:
+        runner, _, _, _, portfolio, _ = build()
+        await runner.warmup(portfolio)
+
+        await runner.evaluate(portfolio)
+        await runner.evaluate(portfolio)
+
+        assert runner.stats.evaluated_minutes == {START}
+
+    @pytest.mark.asyncio
+    async def test_a_failed_pass_records_nothing(self) -> None:
+        runner, _, _, _, portfolio, _ = build()
+        await runner.warmup(portfolio)
+
+        async def boom() -> list[Bar]:
+            raise RuntimeError("bar store unreachable")
+
+        runner._refresh_bars = boom  # type: ignore[method-assign]
+        await runner.evaluate(portfolio)
+
+        assert runner.stats.evaluated_minutes == set()
+
+
+class TestProtectionWaitsForTheEntry:
+    """docs/paper-week/day-4-review.md, F5: a stop per partial fill met a venue
+    that refuses an opposite-side stop against a working order, 69 times. The
+    router now defers while the entry works; this is the runner's half."""
+
+    @pytest.mark.asyncio
+    async def test_a_deferral_is_a_known_gap_the_engine_watches_not_a_refusal(self) -> None:
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        orders = FakeOrderRepository()
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)], order_repo=orders)
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+        await runner.evaluate(portfolio)
+
+        async def defer(entry_order: Order, *_: Any, **__: Any) -> ProtectionResult:
+            return ProtectionResult(
+                unprotected_qty=Decimal(10), engine_side_stop=Decimal(95), deferred=True
+            )
+
+        router.submit_protective_orders = defer  # type: ignore[method-assign]
+        with capture_logs() as logs:
+            await runner.on_fill_event(TestFills.a_fill_update("atp-1"), portfolio)
+
+        events = [e["event"] for e in logs]
+        assert "runner.protection_deferred" in events
+        assert "runner.position_unprotected" not in events, "nothing was refused"
+        assert runner._unprotected[SYMBOL] == Decimal(10)
+        assert runner._stop_is_missing(portfolio.position(SYMBOL)), "the engine watches the level"
+        assert not [o for o in orders.saved.values() if o.status is OrderStatus.REJECTED_RISK]
+
+    @pytest.mark.asyncio
+    async def test_an_entry_cancelled_after_a_partial_fill_is_protected_then(self) -> None:
+        """It goes terminal with no new fill, so nothing else would place the
+        stop its fills were waiting for."""
+        partial = Order(
+            symbol=SYMBOL,
+            side=Side.BUY,
+            qty=Decimal(100),
+            client_order_id="atp-part",
+            broker_order_id="brk-part",
+        )
+        partial.status = OrderStatus.PARTIALLY_FILLED
+        partial.filled_qty = Decimal(40)
+        partial.avg_fill_price = Decimal(100)
+        orders = FakeOrderRepository()
+        orders.restorable = [partial]
+        runner, router, _, _, portfolio, _ = build(order_repo=orders)
+        position = portfolio.position(SYMBOL)
+        position.qty = Decimal(40)
+        position.avg_entry_price = Decimal(100)
+        await runner.warmup(portfolio)
+
+        cancelled = TradeUpdate(
+            event="canceled",
+            client_order_id="atp-part",
+            broker_order_id="brk-part",
+            symbol=SYMBOL,
+            at=START,
+            status=OrderStatus.CANCELLED,
+        )
+        await runner.on_fill_event(cancelled, portfolio)
+
+        assert [o.client_order_id for o in router.protected] == ["atp-part"]
+
+
+class TestARefusedStopIsAskedForAgain:
+    """docs/paper-week/day-4-review.md, F9 (day-5-readiness.md §4.4). MSFT's
+    stop was refused `stale_data` 1.2 s before the stream connected and never
+    asked for again: 17 minutes with no venue stop."""
+
+    async def _refused_at_fill(
+        self,
+    ) -> tuple[StrategyRunner, FakeRouter, Portfolio, FakeOrderRepository]:
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        orders = FakeOrderRepository()
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)], order_repo=orders)
+        router.refuse_protection = True
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+        await runner.evaluate(portfolio)
+        await runner.on_fill_event(TestFills.a_fill_update("atp-1"), portfolio)
+        assert SYMBOL in runner._unprotected, "the premise: refused and recorded"
+        return runner, router, portfolio, orders
+
+    @pytest.mark.asyncio
+    async def test_the_next_pass_asks_again_and_the_gap_closes(self) -> None:
+        runner, router, portfolio, _ = await self._refused_at_fill()
+        router.refuse_protection = False  # the quote arrived
+
+        await runner.evaluate(portfolio)
+
+        assert [o.client_order_id for o in router.protected] == ["atp-1", "atp-1"]
+        assert SYMBOL not in runner._unprotected
+        assert SYMBOL not in runner._unprotected_entries
+
+    @pytest.mark.asyncio
+    async def test_a_retry_that_is_refused_again_writes_no_second_row(self) -> None:
+        runner, _router, portfolio, orders = await self._refused_at_fill()
+        rows_before = list(orders.save_calls)
+
+        await runner.evaluate(portfolio)
+
+        refused_rows = [
+            cid
+            for cid in orders.save_calls[len(rows_before) :]
+            if orders.saved[cid].status is OrderStatus.REJECTED_RISK
+        ]
+        assert refused_rows == []
+        assert SYMBOL in runner._unprotected, "still missing, still recorded"
+
+    @pytest.mark.asyncio
+    async def test_a_retry_that_raises_does_not_fail_the_pass(self) -> None:
+        runner, router, portfolio, _ = await self._refused_at_fill()
+        router.protection_raises = RuntimeError("venue unreachable")
+
+        await runner.evaluate(portfolio)
+
+        assert runner.stats.consecutive_errors == 0
+
+    @pytest.mark.asyncio
+    async def test_a_working_entry_is_left_to_finish(self) -> None:
+        """Its stop is deferred on purpose (F5); the event that ends it places it."""
+        runner, router, portfolio, _ = await self._refused_at_fill()
+        entry = runner._unprotected_entries[SYMBOL]
+        entry.status = OrderStatus.PARTIALLY_FILLED
+        router.refuse_protection = False
+
+        await runner.evaluate(portfolio)
+
+        assert [o.client_order_id for o in router.protected] == ["atp-1"]
+
+
+class TestARefusedCloseThatTookTheStopIsWatched:
+    """docs/paper-week/day-5-readiness.md §4.6. A close that released the venue
+    stop, was refused, and could not re-arm left a position with no venue stop,
+    and the engine did not watch the level either, because nothing recorded
+    the gap where `_stop_is_missing` looks."""
+
+    async def _held(self, *, protected: str) -> tuple[StrategyRunner, FakeRouter, Portfolio]:
+        strategy = ScriptedStrategy({0: SignalAction.EXIT})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+        position = portfolio.position(SYMBOL)
+        position.qty = Decimal(10)
+        position.avg_entry_price = Decimal(100)
+        position.stop_loss_price = Decimal(95)
+        router.protected_qty[SYMBOL] = Decimal(protected)
+        router.refuse_signals = True
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+        return runner, router, portfolio
+
+    @pytest.mark.asyncio
+    async def test_a_refused_exit_with_no_venue_stop_left_is_recorded(self) -> None:
+        runner, _router, portfolio = await self._held(protected="0")
+
+        await runner.evaluate(portfolio)
+
+        assert runner._unprotected[SYMBOL] == Decimal(10)
+        assert runner._stop_is_missing(portfolio.position(SYMBOL)), "the engine watches now"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_exit_that_kept_its_stop_records_nothing(self) -> None:
+        """The ordinary refusal: the stop is still at the venue, and an engine
+        watching as well would close the position twice."""
+        runner, _router, portfolio = await self._held(protected="10")
+
+        await runner.evaluate(portfolio)
+
+        assert SYMBOL not in runner._unprotected

@@ -226,3 +226,20 @@ class TestDatabaseCredentials:
         """
         for _, command in check.CONFIGS:
             assert "migrate" in command, command
+
+
+class TestTheWorkersGracePeriod:
+    """docs/paper-week/day-4-review.md, F10: the worker logged nothing when it
+    was stopped. Its drain writes the book (B2) and closes the broker's sockets,
+    so the time Docker allows before SIGKILL is part of the shutdown contract."""
+
+    def test_compose_allows_the_drain_main_measures_against(self) -> None:
+        import yaml
+
+        from atp_worker.main import STOP_GRACE_SECONDS
+
+        compose = yaml.safe_load((SCRIPTS.parent / "docker-compose.yml").read_text())
+        grace = compose["services"]["worker"]["stop_grace_period"]
+
+        assert grace == f"{int(STOP_GRACE_SECONDS)}s"
+        assert STOP_GRACE_SECONDS > 10, "Docker's default is what F10 ran into"

@@ -290,6 +290,7 @@ async def _history_check(
         required=required,
         stored=len(stored),
         newest=stored[-1].ts if stored else None,
+        today=datetime.now(UTC).date(),
     )
 
 

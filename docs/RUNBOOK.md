@@ -901,6 +901,14 @@ values, rather than migrating on a fallback nobody asked for.
 3. Positions are safe if broker-side stops are in place — verify.
 4. Fix, then restart. `warmup()` will reconcile and adopt open positions.
 
+**First tell a stop from a crash.** A stop logs `worker.stopping` (with the signal)
+when it begins and `worker.stopped` (with `drain_seconds`) after the book is written
+and every connection is closed. `worker.stopping` with no `worker.stopped` after it
+means the drain was killed partway, so the book may not have been written:
+compare `drain_seconds` on earlier stops with the service's `stop_grace_period` (30 s).
+`worker.slow_drain` warns when a drain uses more than half of it. No `worker.stopping`
+at all means nothing asked this process to stop, so read the lines before its last.
+
 `worker.config_unreadable` at CRITICAL is a specific and common shape of this:
 the worker reads what it trades from the `worker_config` row (ADR 0023) and
 **refuses to start rather than falling back to the defaults**, because a worker
@@ -908,6 +916,26 @@ that quietly ingested nothing and traded nothing because Postgres blinked would
 stay that way until somebody noticed. Bring the database up and the next restart
 succeeds on its own. `make check-env` and `docker compose ps db` are the two
 things to look at.
+
+## A session that decided nothing
+
+Zero orders is a normal day for a crossover strategy, and it is also what every
+failure below looks like. Before believing it was quiet, check which:
+
+- `runner.signal_discarded_cold` (WARNING): the strategy spoke on a symbol with
+  less history than it declares, and the signal was dropped, as the backtest
+  drops it. Normal for the first `warmup_bars` bars of an intraday session. Many
+  of these all session means history is missing: run `make preflight`.
+  `runner.cold_exit_admitted` is the exception: an exit on a held position,
+  let through because it can only reduce the book.
+- `runner.signal_rejected_by_venue` (WARNING): risk approved it and Alpaca
+  refused it, with Alpaca's reason on the line. Not a risk-configuration
+  problem. `insufficient qty available` means one of our own orders holds the
+  shares, and "A stop released for a close" below applies.
+- `runner.signal_refused` (INFO): the risk chain refused it, with the rule named.
+- `runner.decision_bar_missing`: a `1d` worker had no bar to decide on.
+- The daily report's `RTH coverage` line: how many regular-hours minutes the
+  runner actually evaluated.
 
 ## A saved configuration has not taken effect
 
@@ -989,6 +1017,32 @@ that fixes it. The API checks coverage before queueing, so seeing this from the
 worker means the bars were there at request time and are not now — a restored
 database, or a symbol whose bars were deleted.
 
+## Daily loss limit not anchored (`runner.session_anchor_unreadable`)
+
+*Symptom:* a `CRITICAL` page, *"Daily loss limit could not be anchored — entries are
+blocked"*.
+
+The worker anchors the daily loss limit once per session, on the first evaluation's marks, and
+keeps the anchor in Redis under `atp:risk:session_anchor:<run mode>:<session date>`. A restart
+mid-session restores it, so the day's allowance is not granted twice. This page means the read
+failed: Redis was unreachable, or the stored value does not parse.
+
+**The worker has not guessed.** `DailyLossLimitRule` stays unanchored, which is its
+default-closed state. Every entry is refused for the rest of the session. Exits, including
+stops and flattens, are not.
+
+1. Check Redis (`make up`, `docker compose ps`). The kill switch lives there too, so if Redis
+   is down this is not your only problem.
+2. If the key holds garbage, read it with `redis-cli GET atp:risk:session_anchor:paper:<date>`.
+   If you know the day's starting equity from the broker's own statement, `SET` it to that
+   number. Otherwise `DEL` the key: the next start then anchors fresh on its first pass, and
+   you knowingly grant the day a new allowance.
+3. Restart the worker. `warmup` re-owes the anchor and the first pass takes it.
+
+`runner.session_anchor_deferred` at `WARNING` is the benign cousin. A held position had no
+price on that pass, so anchoring was put off rather than taken too low. It clears on its own
+once the position is marked.
+
 ## Broker unreachable
 
 1. Auto-halts. Confirm.
@@ -1021,6 +1075,19 @@ acknowledged".
 ## Position open with no stop (`order.position_unprotected`, `order.protection_not_rearmed`)
 
 *Symptom:* a `CRITICAL` log with either event name.
+
+`runner.protection_retry` at `INFO` is the runner asking again, on every
+evaluation, for a stop that was refused. A transient refusal (`stale_data`
+before the feed connects, `trading_hours`, `rate_limit`) clears on its own
+within a pass or two. A refusal that repeats every pass is one of the steps
+below.
+
+`order.protection_deferred` / `runner.protection_deferred` at `INFO` are **not** this.
+They mean the entry is still working, so its stop waits for the entry to finish.
+The venue refuses an opposite-side stop against a working order, and the engine
+watches the armed level meanwhile. A market entry closes that gap in about a
+second. A limit entry resting part-filled keeps it open until it fills, is
+cancelled or expires, and the unprotected page will say so while it lasts.
 
 The position is live and the venue holds nothing against it. An engine-side
 level may be armed, which protects you only while the worker is up — that is not
@@ -1093,6 +1160,17 @@ that is a bug worth an issue. Do not add another stop.
 
 ### A stop released for a close
 
+**The release now waits for the venue to confirm each cancel** before retrying
+the close. Alpaca holds the shares through `pending_cancel`, and a retry inside
+that window was refused again. `order.cancel_unconfirmed` (WARNING) means it did
+not confirm within about five seconds and the close was retried anyway.
+`order.protection_filled_during_release` (CRITICAL) means the stop fired first.
+The position is closing at its stop, and the platform sent no second close and
+re-armed nothing. Check the broker's UI that it is flat.
+`runner.protection_lost_on_refused_close` (ERROR) means a refused close left
+shares with no venue stop. The engine is watching the armed level; the steps
+below still apply.
+
 Expect `order.protection_released` immediately before any of this. On the
 ordinary version of the story the stop goes straight back and you get
 `order.protection_rearmed` at `WARNING`, naming the replacement's `level` and
@@ -1159,7 +1237,9 @@ Two lines carry it, and the first one gives you time:
 - `worker.session_bars.missing`, at open−30 or open−15, from the pre-open pull.
   The vendor would not serve the bar. **There is still time to fix it**, and the
   alert carries the command:
-  `uv run python scripts/backfill_bars.py --symbols <names> --timeframe 1d --verify`.
+  `uv run python scripts/backfill_bars.py --symbols <names> --start <previous session date> --timeframe 1d --verify`.
+  `--start` is required by the script. Alerts raised before this fix printed the command
+  without it, and it fails on an argparse error until you add it.
   Re-run it, then check `scripts/status.py` for the newest stored bar per symbol.
 - `runner.decision_bar_missing`, at the open, from warmup. The bar was still not
   there when the runner warmed up. Today's decision on those names is lost; the

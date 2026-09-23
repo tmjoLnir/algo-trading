@@ -20,7 +20,7 @@ discovered during it, and the properties worth pinning follow from that:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -33,6 +33,9 @@ from atp_core.risk.limits import RiskLimits
 from atp_core.worker import WorkerConfig
 from atp_worker import preflight, trading
 from atp_worker.preflight import Check, Preflight, Status
+
+#: A fixed "today" for the backfill command's `--start`.
+TODAY = date(2026, 9, 23)
 
 SECRET = "sk-do-not-print-me-0123456789"
 
@@ -234,7 +237,7 @@ class TestTheExpensiveFailures:
 
     def test_short_history_fails_rather_than_warns(self) -> None:
         check = preflight.check_warmup(
-            "SPY", timeframe=Timeframe.D1, required=51, stored=30, newest=None
+            "SPY", timeframe=Timeframe.D1, required=51, stored=30, newest=None, today=TODAY
         )
         assert check.status is Status.FAIL
         # Says what it would produce, not just that it is short — the reason
@@ -245,10 +248,23 @@ class TestTheExpensiveFailures:
 
     def test_no_history_at_all_names_the_backfill_command(self) -> None:
         check = preflight.check_warmup(
-            "SPY", timeframe=Timeframe.D1, required=51, stored=0, newest=None
+            "SPY", timeframe=Timeframe.D1, required=51, stored=0, newest=None, today=TODAY
         )
         assert check.status is Status.FAIL
         assert "--symbols SPY" in check.fix
+
+    def test_the_backfill_command_carries_the_start_it_requires(self) -> None:
+        """`scripts/backfill_bars.py` requires `--start`. Every fix line printed
+        for it omitted the flag, so pasting one exited on an argparse error.
+        51 sessions is 72 calendar days, plus 14 for holidays."""
+        check = preflight.check_warmup(
+            "SPY", timeframe=Timeframe.D1, required=51, stored=0, newest=None, today=TODAY
+        )
+        assert "--start 2026-06-29 " in check.fix
+
+    def test_an_intraday_backfill_starts_today(self) -> None:
+        """Warmup is floored at this session's open, so older minutes warm nothing."""
+        assert preflight.backfill_start(Timeframe.M1, 51, TODAY) == TODAY
 
     def test_enough_history_passes_and_reports_how_stale_it_is(self) -> None:
         check = preflight.check_warmup(
@@ -257,6 +273,7 @@ class TestTheExpensiveFailures:
             required=51,
             stored=200,
             newest=datetime(2026, 8, 20, tzinfo=UTC),
+            today=TODAY,
         )
         assert check.status is Status.PASS
         assert "2026-08-20" in check.detail

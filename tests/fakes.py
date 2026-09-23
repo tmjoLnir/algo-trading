@@ -133,6 +133,17 @@ class FakeBroker:
         #: `reads_fail`: the lookup succeeds and the retraction does not,
         #: which is the case where an order is known to still be working.
         self.cancel_refuses: set[str] = set()
+        #: Acknowledge a cancel only after this many `get_order` reads of the
+        #: order, standing in for Alpaca's `pending_cancel`: the order stays
+        #: working, and keeps holding its shares, until then. Zero, the default,
+        #: cancels in the same call, which is what every test before this
+        #: assumed and what hid the retry landing inside that window
+        #: (docs/paper-week/day-5-readiness.md, §6).
+        self.cancel_ack_after = 0
+        self._pending_cancel: dict[str, int] = {}
+        #: Venue order ids that fill when asked to cancel: the race the cancel
+        #: can lose, where the stop fires first.
+        self.fill_on_cancel: set[str] = set()
         #: Whether a working order reserves the shares it covers, so a second
         #: order over the same inventory is refused. **On by default, because
         #: the venue does it and a fake that did not let day 4 of the paper week
@@ -245,13 +256,25 @@ class FakeBroker:
         self.cancelled.append(broker_order_id)
         for held in self.accepted.values():
             if held.broker_order_id == broker_order_id and not held.is_complete:
-                held.status = OrderStatus.CANCELLED
+                if broker_order_id in self.fill_on_cancel:
+                    held.filled_qty = held.qty
+                    held.status = OrderStatus.FILLED
+                elif self.cancel_ack_after > 0:
+                    self._pending_cancel[broker_order_id] = self.cancel_ack_after
+                else:
+                    held.status = OrderStatus.CANCELLED
 
     async def get_order(self, broker_order_id: str) -> Order | None:
         self._guard_reads()
-        return next(
+        held = next(
             (o for o in self.accepted.values() if o.broker_order_id == broker_order_id), None
         )
+        if held is not None and broker_order_id in self._pending_cancel:
+            self._pending_cancel[broker_order_id] -= 1
+            if self._pending_cancel[broker_order_id] <= 0:
+                del self._pending_cancel[broker_order_id]
+                held.status = OrderStatus.CANCELLED
+        return held
 
     async def get_open_orders(self) -> list[Order]:
         self._guard_reads()

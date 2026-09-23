@@ -101,7 +101,7 @@ And the findings §8 did not enumerate:
 |---|---|---|
 | F3 | Venue rejection reported as a risk refusal, fields blank | **not fixed** — reproduced in the probe above: `approved=True rule='' reason=''` |
 | F9 | Boot-race refuses a recovered position's stop, never re-arms | **not fixed** — nothing in `risk/` or the recovery path changed |
-| F10 | Worker logs nothing on shutdown | **not fixed** — which is why B2's shutdown snapshot has no foundation |
+| F10 | Worker logs nothing on shutdown | **not fixed** — which is why B2's shutdown snapshot has no foundation. *(Fixed later by #167: `worker.stopping` / `worker.stopped` with `drain_seconds`, and a 30 s `stop_grace_period`.)* |
 | F12/F13 | Papercuts — fee double-settle, nginx `Date`, WS reconnects, bar-write amplification | **not fixed** |
 
 One verifiable summary of the six that did not start:
@@ -349,6 +349,20 @@ The honest caveat, which #159 states: one daily session is one bar per symbol. A
 five decisions per symbol, not two thousand. This does not make day 5 conclusive. It makes day 5
 worth recording.
 
+> **The documentation half closed by #167.** ADR 0034 made the flip executable, but the
+> pages an operator reads before the open still said otherwise. `FIRST_PAPER_RUN.md` ("The
+> strategy's series must match the worker's") now recommends `1d` and lists the steps:
+> backfill, Config tab, preflight, and what to read at the open. The F8 page says its advice
+> became executable with ADR 0034, and points there. The flip itself is still a row an operator
+> edits, and nobody has made it yet.
+>
+> **One defect found on the way, and fixed in the same diff.** `scripts/backfill_bars.py`
+> requires `--start`. The command printed by the pre-open `worker.session_bars.missing` alert,
+> by preflight's `history` checks, and by `RUNBOOK.md` all omitted it. So the one command the
+> `1d` path tells an operator to paste before the bell exited on an argparse error. The alert
+> now carries `--start <the missing session>`. Preflight prints a start far enough back for the
+> strategy's warmup, and the runbook says so.
+
 ### 3.3 The warmup gate discards exits, not just entries `blocker at 1m`
 
 `_poll_strategy` (`runner.py:1599`) discards every signal on a symbol with `have <= warm_after`.
@@ -471,6 +485,25 @@ Redis key, no snapshot field — six hits, all inside `rules.py`. The guarantee 
 docstring, warned about in a second (`engine.py:275`), and implemented nowhere. A restart to
 clear the halt above would grant day 5 a fresh 3% on top of the loss already taken.
 
+> **Closed by #167**, recorded here rather than by editing the finding above.
+>
+> - **The stale anchor.** `warmup` no longer anchors. It records that the session owes one,
+>   and `_anchor_if_pending` takes it on the first evaluation, right after that pass's
+>   `_mark`. So the anchor uses exactly the marks that pass's risk checks use, and the first
+>   comparison starts at zero by construction. This goes further than "mark in warmup, then
+>   anchor", which would still leave the first pass's quotes and the anchor's quotes
+>   different.
+> - **An unpriced book defers.** An unmarked holding is worth zero in `equity`, so anchoring
+>   then would set the day's start too low and widen the allowance. It retries next pass, and
+>   the rule stays default-closed meanwhile.
+> - **Persisted.** A new port, `risk.ports.SessionAnchorStore`, has a Redis adapter keyed by
+>   run mode and session date. A restart restores the stored anchor and does not re-anchor.
+>   A store that cannot answer leaves the rule unanchored (entries refused, exits allowed) and
+>   pages CRITICAL. "Cannot tell" is never read as "not anchored yet". `RUNBOOK.md` has the
+>   section the page links to.
+>
+> Established from the code and tests only: day 5 has not run.
+
 ---
 
 ## 4. Not fixed, and carried from day 4
@@ -490,6 +523,27 @@ book may have been reconstructed from the broker it is being checked against.
 `docs/ROADMAP.md:1627-1644` states this correctly and in the same diff as the day-4 review,
 which is CLAUDE.md §6 working as intended.
 
+> **Closed by #167** (added to that PR after §3's fixes), recorded here rather than by editing
+> the finding above.
+>
+> - **On fill.** `on_fill_event` writes the book after every booked fill, last, so the orders
+>   the fill touched land first. Boot-time catch-up fills go through the same path, so a restart
+>   that books a missed fill writes the book too.
+> - **From the reconcile job.** `reconcile_with_broker` calls `StrategyRunner.checkpoint` after
+>   every clean run, which is every five minutes during market hours, whether or not the
+>   strategy is evaluating. It writes nothing on a divergence, because a disputed book is
+>   already halted on.
+> - **At shutdown.** `StrategyRunner.shutdown` writes it. This is only as reliable as the
+>   shutdown path. F10 is now fixed in the same PR: `worker.stopping` is logged at the
+>   signal, and `worker.stopped` with `drain_seconds` once `run` has unwound, after this
+>   write. The grace period is 30 s instead of Docker's 10.
+> - **The age.** `worker.restored_book` carries `snapshot_at` and `age_seconds`.
+>
+> Every out-of-loop write takes the runner's lock, swallows a storage failure
+> (`runner.book_unwritten`, ERROR), and refuses to write before `warmup` binds the real book.
+> Without that last guard, an early shutdown would overwrite the stored book with an empty
+> placeholder. Proven by unit tests only: no worker has yet been restarted on this code.
+
 ### 4.2 F4 and F11 — the only end-of-day artifact still prints four wrong numbers `high`
 
 `libs/core/src/atp_core/analytics/daily.py` and `paper_run.py` do not appear in
@@ -507,6 +561,31 @@ was**, and an operator reading them would again conclude the risk configuration 
 F3's own severity is observability, not blocking — the blocking weight it was assigned during
 this check is borrowed from §3.1 and belongs there.
 
+> **Closed by #167** (added after §3's fixes and B2), recorded here rather than by editing the
+> finding above.
+>
+> - **Submitted vs accepted.** `analytics.daily.count_outcomes` is now the one count both
+>   reports use. `orders_submitted` means reached the venue, split into `orders_accepted` and
+>   `orders_rejected_by_venue`. Venue rejections get their own section, ranked by the venue's
+>   words.
+> - **Refused vs refused-by-risk.** `orders_refused` is refused before submission only, and the
+>   headline names both kinds.
+> - **The window.** `scheduler.report_window` uses the session that just closed, from the
+>   previous session's close, labelled with that session's date.
+> - **P&L.** Equity comes from the session's first and last snapshots. When one end is missing,
+>   the report lists an absent `equity` section. The `realised_pnl` field, which summed fill cash
+>   flows, is removed.
+> - **RTH coverage.** `RunnerStats.evaluated_minutes` records each minute in which an evaluation
+>   succeeded, and the report counts them inside the session's regular hours. It is in the
+>   worker's memory only: the API's report says so, and a restarted worker names the minutes
+>   before it started as not visible, not as uncovered.
+> - **F3.** `_submit` now separates a venue refusal (an approved decision, not submitted) from a
+>   risk refusal. It counts `orders_rejected_by_venue`, logs `runner.signal_rejected_by_venue`
+>   with the venue's reason, and no longer escalates it as a risk event. The session summary at
+>   the bell names both counts.
+>
+> Proven by unit tests only: no session has produced a report on this code.
+
 ### 4.3 F5 — protection is still submitted against a working parent `medium`
 
 `_protect` is still called on every fill (`runner.py:2001`) with no `is_complete` gate, and
@@ -515,12 +594,31 @@ unprotected windows, and the alert-budget exhaustion in the first thirty seconds
 blocking on its own; it is what makes §3.4's silence expensive, because it is what fills the
 budget before anything real happens.
 
+> **Closed by #167** (added after F10), recorded here rather than by editing the finding above.
+> `submit_protective_orders` still arms the level on every fill, but while the entry is working
+> it places nothing and returns `ProtectionResult(deferred=True)`. The covered total does not
+> move, so the fill that completes the entry places **one** stop over everything it filled. The
+> runner records a deferred gap in `_unprotected`, which makes `_stop_is_missing` have the engine
+> watch the armed level: that is the engine-side stop covering the gap, as day 3 and day 4 both
+> asked. It is logged at INFO and is not a refusal. An entry that part-fills and is then
+> cancelled or expires goes terminal with no new fill, so `on_fill_event` now protects on that
+> transition too; otherwise its remainder would never get a venue stop. Proven by unit tests
+> only.
+
 ### 4.4 F9 — a stop refused at boot is never re-armed `medium`
 
 Nothing in `libs/core/src/atp_core/risk/` or the recovery path changed. The ordering that
 refused MSFT's stop with `stale_data` 1.2 seconds before `stream_connected` is intact, and there
 is still no retry. Less likely to bite on day 5 — the inherited orders are closing stops, not
 new entries — but live for anything that fills during the boot window.
+
+> **Closed by #167.** `StrategyRunner._retry_protection` runs every evaluation, after `_mark`,
+> and asks again for each venue stop recorded missing. The runner now remembers the entry each
+> gap belongs to (`_unprotected_entries`). The router keys the stop on the uncovered range,
+> which has not moved since the refusal, so a retry of an attempt that did reach the venue is
+> the same order, not a second stop. A working entry is skipped (its stop is deferred, F5). A
+> retry that raises is logged and does not fail the pass, and repeat refusals write no second
+> row. Day 4's MSFT would have waited one pass for its stop, not 17 minutes.
 
 ### 4.5 A latent hazard that is *not* reachable on this configuration `noted`
 
@@ -547,7 +645,8 @@ shorts is configured, which is a thing to remember rather than a thing to do now
   lines under Phase 4's *Verifiable:* line, while the same file at `:1629` narrates day 4's
   bounce in detail. A reader opening the roadmap to ask "has the paper week started?" is told no.
 - **`docs/FIRST_PAPER_RUN.md:302` vs `f8-timeframe-and-stop-sizing.md`** — opposite advice on
-  the one setting that decides whether day 5 means anything (§3.2).
+  the one setting that decides whether day 5 means anything (§3.2). *(Reconciled by
+  #167: both now say `1d`, and why it is executable.)*
 - **`docs/RUNBOOK.md`, "A stop released for a close"** — describes `_close` as cancelling stops
   *"once the venue names one of our own orders as the holder"*, with no qualifier that "our own"
   means *this process's*. For an inherited position that paragraph is false, and it is the
@@ -562,6 +661,15 @@ shorts is configured, which is a thing to remember rather than a thing to do now
 - **`runner.signal_discarded_cold`** appears in `docs/` zero times. It is now the most likely
   cause of a silent session, and the symptom is indistinguishable from the strategy simply not
   crossing.
+
+> **Reconciled by #167.** `FIRST_PAPER_RUN.md` and `ROADMAP.md` no longer say nothing has met
+> Alpaca. The runbook's "our own orders" was already qualified by #163. The timeframe advice was
+> reconciled earlier in #167. `RUNBOOK.md` gains "A session that decided nothing", with
+> `signal_discarded_cold` in it. **`RISK.md` was right that it was wrong, and the fix is
+> code:** after a refused close the runner records any venue stop the attempt left missing
+> (`runner.protection_lost_on_refused_close`), so the engine watches the armed level. The
+> paragraph now describes that, and says plainly that the gap before an *accepted* close's fill
+> is covered by the working close, not by the level.
 
 ---
 
@@ -605,7 +713,10 @@ Stated separately so it is not lost in the above.
   close through another, assert a cancel was sent.
 - **No test discards an `EXIT` on an open position** (§3.3). The five cold-symbol tests are all
   entries.
-- **The cancel is fire-and-forget and the fake makes it synchronous.**
+- **The cancel is fire-and-forget and the fake makes it synchronous.** *(Closed by #167:
+  `_close` waits for the venue to confirm each cancel; `FakeBroker.cancel_ack_after` and
+  `fill_on_cancel` model `pending_cancel` and the lost race, with a control test showing the
+  retry refused without the wait.)*
   `_release_protection` treats a non-exception as released (`router.py:1055-1062`);
   `AlpacaBroker.cancel_order` returns on 204, and Alpaca moves an order through `pending_cancel`
   before `canceled` — `held_for_orders` is released only at the terminal state.
@@ -719,6 +830,9 @@ Before the open, in the session itself — no code:
    daily-bar pull during or after the session, or an evaluation trigger that is not "a bar just
    closed". Until one of those exists, no configuration of this platform can run the strategy on
    the timeframe it declares.
+   *(Reinstated: ADR 0034 (#164) is the real change. The steps are now in
+   `FIRST_PAPER_RUN.md`, whose contrary advice #167 removed. It is still an operator's
+   action, not code.)*
 
 Then, as code, in this order:
 
@@ -732,18 +846,24 @@ Then, as code, in this order:
    symbol per session, not the ~52 minutes. See §3.3's note.)*
 5. **Mark the book before anchoring the session** (§3.5), or anchor from fresh quotes. And
    persist `day_start_equity`, which two docstrings already promise.
+   *(Done, #167: anchored on the first evaluation's marks, persisted per session date.
+   See §3.5's note.)*
 6. **B2: snapshot on fill and from the reconcile job, and put the snapshot's age in
    `restored_book`** (§4.1). The shutdown snapshot waits on F10's handler; the other two do not.
+   *(Done, #167: all three, plus a shutdown write. F10's logging and grace period landed
+   in the same PR. See §4.1's note.)*
 7. **The unprotected alert in both directions, plus the refusal text** (§3.4, F1/F2) — and fix
    `_mark_broker_protection` so an inherited stop counts, which is the same fallback as item 3.
    *(Done, #165 — by boot-time adoption rather than a fallback, which also closes §4.5. See
    §3.4's note.)*
 8. **The daily report's four numbers and RTH coverage** (§4.2). It is the only end-of-day
    artifact and it finally runs.
+   *(Done, #167, with F3's venue/risk split. See §4.2's note.)*
 9. **Await the venue's cancel acknowledgement rather than the request** (§6), and add the
-   async-cancel test.
+   async-cancel test. *(Done, #167.)*
 10. **Reconcile the four documentation defects in §4.6** — `FIRST_PAPER_RUN.md` first, because
-    it is the page read before the open and it currently argues against #159.
+    it is the page read before the open and it currently argues against #159. *(Done, #167.
+    The `RISK.md` defect turned out to be code, and is fixed in code. See §4.6's note.)*
 
 Items 1 and 2 are what stand between this commit and a day 5 that can be believed. Item 3 is
 what stands between it and a day 5 that can be believed *twice*, because the first restart

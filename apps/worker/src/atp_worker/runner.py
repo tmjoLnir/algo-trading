@@ -35,7 +35,7 @@ import asyncio
 import statistics
 import time
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -70,7 +70,7 @@ from atp_core.strategy.ports import SignalOutcome, StrategyRecord
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
-    from datetime import datetime
+    from datetime import date, datetime
 
     from atp_core.alerts.ports import AlertSink
     from atp_core.brokers.ports import TradeUpdate
@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     from atp_core.execution.router import OrderRouter, SubmitResult
     from atp_core.risk.engine import RiskDecision
     from atp_core.risk.killswitch import KillSwitch
+    from atp_core.risk.ports import SessionAnchorStore
     from atp_core.risk.stops import StopConfig, StopManager
     from atp_core.strategy.base import Strategy
     from atp_core.strategy.ports import SignalRepository, StrategyRepository
@@ -138,6 +139,12 @@ class RunnerStats:
     signals_generated: int = 0
     orders_submitted: int = 0
     orders_rejected_by_risk: int = 0
+    #: Orders the risk chain approved and the venue refused. Counted apart
+    #: from `orders_rejected_by_risk`, which is the number read to decide
+    #: whether the risk configuration is too tight. Day 4 counted 38 venue
+    #: refusals there, from a chain that had refused nothing
+    #: (docs/paper-week/day-4-review.md, F3).
+    orders_rejected_by_venue: int = 0
     last_evaluation_at: datetime | None = None
     errors: int = 0
     consecutive_errors: int = 0
@@ -148,6 +155,16 @@ class RunnerStats:
     #: and a session where it is large is a session whose trades mean less than
     #: they look like they do (docs/paper-week/day-4-review.md, F6).
     signals_discarded_cold: int = 0
+    #: Each UTC minute in which an evaluation succeeded, so the daily report
+    #: can say how much of regular hours the runner covered (F11). Pruned to
+    #: the last few days. In memory only, so a restart loses its predecessor's
+    #: minutes, and the report says so rather than counting them as gaps.
+    evaluated_minutes: set[datetime] = field(default_factory=set)
+
+
+#: How long `RunnerStats.evaluated_minutes` keeps a minute. Long enough for the
+#: report half an hour after the close, and over a weekend for a late read.
+_EVALUATED_MINUTES_KEPT = timedelta(days=4)
 
 
 @dataclass(slots=True)
@@ -354,6 +371,7 @@ class StrategyRunner:
         snapshot_store: SnapshotStore | None = None,
         publisher: EventPublisher | None = None,
         alerts: AlertSink | None = None,
+        anchor_store: SessionAnchorStore | None = None,
         unprotected_alert_cooldown_seconds: float = 900.0,
         signal_limit: int = DEFAULT_SIGNAL_LIMIT,
         tick_interval_seconds: float = 60.0,
@@ -413,6 +431,15 @@ class StrategyRunner:
         #: for a false positive; the protection machinery had no route at all
         #: (docs/paper-week/day-2-review.md, F3).
         self.alerts = alerts
+        #: Where each session's starting equity is kept across a restart
+        #: (`DailyLossLimitRule.day_start_equity`). Optional so a test can
+        #: build a runner without Redis. Production passes one, because without
+        #: it a restart re-anchors to a drawn-down book and grants the day a
+        #: second allowance (docs/paper-week/day-5-readiness.md, §3.5).
+        self.anchor_store = anchor_store
+        #: Set by `warmup`, cleared once the session is anchored. The anchor is
+        #: owed to the session, not to the process.
+        self._anchor_pending = False
         self.unprotected_alert_cooldown_seconds = unprotected_alert_cooldown_seconds
         #: The unprotected set as last paged, and when. Together they are the
         #: deduplication: 85 fill-level events collapse to one page naming every
@@ -440,6 +467,11 @@ class StrategyRunner:
         #: portfolio. Empty rather than `None` so every accessor can be typed
         #: without an optional, and replaced rather than mutated.
         self._portfolio = Portfolio(cash=Decimal(0), starting_equity=Decimal(0))
+        #: Whether `_portfolio` is the real book yet. Until `warmup` binds it,
+        #: it is this empty placeholder, and a checkpoint written from it would
+        #: overwrite the stored book with nothing. Every write outside the
+        #: evaluate loop checks this first.
+        self._book_bound = False
         self._context = LiveContext(
             self._bars, self._quotes, self._portfolio, clock, tuple(symbols), timeframe
         )
@@ -461,6 +493,10 @@ class StrategyRunner:
         #: reversed one with nothing on it. Only a refusal this process actually
         #: saw goes in here.
         self._unprotected: dict[str, Decimal] = {}
+        #: The entry each known gap in `_unprotected` belongs to, so protection
+        #: can be retried against it (`_retry_protection`). Same lifetime: set
+        #: and cleared beside it.
+        self._unprotected_entries: dict[str, Order] = {}
         #: Fills booked since the last pass, awaiting `strategy.on_fill`.
         self._pending_fills: list[_AppliedFill] = []
         #: What the strategy decided lately and what became of it, newest last.
@@ -648,6 +684,7 @@ class StrategyRunner:
         finding a process that is running and silently declining to trade.
         """
         self._portfolio = portfolio
+        self._book_bound = True
         self._context = LiveContext(
             self._bars, self._quotes, portfolio, self.clock, tuple(self.symbols), self.timeframe
         )
@@ -786,19 +823,12 @@ class StrategyRunner:
                 "See docs/RUNBOOK.md 'Reconciliation mismatch'."
             )
 
-        # The day's starting equity, and **nothing was setting it**.
-        # `default_rules()` has always included `DailyLossLimitRule`, that rule
-        # is default-closed and denies every entry until it is anchored, and no
-        # path in this platform ever called `anchor` — so this runner was
-        # configured to refuse every entry it would ever produce. It went
-        # unnoticed because a chain refusing everything and a chain nothing has
-        # reached look identical from outside, and nothing has traded paper yet.
-        #
-        # Here rather than in `run`'s loop because this is the session boundary:
-        # `warmup` is re-run at each open, and anchoring per iteration would
-        # re-anchor to a drawn-down number and grant the day a second allowance.
-        # After reconciliation, so the anchor is the book the broker agrees we
-        # hold rather than the one we believed before checking.
+        # The day's starting equity is **owed** here and taken on the first
+        # evaluation, after that pass's `_mark` — see `_anchor_if_pending` for
+        # why not here. Set only after reconciliation, so a runner about to
+        # quarantine never anchors anything.
+        self._anchor_pending = True
+
         # After reconciliation, deliberately. A runner whose book does not match
         # the broker's is about to quarantine, and a note about which bar it
         # would have decided on is noise on top of a halt — the alert budget
@@ -806,9 +836,6 @@ class StrategyRunner:
         # (docs/paper-week/day-4-review.md, F1).
         if decision is not None:
             self._announce_decision_bar(decision, withheld, no_decision_bar)
-
-        anchored = self.router.risk_engine.anchor_session(portfolio.equity)
-        log.info("runner.session_anchored", equity=str(portfolio.equity), rules=anchored)
 
         self.strategy.on_start()
         self.stats.started_at = self.clock.now()
@@ -1146,6 +1173,11 @@ class StrategyRunner:
         self._running = False
         self.strategy.on_stop()
         if not close_positions:
+            # The last thing this process knows, written down for the next one
+            # (B2). Only as reliable as the shutdown path itself: day 4's
+            # worker logged nothing on SIGTERM, so whether this runs then is
+            # unproven (day-4-review.md, F10).
+            await self.checkpoint("shutdown")
             log.info("runner.stopped", positions_left_open=True)
             return
 
@@ -1163,6 +1195,7 @@ class StrategyRunner:
                 # The book is still open and the worker is going home. This is
                 # the row that says so tomorrow morning.
                 await self._record_refusal(result)
+        await self.checkpoint("shutdown")
         log.warning("runner.stopped", positions_left_open=False)
 
     # ── one pass ────────────────────────────────────────────────────────────
@@ -1220,11 +1253,21 @@ class StrategyRunner:
             )
 
         self.stats.consecutive_errors = 0
+        self._note_evaluated_minute(self.clock.now())
+
+    def _note_evaluated_minute(self, now: datetime) -> None:
+        """Record that the runner evaluated during this minute (F11)."""
+        minutes = self.stats.evaluated_minutes
+        minutes.add(now.replace(second=0, microsecond=0))
+        cutoff = now - _EVALUATED_MINUTES_KEPT
+        minutes.difference_update({m for m in minutes if m < cutoff})
 
     async def _evaluate_once(self, portfolio: Portfolio) -> None:
         closed = await self._refresh_bars()  # feeds steps 1, 2 and 4
 
         await self._mark(portfolio)  # 1
+        await self._anchor_if_pending(portfolio)  # 1a — on the marks this pass trades on
+        await self._retry_protection(portfolio)  # 1b — a refused stop, asked for again
         await self._check_stops(portfolio, closed)  # 2
         signals = self._drain_fills(portfolio)  # 3
         signals.extend(self._poll_strategy(closed))  # 4
@@ -1306,11 +1349,65 @@ class StrategyRunner:
         snapshot is visible on the dashboard as an age that stops advancing.
         """
         self._mark_broker_protection(portfolio)
+        at = await self._save_book(portfolio)
+        await self._publish_snapshot(portfolio, at)
+
+    async def _save_book(self, portfolio: Portfolio) -> datetime:
+        """Write the working orders, then the book. Returns the snapshot's instant.
+
+        The durable half of `_persist`, and the only way the book is written.
+        Orders first, for the reason `_persist` gives. Raises: the evaluate loop
+        wants a failed write to count as a failed pass, and the out-of-loop
+        callers go through `_checkpoint`, which does not.
+        """
         for order in self._open_orders.values():
             await self.order_repo.save(order, run_mode=self.run_mode)
         at = self.clock.now()
         await self.portfolio_repo.snapshot(portfolio, at=at, run_mode=self.run_mode)
-        await self._publish_snapshot(portfolio, at)
+        return at
+
+    async def checkpoint(self, reason: str) -> None:
+        """Write the book now, from outside the evaluate loop. Never raises.
+
+        **B2 of the paper week.** The book was written only as step 6 of
+        `evaluate`, so a worker that was not evaluating (halted, pre-open,
+        parked, or between daily decisions) never wrote one. Day 4's restart
+        restored a book two days old, with a position and $4,932 of cash
+        movement missing, and the platform rebuilt the truth from the broker it
+        was about to check against. That made the restart's clean reconcile
+        worthless as evidence (docs/paper-week/day-4-review.md, B2). So the
+        book is also written on every fill, after every clean scheduled
+        reconcile, and at shutdown.
+
+        Takes the runner's lock, so a checkpoint cannot land halfway through an
+        evaluation or a fill. The fill path already holds it and calls
+        `_checkpoint` directly.
+        """
+        async with self._lock:
+            await self._checkpoint(self._portfolio, reason)
+
+    async def _checkpoint(self, portfolio: Portfolio, reason: str) -> None:
+        """`checkpoint`'s body, for a caller that already holds the lock.
+
+        Swallows a failed write and logs it at ERROR. Every caller is holding
+        an outcome of its own (a booked fill, a clean reconcile, a shutdown)
+        that a storage failure must not undo. The next write retries it: the
+        evaluate loop writes every pass.
+        """
+        if not self._book_bound:
+            return
+        try:
+            at = await self._save_book(portfolio)
+        except Exception as exc:
+            log.error(
+                "runner.book_unwritten",
+                reason=reason,
+                error=str(exc),
+                error_type=type(exc).__name__,
+                effect="the stored book is older than the one in memory until the next write",
+            )
+            return
+        log.info("runner.book_written", reason=reason, at=at.isoformat())
 
     def _mark_broker_protection(self, portfolio: Portfolio) -> None:
         """Record how much of each position the *venue* is holding a stop over.
@@ -1595,6 +1692,117 @@ class StrategyRunner:
                 # symbol per pass would drown the holdings that are.
                 log.warning("runner.no_quote_for_mark", symbol=symbol)
 
+    async def _anchor_if_pending(self, portfolio: Portfolio) -> None:
+        """Anchor the daily loss limit once per session: restored if stored, else fresh.
+
+        **Why here and not in `warmup`.** `warmup` anchored on
+        `portfolio.equity` before anything had marked the book. After a restart
+        that equity is cash plus the inherited positions at the prices restored
+        from the snapshot, which on day 5 would be the close of the session
+        before last. This pass's `_mark` then reprices them at today's quotes,
+        and `DailyLossLimitRule` measures that repricing as today's loss. A 3%
+        gap on the inherited book would read as a 3% loss on the day, and
+        `_escalate` turns the first such refusal into a global halt for the rest
+        of the session (docs/paper-week/day-5-readiness.md, §3.5). Here, right
+        after `_mark`, the anchor uses exactly the marks this pass's risk checks
+        use, so the first comparison starts at zero by construction.
+
+        **An unpriced book is not anchored.** An unmarked position is worth zero
+        in `Portfolio.equity`, so anchoring then would set the day's start too
+        low and quietly widen the allowance once the mark arrives. It stays
+        pending and is retried next pass. Meanwhile `DailyLossLimitRule` is
+        default-closed: entries are refused and exits are not.
+
+        **A stored anchor for this session wins over a fresh one.** That is the
+        guarantee `day_start_equity`'s docstring gave and nothing implemented:
+        a worker restarted mid-session, perhaps to clear the very halt this
+        rule engaged, would otherwise anchor to the drawn-down book and be
+        granted a second `max_daily_loss_pct`. **A store that cannot answer
+        leaves the rule unanchored**, the same default-closed state, and says
+        so at CRITICAL. Treating "cannot tell" as "not anchored yet" is
+        exactly that second allowance. A write that fails after a fresh anchor
+        is only an error: this process is anchored correctly, and only the
+        next restart loses the guarantee.
+        """
+        if not self._anchor_pending:
+            return
+        unpriced = portfolio.unmarked_symbols
+        if unpriced:
+            log.warning(
+                "runner.session_anchor_deferred",
+                unmarked=sorted(unpriced),
+                detail="an unpriced book would anchor the day too low — retrying next pass",
+            )
+            return
+
+        day = self._session_day(self.clock.now())
+        stored = None
+        if self.anchor_store is not None:
+            try:
+                stored = await self.anchor_store.get(self.run_mode, day)
+            except Exception as exc:
+                self._anchor_pending = False
+                log.critical(
+                    "runner.session_anchor_unreadable",
+                    session=day.isoformat(),
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    effect="the daily loss limit stays unanchored: entries refused, exits allowed",
+                )
+                if self.alerts is not None:
+                    self.alerts.send(
+                        Alert(
+                            severity=Severity.CRITICAL,
+                            title="Daily loss limit could not be anchored — entries are blocked",
+                            body=(
+                                "The worker could not read this session's starting equity, so "
+                                "it cannot tell how much of today's allowance is spent. Entries "
+                                "are refused for the rest of the session; exits are not.\n"
+                                "docs/RUNBOOK.md, 'Daily loss limit not anchored'."
+                            ),
+                            key="risk.session_anchor_unreadable",
+                            context={"session": day.isoformat()},
+                        )
+                    )
+                return
+
+        if stored is not None:
+            equity, source = stored, "restored"
+        else:
+            equity, source = portfolio.equity, "fresh"
+        anchored = self.router.risk_engine.anchor_session(equity)
+        self._anchor_pending = False
+        log.info(
+            "runner.session_anchored",
+            equity=str(equity),
+            marked_equity=str(portfolio.equity),
+            session=day.isoformat(),
+            source=source,
+            rules=anchored,
+        )
+        if source == "fresh" and self.anchor_store is not None:
+            try:
+                await self.anchor_store.put(self.run_mode, day, equity)
+            except Exception as exc:
+                log.error(
+                    "runner.session_anchor_unsaved",
+                    session=day.isoformat(),
+                    error=str(exc),
+                    effect="anchored in this process; a restart today would re-anchor",
+                )
+
+    def _session_day(self, now: datetime) -> date:
+        """The exchange-local date of the session in progress, or the next one.
+
+        The same lookup `_warmup_floor` makes, and for the same reason: `now`
+        is UTC and a session is named by its exchange-local date.
+        """
+        today = now.date()
+        for session in self.calendar.sessions(today - timedelta(days=1), today + timedelta(days=1)):
+            if session.open_at <= now < session.close_at:
+                return session.day
+        return self.calendar.local_date(self.calendar.next_open(now))
+
     async def _check_stops(self, portfolio: Portfolio, closed: list[Bar]) -> None:
         """Step 2. Engine-side protective levels, and trailing ratchets.
 
@@ -1648,6 +1856,7 @@ class StrategyRunner:
                 # is still on. Of the four refusals recorded here this is the
                 # one most likely to cost money.
                 await self._record_refusal(result)
+                self._note_protection_gap(position.symbol, portfolio)
             elif result.order is not None:
                 self._track(result.order)
 
@@ -1933,32 +2142,55 @@ class StrategyRunner:
             await self._record_signal(signal, result)
 
             if not result.submitted:
-                # **`no_action` is not a rejection**, and counting it as one
-                # inverted the number this counter exists to inform.
-                # `SubmitResult.no_action` builds an *approved* decision
-                # precisely so a HOLD-shaped outcome — an exit signal for a
-                # position that is already flat — does not read as the risk
-                # config being too tight. Then this line counted every
-                # unsubmitted result alike, so it did anyway
+                # Three outcomes, and they must not be counted as one.
+                #
+                # **`no_action` is not a rejection.** `SubmitResult.no_action`
+                # builds an *approved* decision so an exit for a position that is
+                # already flat does not read as the risk config being too tight
                 # (docs/paper-week/day-1-review.md, F14).
-                if result.decision.rule != NO_ACTION:
+                #
+                # **Nor is a venue refusal a risk refusal.** The chain approved
+                # it, so the decision is approved and its rule and reason are
+                # empty. Day 4 logged 38 refused exits as
+                # `runner.signal_refused rule= reason=` and counted them against
+                # a risk chain that had refused nothing. Read cold, that says
+                # the risk configuration is too tight, the opposite of the truth
+                # (docs/paper-week/day-4-review.md, F3). The venue's words are on
+                # the order (`refusal_reason`).
+                if result.decision.rule == NO_ACTION:
+                    log.info(
+                        "runner.no_action",
+                        symbol=signal.symbol,
+                        action=signal.action.value,
+                        reason=result.decision.reason,
+                    )
+                elif result.decision.approved:
+                    self.stats.orders_rejected_by_venue += 1
+                    log.warning(
+                        "runner.signal_rejected_by_venue",
+                        symbol=signal.symbol,
+                        action=signal.action.value,
+                        reason=result.refusal_reason,
+                        inventory_held=result.inventory_held,
+                    )
+                else:
                     self.stats.orders_rejected_by_risk += 1
                     self._escalate(result.decision)
-                log.info(
-                    "runner.signal_refused"
-                    if result.decision.rule != NO_ACTION
-                    else "runner.no_action",
-                    symbol=signal.symbol,
-                    action=signal.action.value,
-                    rule=result.decision.rule,
-                    reason=result.decision.reason,
-                )
+                    log.info(
+                        "runner.signal_refused",
+                        symbol=signal.symbol,
+                        action=signal.action.value,
+                        rule=result.decision.rule,
+                        reason=result.decision.reason,
+                    )
                 # Already durable as a decision, above. Recorded as an order
                 # too, because the two answer different questions: the signal
                 # says what the strategy wanted, this says what was actually
                 # composed — the quantity after sizing, the type, the limit —
                 # and `/orders` is where a person looks for that.
                 await self._record_refusal(result)
+                if signal.action is SignalAction.EXIT:
+                    self._note_protection_gap(signal.symbol, portfolio)
                 continue
 
             self.stats.orders_submitted += 1
@@ -2270,11 +2502,14 @@ class StrategyRunner:
                 return
 
             before = order.filled_qty
+            was_complete = order.is_complete
             if not apply_trade_update(order, update):
                 return
 
             fill = order.fills[-1] if order.fills else None
-            if fill is not None and order.filled_qty > before:
+            booked = fill is not None and order.filled_qty > before
+            if booked:
+                assert fill is not None  # narrowed by `booked`
                 self._apply_to_portfolio(order, fill, portfolio)
                 self.stats.fills_applied += 1
                 self._pending_fills.append(_AppliedFill(order=order, fill=fill))
@@ -2286,6 +2521,12 @@ class StrategyRunner:
                 # managing, and a reader who acts on that is acting earlier
                 # than the system did.
                 await self._announce(CHANNEL_ORDERS, _fill_message(order, fill))
+            elif order.is_complete and not was_complete and order.filled_qty > 0:
+                # An entry that part-filled and was then cancelled or expired
+                # goes terminal with no new fill. Protection deferred while it
+                # was working is owed now, and nothing else would place it
+                # (day-4 F5). `_protect` returns early for a reducing order.
+                await self._protect(order, portfolio)
 
             if order.is_complete:
                 # Saved before it leaves the working set: `_persist` only walks
@@ -2293,6 +2534,11 @@ class StrategyRunner:
                 # otherwise never reach storage.
                 await self.order_repo.save(order, run_mode=self.run_mode)
                 self._open_orders.pop(order.client_order_id, None)
+
+            if booked:
+                # Last, so the orders this fill touched are written before the
+                # book that reflects them — `_persist`'s ordering (B2).
+                await self._checkpoint(portfolio, "fill")
 
     def _apply_to_portfolio(self, order: Order, fill: Fill, portfolio: Portfolio) -> None:
         """Fold a fill into cash and the position.
@@ -2309,6 +2555,7 @@ class StrategyRunner:
             # make the next entry in this symbol look known-unprotected before
             # `_protect` has had a chance to say otherwise.
             self._unprotected.pop(order.symbol, None)
+            self._unprotected_entries.pop(order.symbol, None)
 
     async def _disarm_if_flat(self, order: Order, portfolio: Portfolio) -> None:
         """Take the protective stop with the position when it closes.
@@ -2341,11 +2588,15 @@ class StrategyRunner:
             return
         await self.router.cancel_protection(order.symbol)
 
-    async def _protect(self, order: Order, portfolio: Portfolio) -> None:
+    async def _protect(self, order: Order, portfolio: Portfolio, *, retry: bool = False) -> None:
         """Arm protection on a position that just opened or grew.
 
         Only for entries. A fill that *reduces* a position needs no new stop —
         and asking for one would place a stop on the way out of a trade.
+
+        `retry` is `_retry_protection` asking again for a gap already recorded.
+        The refusal is still logged, but no second refusal row is written: one
+        row per failed stop is the record, and one per pass would bury it.
         """
         position = portfolio.position(order.symbol)
         if position.is_flat:
@@ -2376,6 +2627,7 @@ class StrategyRunner:
             # the log, and so a caller that chooses to swallow this inherits a
             # position in the "known short" state rather than the unknown one.
             self._unprotected[order.symbol] = abs(position.qty)
+            self._unprotected_entries[order.symbol] = order
             log.critical(
                 "runner.position_unprotected",
                 symbol=order.symbol,
@@ -2385,16 +2637,34 @@ class StrategyRunner:
             raise
         for protective in result.placed:
             self._track(protective)
+        if result.deferred:
+            # Nothing was refused: the entry is still working, so the venue stop
+            # waits for it to finish (day-4 F5). The gap is recorded as a known
+            # one so `_stop_is_missing` has the engine watch the level the router
+            # just armed. That is the engine-side stop covering the gap, as
+            # intended. Not an error, and no refusal row: there is nothing to
+            # refuse yet.
+            self._unprotected[order.symbol] = result.unprotected_qty
+            self._unprotected_entries[order.symbol] = order
+            log.info(
+                "runner.protection_deferred",
+                symbol=order.symbol,
+                uncovered_qty=str(result.unprotected_qty),
+                engine_side_stop=str(result.engine_side_stop),
+            )
+            return
         if result.is_fully_protected:
             # Records the opposite fact just as explicitly: a symbol that was
             # short a stop and now is not must stop being treated as one, or the
             # engine keeps watching a level the venue is already holding.
             self._unprotected.pop(order.symbol, None)
+            self._unprotected_entries.pop(order.symbol, None)
         else:
             # Remembered, not only logged. `_exit_reason` needs to know the
             # venue is *not* holding this position's stop, and this is the only
             # moment anything learns it.
             self._unprotected[order.symbol] = result.unprotected_qty
+            self._unprotected_entries[order.symbol] = order
             # Loud: this is docs/SAFETY.md layer 5 not holding, and the position
             # is real whether or not the stop is. `unprotected_qty` is measured
             # after the risk chain, so a stop the chain shrank reports the
@@ -2412,8 +2682,92 @@ class StrategyRunner:
             # one refused child. Each is its own row: "the stop was refused" and
             # "the stop and the target were both refused" are different states
             # of the same position.
-            for refusal in result.refused:
-                await self._record_refusal(refusal)
+            if not retry:
+                for refusal in result.refused:
+                    await self._record_refusal(refusal)
+
+    def _note_protection_gap(self, symbol: str, portfolio: Portfolio) -> None:
+        """After a refused close, record any venue stop the attempt left missing.
+
+        **A close can take the stop with it and still be refused.** `_close`
+        releases the venue stop when the venue names it as what holds the
+        shares, retries, and re-arms if the retry is refused. If the re-arm is
+        refused too, the position has no venue stop. The router logs that at
+        CRITICAL, but nothing told this runner. `_stop_is_missing` only trusts
+        a gap recorded here, so the engine declined to watch the armed level
+        as well. That is no stop anywhere, the state `_disarm_if_flat` calls
+        the worst in the system, and docs/RISK.md described the level as
+        covering it (docs/paper-week/day-5-readiness.md, §4.6).
+
+        Asked of the router rather than inferred: its count is what the venue
+        holds for this process, and since #165 it includes the stops a previous
+        process placed. **Only after a refusal.** After an accepted close, the
+        exit is working, and an engine that also watched the level would close
+        the position a second time.
+        """
+        position = portfolio.positions.get(symbol)
+        if position is None or position.is_flat:
+            return
+        covered = self.router.broker_side_protected_qty(symbol, position)
+        missing = abs(position.qty) - covered
+        if missing <= 0:
+            return
+        self._unprotected[symbol] = missing
+        log.error(
+            "runner.protection_lost_on_refused_close",
+            symbol=symbol,
+            unprotected_qty=str(missing),
+            effect="the engine now watches the armed level; no venue stop covers these shares",
+        )
+
+    async def _retry_protection(self, portfolio: Portfolio) -> None:
+        """Step 1b. Ask again for every venue stop that is known to be missing.
+
+        **A stop refused once was never asked for again.** Day 4's MSFT: a fill
+        booked during boot catch-up, 1.2 seconds before the market-data stream
+        connected, so `stale_data` refused its stop for want of any quote. That
+        refusal is right, because a stop priced off no data is worse than none.
+        But nothing retried it, and the position ran 17 minutes without a venue
+        stop until the strategy happened to exit it
+        (docs/paper-week/day-4-review.md, F9; day-5-readiness.md, §4.4).
+        docs/SAFETY.md's go-live gate is "no unprotected positions".
+
+        Here, after `_mark`, because a fresh quote is exactly what the transient
+        refusals (`stale_data`, `trading_hours`, `rate_limit`) were waiting for.
+        Safe to repeat: the router keys the stop on the range it covers, which
+        has not moved since the refusal, so a retry of an attempt that did reach
+        the venue is that same order to the venue, not a second stop (rule §1.4).
+
+        An entry still working is skipped. Its stop is deferred on purpose
+        (day-4 F5), and the fill or cancel that ends it places the stop. A
+        retry that raises is logged and left for the next pass rather than
+        failing this one: three failed passes halt the strategy, and a missing
+        stop is not a reason to stop managing the positions that have one.
+        """
+        for symbol, entry in list(self._unprotected_entries.items()):
+            position = portfolio.positions.get(symbol)
+            if position is None or position.is_flat:
+                self._unprotected.pop(symbol, None)
+                self._unprotected_entries.pop(symbol, None)
+                continue
+            if not entry.is_complete:
+                continue
+            log.info(
+                "runner.protection_retry",
+                symbol=symbol,
+                entry_order_id=entry.id,
+                uncovered_qty=str(self._unprotected.get(symbol, Decimal(0))),
+            )
+            try:
+                await self._protect(entry, portfolio, retry=True)
+            except Exception as exc:
+                log.error(
+                    "runner.protection_retry_failed",
+                    symbol=symbol,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    effect="still no venue stop — the engine-side level is watching; retried next pass",
+                )
 
     def _track(self, order: Order) -> None:
         """Remember an order we believe is working at the venue."""

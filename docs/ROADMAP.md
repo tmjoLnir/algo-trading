@@ -599,8 +599,16 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   every entry it would ever produce. It survived because the failure is
   invisible from outside: a chain refusing everything and a chain nothing has
   reached look identical, and nothing has traded paper. `RiskEngine
-  .anchor_session` is the named seam, `StrategyRunner.warmup` calls it at each
-  session open and the backtest engine at each session in the replay.
+  .anchor_session` is the named seam. The live runner calls it once per session,
+  and the backtest engine at each session in the replay.
+
+  **And the live anchor was taken on a stale book and kept nowhere** (#167).
+  `warmup` anchored before anything had marked it, so after a restart the first
+  pass would read the repricing of inherited positions as the day's loss. And
+  `day_start_equity`'s promise to survive a restart had no storage behind it. The
+  anchor is now taken on the first evaluation's marks and kept per session date
+  in Redis. A restart restores it, and a store that cannot answer leaves the rule
+  closed and pages (docs/paper-week/day-5-readiness.md, §3.5).
 
   **And every one of those nine rules measured the wrong book** (#112). A limit
   is checked per order and the book only moves on a fill, so a caller submitting
@@ -1696,10 +1704,31 @@ above.
   happen on a fill and from the reconcile job, not only from inside the
   strategy loop (docs/paper-week/day-4-review.md, B2).
 
+  **Now it does** (#167). `StrategyRunner.checkpoint` writes the book, orders
+  first, on every booked fill, after every clean scheduled reconcile, and at
+  shutdown. It never writes before `warmup` has bound the real book, so an early
+  shutdown cannot overwrite the stored book with an empty one. `worker.restored_book`
+  now carries `snapshot_at` and `age_seconds`, so a stale restore reads as one.
+  Still unticked, for the reason above rather than a new one: this is a fix to
+  what failed the demonstration, and the demonstration is a restart that
+  survives, which has not happened yet. The shutdown write is only as reliable
+  as the shutdown path, which F10 found no evidence of on day 4. That path now
+  says so both ways: `worker.stopping` at the signal, and `worker.stopped` with
+  the measured `drain_seconds` after the last write. The worker's
+  `stop_grace_period` is 30 s instead of Docker's 10, so the drain has room to
+  finish (#167).
+
+  **And the stop now waits for the entry** (#167, day-4 F5). A working entry is
+  armed engine-side and gets its venue stop, one stop, once it is terminal. That
+  removes the wash-trade rejection a stop per partial fill met 69 times on day 4.
+
 *Verifiable:* a strategy trades the paper account for a week and reconciles clean.
 
 **Not shown, and the two tools that would let it be are built** — @claude (#83).
-Nothing in Phase 4 has met Alpaca; this PR does not change that and could not.
+*(Since corrected: Phase 4 has met Alpaca. Days 1 to 4 of the paper week ran
+against the paper account and each was voided by a defect it found; see
+docs/paper-week/. The week the line asks for has not been shown.)*
+When this was written, nothing in Phase 4 had met Alpaca; this PR did not change that and could not.
 What it changes is what happens on either side of the week, because the input
 this line needs and cannot re-run is calendar time.
 
@@ -2559,6 +2588,22 @@ production is the two halves describing different periods or different runs.
   The halts a *human* engaged are counted; the ones the risk layer engages on
   its own still write no audit row, and the section says that on the face of its
   own number rather than letting the count imply a coverage it does not have.
+
+  **Four of its five numbers were wrong the first time it ran** (day 4, F4), and
+  #167 fixes them.
+  - `submitted` counted every row, refused ones included. It now means reached the
+    venue, split into accepted and rejected by it. Venue rejections are their own
+    section, grouped by the venue's words.
+  - The window was the last 24 hours. It is now the session that just closed,
+    from the previous session's close.
+  - The report never carried P&L. It now carries the equity change over the
+    session's snapshots, and names the section as absent when a snapshot is
+    missing. The field that summed fill cash flows is gone.
+  - It gained **RTH coverage**: regular-hours minutes with an evaluating runner,
+    against the session's. The count is in the worker's memory only, so the
+    worker's report carries it, the API's reports it as absent, and a mid-session
+    restart names the minutes it cannot see.
+  - `paper_run` counts the same way, through the same function.
 
 *Verifiable:* with the stack up and a worker trading paper, a browser opened at
 any moment shows the same positions, cash and equity the worker's own log

@@ -713,6 +713,9 @@ class TestProtectiveOrders:
         routed.broker = broker
         entry = await self._entry(broker, portfolio, routed)
         fill(entry, portfolio, 40, 100)
+        # Terminal with 40 of 100 filled: the rest was cancelled. A working
+        # entry defers its stop (day-4 F5), so this is the state that places it.
+        entry.status = OrderStatus.CANCELLED
 
         protection = await routed.submit_protective_orders(entry, portfolio)
 
@@ -726,24 +729,41 @@ class TestProtectiveOrders:
         assert stop.time_in_force is TimeInForce.GTC
         assert stop.parent_order_id == entry.id
 
-    async def test_each_partial_fill_gets_its_own_stop(self) -> None:
-        """Two equal partials are the ordinary case and the one a key derived
-        from the increment collapses into a single order, leaving the second
-        tranche naked while the router reports success."""
+    async def test_a_working_entry_defers_its_stop_and_arms_the_level(self) -> None:
+        """**Day 4's F5.** A stop per piece met a venue that refuses an
+        opposite-side stop against a working order: 69 wash-trade rejections,
+        each a short unprotected window and a wasted request. While the entry
+        works, the level is armed for the engine and nothing goes to the venue."""
         broker, portfolio = FakeBroker(), book()
         routed = router(broker)
         entry = await self._entry(broker, portfolio, routed, qty=200)
 
         fill(entry, portfolio, 100, 100)
-        first = await routed.submit_protective_orders(entry, portfolio)
-        fill(entry, portfolio, 100, 100)
-        second = await routed.submit_protective_orders(entry, portfolio)
+        partial = await routed.submit_protective_orders(entry, portfolio)
 
-        assert first.covered_qty == Decimal(100)
-        assert second.covered_qty == Decimal(100)
-        assert first.stop_order is not None and second.stop_order is not None
-        assert first.stop_order.client_order_id != second.stop_order.client_order_id
-        assert broker.open_order_count("SPY", Side.SELL) == 2
+        assert partial.deferred
+        assert partial.placed == [] and partial.refused == []
+        assert partial.unprotected_qty == Decimal(100), "the gap the engine covers"
+        assert partial.engine_side_stop == Decimal(95)
+        assert portfolio.position("SPY").stop_loss_price == Decimal(95)
+        assert broker.open_stops("SPY") == 0
+
+    async def test_the_terminal_fill_places_one_stop_over_everything(self) -> None:
+        """Two partials, one stop. The covered total does not move while the
+        entry defers, so the call that sees it complete covers all of it."""
+        broker, portfolio = FakeBroker(), book()
+        routed = router(broker)
+        entry = await self._entry(broker, portfolio, routed, qty=200)
+
+        fill(entry, portfolio, 100, 100)
+        await routed.submit_protective_orders(entry, portfolio)
+        fill(entry, portfolio, 100, 100)
+        assert entry.is_complete
+        final = await routed.submit_protective_orders(entry, portfolio)
+
+        assert not final.deferred
+        assert final.covered_qty == Decimal(200)
+        assert broker.open_stops("SPY") == 1
         assert routed._protected_qty("SPY", Side.SELL) == Decimal(200)
 
     async def test_a_replayed_fill_event_places_nothing(self) -> None:
@@ -1201,12 +1221,21 @@ class TestFlatten:
         while adding a second market close."""
         broker, portfolio = FakeBroker(), book()
         routed = router(broker)
-        entry = await routed.submit(request(qty=200, stop_loss_price=Decimal(95)), portfolio)
-        assert entry.order is not None
-        fill(entry.order, portfolio, 100, 100)
-        await routed.submit_protective_orders(entry.order, portfolio)
-        fill(entry.order, portfolio, 100, 100)
-        await routed.submit_protective_orders(entry.order, portfolio)
+        # Two complete entries, so two stops: a working entry places none
+        # (day-4 F5), and this test is about two live stops, not about tranches.
+        stop_ids: list[str] = []
+        for minute in (0, 1):
+            entry = await routed.submit(
+                request(
+                    qty=100, stop_loss_price=Decimal(95), ts=OPEN_HOURS + timedelta(minutes=minute)
+                ),
+                portfolio,
+            )
+            assert entry.order is not None
+            fill(entry.order, portfolio, 100, 100)
+            placed = (await routed.submit_protective_orders(entry.order, portfolio)).stop_order
+            assert placed is not None and placed.broker_order_id is not None
+            stop_ids.append(placed.broker_order_id)
         assert broker.open_stops("SPY") == 2
 
         attempted: list[str] = []
@@ -1214,7 +1243,7 @@ class TestFlatten:
 
         async def flaky(broker_order_id: str) -> None:
             attempted.append(broker_order_id)
-            if broker_order_id == "brk-2":
+            if broker_order_id == stop_ids[0]:
                 raise BrokerConnectionError("timed out")
             await real_cancel(broker_order_id)
 
@@ -1224,7 +1253,7 @@ class TestFlatten:
 
         # The second stop was still attempted, and the one that failed is still
         # known to the router rather than orphaned.
-        assert attempted == ["brk-2", "brk-3"]
+        assert attempted == stop_ids
         assert cancelled == 1
         assert routed._protected_qty("SPY", Side.SELL) == Decimal(100)
 
@@ -2109,3 +2138,81 @@ class TestTheRefusalReason:
         result = SubmitResult(order=None, decision=RiskDecision.allow(), submitted=False)
 
         assert result.refusal_reason == ""
+
+
+class TestACancelIsNotReleasedUntilTheVenueSaysSo:
+    """docs/paper-week/day-5-readiness.md, §6 and §8 item 9. Alpaca answers a
+    cancel with 204 and moves the order through `pending_cancel`; its shares
+    are held until `canceled`. `FakeBroker` cancelled in the same call, so every
+    release test saw `available: 100` on the retry and none could fail on it."""
+
+    def _routed(self, broker: FakeBroker, *, polls: int = 50) -> tuple[OrderRouter, list[float]]:
+        slept: list[float] = []
+
+        async def sleep(seconds: float) -> None:
+            slept.append(seconds)
+
+        return (
+            OrderRouter(
+                broker,
+                chain(),
+                StopManager(),
+                SimulatedClock(OPEN_HOURS),
+                sleep=sleep,
+                cancel_ack_polls=polls,
+            ),
+            slept,
+        )
+
+    async def _protected(
+        self, broker: FakeBroker, routed: OrderRouter, portfolio: Portfolio
+    ) -> Order:
+        return await TestClosingReleasesProtection()._open_protected(broker, routed, portfolio)
+
+    async def test_without_waiting_the_retry_lands_in_the_pending_window(self) -> None:
+        """The control, and the failure the finding named: one read, no wait, so
+        the retry is refused for shares the cancelling stop still holds."""
+        broker, portfolio = FakeBroker(), book()
+        routed, _ = self._routed(broker, polls=1)
+        await self._protected(broker, routed, portfolio)
+        broker.cancel_ack_after = 3
+
+        result = await routed.flatten("SPY", portfolio)
+
+        assert not result.submitted
+
+    async def test_the_retry_waits_for_the_cancel_to_be_confirmed(self) -> None:
+        broker, portfolio = FakeBroker(), book()
+        routed, slept = self._routed(broker)
+        stop = await self._protected(broker, routed, portfolio)
+        broker.cancel_ack_after = 3
+
+        result = await routed.flatten("SPY", portfolio)
+
+        assert result.submitted, "the close reached the venue once the stop let go of the shares"
+        assert broker.cancelled == [stop.broker_order_id]
+        assert len(slept) == 2, "read, wait, read, wait, read — confirmed on the third"
+        assert broker.open_stops("SPY") == 0, "and nothing was re-armed over it"
+
+    async def test_a_stop_that_filled_while_cancelling_is_not_closed_over(self) -> None:
+        """The race the cancel can lose. The stop sold the shares; a retried
+        close would sell them again, and a re-armed stop would sit over nothing."""
+        broker, portfolio = FakeBroker(), book()
+        routed, _ = self._routed(broker)
+        stop = await self._protected(broker, routed, portfolio)
+        assert stop.broker_order_id is not None
+        broker.fill_on_cancel.add(stop.broker_order_id)
+        closes_before = len(
+            [o for o in broker.accepted.values() if o.order_type is OrderType.MARKET]
+        )
+
+        with capture_logs() as logs:
+            result = await routed.flatten("SPY", portfolio)
+
+        assert not result.submitted
+        closes_after = len(
+            [o for o in broker.accepted.values() if o.order_type is OrderType.MARKET]
+        )
+        assert closes_after == closes_before, "no second close was sent"
+        assert broker.open_stops("SPY") == 0, "and no stop was re-armed"
+        assert any(e["event"] == "order.protection_filled_during_release" for e in logs)

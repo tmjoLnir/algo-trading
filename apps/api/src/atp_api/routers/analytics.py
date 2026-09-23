@@ -36,6 +36,7 @@ from atp_api.deps import (
     get_bar_repository,
     get_clock,
     get_order_repository,
+    get_portfolio_repository,
 )
 from atp_core.analytics.daily import render, summarise
 from atp_core.analytics.performance import (
@@ -53,7 +54,7 @@ from atp_core.clock import Clock
 from atp_core.config import Settings, get_settings
 from atp_core.data.ports import BarRepository
 from atp_core.domain import Bar, Timeframe
-from atp_core.execution.ports import OrderRepository
+from atp_core.execution.ports import OrderRepository, PortfolioRepository
 from atp_core.logging import get_logger
 from atp_core.persistence.audit import PostgresAuditLog
 
@@ -738,10 +739,21 @@ class DailySectionView(BaseModel):
 class DailyReportView(BaseModel):
     day: date
     headline: str
+    #: Orders that reached the venue, and of those what it accepted and
+    #: refused. `orders_submitted` used to count every row, refused ones
+    #: included (docs/paper-week/day-4-review.md, F4).
     orders_submitted: int
+    orders_accepted: int
+    orders_rejected_by_venue: int
     orders_filled: int
+    #: Refused before submission, by the risk chain or a stage before it.
     orders_refused: int
     refusals_by_rule: dict[str, int]
+    rejections_by_reason: dict[str, int]
+    #: The first and last equity snapshot in the day's window, or None when
+    #: there is none at one end. That case is also listed in `not_measured`.
+    starting_equity: Decimal | None
+    ending_equity: Decimal | None
     symbols: list[str]
     sections: list[DailySectionView]
     #: The names of the sections nothing could answer. Duplicated out of
@@ -755,6 +767,7 @@ class DailyReportView(BaseModel):
 async def daily_report(
     order_repo: Annotated[OrderRepository, Depends(get_order_repository)],
     audit_reader: Annotated[PostgresAuditLog | None, Depends(get_audit_reader)],
+    portfolio_repo: Annotated[PortfolioRepository, Depends(get_portfolio_repository)],
     settings: Annotated[Settings, Depends(get_settings)],
     clock: Annotated[Clock, Depends(get_clock)],
     day: date | None = None,
@@ -802,14 +815,37 @@ async def daily_report(
             log.warning("analytics.daily_report.audit_unavailable", error=str(exc))
             audit = None
 
-    report = summarise(target, orders, audit=audit)
+    # The day's P&L, which the report never carried (F4). Degrades the same
+    # way the audit read does: one unreadable section, not a failed report.
+    try:
+        points = await portfolio_repo.equity_history(
+            settings.run_mode, start=window_start, end=window_end
+        )
+    except Exception as exc:  # deliberate breadth — see the audit comment above
+        log.warning("analytics.daily_report.equity_unavailable", error=str(exc))
+        points = []
+
+    # No coverage: which minutes the runner evaluated is held in the worker's
+    # memory, and the worker's own report is the one that carries it.
+    report = summarise(
+        target,
+        orders,
+        audit=audit,
+        starting_equity=points[0].equity if points else None,
+        ending_equity=points[-1].equity if points else None,
+    )
     return DailyReportView(
         day=report.day,
         headline=report.headline(),
         orders_submitted=report.orders_submitted,
+        orders_accepted=report.orders_accepted,
+        orders_rejected_by_venue=report.orders_rejected_by_venue,
         orders_filled=report.orders_filled,
         orders_refused=report.orders_refused,
         refusals_by_rule=report.refusals_by_rule,
+        rejections_by_reason=report.rejections_by_reason,
+        starting_equity=report.starting_equity,
+        ending_equity=report.ending_equity,
         symbols=list(report.symbols),
         sections=[
             DailySectionView(

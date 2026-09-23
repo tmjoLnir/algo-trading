@@ -43,6 +43,7 @@ and there is no layer for targets.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field, replace
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -83,7 +84,7 @@ from atp_core.risk.rules import position_size, reference_price
 from atp_core.risk.stops import FROM_ENTRY_TYPES
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Awaitable, Callable, Iterable, Mapping
     from datetime import datetime
 
     from atp_core.brokers.ports import BrokerPort
@@ -124,6 +125,13 @@ def _refusal_stage(order: Order) -> str:
 #: same record. `NO_ACTION` stays local — nothing is refused, so it never
 #: reaches that column.
 NO_ACTION = "no_action"
+
+#: How many times a release reads a cancelled stop back before retrying the
+#: close, and how far apart. Five seconds in all: Alpaca's `pending_cancel`
+#: normally resolves well inside one, and a close held longer than this is a
+#: close whose market has moved (`OrderRouter._await_cancelled`).
+CANCEL_ACK_POLLS = 50
+CANCEL_ACK_POLL_SECONDS = 0.1
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +249,11 @@ class ProtectionResult:
     unprotected_qty: Decimal = Decimal(0)
     #: The level armed on the `Position` for the engine to watch, placed or not.
     engine_side_stop: Decimal | None = None
+    #: Nothing was placed because the entry is still working, not because
+    #: anything refused. The level is armed; the venue stop goes on when the
+    #: entry is terminal, in one piece (day-4 F5). Its `unprotected_qty` is
+    #: the gap the engine-side level covers until then.
+    deferred: bool = False
 
     @property
     def stop_order(self) -> Order | None:
@@ -263,6 +276,8 @@ class OrderRouter:
         *,
         kill_switch: KillSwitch | None = None,
         instruments: Mapping[str, Instrument] | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        cancel_ack_polls: int = CANCEL_ACK_POLLS,
     ) -> None:
         """
         `clock` supplies submission timestamps. It is injected rather than read
@@ -296,6 +311,12 @@ class OrderRouter:
         self.clock = clock
         self.kill_switch = kill_switch
         self._instruments: Mapping[str, Instrument] = instruments or {}
+        #: How a release waits for the venue to confirm its cancels (see
+        #: `_await_cancelled`). Injected so a test does not sleep.
+        self._sleep: Callable[[float], Awaitable[None]] = (
+            sleep if sleep is not None else asyncio.sleep
+        )
+        self._cancel_ack_polls = cancel_ack_polls
 
         #: entry order id → the protective levels its request asked for. Intent,
         #: not truth: what we were told to protect, never what the venue holds.
@@ -541,6 +562,19 @@ class OrderRouter:
             # Either way the venue's answer stands and the position keeps
             # whatever protection it had.
             return result
+        filled = await self._await_cancelled(request.symbol, released)
+        if filled:
+            # The race the cancel can lose, and it lost: the stop fired first,
+            # so the position is closing at its stop. Retrying the close would
+            # sell shares already sold, and re-arming would put a stop over
+            # them. The fill reaches the book through the trade stream.
+            log.critical(
+                "order.protection_filled_during_release",
+                symbol=request.symbol,
+                broker_order_ids=[o.broker_order_id for o in filled],
+                detail="the stop filled while being cancelled — not retrying the close, not re-arming",
+            )
+            return result
 
         retried = await self.submit(request, portfolio, pending=pending)
         if not retried.submitted:
@@ -580,11 +614,22 @@ class OrderRouter:
         sizing is defined off `|entry − stop|`, so a level anchored to a price
         we did not get silently stops meaning what the sizer assumed.
 
-        **Covers what has filled since the last call**, capped at the exposure
-        actually held. An entry that fills in pieces gets a stop per piece;
-        `protective_client_order_id` keys each by the range it covers, so a
-        replayed fill event places nothing and a genuinely new tranche is not
-        deduplicated against the last one.
+        **Placed once the entry is terminal, not per piece.** An entry still
+        working is armed on the position and nothing goes to the venue
+        (`ProtectionResult.deferred`). The venue refuses an opposite-side stop
+        against a working order as a potential wash trade: "a stop per piece"
+        met that refusal 69 times on day 4, across 18 symbols, and every refusal
+        was a short unprotected window plus a wasted request against a
+        30-a-minute rate limit (docs/paper-week/day-4-review.md, F5; day 3's
+        B2 asked for exactly this). The engine-side level covers the gap, and
+        the call that sees the entry terminal covers everything it filled with
+        one stop, because the covered total does not move while it defers.
+
+        **Covers what has filled since the last placement**, capped at the
+        exposure actually held. `protective_client_order_id` keys each stop by
+        the range it covers, so a replayed fill event places nothing, and a
+        second placement for the same entry (a remainder after a re-arm) is not
+        deduplicated against the first.
 
         Two contracts this places on whoever calls it, both load-bearing:
 
@@ -707,6 +752,24 @@ class OrderRouter:
                 detail="no usable stop level for this position",
             )
             return ProtectionResult(unprotected_qty=increment, engine_side_stop=armed)
+
+        if not entry_order.is_complete:
+            # After arming and after the no-level check, so a deferred entry is
+            # always one with a level armed for the engine to watch.
+            log.info(
+                "order.protection_deferred",
+                symbol=symbol,
+                entry_order_id=entry_order.id,
+                filled=str(entry_order.filled_qty),
+                level=str(stop_level),
+                detail=(
+                    "the entry is still working and the venue refuses an opposite-side stop "
+                    "against it — armed engine-side, placed at the venue when the entry is terminal"
+                ),
+            )
+            return ProtectionResult(
+                unprotected_qty=increment, engine_side_stop=armed, deferred=True
+            )
 
         stop_child = self._stop_order(
             entry_order, position, increment, stop_level, covered_from, covered_to
@@ -1316,6 +1379,63 @@ class OrderRouter:
             detail="freeing the shares the close needs — the armed level covers the gap",
         )
         return released
+
+    async def _await_cancelled(self, symbol: str, released: list[Order]) -> list[Order]:
+        """Wait for the venue to confirm the cancels; return any stop that filled.
+
+        **A cancel request is not a cancel.** Alpaca answers the request with
+        204 and moves the order through `pending_cancel` before `canceled`, and
+        the shares it holds are released only at the end. Retrying the close on
+        the request alone lands inside that window, where it is refused again.
+        That refusal fires `_rearm`, which submits a second stop the venue also
+        refuses. `FakeBroker` used to cancel in the same call, which is why
+        nothing caught it (docs/paper-week/day-5-readiness.md, §6 and §8 item 9).
+
+        Polls `get_order` for each released stop, up to `cancel_ack_polls` reads
+        a stop, `CANCEL_ACK_POLL_SECONDS` apart. Three outcomes per stop:
+
+        - **terminal without a fill**: released, as the caller assumed;
+        - **filled**: the race was lost and returned to the caller, who must not
+          close or re-arm over shares the stop already sold;
+        - **unconfirmed** after the last read, or unreadable: logged, and the
+          caller proceeds as it did before this existed. That is no worse than
+          before, and loud where it was silent. A read that fails stops polling
+          that stop at once: a broker that cannot be read will not become
+          readable in the next second, and a close should not wait on it.
+        """
+        filled: list[Order] = []
+        for stop in released:
+            if stop.broker_order_id is None:
+                continue
+            seen: Order | None = None
+            for poll in range(self._cancel_ack_polls):
+                try:
+                    seen = await self.broker.get_order(stop.broker_order_id)
+                except BrokerError as exc:
+                    log.warning(
+                        "order.cancel_unconfirmed",
+                        symbol=symbol,
+                        broker_order_id=stop.broker_order_id,
+                        error=str(exc),
+                        detail="could not read the cancelled stop back — retrying the close anyway",
+                    )
+                    seen = None
+                    break
+                if seen is None or seen.is_complete or seen.filled_qty > 0:
+                    break
+                if poll + 1 < self._cancel_ack_polls:
+                    await self._sleep(CANCEL_ACK_POLL_SECONDS)
+            if seen is not None and seen.filled_qty > 0:
+                filled.append(stop)
+            elif seen is not None and not seen.is_complete:
+                log.warning(
+                    "order.cancel_unconfirmed",
+                    symbol=symbol,
+                    broker_order_id=stop.broker_order_id,
+                    status=seen.status.value,
+                    detail="the venue has not confirmed the cancel — retrying the close anyway",
+                )
+        return filled
 
     async def _rearm(self, symbol: str, released: list[Order], portfolio: Portfolio) -> None:
         """Put back the stops a refused close left the position without.

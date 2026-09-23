@@ -21,6 +21,7 @@ dependence on how fast the machine is.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -60,8 +61,10 @@ from atp_worker.scheduler import (
     next_due,
     reconcile_with_broker,
     remind_about_halts,
+    report_window,
     rollover_daily_counters,
     run_scheduler,
+    session_coverage,
     summarise_the_session,
     sweepable_series,
 )
@@ -417,6 +420,45 @@ class TestReconcileWithBroker:
 
         assert switch.is_engaged() is True
         assert switch.engagements[-1][1] == HaltReason.RECONCILIATION_MISMATCH.value
+
+    async def test_a_clean_reconcile_writes_the_book(self) -> None:
+        """**B2.** This job runs every five minutes whether or not the strategy
+        is evaluating, so it is what keeps the stored book current for a worker
+        that is halted, parked, or between daily decisions."""
+        broker = FakeBroker()
+        broker.positions["SPY"] = Position(
+            symbol="SPY", qty=Decimal(100), avg_entry_price=Decimal("100")
+        )
+        written: list[str] = []
+
+        async def checkpoint() -> None:
+            written.append("book")
+
+        session = dataclasses.replace(
+            _session(broker, FakeKillSwitch(), _book(SPY=100)), checkpoint=checkpoint
+        )
+        await reconcile_with_broker(session)
+
+        assert written == ["book"]
+
+    async def test_a_diverged_reconcile_writes_nothing(self) -> None:
+        """A book the venue disputes is already halted on. Writing it here would
+        put a disputed book on disk as though it had been checked."""
+        broker = FakeBroker()
+        broker.positions["SPY"] = Position(
+            symbol="SPY", qty=Decimal(1000), avg_entry_price=Decimal("100")
+        )
+        written: list[str] = []
+
+        async def checkpoint() -> None:
+            written.append("book")
+
+        session = dataclasses.replace(
+            _session(broker, FakeKillSwitch(), _book(SPY=100)), checkpoint=checkpoint
+        )
+        await reconcile_with_broker(session)
+
+        assert written == []
 
     async def test_it_does_not_raise_on_a_divergence(self) -> None:
         """The driver reschedules a job that raised, but it also logs it as a
@@ -1079,6 +1121,9 @@ class TestTheDecisionBarIsFetchedBeforeTheOpen:
         assert "QQQ" in body and "SPY" not in body, "only the ones actually missing"
         assert "backfill_bars.py --symbols QQQ" in body, "the command, ready to run"
         assert "--timeframe 1d" in body, "on the series that is missing, not the default"
+        # `backfill_bars.py` requires `--start`. Without it, "ready to run" was
+        # an argparse error at the one moment there is no time for one.
+        assert "--start 2026-09-21 " in body, "from the session whose bar is missing"
 
     def test_it_says_nothing_when_every_symbol_came_back(self) -> None:
         alerts = RecordingAlerts()
@@ -1162,3 +1207,50 @@ class TestWhichSessionABarBelongsTo:
 
     def test_early_utc_belongs_to_the_previous_exchange_day(self) -> None:
         assert CAL.local_date(datetime(2026, 9, 22, 1, 0, tzinfo=UTC)) == date(2026, 9, 21)
+
+
+class TestTheDailyReportsWindow:
+    """docs/paper-week/day-4-review.md, F4 and F11, on the scheduler's side."""
+
+    def test_it_is_the_trading_day_not_the_last_24_hours(self) -> None:
+        """Day 4's report counted 9 halts from the day before on a session that
+        had none, because the window was `now - 1 day`. It is now the session
+        that just closed, from the previous session's close."""
+        after_the_close = ORDINARY_CLOSE + timedelta(minutes=30)
+
+        window = report_window(CAL, after_the_close)
+
+        assert window is not None
+        session, start = window
+        assert session.day == date(2024, 6, 3)
+        assert start == datetime(2024, 5, 31, 20, 0, tzinfo=UTC), "Friday's close, over the weekend"
+
+    def test_coverage_counts_only_the_sessions_regular_hours(self) -> None:
+        stats = RunnerStats(started_at=ORDINARY_OPEN)
+        stats.evaluated_minutes = {ORDINARY_OPEN + timedelta(minutes=i) for i in range(355)} | {
+            ORDINARY_OPEN - timedelta(minutes=5),
+            ORDINARY_CLOSE + timedelta(minutes=1),
+        }
+        session = CAL.previous_session(ORDINARY_CLOSE + timedelta(minutes=30))
+        assert session is not None
+
+        coverage = session_coverage(stats, session)
+
+        assert (coverage.evaluated_minutes, coverage.session_minutes) == (355, 390)
+
+    def test_no_runner_is_a_measured_zero(self) -> None:
+        session = CAL.previous_session(ORDINARY_CLOSE + timedelta(minutes=30))
+        assert session is not None
+
+        coverage = session_coverage(None, session)
+
+        assert (coverage.evaluated_minutes, coverage.session_minutes) == (0, 390)
+
+    def test_a_runner_started_mid_session_says_when(self) -> None:
+        started = ORDINARY_OPEN + timedelta(minutes=34)
+        session = CAL.previous_session(ORDINARY_CLOSE + timedelta(minutes=30))
+        assert session is not None
+
+        coverage = session_coverage(RunnerStats(started_at=started), session)
+
+        assert coverage.visible_from == started
