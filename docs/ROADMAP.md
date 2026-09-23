@@ -1172,6 +1172,19 @@ above.
   books them through the one fill path, so a recovered position is protected
   like any other.
 
+  **It closes it for an order still working in our book, and that is narrower
+  than it reads.** The candidate set is `order_repo.open_orders`, which is
+  `status.notin_(terminal)`, and `read_missed_updates` says so itself: "every
+  order we believe is working". An order our book has already retired *while
+  still holding the position it was closing* is outside that set on every boot,
+  so the one mechanism built to repair the divergence cannot see the orders
+  that caused it. Ten protective stops armed on 2026-09-11 filled at the venue
+  over six days; every fill reached `orders` and `fills`, by the live stream or
+  by this catch-up, and no position book has been written since 09-11 19:59:05.
+  Each order went terminal without the book write that should have followed
+  it, and so out of reach of every later catch-up
+  (docs/paper-week/dropped-stop-fills.md).
+
   It is **not** adoption and the distinction is load-bearing: orders are
   addressed by the venue id we hold for our own `client_order_id`, so nothing
   can be learned about an order we did not submit. A venue position no order
