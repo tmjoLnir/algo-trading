@@ -164,7 +164,7 @@ about 19:56:30. **The failure is intermittent, not total** — which matters for
 order = self._open_orders.get(update.client_order_id)
 if order is None:
     log.warning("runner.fill_for_unknown_order", client_order_id=..., symbol=...)
-    return          # the position is never touched
+    return  # the position is never touched
 ```
 
 A fill for an order that is not in `_open_orders` is logged at **warning** and discarded. The
