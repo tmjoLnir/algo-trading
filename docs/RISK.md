@@ -100,10 +100,17 @@ ATR(14).
   on the opposite side. A target that only exists in our process is an
   acceptable loss when the process dies; a stop is not, which is why SAFETY.md
   has a layer for one and not the other.
-- **An entry that fills in pieces gets a stop per piece.** Protection is
-  additive rather than cancel-and-replace: replacing opens an unprotected window
-  between the cancel landing and the replacement being acknowledged, and the
-  cancel can lose the race outright.
+- **An entry that fills in pieces gets one stop, placed when it is terminal.**
+  While the entry works, the level is armed on the position and the engine
+  watches it. Nothing goes to the venue, because the venue refuses an
+  opposite-side stop against a working order as a potential wash trade: "a stop
+  per piece", which this line used to say, met that refusal 69 times on day 4
+  (docs/paper-week/day-4-review.md, F5). The fill that completes the entry (or
+  the cancel or expiry that ends a partly filled one) places a single stop over
+  everything it filled. Protection stays additive rather than cancel-and-replace
+  across separate entries: replacing opens an unprotected window between the
+  cancel landing and the replacement being acknowledged, and the cancel can lose
+  the race outright.
 - **A close is the one thing that may take a stop off, and only after the venue
   says so.** A working order reserves the shares it covers, so the GTC stop over
   a whole position reserves the whole position and the close that would flatten

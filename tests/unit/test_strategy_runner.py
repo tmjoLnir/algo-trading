@@ -3749,3 +3749,68 @@ class TestTheEvaluatedMinutes:
         await runner.evaluate(portfolio)
 
         assert runner.stats.evaluated_minutes == set()
+
+
+class TestProtectionWaitsForTheEntry:
+    """docs/paper-week/day-4-review.md, F5: a stop per partial fill met a venue
+    that refuses an opposite-side stop against a working order, 69 times. The
+    router now defers while the entry works; this is the runner's half."""
+
+    @pytest.mark.asyncio
+    async def test_a_deferral_is_a_known_gap_the_engine_watches_not_a_refusal(self) -> None:
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        orders = FakeOrderRepository()
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)], order_repo=orders)
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+        await runner.evaluate(portfolio)
+
+        async def defer(entry_order: Order, *_: Any, **__: Any) -> ProtectionResult:
+            return ProtectionResult(
+                unprotected_qty=Decimal(10), engine_side_stop=Decimal(95), deferred=True
+            )
+
+        router.submit_protective_orders = defer  # type: ignore[method-assign]
+        with capture_logs() as logs:
+            await runner.on_fill_event(TestFills.a_fill_update("atp-1"), portfolio)
+
+        events = [e["event"] for e in logs]
+        assert "runner.protection_deferred" in events
+        assert "runner.position_unprotected" not in events, "nothing was refused"
+        assert runner._unprotected[SYMBOL] == Decimal(10)
+        assert runner._stop_is_missing(portfolio.position(SYMBOL)), "the engine watches the level"
+        assert not [o for o in orders.saved.values() if o.status is OrderStatus.REJECTED_RISK]
+
+    @pytest.mark.asyncio
+    async def test_an_entry_cancelled_after_a_partial_fill_is_protected_then(self) -> None:
+        """It goes terminal with no new fill, so nothing else would place the
+        stop its fills were waiting for."""
+        partial = Order(
+            symbol=SYMBOL,
+            side=Side.BUY,
+            qty=Decimal(100),
+            client_order_id="atp-part",
+            broker_order_id="brk-part",
+        )
+        partial.status = OrderStatus.PARTIALLY_FILLED
+        partial.filled_qty = Decimal(40)
+        partial.avg_fill_price = Decimal(100)
+        orders = FakeOrderRepository()
+        orders.restorable = [partial]
+        runner, router, _, _, portfolio, _ = build(order_repo=orders)
+        position = portfolio.position(SYMBOL)
+        position.qty = Decimal(40)
+        position.avg_entry_price = Decimal(100)
+        await runner.warmup(portfolio)
+
+        cancelled = TradeUpdate(
+            event="canceled",
+            client_order_id="atp-part",
+            broker_order_id="brk-part",
+            symbol=SYMBOL,
+            at=START,
+            status=OrderStatus.CANCELLED,
+        )
+        await runner.on_fill_event(cancelled, portfolio)
+
+        assert [o.client_order_id for o in router.protected] == ["atp-part"]

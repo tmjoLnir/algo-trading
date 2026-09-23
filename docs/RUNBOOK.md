@@ -1056,6 +1056,13 @@ acknowledged".
 
 *Symptom:* a `CRITICAL` log with either event name.
 
+`order.protection_deferred` / `runner.protection_deferred` at `INFO` are **not** this.
+They mean the entry is still working, so its stop waits for the entry to finish.
+The venue refuses an opposite-side stop against a working order, and the engine
+watches the armed level meanwhile. A market entry closes that gap in about a
+second. A limit entry resting part-filled keeps it open until it fills, is
+cancelled or expires, and the unprotected page will say so while it lasts.
+
 The position is live and the venue holds nothing against it. An engine-side
 level may be armed, which protects you only while the worker is up — that is not
 the guarantee a broker-side stop gives.

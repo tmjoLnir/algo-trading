@@ -241,6 +241,11 @@ class ProtectionResult:
     unprotected_qty: Decimal = Decimal(0)
     #: The level armed on the `Position` for the engine to watch, placed or not.
     engine_side_stop: Decimal | None = None
+    #: Nothing was placed because the entry is still working, not because
+    #: anything refused. The level is armed; the venue stop goes on when the
+    #: entry is terminal, in one piece (day-4 F5). Its `unprotected_qty` is
+    #: the gap the engine-side level covers until then.
+    deferred: bool = False
 
     @property
     def stop_order(self) -> Order | None:
@@ -580,11 +585,22 @@ class OrderRouter:
         sizing is defined off `|entry − stop|`, so a level anchored to a price
         we did not get silently stops meaning what the sizer assumed.
 
-        **Covers what has filled since the last call**, capped at the exposure
-        actually held. An entry that fills in pieces gets a stop per piece;
-        `protective_client_order_id` keys each by the range it covers, so a
-        replayed fill event places nothing and a genuinely new tranche is not
-        deduplicated against the last one.
+        **Placed once the entry is terminal, not per piece.** An entry still
+        working is armed on the position and nothing goes to the venue
+        (`ProtectionResult.deferred`). The venue refuses an opposite-side stop
+        against a working order as a potential wash trade: "a stop per piece"
+        met that refusal 69 times on day 4, across 18 symbols, and every refusal
+        was a short unprotected window plus a wasted request against a
+        30-a-minute rate limit (docs/paper-week/day-4-review.md, F5; day 3's
+        B2 asked for exactly this). The engine-side level covers the gap, and
+        the call that sees the entry terminal covers everything it filled with
+        one stop, because the covered total does not move while it defers.
+
+        **Covers what has filled since the last placement**, capped at the
+        exposure actually held. `protective_client_order_id` keys each stop by
+        the range it covers, so a replayed fill event places nothing, and a
+        second placement for the same entry (a remainder after a re-arm) is not
+        deduplicated against the first.
 
         Two contracts this places on whoever calls it, both load-bearing:
 
@@ -707,6 +723,24 @@ class OrderRouter:
                 detail="no usable stop level for this position",
             )
             return ProtectionResult(unprotected_qty=increment, engine_side_stop=armed)
+
+        if not entry_order.is_complete:
+            # After arming and after the no-level check, so a deferred entry is
+            # always one with a level armed for the engine to watch.
+            log.info(
+                "order.protection_deferred",
+                symbol=symbol,
+                entry_order_id=entry_order.id,
+                filled=str(entry_order.filled_qty),
+                level=str(stop_level),
+                detail=(
+                    "the entry is still working and the venue refuses an opposite-side stop "
+                    "against it — armed engine-side, placed at the venue when the entry is terminal"
+                ),
+            )
+            return ProtectionResult(
+                unprotected_qty=increment, engine_side_stop=armed, deferred=True
+            )
 
         stop_child = self._stop_order(
             entry_order, position, increment, stop_level, covered_from, covered_to

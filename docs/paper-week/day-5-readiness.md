@@ -594,6 +594,17 @@ unprotected windows, and the alert-budget exhaustion in the first thirty seconds
 blocking on its own; it is what makes §3.4's silence expensive, because it is what fills the
 budget before anything real happens.
 
+> **Closed by #167** (added after F10), recorded here rather than by editing the finding above.
+> `submit_protective_orders` still arms the level on every fill, but while the entry is working
+> it places nothing and returns `ProtectionResult(deferred=True)`. The covered total does not
+> move, so the fill that completes the entry places **one** stop over everything it filled. The
+> runner records a deferred gap in `_unprotected`, which makes `_stop_is_missing` have the engine
+> watch the armed level: that is the engine-side stop covering the gap, as day 3 and day 4 both
+> asked. It is logged at INFO and is not a refusal. An entry that part-fills and is then
+> cancelled or expires goes terminal with no new fill, so `on_fill_event` now protects on that
+> transition too; otherwise its remainder would never get a venue stop. Proven by unit tests
+> only.
+
 ### 4.4 F9 — a stop refused at boot is never re-armed `medium`
 
 Nothing in `libs/core/src/atp_core/risk/` or the recovery path changed. The ordering that

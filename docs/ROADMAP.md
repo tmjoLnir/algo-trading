@@ -1718,6 +1718,10 @@ above.
   `stop_grace_period` is 30 s instead of Docker's 10, so the drain has room to
   finish (#167).
 
+  **And the stop now waits for the entry** (#167, day-4 F5). A working entry is
+  armed engine-side and gets its venue stop, one stop, once it is terminal. That
+  removes the wash-trade rejection a stop per partial fill met 69 times on day 4.
+
 *Verifiable:* a strategy trades the paper account for a week and reconciles clean.
 
 **Not shown, and the two tools that would let it be are built** — @claude (#83).

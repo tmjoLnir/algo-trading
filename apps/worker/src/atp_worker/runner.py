@@ -2494,6 +2494,7 @@ class StrategyRunner:
                 return
 
             before = order.filled_qty
+            was_complete = order.is_complete
             if not apply_trade_update(order, update):
                 return
 
@@ -2512,6 +2513,12 @@ class StrategyRunner:
                 # managing, and a reader who acts on that is acting earlier
                 # than the system did.
                 await self._announce(CHANNEL_ORDERS, _fill_message(order, fill))
+            elif order.is_complete and not was_complete and order.filled_qty > 0:
+                # An entry that part-filled and was then cancelled or expired
+                # goes terminal with no new fill. Protection deferred while it
+                # was working is owed now, and nothing else would place it
+                # (day-4 F5). `_protect` returns early for a reducing order.
+                await self._protect(order, portfolio)
 
             if order.is_complete:
                 # Saved before it leaves the working set: `_persist` only walks
@@ -2616,6 +2623,21 @@ class StrategyRunner:
             raise
         for protective in result.placed:
             self._track(protective)
+        if result.deferred:
+            # Nothing was refused: the entry is still working, so the venue stop
+            # waits for it to finish (day-4 F5). The gap is recorded as a known
+            # one so `_stop_is_missing` has the engine watch the level the router
+            # just armed. That is the engine-side stop covering the gap, as
+            # intended. Not an error, and no refusal row: there is nothing to
+            # refuse yet.
+            self._unprotected[order.symbol] = result.unprotected_qty
+            log.info(
+                "runner.protection_deferred",
+                symbol=order.symbol,
+                uncovered_qty=str(result.unprotected_qty),
+                engine_side_stop=str(result.engine_side_stop),
+            )
+            return
         if result.is_fully_protected:
             # Records the opposite fact just as explicitly: a symbol that was
             # short a stop and now is not must stop being treated as one, or the
