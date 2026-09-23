@@ -1082,7 +1082,7 @@ above.
   reverses. Unticked either way: this item waits on the phase's
   *Verifiable:* line, not on code.
 
-  **The map itself is now rebuilt at boot** (PR_NUMBER). `warmup` hands the
+  **The map itself is now rebuilt at boot** (#165). `warmup` hands the
   stops it restored to `OrderRouter.adopt_protection` before it catches up on
   what the venue did, so the per-pass protection count sees them. Before this,
   every position carried across a restart paged "NO stop at the broker" at the

@@ -399,7 +399,7 @@ walks a reader receiving this alert through placing a stop by hand through the b
 Followed here, that produces a second stop over a position that already has one. Decide now not
 to act on that page.
 
-> **Closed by PR_NUMBER**, recorded here rather than by editing the finding above. All three
+> **Closed by #165**, recorded here rather than by editing the finding above. All three
 > parts landed together, as item 7 of §8 asked.
 >
 > - **The false page.** `OrderRouter.adopt_protection` runs in `warmup`, right after the
@@ -514,7 +514,7 @@ cover this call site too or it will be fixed in one of three places.
 `EXIT` — it never flips a position through zero. It becomes reachable the moment a strategy that
 shorts is configured, which is a thing to remember rather than a thing to do now.
 
-> **Closed by PR_NUMBER** with §3.4. It uses boot-time adoption, not a venue read on every fill,
+> **Closed by #165** with §3.4. It uses boot-time adoption, not a venue read on every fill,
 > so the unprotected window after each entry is unchanged.
 
 ### 4.6 Documentation that now contradicts the tree or itself `medium`
@@ -711,7 +711,7 @@ Then, as code, in this order:
    `restored_book`** (§4.1). The shutdown snapshot waits on F10's handler; the other two do not.
 7. **The unprotected alert in both directions, plus the refusal text** (§3.4, F1/F2) — and fix
    `_mark_broker_protection` so an inherited stop counts, which is the same fallback as item 3.
-   *(Done, PR_NUMBER — by boot-time adoption rather than a fallback, which also closes §4.5. See
+   *(Done, #165 — by boot-time adoption rather than a fallback, which also closes §4.5. See
    §3.4's note.)*
 8. **The daily report's four numbers and RTH coverage** (§4.2). It is the only end-of-day
    artifact and it finally runs.
