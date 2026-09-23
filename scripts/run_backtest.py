@@ -399,7 +399,7 @@ async def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             f"No stored bars for {', '.join(missing)} in {start.date()} → {end.date()}. "
             f"Backfill first: scripts/backfill_bars.py --symbols {','.join(missing)} "
-            f"--start {start.date()}"
+            f"--start {start.date()} --timeframe {timeframe.value}"
         )
 
     # Three things this run is NOT evidence about, said before the numbers

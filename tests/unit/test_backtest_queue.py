@@ -375,6 +375,9 @@ class TestFailurePaths:
         stored = runs.runs[RUN_ID]
         assert stored.status == "failed"
         assert "backfill_bars.py" in (stored.error or "")
+        assert "--timeframe " in (stored.error or ""), (
+            "the series the run needs, not the 1d default"
+        )
 
     async def test_a_domain_failure_lands_on_the_row_in_words(
         self, ctx: dict[str, Any], runs: FakeBacktestRunRepository, bar_repo: FakeBarRepository

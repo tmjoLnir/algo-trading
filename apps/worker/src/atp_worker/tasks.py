@@ -144,7 +144,7 @@ async def _execute(ctx: dict[str, Any], spec: BacktestRunSpec, run_id: str) -> B
     bars = await _load_bars(ctx, spec)
     missing = missing_coverage(bars, spec.symbols)
     if missing:
-        raise _CoverageGapError(backfill_hint(missing, spec.start))
+        raise _CoverageGapError(backfill_hint(missing, spec.start, timeframe=spec.timeframe))
 
     return await asyncio.to_thread(
         run_spec,

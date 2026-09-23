@@ -450,6 +450,9 @@ class TestValidation:
         assert "backfill_bars.py --symbols TEST" in message
         assert "--start 2024-01-04" in message  # the last bar before the hole
         assert "--end 2025-02-05" in message  # the first bar after it
+        # `backfill_bars.py` defaults to `1d`; naming the series is what keeps
+        # an intraday run from refilling the wrong one.
+        assert "--timeframe 1d" in message
 
     def test_weekends_and_holidays_are_not_holes(self) -> None:
         """Real daily data is full of three- and four-day steps. A check that
@@ -1060,6 +1063,44 @@ class TestCorporateActions:
 
         with pytest.raises(UnadjustedDataError, match="--raw-only"):
             engine(ScriptedStrategy({})).run({"TEST": bars})
+
+    def test_the_backfill_command_runs_as_printed(self) -> None:
+        """`backfill_bars.py` requires `--start` and defaults `--timeframe` to
+        `1d`. The command this printed carried neither, so pasting it exited on
+        an argparse error, and with a start would have refilled the wrong
+        series under an intraday run. The window is the unadjusted bars' own,
+        with `--end` the day after the last, since `--end` is that day's
+        midnight UTC."""
+        bars = [
+            replace(candle, adj_close=None) if 2 <= index <= 6 else candle
+            for index, candle in enumerate(split_bars())
+        ]
+        first = (START + timedelta(days=2)).date()
+        end = (START + timedelta(days=7)).date()
+
+        with pytest.raises(UnadjustedDataError) as refused:
+            engine(ScriptedStrategy({})).run({"TEST": bars})
+
+        assert (
+            f"scripts/backfill_bars.py --symbols TEST --start {first.isoformat()} "
+            f"--end {end.isoformat()} --timeframe 1d"
+        ) in str(refused.value)
+
+    def test_the_command_covers_every_symbol_not_the_eight_it_names(self) -> None:
+        """The prose stops at eight. A command that repaired eight of twelve
+        would leave a run refused again for the other four."""
+        # `TEST` is the symbol the engine's config asks for; eleven more beside it.
+        names = ["TEST", *(f"S{n:02d}" for n in range(11))]
+        universe = {
+            name: [replace(c, symbol=name, adj_close=None) for c in split_bars()] for name in names
+        }
+
+        with pytest.raises(UnadjustedDataError) as refused:
+            engine(ScriptedStrategy({})).run(universe)
+
+        message = str(refused.value)
+        assert "and 4 more" in message
+        assert "--symbols " + ",".join(sorted(universe)) + " " in message
 
     def test_one_unadjusted_symbol_refuses_the_whole_run(self) -> None:
         """Not just its own series. A universe where nineteen symbols are

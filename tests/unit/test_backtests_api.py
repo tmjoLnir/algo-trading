@@ -548,6 +548,7 @@ class TestRefusalsBeforeTheJobIsQueued:
         detail = response.json()["detail"]
         assert "backfill_bars.py" in detail
         assert "--symbols SPY" in detail
+        assert "--timeframe " in detail, "the series the run needs, not the 1d default"
         # And nothing was queued or recorded: the refusal is complete.
         assert runs.runs == {}
         assert queue.enqueued == []
