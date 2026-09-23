@@ -3041,6 +3041,100 @@ class TestAColdSymbolCannotTrade:
         assert runner._cold_symbols() == 0, "the gate opens rather than latching"
 
 
+class TestAColdExitOnAHeldPositionPasses:
+    """§3.3 of docs/paper-week/day-5-readiness.md.
+
+    The cold gate mirrors `BacktestEngine.run`, and a backtest starts flat: it
+    takes no entry while cold, so it never holds a position the gate could judge
+    an exit on. Live, `_warmup_floor` restarts an intraday series at every open,
+    so every position carried in overnight is judged by it. An `EXIT` on one was
+    discarded like a cold entry, keeping exposure the strategy asked to shed.
+    """
+
+    @staticmethod
+    async def _held_and_warm(
+        strategy: Strategy,
+    ) -> tuple[StrategyRunner, FakeRouter, Portfolio]:
+        """A runner through `warmup` on one bar, holding 10 SPY."""
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])  # type: ignore[arg-type]  # a real strategy, too
+        position = portfolio.position(SYMBOL)
+        position.qty = Decimal(10)
+        position.avg_entry_price = Decimal(100)
+        position.last_price = Decimal(100)
+        await runner.warmup(portfolio)
+        return runner, router, portfolio
+
+    @staticmethod
+    async def _close(runner: StrategyRunner, portfolio: Portfolio, closes: list[float]) -> None:
+        """Close the bars after `bar(0)`, one per evaluation."""
+        series = [bar(0)]
+        for index, close in enumerate(closes, start=1):
+            series.append(bar(index, close))
+            runner.bar_repo.bars[SYMBOL] = list(series)  # type: ignore[attr-defined]
+            await runner.evaluate(portfolio)
+
+    @pytest.mark.asyncio
+    async def test_a_cold_exit_on_a_held_position_reaches_the_router(self) -> None:
+        """**The finding.** Without the exemption this is discarded and
+        counted, and the position waits for the window to fill or for its stop."""
+        strategy = ScriptedStrategy({0: SignalAction.EXIT}, warmup=5)
+        runner, router, _ = await self._held_and_warm(strategy)
+
+        with capture_logs() as logs:
+            await self._close(runner, runner._portfolio, [100.0])
+
+        assert [s.action for s in router.signals] == [SignalAction.EXIT]
+        assert runner.stats.signals_discarded_cold == 0
+        assert any(e["event"] == "runner.cold_exit_admitted" for e in logs)
+
+    @pytest.mark.asyncio
+    async def test_a_cold_entry_is_still_discarded_while_holding(self) -> None:
+        """The exemption is for reducing the book, not for being in it. Adding
+        to a position on a cold indicator is exactly the trade the gate
+        exists to stop."""
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG}, warmup=5)
+        runner, router, _ = await self._held_and_warm(strategy)
+
+        await self._close(runner, runner._portfolio, [100.0])
+
+        assert router.signals == []
+        assert runner.stats.signals_discarded_cold == 1
+
+    @pytest.mark.asyncio
+    async def test_a_cold_exit_while_flat_is_still_discarded(self) -> None:
+        """Nothing to reduce, so it would be a no-op at the router. It is
+        still counted as the strategy speaking while cold."""
+        strategy = ScriptedStrategy({0: SignalAction.EXIT}, warmup=5)
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+        await runner.warmup(portfolio)
+
+        await self._close(runner, portfolio, [100.0])
+
+        assert router.signals == []
+        assert runner.stats.signals_discarded_cold == 1
+
+    @pytest.mark.asyncio
+    async def test_sma_crossover_loses_exactly_one_bar_to_the_gate(self) -> None:
+        """How much the exemption buys for the strategy the paper week runs.
+
+        `SmaCrossover` returns nothing until it holds `slow + 1` closes, which
+        is `warmup_bars`. The gate admits at `warmup_bars + 1`. So the only
+        signal the gate can take from it is the one on the bar where the two
+        meet. Here, slow=3: the crossing lands on the 4th close, with 4 held
+        against `warm_after` 4.
+        """
+        from atp_core.strategy.examples.sma_crossover import SmaCrossover
+
+        strategy = SmaCrossover({"fast_period": 2, "slow_period": 3, "timeframe": "1d"})
+        runner, router, _ = await self._held_and_warm(strategy)
+        assert runner.warm_after == 4
+
+        await self._close(runner, runner._portfolio, [100.0, 100.0, 90.0])
+
+        assert len(runner._bars[SYMBOL]) == 4, "still cold by the gate's count"
+        assert [s.action for s in router.signals] == [SignalAction.EXIT]
+
+
 class TestTheConfiguredStopHasAWidth:
     """F8. A stop config only means something against a timeframe, and nothing
     said which pair was in force.

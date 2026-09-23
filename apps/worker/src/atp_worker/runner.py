@@ -1793,6 +1793,24 @@ class StrategyRunner:
         that happened legible afterwards. HOLD is not counted: it is the
         strategy saying nothing happened, and `_submit` would not have routed it
         either.
+
+        **An `EXIT` on a position this book holds is not a cold-start decision,
+        and it passes.** The gate mirrors a backtest, and a backtest starts flat:
+        it takes no entry while cold, so it can never be holding a position while
+        `seen <= warmup`, and the comparison never judges an exit there. Live,
+        the floor restarts the series at every session open
+        (`_warmup_floor`), so the gate judges every position carried in
+        overnight. Discarding that exit keeps exposure the strategy asked to shed.
+        Letting it through only reduces the book, and it still passes the whole
+        risk chain (docs/paper-week/day-5-readiness.md, §3.3). An `EXIT` while
+        flat is still discarded and counted. It would be a no-op anyway, and
+        letting it through would put noise in the decision record.
+
+        How much this buys depends on the strategy. `SmaCrossover` checks its own
+        length and says nothing until it has `slow_period + 1` closes, one bar
+        short of `warm_after`, so for it the gate costs exactly one bar per symbol
+        per session. The rest of an intraday session's cold window is the
+        indicator not existing yet, and no gate can change that.
         """
         signals: list[Signal] = []
         for bar in closed:
@@ -1804,6 +1822,19 @@ class StrategyRunner:
                 continue
             for signal in produced:
                 if signal.action is SignalAction.HOLD:
+                    continue
+                if signal.action is SignalAction.EXIT and self._holds(signal.symbol):
+                    log.warning(
+                        "runner.cold_exit_admitted",
+                        symbol=signal.symbol,
+                        have=have,
+                        needed=self.warm_after,
+                        detail=(
+                            "an exit on a held position passes the cold gate — "
+                            "it can only reduce the book"
+                        ),
+                    )
+                    signals.append(signal)
                     continue
                 self.stats.signals_discarded_cold += 1
                 log.warning(
@@ -1818,6 +1849,15 @@ class StrategyRunner:
                     ),
                 )
         return signals
+
+    def _holds(self, symbol: str) -> bool:
+        """Whether the book holds a position in `symbol`.
+
+        `.get`, not `Portfolio.position`, which is a `setdefault` and would
+        insert an empty position into a book this only inspects.
+        """
+        position = self._portfolio.positions.get(symbol)
+        return position is not None and not position.is_flat
 
     def _stamp(self, signal: Signal, bar: Bar) -> Signal:
         """Date a session series' decision by its bar, not by the wall clock.

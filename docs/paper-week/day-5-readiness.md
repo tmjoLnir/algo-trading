@@ -372,6 +372,25 @@ are all entries.
 At `1d` this evaporates: no floor, 51 stored bars, warm at the open. Which is another reason
 §3.2 comes first.
 
+> **Closed by #166, with a correction to the size of the finding**, recorded here rather
+> than by editing it. `_poll_strategy` now lets an `EXIT` through the gate when the book holds
+> a position in that symbol. It logs `runner.cold_exit_admitted` and the exit still passes the
+> whole risk chain. Entries, and an `EXIT` while flat, are discarded and counted as before.
+> This creates no backtest divergence: a backtest takes no entry while cold, so it never holds
+> a position the gate could judge.
+>
+> **The correction.** The ~52-minute window above is real, but the gate causes only one bar of
+> it for `sma_crossover`. The strategy returns `[]` until it holds `slow_period + 1` = 51
+> closes, which is `warmup_bars`, and the gate admits at `have > 51`. So the gate can discard
+> only the signal on the 51st bar of each symbol's session, and at `1m` that is one minute. The
+> other ~50 minutes are SMA(50) not existing yet on a series `_warmup_floor` restarts at the
+> open. No change to the gate can shorten that, and stitching pre-open bars back on is day-2
+> F8's defect. So on a `1m` session a position carried in still cannot be exited *by signal*
+> for about the first 50 minutes. Its venue stop is what protects it, and after #165 that stop
+> is counted correctly. The exemption matters more for a strategy that can decide an exit
+> while its window is short. `test_sma_crossover_loses_exactly_one_bar_to_the_gate` pins the
+> one-bar figure. Established from the code and tests only: day 5 has not run.
+
 ### 3.4 The first evaluation will page one false CRITICAL, then go silent for the session `high`
 
 `_mark_broker_protection` (`runner.py:1156-1191`) sets `position.broker_protected_qty` from
@@ -709,6 +728,8 @@ Then, as code, in this order:
    in it — see §3.1's note. It wants boot-time adoption, together with item 7.)*
 4. **Exempt `EXIT` from the cold gate, or bound it** (§3.3). A position already held is not a
    cold-start decision; discarding its exit is strictly worse than letting it through.
+   *(Done, #166, for held positions only. For `sma_crossover` it recovers one bar per
+   symbol per session, not the ~52 minutes. See §3.3's note.)*
 5. **Mark the book before anchoring the session** (§3.5), or anchor from fresh quotes. And
    persist `day_start_equity`, which two docstrings already promise.
 6. **B2: snapshot on fill and from the reconcile job, and put the snapshot's age in
