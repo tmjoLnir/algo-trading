@@ -18,7 +18,7 @@ The cases worth naming, because each is a specific loss:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -48,7 +48,8 @@ from atp_core.errors import (
     InsufficientFundsError,
     OrderRejectedError,
 )
-from atp_core.execution.router import NO_ACTION, ROUTING, SIZING, OrderRouter
+from atp_core.execution.idempotency import ENTRY, UNKNOWN_PURPOSE
+from atp_core.execution.router import NO_ACTION, ROUTING, SIZING, OrderRouter, SubmitResult
 from atp_core.risk.engine import RiskBooks, RiskDecision, RiskEngine, RiskRule, default_rules
 from atp_core.risk.limits import RiskLimits
 from atp_core.risk.rules import DailyLossLimitRule
@@ -1941,3 +1942,170 @@ class TestClosingReleasesInheritedProtection:
         assert any(e["event"] == "order.protection_release_found_nothing" for e in logs), (
             "a close refused for shares nobody can free must say so"
         )
+
+
+class TestAdoptingInheritedProtection:
+    """The other half of a restart, which #163 left open on purpose.
+
+    #163 taught release and `cancel_protection` to read the venue at the moment
+    they act. Two readers of `_protective` are not lookups and could not be
+    fixed that way: `broker_side_protected_qty`, which the runner's
+    `_mark_broker_protection` reads on every pass, and `_cancel_stale_protection`,
+    which runs on every fill and deliberately does not read the venue. Both see
+    an empty map after every restart, so every inherited position would page as
+    naked at the first evaluation and a wrong-side inherited stop would stay
+    resting (docs/paper-week/day-5-readiness.md, §3.4 and §4.5 — found by
+    reading, before day 5 ran).
+
+    The restart is modelled as in `TestClosingReleasesInheritedProtection`: a
+    second `OrderRouter` over the same `FakeBroker`.
+    """
+
+    async def _restarted(
+        self, broker: FakeBroker, portfolio: Portfolio, *, qty: int = 100
+    ) -> tuple[OrderRouter, Order]:
+        """A long SPY protected by a process that is now gone, and a fresh router.
+
+        Returns the venue's copy of the stop — what a restored order is: the
+        same order, but not the object the dead router held.
+        """
+        dead = router(broker, chain())
+        entry = (await dead.submit(request(qty=qty, stop_loss_price=Decimal(95)), portfolio)).order
+        assert entry is not None
+        fill(entry, portfolio, qty, 100)
+        portfolio.position("SPY").last_price = Decimal(100)
+        venue = broker.positions.setdefault("SPY", Position(symbol="SPY"))
+        venue.qty = Decimal(qty)
+        venue.avg_entry_price = Decimal(100)
+        assert (await dead.submit_protective_orders(entry, portfolio)).stop_order is not None
+        stop = next(o for o in await broker.get_open_orders() if o.order_type is OrderType.STOP)
+        return router(broker, chain()), stop
+
+    async def test_an_adopted_stop_counts_as_protection(self) -> None:
+        """**§3.4.** Without adoption this is 0 and the first evaluation would page
+        *"1 position(s) with NO stop at the broker"* over a live GTC stop."""
+        broker, portfolio = FakeBroker(), book()
+        reborn, stop = await self._restarted(broker, portfolio)
+        position = portfolio.position("SPY")
+        assert reborn.broker_side_protected_qty("SPY", position) == 0, "the premise"
+
+        adopted = reborn.adopt_protection([stop])
+
+        assert adopted == [stop]
+        assert reborn.broker_side_protected_qty("SPY", position) == Decimal(100)
+        assert reborn.has_broker_side_protection("SPY", position)
+
+    async def test_adopting_twice_does_not_count_twice(self) -> None:
+        """`warmup` re-runs at every open against the same working set. A stop
+        counted twice would report a half-covered position as fully covered."""
+        broker, portfolio = FakeBroker(), book()
+        reborn, stop = await self._restarted(broker, portfolio)
+
+        reborn.adopt_protection([stop])
+        again = reborn.adopt_protection([stop, replace(stop)])
+
+        assert again == []
+        assert reborn.broker_side_protected_qty("SPY", portfolio.position("SPY")) == Decimal(100)
+
+    async def test_the_adopted_instance_going_terminal_stops_counting(self) -> None:
+        """Why the caller passes its own instances: a trade update that fills or
+        cancels the stop mutates that object, and the router must see it."""
+        broker, portfolio = FakeBroker(), book()
+        reborn, stop = await self._restarted(broker, portfolio)
+        reborn.adopt_protection([stop])
+
+        stop.status = OrderStatus.CANCELLED
+
+        assert reborn.broker_side_protected_qty("SPY", portfolio.position("SPY")) == 0
+
+    async def test_what_is_not_protection_is_not_adopted(self) -> None:
+        """A stop-*entry* has a stop price and is not protection: adopted, it
+        would be counted as cover and then cancelled on the next fill as facing
+        the wrong way. Terminal orders and orders the venue never acknowledged
+        have nothing working to count."""
+        broker, portfolio = FakeBroker(), book()
+        reborn, stop = await self._restarted(broker, portfolio)
+        stop_entry = replace(stop, id="e", broker_order_id="brk-e", purpose=ENTRY, side=Side.BUY)
+        done = replace(stop, id="d", broker_order_id="brk-d", status=OrderStatus.FILLED)
+        unacknowledged = replace(stop, id="u", broker_order_id=None)
+        not_a_stop = replace(
+            stop,
+            id="m",
+            broker_order_id="brk-m",
+            order_type=OrderType.LIMIT,
+            stop_price=None,
+            limit_price=Decimal(110),
+        )
+
+        adopted = reborn.adopt_protection([stop_entry, done, unacknowledged, not_a_stop])
+
+        assert adopted == []
+        assert reborn._protective == {}
+
+    async def test_a_stop_of_unknown_purpose_is_adopted(self) -> None:
+        """Rows stored before `orders.purpose` existed restore as `unknown`.
+        Every non-entry stop this platform has placed was protective, and
+        leaving these out would bring the false page back for exactly the
+        oldest positions."""
+        broker, portfolio = FakeBroker(), book()
+        reborn, stop = await self._restarted(broker, portfolio)
+
+        adopted = reborn.adopt_protection([replace(stop, purpose=UNKNOWN_PURPOSE)])
+
+        assert len(adopted) == 1
+        assert reborn.broker_side_protected_qty("SPY", portfolio.position("SPY")) == Decimal(100)
+
+    async def test_a_wrong_side_inherited_stop_is_cancelled_once_adopted(self) -> None:
+        """**§4.5.** After a flip the old side's stop *opens* a position when it
+        fires. `_cancel_stale_protection` reads only the map, so without
+        adoption it returned 0 and left the inherited one resting."""
+        broker, portfolio = FakeBroker(), book()
+        reborn, stop = await self._restarted(broker, portfolio)
+        # The inherited stop sells; were the position now short, the closing
+        # side would be BUY and this SELL stop would be the stale one.
+        assert await reborn._cancel_stale_protection("SPY", Side.BUY) == 0, "the premise"
+
+        reborn.adopt_protection([stop])
+
+        assert await reborn._cancel_stale_protection("SPY", Side.BUY) == 1
+        assert broker.open_stops("SPY") == 0
+
+    async def test_an_adopted_stop_is_released_once_not_twice(self) -> None:
+        """Adopted, the stop is tracked, so the venue read in the release must
+        not hand it back a second time — two cancels for one order, and a
+        re-arm count off by one."""
+        broker, portfolio = FakeBroker(), book()
+        reborn, stop = await self._restarted(broker, portfolio)
+        reborn.adopt_protection([stop])
+
+        result = await reborn.flatten("SPY", portfolio)
+
+        assert result.submitted
+        assert broker.cancelled == [stop.broker_order_id]
+        assert broker.open_stops("SPY") == 0
+
+
+class TestTheRefusalReason:
+    """F2: the runner read `decision.reason`, which is empty for a venue refusal
+    — `_route` returns the chain's *approving* decision with `submitted=False`
+    — so `runner.position_unprotected` said `refusals=['']` 69 times on day 4
+    while the venue's words sat on the order (docs/paper-week/day-4-review.md)."""
+
+    def test_a_venue_refusal_reads_the_orders_reason(self) -> None:
+        order = Order(symbol="KO", side=Side.SELL, qty=Decimal(27))
+        order.reject_reason = "potential wash trade detected. use complex orders"
+        result = SubmitResult(order=order, decision=RiskDecision.allow(), submitted=False)
+
+        assert result.refusal_reason == "potential wash trade detected. use complex orders"
+
+    def test_a_risk_refusal_reads_the_decision(self) -> None:
+        result = SubmitResult.refused(
+            "kill_switch", "halted", Order(symbol="KO", side=Side.SELL, qty=Decimal(27))
+        )
+
+        assert result.refusal_reason == "halted"
+
+    def test_nothing_to_say_is_an_empty_string(self) -> None:
+        result = SubmitResult(order=None, decision=RiskDecision.allow(), submitted=False)
+
+        assert result.refusal_reason == ""

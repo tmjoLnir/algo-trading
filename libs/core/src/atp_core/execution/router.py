@@ -158,6 +158,25 @@ class SubmitResult:
         """Refused before the risk chain could run, or by the venue."""
         return cls(order=order, decision=RiskDecision.deny(stage, reason), submitted=False)
 
+    @property
+    def refusal_reason(self) -> str:
+        """Why this was refused, in words — whichever stage refused it.
+
+        `decision.reason` alone is empty for a *venue* refusal: `_route` returns
+        the chain's approving decision with `submitted=False`, and the venue's
+        own text is on the order as `reject_reason`. Reading only the decision
+        is how the runner's `position_unprotected` line carried `refusals=['']`
+        on every one of day 4's 69 wash-trade rejections while the router's line
+        two microseconds earlier had the venue's exact words
+        (docs/paper-week/day-4-review.md, F2). The router's own log lines already
+        fall back this way; this puts the fallback where a caller can reach it.
+        """
+        if self.decision.reason:
+            return self.decision.reason
+        if self.order is not None and self.order.reject_reason:
+            return self.order.reject_reason
+        return ""
+
 
 @dataclass(frozen=True, slots=True)
 class _Cover:
@@ -291,10 +310,12 @@ class OrderRouter:
         #: stop over shares that already have one. One small entry per protected
         #: order is the price of that, and it is the right way round.
         self._covered: dict[str, Decimal] = {}
-        #: symbol → the protective children placed against it. In-memory, so it
-        #: does not survive a restart; a stop placed before one is an orphan
-        #: order for `Reconciler` to report (a separate Phase 4 item), which is
-        #: documented there as report-do-not-auto-cancel.
+        #: symbol → the protective children working against it: the ones this
+        #: process placed, and — once `adopt_protection` has run at boot — the
+        #: ones a previous process placed and this one inherited. In-memory, so
+        #: it starts empty at every boot and is only as complete as that
+        #: adoption; the release and cancel paths read the venue as well for a
+        #: router nothing adopts into (`_inherited_protection`).
         self._protective: dict[str, list[Order]] = {}
         #: protective child order id → the cover it was keyed on, so a stop
         #: released to free the inventory a close needs can be re-armed under a
@@ -778,6 +799,79 @@ class OrderRouter:
         """Whether *all* of `position` has a stop working at the venue."""
         return self.broker_side_protected_qty(symbol, position) >= abs(position.qty)
 
+    def adopt_protection(self, orders: Iterable[Order]) -> list[Order]:
+        """Track protective stops a previous process placed; return the adopted.
+
+        `_protective` is in-memory and empty at every boot, and four things read
+        it. #163 taught two of them — release and `cancel_protection` — to read
+        the venue as well, at the moment they act. That fixes a *lookup*, and
+        two readers are not lookups:
+
+        - `broker_side_protected_qty` feeds `_mark_broker_protection` on every
+          pass. With nothing adopted, every inherited position reads as naked
+          while its GTC stop rests at the venue, so the first evaluation after
+          a restart would page a false CRITICAL — *"N position(s) with NO stop
+          at the broker"* — whose runbook procedure is to place a stop by hand,
+          i.e. a second stop over shares that already have one. Found by reading
+          the code before day 5 ran, not observed
+          (docs/paper-week/day-5-readiness.md, §3.4).
+        - `_cancel_stale_protection` runs on every fill and deliberately does not
+          read the venue (its docstring says why), so an inherited stop left on
+          the wrong side by a flip would stay resting and *open* a position
+          (§4.5). Adopting at boot is the fix that docstring names.
+
+        **Pass the caller's own instances, not fresh reads.** The runner hands
+        over the orders it restored and tracks, and those are the objects trade
+        updates mutate — so an adopted stop that fills, or that the venue
+        cancels, goes terminal here too and stops counting as protection. A copy
+        read from the venue would count as live forever.
+
+        Synchronous and pure: no I/O, so it cannot fail a boot. Idempotent, by
+        order id and venue id, because `warmup` re-runs at every open against
+        the same working set.
+
+        The narrowing matches `_inherited_protection`'s — a stop price, a venue
+        id, not terminal — with one addition that data this caller has makes
+        possible: **an order whose purpose is `ENTRY` is never protection**, even
+        with a stop price on it. A stop-*entry* adopted here would be counted as
+        covering a position and then cancelled by `_cancel_stale_protection` as
+        "facing the wrong way" on the next fill. A stop of `UNKNOWN_PURPOSE`
+        (stored before the column existed) is adopted: every stop this platform
+        has ever placed outside an entry was protective, and leaving one out
+        would bring the false page back for exactly the oldest positions.
+        """
+        seen_ids = {c.id for children in self._protective.values() for c in children}
+        seen_venue = {
+            c.broker_order_id
+            for children in self._protective.values()
+            for c in children
+            if c.broker_order_id is not None
+        }
+        adopted: list[Order] = []
+        for order in orders:
+            if (
+                order.is_complete
+                or order.stop_price is None
+                or order.broker_order_id is None
+                or order.purpose == ENTRY
+                or order.id in seen_ids
+                or order.broker_order_id in seen_venue
+            ):
+                continue
+            self._protective.setdefault(order.symbol, []).append(order)
+            seen_ids.add(order.id)
+            seen_venue.add(order.broker_order_id)
+            adopted.append(order)
+
+        if adopted:
+            log.info(
+                "order.protection_adopted",
+                adopted=len(adopted),
+                symbols=sorted({o.symbol for o in adopted}),
+                detail="stops placed before this process started now count as protection",
+            )
+        return adopted
+
     async def cancel_protection(self, symbol: str) -> int:
         """Cancel this router's protective orders for a symbol; return how many
         cancels were sent.
@@ -1032,6 +1126,11 @@ class OrderRouter:
         stopless holding the inventory therefore leaves the close refused, which
         is honest, rather than naked, which is not.
 
+        **Still needed after `adopt_protection`**, which makes the worker's map
+        complete at boot. The API builds a fresh `OrderRouter` per request and
+        adopts nothing, so every close it makes is still this case, and a
+        worker's map is only as complete as what it restored.
+
         A `known` id is one the caller already tracks; returning it would cancel
         it twice and count it twice.
 
@@ -1084,11 +1183,13 @@ class OrderRouter:
         is unreachable (docs/paper-week/day-5-readiness.md, §4.5). Paying a
         network call per fill for it is the wrong trade.
 
-        It becomes reachable the moment a shorting strategy is configured, and
-        the fix then is not a lookup here — it is adopting inherited protection
-        into `_protective` at boot, which also stops `_mark_broker_protection`
-        reporting every inherited position as naked (§3.4). Recorded so the
-        omission is a decision rather than the same oversight a third time.
+        **An inherited stop is covered anyway, by `adopt_protection`**, which is
+        the fix this note used to name as future work: the runner adopts the
+        stops it restored into `_protective` at boot, so a wrong-side one a
+        previous process placed is in `children` below and is cancelled here like
+        any other. What is still out of reach is a stop the runner never
+        restored — one placed by hand at the venue — and that one fails
+        reconciliation as an orphan before this can run.
         """
         children = self._protective.get(symbol, [])
         stale = [

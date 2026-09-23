@@ -1082,6 +1082,16 @@ above.
   reverses. Unticked either way: this item waits on the phase's
   *Verifiable:* line, not on code.
 
+  **The map itself is now rebuilt at boot** (#165). `warmup` hands the
+  stops it restored to `OrderRouter.adopt_protection` before it catches up on
+  what the venue did, so the per-pass protection count sees them. Without it,
+  every position carried across a restart would have paged "NO stop at the
+  broker" at the first evaluation, over a live GTC stop — found by reading the
+  code before day 5, not observed (docs/paper-week/day-5-readiness.md, §3.4). The stale-side cancel also sees them now, which closes §4.5 without a
+  venue read on every fill. The same change reworks the unprotected page: a
+  newly naked symbol pages at once, a standing set re-pages once per cooldown,
+  and the log line carries the venue's refusal text (day-4 F1, F2).
+
   Three deliberate refusals. A submit that fails in transport gets one lookup
   and then stops — it does not resubmit, because the venue may already hold the
   order, and it halts on `BROKER_UNREACHABLE` (the second auto-engage trigger to
