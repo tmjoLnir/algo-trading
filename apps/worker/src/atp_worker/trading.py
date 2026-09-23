@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     from atp_core.data.ports import BarRepository, EventPublisher, QuoteCache
     from atp_core.execution.ports import FeeLedger, OrderRepository, PortfolioRepository
     from atp_core.risk.killswitch import KillSwitch
+    from atp_core.risk.ports import SessionAnchorStore
     from atp_core.strategy.base import Strategy
     from atp_core.strategy.ports import SignalRepository, StrategyRepository
 
@@ -277,6 +278,7 @@ def build_runner(
     publisher: EventPublisher | None = None,
     alerts: AlertSink | None = None,
     fee_ledger: FeeLedger | None = None,
+    anchor_store: SessionAnchorStore | None = None,
 ) -> tuple[StrategyRunner, Reconciler]:
     """Assemble the live loop from settings.
 
@@ -338,6 +340,9 @@ def build_runner(
         # positions running with no stop at the venue — the halt machinery had
         # this wire and the protection machinery did not (F3).
         alerts=alerts,
+        # Each session's starting equity, so a restart restores the day's
+        # allowance rather than granting a second one (day-5 readiness, §3.5).
+        anchor_store=anchor_store,
         tick_interval_seconds=float(settings.engine_tick_interval_seconds),
     )
     return runner, reconciler

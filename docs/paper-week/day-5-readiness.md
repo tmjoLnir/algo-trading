@@ -349,6 +349,20 @@ The honest caveat, which #159 states: one daily session is one bar per symbol. A
 five decisions per symbol, not two thousand. This does not make day 5 conclusive. It makes day 5
 worth recording.
 
+> **The documentation half closed by PR_NUMBER.** ADR 0034 made the flip executable, but the
+> pages an operator reads before the open still said otherwise. `FIRST_PAPER_RUN.md` ("The
+> strategy's series must match the worker's") now recommends `1d` and lists the steps:
+> backfill, Config tab, preflight, and what to read at the open. The F8 page says its advice
+> became executable with ADR 0034, and points there. The flip itself is still a row an operator
+> edits, and nobody has made it yet.
+>
+> **One defect found on the way, and fixed in the same diff.** `scripts/backfill_bars.py`
+> requires `--start`. The command printed by the pre-open `worker.session_bars.missing` alert,
+> by preflight's `history` checks, and by `RUNBOOK.md` all omitted it. So the one command the
+> `1d` path tells an operator to paste before the bell exited on an argparse error. The alert
+> now carries `--start <the missing session>`. Preflight prints a start far enough back for the
+> strategy's warmup, and the runbook says so.
+
 ### 3.3 The warmup gate discards exits, not just entries `blocker at 1m`
 
 `_poll_strategy` (`runner.py:1599`) discards every signal on a symbol with `have <= warm_after`.
@@ -471,6 +485,25 @@ Redis key, no snapshot field — six hits, all inside `rules.py`. The guarantee 
 docstring, warned about in a second (`engine.py:275`), and implemented nowhere. A restart to
 clear the halt above would grant day 5 a fresh 3% on top of the loss already taken.
 
+> **Closed by PR_NUMBER**, recorded here rather than by editing the finding above.
+>
+> - **The stale anchor.** `warmup` no longer anchors. It records that the session owes one,
+>   and `_anchor_if_pending` takes it on the first evaluation, right after that pass's
+>   `_mark`. So the anchor uses exactly the marks that pass's risk checks use, and the first
+>   comparison starts at zero by construction. This goes further than "mark in warmup, then
+>   anchor", which would still leave the first pass's quotes and the anchor's quotes
+>   different.
+> - **An unpriced book defers.** An unmarked holding is worth zero in `equity`, so anchoring
+>   then would set the day's start too low and widen the allowance. It retries next pass, and
+>   the rule stays default-closed meanwhile.
+> - **Persisted.** A new port, `risk.ports.SessionAnchorStore`, has a Redis adapter keyed by
+>   run mode and session date. A restart restores the stored anchor and does not re-anchor.
+>   A store that cannot answer leaves the rule unanchored (entries refused, exits allowed) and
+>   pages CRITICAL. "Cannot tell" is never read as "not anchored yet". `RUNBOOK.md` has the
+>   section the page links to.
+>
+> Established from the code and tests only: day 5 has not run.
+
 ---
 
 ## 4. Not fixed, and carried from day 4
@@ -547,7 +580,8 @@ shorts is configured, which is a thing to remember rather than a thing to do now
   lines under Phase 4's *Verifiable:* line, while the same file at `:1629` narrates day 4's
   bounce in detail. A reader opening the roadmap to ask "has the paper week started?" is told no.
 - **`docs/FIRST_PAPER_RUN.md:302` vs `f8-timeframe-and-stop-sizing.md`** — opposite advice on
-  the one setting that decides whether day 5 means anything (§3.2).
+  the one setting that decides whether day 5 means anything (§3.2). *(Reconciled by
+  PR_NUMBER: both now say `1d`, and why it is executable.)*
 - **`docs/RUNBOOK.md`, "A stop released for a close"** — describes `_close` as cancelling stops
   *"once the venue names one of our own orders as the holder"*, with no qualifier that "our own"
   means *this process's*. For an inherited position that paragraph is false, and it is the
@@ -719,6 +753,9 @@ Before the open, in the session itself — no code:
    daily-bar pull during or after the session, or an evaluation trigger that is not "a bar just
    closed". Until one of those exists, no configuration of this platform can run the strategy on
    the timeframe it declares.
+   *(Reinstated: ADR 0034 (#164) is the real change. The steps are now in
+   `FIRST_PAPER_RUN.md`, whose contrary advice PR_NUMBER removed. It is still an operator's
+   action, not code.)*
 
 Then, as code, in this order:
 
@@ -732,6 +769,8 @@ Then, as code, in this order:
    symbol per session, not the ~52 minutes. See §3.3's note.)*
 5. **Mark the book before anchoring the session** (§3.5), or anchor from fresh quotes. And
    persist `day_start_equity`, which two docstrings already promise.
+   *(Done, PR_NUMBER: anchored on the first evaluation's marks, persisted per session date.
+   See §3.5's note.)*
 6. **B2: snapshot on fill and from the reconcile job, and put the snapshot's age in
    `restored_book`** (§4.1). The shutdown snapshot waits on F10's handler; the other two do not.
 7. **The unprotected alert in both directions, plus the refusal text** (§3.4, F1/F2) — and fix

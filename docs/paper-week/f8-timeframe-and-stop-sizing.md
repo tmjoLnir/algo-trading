@@ -139,6 +139,14 @@ measurement prefers. This is a configuration row an operator edits on the
 dashboard, not something code can change, so it is a recommendation rather than
 part of this diff.
 
+> **Executable since ADR 0034, and not before.** When this was written a `1d`
+> worker would have decided nothing: the live feed carries minute bars only, and
+> nothing wrote a daily bar while the market was open
+> (docs/paper-week/day-5-readiness.md, §3.2). The previous session's bar is now
+> fetched before the open and decided on at the open. The operator steps
+> (backfill, Config tab, preflight, what to read at the open) are in
+> `docs/FIRST_PAPER_RUN.md`, "The strategy's series must match the worker's".
+
 **Leave the stop at `atr x2 period=14`.** At `1d` that is a ~4% stop, which is a
 sane distance for a daily swing position, and the multiplier is second-order in
 every block above.

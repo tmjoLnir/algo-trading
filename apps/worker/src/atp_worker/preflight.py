@@ -29,7 +29,9 @@ reasoning about the third lock, applied to this).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
+from datetime import timedelta
 from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -43,7 +45,7 @@ from atp_core.strategy import registry
 from atp_worker.trading import resolve_stop_config
 
 if TYPE_CHECKING:
-    from datetime import datetime
+    from datetime import date, datetime
 
     from atp_core.config import Settings
     from atp_core.risk.killswitch import HaltRecord
@@ -360,8 +362,32 @@ def check_metrics_token(settings: Settings) -> Check:
     )
 
 
+def backfill_start(timeframe: Timeframe, required: int, today: date) -> date:
+    """How far back a backfill must start to hold `required` bars of `timeframe`.
+
+    `scripts/backfill_bars.py` requires `--start`, and every fix line this
+    platform printed for it omitted the flag. So the command an operator was
+    told to paste before the open exited on an argparse error instead
+    (docs/paper-week/day-5-readiness.md, §3.2).
+
+    A session series needs `required` *sessions*: seven calendar days per five,
+    plus two weeks for holidays, rounded up. An intraday series is floored at
+    this session's open (`StrategyRunner._warmup_floor`), so history before
+    today warms nothing and the start is today.
+    """
+    if timeframe.seconds < 24 * 60 * 60:
+        return today
+    return today - timedelta(days=math.ceil(required * 7 / 5) + 14)
+
+
 def check_warmup(
-    symbol: str, *, timeframe: Timeframe, required: int, stored: int, newest: datetime | None
+    symbol: str,
+    *,
+    timeframe: Timeframe,
+    required: int,
+    stored: int,
+    newest: datetime | None,
+    today: date,
 ) -> Check:
     """Enough stored history for the strategy to have an opinion.
 
@@ -386,6 +412,7 @@ def check_warmup(
     """
     backfill = (
         f"uv run python scripts/backfill_bars.py --symbols {symbol} "
+        f"--start {backfill_start(timeframe, required, today).isoformat()} "
         f"--timeframe {timeframe.value} --verify"
     )
     if stored == 0:

@@ -599,8 +599,16 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   every entry it would ever produce. It survived because the failure is
   invisible from outside: a chain refusing everything and a chain nothing has
   reached look identical, and nothing has traded paper. `RiskEngine
-  .anchor_session` is the named seam, `StrategyRunner.warmup` calls it at each
-  session open and the backtest engine at each session in the replay.
+  .anchor_session` is the named seam. The live runner calls it once per session,
+  and the backtest engine at each session in the replay.
+
+  **And the live anchor was taken on a stale book and kept nowhere** (PR_NUMBER).
+  `warmup` anchored before anything had marked it, so after a restart the first
+  pass would read the repricing of inherited positions as the day's loss. And
+  `day_start_equity`'s promise to survive a restart had no storage behind it. The
+  anchor is now taken on the first evaluation's marks and kept per session date
+  in Redis. A restart restores it, and a store that cannot answer leaves the rule
+  closed and pages (docs/paper-week/day-5-readiness.md, §3.5).
 
   **And every one of those nine rules measured the wrong book** (#112). A limit
   is checked per order and the book only moves on a fill, so a caller submitting

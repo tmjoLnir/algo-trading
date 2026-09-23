@@ -3509,3 +3509,173 @@ class TestTheUnprotectedLineSaysWhy:
 
         line = next(e for e in logs if e["event"] == "runner.position_unprotected")
         assert line["refusals"] == ["potential wash trade detected. use complex orders"]
+
+
+class FakeAnchorStore:
+    """In-memory `SessionAnchorStore`. `broken` makes every read raise."""
+
+    def __init__(self) -> None:
+        self.anchors: dict[tuple[RunMode, date], Decimal] = {}
+        self.broken = False
+        self.puts: list[tuple[RunMode, date, Decimal]] = []
+
+    async def get(self, run_mode: RunMode, day: date) -> Decimal | None:
+        if self.broken:
+            raise ConnectionError("redis is down")
+        return self.anchors.get((run_mode, day))
+
+    async def put(self, run_mode: RunMode, day: date, equity: Decimal) -> None:
+        self.puts.append((run_mode, day, equity))
+        self.anchors[(run_mode, day)] = equity
+
+
+class TestTheSessionIsAnchoredOnFreshMarks:
+    """§3.5 of docs/paper-week/day-5-readiness.md, found by reading the code.
+
+    `warmup` anchored the daily loss limit on `portfolio.equity` before anything
+    had marked the book. After a restart that is cash plus the inherited
+    positions at the prices restored from the snapshot. The first `_mark`
+    reprices them at today's quotes, and the rule would measure the gap as
+    today's loss. `_escalate` turns the first such refusal into a global halt
+    for the session.
+
+    And `day_start_equity`'s promise to survive a restart was implemented
+    nowhere, so a restart to clear that halt would grant a second allowance.
+    """
+
+    SESSION = START.date()
+
+    @staticmethod
+    def _rule(runner: StrategyRunner) -> Any:
+        return next(
+            r for r in runner.router.risk_engine.rules if getattr(r, "name", "") == DAILY_LOSS_RULE
+        )
+
+    def _inherited(
+        self, *, store: FakeAnchorStore | None = None, alerts: RecordingAlertSink | None = None
+    ) -> tuple[StrategyRunner, Portfolio]:
+        """100 SPY carried in, its restored mark stale at 50; today's quote is 60."""
+        runner, _router, _switch, _rec, portfolio, _slept = build(alerts=alerts)
+        runner.anchor_store = store
+        position = portfolio.position(SYMBOL)
+        position.qty = Decimal(100)
+        position.avg_entry_price = Decimal(50)
+        position.last_price = Decimal(50)
+        runner.quote_cache.quotes[SYMBOL] = Quote(  # type: ignore[attr-defined]
+            symbol=SYMBOL, ts=START, bid=Decimal("59.99"), ask=Decimal("60.01")
+        )
+        return runner, portfolio
+
+    @pytest.mark.asyncio
+    async def test_the_anchor_is_taken_on_the_first_passs_marks(self) -> None:
+        """**The finding.** Without the fix the anchor is 100,000 + 100 × 50,
+        the restored mark, and the first pass reads +1,000 as today's P&L on a
+        book that has not traded."""
+        runner, portfolio = self._inherited()
+        await runner.warmup(portfolio)
+        assert self._rule(runner).day_start_equity is None, "owed, not yet taken"
+
+        await runner.evaluate(portfolio)
+
+        assert self._rule(runner).day_start_equity == Decimal(100_000) + 100 * Decimal(60)
+        assert self._rule(runner).day_start_equity == portfolio.equity
+
+    @pytest.mark.asyncio
+    async def test_it_is_taken_once_per_session_not_per_pass(self) -> None:
+        """Re-anchoring each pass would follow a losing book down and never
+        trip. That is the second allowance, granted every minute."""
+        runner, portfolio = self._inherited()
+        await runner.warmup(portfolio)
+        await runner.evaluate(portfolio)
+        anchored = self._rule(runner).day_start_equity
+
+        runner.quote_cache.quotes[SYMBOL] = Quote(  # type: ignore[attr-defined]
+            symbol=SYMBOL, ts=START, bid=Decimal("39.99"), ask=Decimal("40.01")
+        )
+        await runner.evaluate(portfolio)
+
+        assert self._rule(runner).day_start_equity == anchored
+
+    @pytest.mark.asyncio
+    async def test_a_fresh_anchor_is_stored_under_the_session_date(self) -> None:
+        store = FakeAnchorStore()
+        runner, portfolio = self._inherited(store=store)
+        await runner.warmup(portfolio)
+
+        await runner.evaluate(portfolio)
+
+        assert store.puts == [(RunMode.PAPER, self.SESSION, Decimal(106_000))]
+
+    @pytest.mark.asyncio
+    async def test_a_restart_restores_the_sessions_anchor(self) -> None:
+        """**The promise nothing kept.** The book is down since the open, which
+        is why the worker was restarted. The day's start is still the open's
+        equity, so the allowance already spent stays spent."""
+        store = FakeAnchorStore()
+        store.anchors[(RunMode.PAPER, self.SESSION)] = Decimal(110_000)
+        runner, portfolio = self._inherited(store=store)
+        await runner.warmup(portfolio)
+
+        await runner.evaluate(portfolio)
+
+        assert self._rule(runner).day_start_equity == Decimal(110_000)
+        assert store.puts == [], "a restored anchor is not re-written"
+
+    @pytest.mark.asyncio
+    async def test_a_store_that_cannot_answer_leaves_the_rule_closed(self) -> None:
+        """ "Cannot tell" is not "not anchored yet". Anchoring fresh here is the
+        second allowance, so the rule stays default-closed (entries refused,
+        exits allowed), and a human is told."""
+        store = FakeAnchorStore()
+        store.broken = True
+        alerts = RecordingAlertSink()
+        runner, portfolio = self._inherited(store=store, alerts=alerts)
+        await runner.warmup(portfolio)
+
+        with capture_logs() as logs:
+            await runner.evaluate(portfolio)
+            await runner.evaluate(portfolio)
+
+        assert self._rule(runner).day_start_equity is None
+        unreadable = [e for e in logs if e["event"] == "runner.session_anchor_unreadable"]
+        assert len(unreadable) == 1, "said once, not every pass"
+        # Filtered by key: the held SPY has no stop in this fake, so the
+        # unprotected page rightly fires as well.
+        paged = [a for a in alerts.sent if a.key == "risk.session_anchor_unreadable"]
+        assert len(paged) == 1
+        assert paged[0].severity is Severity.CRITICAL
+
+    @pytest.mark.asyncio
+    async def test_an_unpriced_book_defers_the_anchor(self) -> None:
+        """An unmarked holding is worth zero in `equity`, so anchoring now would
+        set the day's start too low and widen the allowance once it is priced."""
+        runner, portfolio = self._inherited()
+        held = portfolio.position("XYZ")
+        held.qty = Decimal(10)
+        held.avg_entry_price = Decimal(20)
+        held.last_price = None
+        await runner.warmup(portfolio)
+
+        await runner.evaluate(portfolio)
+        assert self._rule(runner).day_start_equity is None
+
+        runner.quote_cache.quotes["XYZ"] = Quote(  # type: ignore[attr-defined]
+            symbol="XYZ", ts=START, bid=Decimal("19.99"), ask=Decimal("20.01")
+        )
+        await runner.evaluate(portfolio)
+        assert self._rule(runner).day_start_equity == Decimal(106_000) + 10 * Decimal(20)
+
+    @pytest.mark.asyncio
+    async def test_a_new_session_is_anchored_again(self) -> None:
+        """`warmup` re-runs at each open, and each open owes its own anchor."""
+        runner, portfolio = self._inherited()
+        await runner.warmup(portfolio)
+        await runner.evaluate(portfolio)
+
+        runner.quote_cache.quotes[SYMBOL] = Quote(  # type: ignore[attr-defined]
+            symbol=SYMBOL, ts=START, bid=Decimal("69.99"), ask=Decimal("70.01")
+        )
+        await runner.warmup(portfolio, at_session_open=True)
+        await runner.evaluate(portfolio)
+
+        assert self._rule(runner).day_start_equity == Decimal(107_000)

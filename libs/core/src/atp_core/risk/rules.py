@@ -602,9 +602,12 @@ class DailyLossLimitRule:
     """
 
     name: str = DAILY_LOSS_RULE
-    #: Equity at the session's open. Anchored by whoever owns the session
+    #: Equity at the session's start. Anchored by whoever owns the session
     #: boundary, and persisted there so a mid-session restart does not re-anchor
     #: to a drawn-down number and silently grant the day a second allowance.
+    #: The live runner keeps it in a `risk.ports.SessionAnchorStore`, keyed by
+    #: session date. That promise was written here long before anything kept
+    #: it (docs/paper-week/day-5-readiness.md, §3.5).
     day_start_equity: Decimal | None = None
 
     def anchor(self, equity: Decimal) -> None:

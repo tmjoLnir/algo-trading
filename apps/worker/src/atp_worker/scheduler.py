@@ -477,6 +477,7 @@ def _announce_missing_session_bars(pull: BarPull, decision: Session, missing: li
                 "decision cannot be taken on them.\n"
                 "There is time to backfill by hand before the open:\n"
                 f"  uv run python scripts/backfill_bars.py --symbols {','.join(missing)} "
+                f"--start {decision.day.isoformat()} "
                 f"--timeframe {pull.timeframe.value} --verify\n"
                 "docs/RUNBOOK.md, 'No decision bar at the open'."
             ),

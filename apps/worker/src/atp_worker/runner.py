@@ -70,7 +70,7 @@ from atp_core.strategy.ports import SignalOutcome, StrategyRecord
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
-    from datetime import datetime
+    from datetime import date, datetime
 
     from atp_core.alerts.ports import AlertSink
     from atp_core.brokers.ports import TradeUpdate
@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     from atp_core.execution.router import OrderRouter, SubmitResult
     from atp_core.risk.engine import RiskDecision
     from atp_core.risk.killswitch import KillSwitch
+    from atp_core.risk.ports import SessionAnchorStore
     from atp_core.risk.stops import StopConfig, StopManager
     from atp_core.strategy.base import Strategy
     from atp_core.strategy.ports import SignalRepository, StrategyRepository
@@ -354,6 +355,7 @@ class StrategyRunner:
         snapshot_store: SnapshotStore | None = None,
         publisher: EventPublisher | None = None,
         alerts: AlertSink | None = None,
+        anchor_store: SessionAnchorStore | None = None,
         unprotected_alert_cooldown_seconds: float = 900.0,
         signal_limit: int = DEFAULT_SIGNAL_LIMIT,
         tick_interval_seconds: float = 60.0,
@@ -413,6 +415,15 @@ class StrategyRunner:
         #: for a false positive; the protection machinery had no route at all
         #: (docs/paper-week/day-2-review.md, F3).
         self.alerts = alerts
+        #: Where each session's starting equity is kept across a restart
+        #: (`DailyLossLimitRule.day_start_equity`). Optional so a test can
+        #: build a runner without Redis. Production passes one, because without
+        #: it a restart re-anchors to a drawn-down book and grants the day a
+        #: second allowance (docs/paper-week/day-5-readiness.md, §3.5).
+        self.anchor_store = anchor_store
+        #: Set by `warmup`, cleared once the session is anchored. The anchor is
+        #: owed to the session, not to the process.
+        self._anchor_pending = False
         self.unprotected_alert_cooldown_seconds = unprotected_alert_cooldown_seconds
         #: The unprotected set as last paged, and when. Together they are the
         #: deduplication: 85 fill-level events collapse to one page naming every
@@ -786,19 +797,12 @@ class StrategyRunner:
                 "See docs/RUNBOOK.md 'Reconciliation mismatch'."
             )
 
-        # The day's starting equity, and **nothing was setting it**.
-        # `default_rules()` has always included `DailyLossLimitRule`, that rule
-        # is default-closed and denies every entry until it is anchored, and no
-        # path in this platform ever called `anchor` — so this runner was
-        # configured to refuse every entry it would ever produce. It went
-        # unnoticed because a chain refusing everything and a chain nothing has
-        # reached look identical from outside, and nothing has traded paper yet.
-        #
-        # Here rather than in `run`'s loop because this is the session boundary:
-        # `warmup` is re-run at each open, and anchoring per iteration would
-        # re-anchor to a drawn-down number and grant the day a second allowance.
-        # After reconciliation, so the anchor is the book the broker agrees we
-        # hold rather than the one we believed before checking.
+        # The day's starting equity is **owed** here and taken on the first
+        # evaluation, after that pass's `_mark` — see `_anchor_if_pending` for
+        # why not here. Set only after reconciliation, so a runner about to
+        # quarantine never anchors anything.
+        self._anchor_pending = True
+
         # After reconciliation, deliberately. A runner whose book does not match
         # the broker's is about to quarantine, and a note about which bar it
         # would have decided on is noise on top of a halt — the alert budget
@@ -806,9 +810,6 @@ class StrategyRunner:
         # (docs/paper-week/day-4-review.md, F1).
         if decision is not None:
             self._announce_decision_bar(decision, withheld, no_decision_bar)
-
-        anchored = self.router.risk_engine.anchor_session(portfolio.equity)
-        log.info("runner.session_anchored", equity=str(portfolio.equity), rules=anchored)
 
         self.strategy.on_start()
         self.stats.started_at = self.clock.now()
@@ -1225,6 +1226,7 @@ class StrategyRunner:
         closed = await self._refresh_bars()  # feeds steps 1, 2 and 4
 
         await self._mark(portfolio)  # 1
+        await self._anchor_if_pending(portfolio)  # 1a — on the marks this pass trades on
         await self._check_stops(portfolio, closed)  # 2
         signals = self._drain_fills(portfolio)  # 3
         signals.extend(self._poll_strategy(closed))  # 4
@@ -1594,6 +1596,117 @@ class StrategyRunner:
                 # has not reached yet is not an alarm, and one line per quiet
                 # symbol per pass would drown the holdings that are.
                 log.warning("runner.no_quote_for_mark", symbol=symbol)
+
+    async def _anchor_if_pending(self, portfolio: Portfolio) -> None:
+        """Anchor the daily loss limit once per session: restored if stored, else fresh.
+
+        **Why here and not in `warmup`.** `warmup` anchored on
+        `portfolio.equity` before anything had marked the book. After a restart
+        that equity is cash plus the inherited positions at the prices restored
+        from the snapshot, which on day 5 would be the close of the session
+        before last. This pass's `_mark` then reprices them at today's quotes,
+        and `DailyLossLimitRule` measures that repricing as today's loss. A 3%
+        gap on the inherited book would read as a 3% loss on the day, and
+        `_escalate` turns the first such refusal into a global halt for the rest
+        of the session (docs/paper-week/day-5-readiness.md, §3.5). Here, right
+        after `_mark`, the anchor uses exactly the marks this pass's risk checks
+        use, so the first comparison starts at zero by construction.
+
+        **An unpriced book is not anchored.** An unmarked position is worth zero
+        in `Portfolio.equity`, so anchoring then would set the day's start too
+        low and quietly widen the allowance once the mark arrives. It stays
+        pending and is retried next pass. Meanwhile `DailyLossLimitRule` is
+        default-closed: entries are refused and exits are not.
+
+        **A stored anchor for this session wins over a fresh one.** That is the
+        guarantee `day_start_equity`'s docstring gave and nothing implemented:
+        a worker restarted mid-session, perhaps to clear the very halt this
+        rule engaged, would otherwise anchor to the drawn-down book and be
+        granted a second `max_daily_loss_pct`. **A store that cannot answer
+        leaves the rule unanchored**, the same default-closed state, and says
+        so at CRITICAL. Treating "cannot tell" as "not anchored yet" is
+        exactly that second allowance. A write that fails after a fresh anchor
+        is only an error: this process is anchored correctly, and only the
+        next restart loses the guarantee.
+        """
+        if not self._anchor_pending:
+            return
+        unpriced = portfolio.unmarked_symbols
+        if unpriced:
+            log.warning(
+                "runner.session_anchor_deferred",
+                unmarked=sorted(unpriced),
+                detail="an unpriced book would anchor the day too low — retrying next pass",
+            )
+            return
+
+        day = self._session_day(self.clock.now())
+        stored = None
+        if self.anchor_store is not None:
+            try:
+                stored = await self.anchor_store.get(self.run_mode, day)
+            except Exception as exc:
+                self._anchor_pending = False
+                log.critical(
+                    "runner.session_anchor_unreadable",
+                    session=day.isoformat(),
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    effect="the daily loss limit stays unanchored: entries refused, exits allowed",
+                )
+                if self.alerts is not None:
+                    self.alerts.send(
+                        Alert(
+                            severity=Severity.CRITICAL,
+                            title="Daily loss limit could not be anchored — entries are blocked",
+                            body=(
+                                "The worker could not read this session's starting equity, so "
+                                "it cannot tell how much of today's allowance is spent. Entries "
+                                "are refused for the rest of the session; exits are not.\n"
+                                "docs/RUNBOOK.md, 'Daily loss limit not anchored'."
+                            ),
+                            key="risk.session_anchor_unreadable",
+                            context={"session": day.isoformat()},
+                        )
+                    )
+                return
+
+        if stored is not None:
+            equity, source = stored, "restored"
+        else:
+            equity, source = portfolio.equity, "fresh"
+        anchored = self.router.risk_engine.anchor_session(equity)
+        self._anchor_pending = False
+        log.info(
+            "runner.session_anchored",
+            equity=str(equity),
+            marked_equity=str(portfolio.equity),
+            session=day.isoformat(),
+            source=source,
+            rules=anchored,
+        )
+        if source == "fresh" and self.anchor_store is not None:
+            try:
+                await self.anchor_store.put(self.run_mode, day, equity)
+            except Exception as exc:
+                log.error(
+                    "runner.session_anchor_unsaved",
+                    session=day.isoformat(),
+                    error=str(exc),
+                    effect="anchored in this process; a restart today would re-anchor",
+                )
+
+    def _session_day(self, now: datetime) -> date:
+        """The exchange-local date of the session in progress, or the next one.
+
+        The same lookup `_warmup_floor` makes, and for the same reason: `now`
+        is UTC and a session is named by its exchange-local date.
+        """
+        today = now.date()
+        for session in self.calendar.sessions(today - timedelta(days=1), today + timedelta(days=1)):
+            if session.open_at <= now < session.close_at:
+                return session.day
+        return self.calendar.local_date(self.calendar.next_open(now))
 
     async def _check_stops(self, portfolio: Portfolio, closed: list[Bar]) -> None:
         """Step 2. Engine-side protective levels, and trailing ratchets.

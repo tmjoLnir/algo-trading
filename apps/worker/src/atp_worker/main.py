@@ -56,6 +56,7 @@ from atp_core.persistence.orders import PostgresOrderRepository
 from atp_core.persistence.positions import PostgresPortfolioRepository
 from atp_core.persistence.quotes import RedisQuoteCache
 from atp_core.persistence.redis_client import close_redis, create_redis, create_sync_redis
+from atp_core.persistence.session_anchor import RedisSessionAnchorStore
 from atp_core.persistence.signals import PostgresSignalRepository
 from atp_core.persistence.strategies import PostgresStrategyRepository
 from atp_core.persistence.worker_config import PostgresWorkerConfigRepository
@@ -319,6 +320,7 @@ async def run(settings: Settings, stop_event: asyncio.Event) -> None:
                 snapshot_store=snapshot_store,
                 publisher=publisher,
                 alerts=alerts,
+                anchor_store=RedisSessionAnchorStore(redis),
             )
             portfolio = await trading.restore_or_adopt(
                 reconciler, portfolio_repo, settings.run_mode

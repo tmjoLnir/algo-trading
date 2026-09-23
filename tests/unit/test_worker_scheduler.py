@@ -1079,6 +1079,9 @@ class TestTheDecisionBarIsFetchedBeforeTheOpen:
         assert "QQQ" in body and "SPY" not in body, "only the ones actually missing"
         assert "backfill_bars.py --symbols QQQ" in body, "the command, ready to run"
         assert "--timeframe 1d" in body, "on the series that is missing, not the default"
+        # `backfill_bars.py` requires `--start`. Without it, "ready to run" was
+        # an argparse error at the one moment there is no time for one.
+        assert "--start 2026-09-21 " in body, "from the session whose bar is missing"
 
     def test_it_says_nothing_when_every_symbol_came_back(self) -> None:
         alerts = RecordingAlerts()

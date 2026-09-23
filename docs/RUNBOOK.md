@@ -989,6 +989,32 @@ that fixes it. The API checks coverage before queueing, so seeing this from the
 worker means the bars were there at request time and are not now — a restored
 database, or a symbol whose bars were deleted.
 
+## Daily loss limit not anchored (`runner.session_anchor_unreadable`)
+
+*Symptom:* a `CRITICAL` page, *"Daily loss limit could not be anchored — entries are
+blocked"*.
+
+The worker anchors the daily loss limit once per session, on the first evaluation's marks, and
+keeps the anchor in Redis under `atp:risk:session_anchor:<run mode>:<session date>`. A restart
+mid-session restores it, so the day's allowance is not granted twice. This page means the read
+failed: Redis was unreachable, or the stored value does not parse.
+
+**The worker has not guessed.** `DailyLossLimitRule` stays unanchored, which is its
+default-closed state. Every entry is refused for the rest of the session. Exits, including
+stops and flattens, are not.
+
+1. Check Redis (`make up`, `docker compose ps`). The kill switch lives there too, so if Redis
+   is down this is not your only problem.
+2. If the key holds garbage, read it with `redis-cli GET atp:risk:session_anchor:paper:<date>`.
+   If you know the day's starting equity from the broker's own statement, `SET` it to that
+   number. Otherwise `DEL` the key: the next start then anchors fresh on its first pass, and
+   you knowingly grant the day a new allowance.
+3. Restart the worker. `warmup` re-owes the anchor and the first pass takes it.
+
+`runner.session_anchor_deferred` at `WARNING` is the benign cousin. A held position had no
+price on that pass, so anchoring was put off rather than taken too low. It clears on its own
+once the position is marked.
+
 ## Broker unreachable
 
 1. Auto-halts. Confirm.
@@ -1159,7 +1185,9 @@ Two lines carry it, and the first one gives you time:
 - `worker.session_bars.missing`, at open−30 or open−15, from the pre-open pull.
   The vendor would not serve the bar. **There is still time to fix it**, and the
   alert carries the command:
-  `uv run python scripts/backfill_bars.py --symbols <names> --timeframe 1d --verify`.
+  `uv run python scripts/backfill_bars.py --symbols <names> --start <previous session date> --timeframe 1d --verify`.
+  `--start` is required by the script. Alerts raised before this fix printed the command
+  without it, and it fails on an argparse error until you add it.
   Re-run it, then check `scripts/status.py` for the newest stored bar per symbol.
 - `runner.decision_bar_missing`, at the open, from warmup. The bar was still not
   there when the runner warmed up. Today's decision on those names is lost; the
