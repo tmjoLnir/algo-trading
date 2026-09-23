@@ -35,7 +35,7 @@ import asyncio
 import statistics
 import time
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -139,6 +139,12 @@ class RunnerStats:
     signals_generated: int = 0
     orders_submitted: int = 0
     orders_rejected_by_risk: int = 0
+    #: Orders the risk chain approved and the venue refused. Counted apart
+    #: from `orders_rejected_by_risk`, which is the number read to decide
+    #: whether the risk configuration is too tight. Day 4 counted 38 venue
+    #: refusals there, from a chain that had refused nothing
+    #: (docs/paper-week/day-4-review.md, F3).
+    orders_rejected_by_venue: int = 0
     last_evaluation_at: datetime | None = None
     errors: int = 0
     consecutive_errors: int = 0
@@ -149,6 +155,16 @@ class RunnerStats:
     #: and a session where it is large is a session whose trades mean less than
     #: they look like they do (docs/paper-week/day-4-review.md, F6).
     signals_discarded_cold: int = 0
+    #: Each UTC minute in which an evaluation succeeded, so the daily report
+    #: can say how much of regular hours the runner covered (F11). Pruned to
+    #: the last few days. In memory only, so a restart loses its predecessor's
+    #: minutes, and the report says so rather than counting them as gaps.
+    evaluated_minutes: set[datetime] = field(default_factory=set)
+
+
+#: How long `RunnerStats.evaluated_minutes` keeps a minute. Long enough for the
+#: report half an hour after the close, and over a weekend for a late read.
+_EVALUATED_MINUTES_KEPT = timedelta(days=4)
 
 
 @dataclass(slots=True)
@@ -1233,6 +1249,14 @@ class StrategyRunner:
             )
 
         self.stats.consecutive_errors = 0
+        self._note_evaluated_minute(self.clock.now())
+
+    def _note_evaluated_minute(self, now: datetime) -> None:
+        """Record that the runner evaluated during this minute (F11)."""
+        minutes = self.stats.evaluated_minutes
+        minutes.add(now.replace(second=0, microsecond=0))
+        cutoff = now - _EVALUATED_MINUTES_KEPT
+        minutes.difference_update({m for m in minutes if m < cutoff})
 
     async def _evaluate_once(self, portfolio: Portfolio) -> None:
         closed = await self._refresh_bars()  # feeds steps 1, 2 and 4
@@ -2112,26 +2136,47 @@ class StrategyRunner:
             await self._record_signal(signal, result)
 
             if not result.submitted:
-                # **`no_action` is not a rejection**, and counting it as one
-                # inverted the number this counter exists to inform.
-                # `SubmitResult.no_action` builds an *approved* decision
-                # precisely so a HOLD-shaped outcome — an exit signal for a
-                # position that is already flat — does not read as the risk
-                # config being too tight. Then this line counted every
-                # unsubmitted result alike, so it did anyway
+                # Three outcomes, and they must not be counted as one.
+                #
+                # **`no_action` is not a rejection.** `SubmitResult.no_action`
+                # builds an *approved* decision so an exit for a position that is
+                # already flat does not read as the risk config being too tight
                 # (docs/paper-week/day-1-review.md, F14).
-                if result.decision.rule != NO_ACTION:
+                #
+                # **Nor is a venue refusal a risk refusal.** The chain approved
+                # it, so the decision is approved and its rule and reason are
+                # empty. Day 4 logged 38 refused exits as
+                # `runner.signal_refused rule= reason=` and counted them against
+                # a risk chain that had refused nothing. Read cold, that says
+                # the risk configuration is too tight, the opposite of the truth
+                # (docs/paper-week/day-4-review.md, F3). The venue's words are on
+                # the order (`refusal_reason`).
+                if result.decision.rule == NO_ACTION:
+                    log.info(
+                        "runner.no_action",
+                        symbol=signal.symbol,
+                        action=signal.action.value,
+                        reason=result.decision.reason,
+                    )
+                elif result.decision.approved:
+                    self.stats.orders_rejected_by_venue += 1
+                    log.warning(
+                        "runner.signal_rejected_by_venue",
+                        symbol=signal.symbol,
+                        action=signal.action.value,
+                        reason=result.refusal_reason,
+                        inventory_held=result.inventory_held,
+                    )
+                else:
                     self.stats.orders_rejected_by_risk += 1
                     self._escalate(result.decision)
-                log.info(
-                    "runner.signal_refused"
-                    if result.decision.rule != NO_ACTION
-                    else "runner.no_action",
-                    symbol=signal.symbol,
-                    action=signal.action.value,
-                    rule=result.decision.rule,
-                    reason=result.decision.reason,
-                )
+                    log.info(
+                        "runner.signal_refused",
+                        symbol=signal.symbol,
+                        action=signal.action.value,
+                        rule=result.decision.rule,
+                        reason=result.decision.reason,
+                    )
                 # Already durable as a decision, above. Recorded as an order
                 # too, because the two answer different questions: the signal
                 # says what the strategy wanted, this says what was actually

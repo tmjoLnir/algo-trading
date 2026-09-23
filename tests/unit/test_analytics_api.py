@@ -30,6 +30,7 @@ from atp_api.deps import (
     get_clock,
     get_current_session,
     get_order_repository,
+    get_portfolio_repository,
 )
 from atp_api.main import create_app
 from atp_core.backtest.ports import BacktestRunSpec, StoredBacktestRun
@@ -37,7 +38,7 @@ from atp_core.clock import SimulatedClock
 from atp_core.config import Settings, get_settings
 from atp_core.domain import Bar, Fill, Order, Side, Timeframe
 from atp_core.execution.idempotency import ENTRY, EXIT, STOP_LOSS, TAKE_PROFIT
-from tests.fakes import FakeBacktestRunRepository
+from tests.fakes import FakeBacktestRunRepository, FakePortfolioRepository
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -314,6 +315,7 @@ def app(orders: RecordingOrderRepo, bars: FakeBars, runs: FakeBacktestRunReposit
     application.dependency_overrides[get_order_repository] = lambda: orders
     application.dependency_overrides[get_bar_repository] = lambda: bars
     application.dependency_overrides[get_backtest_repository] = lambda: runs
+    application.dependency_overrides[get_portfolio_repository] = FakePortfolioRepository
     # These are read routes and are not about who is asking;
     # `test_api_contract.py` holds the enforcement itself against every route.
     application.dependency_overrides[get_current_session] = lambda: Session(
@@ -606,6 +608,11 @@ class TestTheDailyReport:
         body = response.json()
         assert body["orders_filled"] == 2
         assert "SPY" in body["symbols"]
+        # F4: the split, and equity reported as not measured rather than dropped.
+        assert body["orders_accepted"] == 2
+        assert body["orders_rejected_by_venue"] == 0
+        assert body["starting_equity"] is None
+        assert "equity" in body["not_measured"]
 
     @pytest.mark.asyncio
     async def test_a_day_the_orders_fall_outside_reports_that_day(

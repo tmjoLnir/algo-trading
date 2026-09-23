@@ -61,8 +61,10 @@ from atp_worker.scheduler import (
     next_due,
     reconcile_with_broker,
     remind_about_halts,
+    report_window,
     rollover_daily_counters,
     run_scheduler,
+    session_coverage,
     summarise_the_session,
     sweepable_series,
 )
@@ -1205,3 +1207,50 @@ class TestWhichSessionABarBelongsTo:
 
     def test_early_utc_belongs_to_the_previous_exchange_day(self) -> None:
         assert CAL.local_date(datetime(2026, 9, 22, 1, 0, tzinfo=UTC)) == date(2026, 9, 21)
+
+
+class TestTheDailyReportsWindow:
+    """docs/paper-week/day-4-review.md, F4 and F11, on the scheduler's side."""
+
+    def test_it_is_the_trading_day_not_the_last_24_hours(self) -> None:
+        """Day 4's report counted 9 halts from the day before on a session that
+        had none, because the window was `now - 1 day`. It is now the session
+        that just closed, from the previous session's close."""
+        after_the_close = ORDINARY_CLOSE + timedelta(minutes=30)
+
+        window = report_window(CAL, after_the_close)
+
+        assert window is not None
+        session, start = window
+        assert session.day == date(2024, 6, 3)
+        assert start == datetime(2024, 5, 31, 20, 0, tzinfo=UTC), "Friday's close, over the weekend"
+
+    def test_coverage_counts_only_the_sessions_regular_hours(self) -> None:
+        stats = RunnerStats(started_at=ORDINARY_OPEN)
+        stats.evaluated_minutes = {ORDINARY_OPEN + timedelta(minutes=i) for i in range(355)} | {
+            ORDINARY_OPEN - timedelta(minutes=5),
+            ORDINARY_CLOSE + timedelta(minutes=1),
+        }
+        session = CAL.previous_session(ORDINARY_CLOSE + timedelta(minutes=30))
+        assert session is not None
+
+        coverage = session_coverage(stats, session)
+
+        assert (coverage.evaluated_minutes, coverage.session_minutes) == (355, 390)
+
+    def test_no_runner_is_a_measured_zero(self) -> None:
+        session = CAL.previous_session(ORDINARY_CLOSE + timedelta(minutes=30))
+        assert session is not None
+
+        coverage = session_coverage(None, session)
+
+        assert (coverage.evaluated_minutes, coverage.session_minutes) == (0, 390)
+
+    def test_a_runner_started_mid_session_says_when(self) -> None:
+        started = ORDINARY_OPEN + timedelta(minutes=34)
+        session = CAL.previous_session(ORDINARY_CLOSE + timedelta(minutes=30))
+        assert session is not None
+
+        coverage = session_coverage(RunnerStats(started_at=started), session)
+
+        assert coverage.visible_from == started

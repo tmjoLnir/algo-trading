@@ -3679,3 +3679,73 @@ class TestTheSessionIsAnchoredOnFreshMarks:
         await runner.evaluate(portfolio)
 
         assert self._rule(runner).day_start_equity == Decimal(107_000)
+
+
+class TestAVenueRefusalIsNotARiskRefusal:
+    """docs/paper-week/day-4-review.md, F3. Day 4 logged 38 refused exits as
+    `runner.signal_refused rule= reason=` and counted them against a risk chain
+    that had refused nothing. A venue refusal comes back with the chain's
+    approving decision; the venue's words are on the order."""
+
+    @pytest.mark.asyncio
+    async def test_it_is_counted_and_logged_as_the_venues(self) -> None:
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+
+        async def venue_refuses(signal: Signal, *_: Any, **__: Any) -> SubmitResult:
+            order = Order(symbol=SYMBOL, side=Side.BUY, qty=Decimal(10))
+            order.status = OrderStatus.REJECTED
+            order.reject_reason = "insufficient qty available for order"
+            return SubmitResult(order=order, decision=RiskDecision.allow(), submitted=False)
+
+        router.submit_signal = venue_refuses  # type: ignore[method-assign]
+        with capture_logs() as logs:
+            await runner.evaluate(portfolio)
+
+        assert runner.stats.orders_rejected_by_venue == 1
+        assert runner.stats.orders_rejected_by_risk == 0
+        line = next(e for e in logs if e["event"] == "runner.signal_rejected_by_venue")
+        assert line["reason"] == "insufficient qty available for order"
+        assert not [e for e in logs if e["event"] == "runner.signal_refused"]
+
+    @pytest.mark.asyncio
+    async def test_a_risk_refusal_is_still_a_risk_refusal(self) -> None:
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+        router.refuse_signals = True
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+
+        await runner.evaluate(portfolio)
+
+        assert runner.stats.orders_rejected_by_risk == 1
+        assert runner.stats.orders_rejected_by_venue == 0
+
+
+class TestTheEvaluatedMinutes:
+    """F11: what the daily report's RTH coverage is counted from."""
+
+    @pytest.mark.asyncio
+    async def test_a_successful_pass_records_its_minute_once(self) -> None:
+        runner, _, _, _, portfolio, _ = build()
+        await runner.warmup(portfolio)
+
+        await runner.evaluate(portfolio)
+        await runner.evaluate(portfolio)
+
+        assert runner.stats.evaluated_minutes == {START}
+
+    @pytest.mark.asyncio
+    async def test_a_failed_pass_records_nothing(self) -> None:
+        runner, _, _, _, portfolio, _ = build()
+        await runner.warmup(portfolio)
+
+        async def boom() -> list[Bar]:
+            raise RuntimeError("bar store unreachable")
+
+        runner._refresh_bars = boom  # type: ignore[method-assign]
+        await runner.evaluate(portfolio)
+
+        assert runner.stats.evaluated_minutes == set()

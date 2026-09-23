@@ -172,9 +172,11 @@ def _render(report: PaperRunReport, strategy_id: str) -> None:
 
 def _counts_block(report: PaperRunReport) -> str:
     lines = [
-        f"  orders submitted   {report.orders_submitted}",
+        f"  orders submitted   {report.orders_submitted} (reached the venue)",
+        f"    accepted         {report.orders_accepted}",
+        f"    rejected by it   {report.orders_rejected_by_venue}",
         f"  orders filled      {report.orders_filled} ({report.fills} fills)",
-        f"  orders refused     {report.orders_refused}",
+        f"  refused by risk    {report.orders_refused}",
     ]
     for rule, count in report.refusals_by_rule.items():
         lines.append(f"    by {rule:<18} {count}")

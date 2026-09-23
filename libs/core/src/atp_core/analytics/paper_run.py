@@ -34,6 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from atp_core.analytics.daily import count_outcomes
 from atp_core.domain import OrderStatus
 
 if TYPE_CHECKING:
@@ -75,6 +76,7 @@ class Clause:
 @dataclass(frozen=True, slots=True)
 class PaperRunReport:
     clauses: list[Clause]
+    #: Orders that reached the venue, not every row (`daily.OrderOutcomes`).
     orders_submitted: int
     orders_filled: int
     orders_refused: int
@@ -86,6 +88,9 @@ class PaperRunReport:
     last_at: datetime | None
     starting_equity: Decimal | None
     ending_equity: Decimal | None
+    #: Of `orders_submitted`, what the venue took and what it refused.
+    orders_accepted: int = 0
+    orders_rejected_by_venue: int = 0
 
     @property
     def unanswerable(self) -> list[Clause]:
@@ -137,6 +142,7 @@ def assess(
         key = order.rejected_by or "unattributed"
         by_rule[key] = by_rule.get(key, 0) + 1
 
+    outcomes = count_outcomes(mine)
     stamps = [o.submitted_at or o.created_at for o in mine]
     known = sorted(s for s in stamps if s is not None)
     sessions = _sessions(equity, known)
@@ -148,7 +154,9 @@ def assess(
             _reconciles_clean(reconcile_lines, mismatch_lines),
             _stops_on_every_position(unprotected_lines, filled),
         ],
-        orders_submitted=len(mine),
+        # Reached the venue, not every row: a refused order has a row and was
+        # never submitted (docs/paper-week/day-4-review.md, F4).
+        orders_submitted=outcomes.sent,
         orders_filled=len(filled),
         orders_refused=len(refused),
         refusals_by_rule=dict(sorted(by_rule.items())),
@@ -159,6 +167,8 @@ def assess(
         last_at=known[-1] if known else None,
         starting_equity=equity[0].equity if equity else None,
         ending_equity=equity[-1].equity if equity else None,
+        orders_accepted=outcomes.accepted,
+        orders_rejected_by_venue=outcomes.rejected_by_venue,
     )
 
 

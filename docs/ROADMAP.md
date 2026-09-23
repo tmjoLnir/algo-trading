@@ -2578,6 +2578,22 @@ production is the two halves describing different periods or different runs.
   its own still write no audit row, and the section says that on the face of its
   own number rather than letting the count imply a coverage it does not have.
 
+  **Four of its five numbers were wrong the first time it ran** (day 4, F4), and
+  #167 fixes them.
+  - `submitted` counted every row, refused ones included. It now means reached the
+    venue, split into accepted and rejected by it. Venue rejections are their own
+    section, grouped by the venue's words.
+  - The window was the last 24 hours. It is now the session that just closed,
+    from the previous session's close.
+  - The report never carried P&L. It now carries the equity change over the
+    session's snapshots, and names the section as absent when a snapshot is
+    missing. The field that summed fill cash flows is gone.
+  - It gained **RTH coverage**: regular-hours minutes with an evaluating runner,
+    against the session's. The count is in the worker's memory only, so the
+    worker's report carries it, the API's reports it as absent, and a mid-session
+    restart names the minutes it cannot see.
+  - `paper_run` counts the same way, through the same function.
+
 *Verifiable:* with the stack up and a worker trading paper, a browser opened at
 any moment shows the same positions, cash and equity the worker's own log
 reports for its latest evaluation; the age of that book is on the screen and

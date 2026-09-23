@@ -15,7 +15,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from atp_core.alerts.ports import Alert, Severity
-from atp_core.analytics.daily import DailyReport, render, summarise
+from atp_core.analytics.daily import Coverage, DailyReport, render, summarise
 from atp_core.clock import SystemClock, TradingCalendar
 from atp_core.config import get_settings
 from atp_core.data.backfill import GapBackfillResult, backfill_gaps
@@ -28,6 +28,7 @@ from atp_core.persistence.audit import PostgresAuditLog
 from atp_core.persistence.bars import PostgresBarRepository
 from atp_core.persistence.db import create_engine, create_session_factory
 from atp_core.persistence.orders import PostgresOrderRepository
+from atp_core.persistence.positions import PostgresPortfolioRepository
 from atp_core.risk.killswitch import HaltReason
 from atp_core.risk.rules import DAILY_LOSS_RULE
 
@@ -212,7 +213,8 @@ async def summarise_the_session(watch: SessionWatch) -> None:
             f"{stats.orders_submitted} orders submitted, "
             f"{stats.signals_generated} signals, "
             f"{stats.evaluations} evaluations, "
-            f"{stats.orders_rejected_by_risk} refused by risk"
+            f"{stats.orders_rejected_by_risk} refused by risk, "
+            f"{stats.orders_rejected_by_venue} rejected by the venue"
         )
 
     lines = [headline]
@@ -236,6 +238,7 @@ async def summarise_the_session(watch: SessionWatch) -> None:
         "worker.session_summary",
         orders_submitted=stats.orders_submitted if stats else None,
         evaluations=stats.evaluations if stats else None,
+        orders_rejected_by_venue=stats.orders_rejected_by_venue if stats else None,
         signals_discarded_cold=stats.signals_discarded_cold if stats else None,
         halted=bool(halts),
     )
@@ -608,7 +611,12 @@ async def generate_daily_report(watch: SessionWatch) -> DailyReport:
     settings = get_settings()
     clock = SystemClock()
     now = clock.now()
-    session_start = now - timedelta(days=1)
+    window = report_window(TradingCalendar(), now)
+    if window is None:
+        log.warning("worker.daily_report.no_session", at=now.isoformat())
+        report = summarise(now.date(), [], audit=None)
+        return report
+    session, session_start = window
 
     engine = create_engine(settings.database_url)
     factory = create_session_factory(engine)
@@ -616,6 +624,16 @@ async def generate_daily_report(watch: SessionWatch) -> DailyReport:
         orders = await PostgresOrderRepository(factory).recent_orders(
             settings.run_mode, since=session_start, limit=DAILY_REPORT_ORDER_LIMIT
         )
+        # The session's first and last snapshot. Read failures degrade the
+        # report to "equity not measured" rather than failing it, the same
+        # posture as the audit read below.
+        try:
+            points = await PostgresPortfolioRepository(factory).equity_history(
+                settings.run_mode, start=session.open_at, end=session.close_at
+            )
+        except Exception as exc:
+            log.warning("worker.daily_report.equity_unavailable", error=str(exc))
+            points = []
         # None, not [], when the read fails: the report renders "not recorded"
         # for an audit table it could not reach and "0 halts" for one it could,
         # and those are different days.
@@ -630,14 +648,23 @@ async def generate_daily_report(watch: SessionWatch) -> DailyReport:
     finally:
         await engine.dispose()
 
-    report = summarise(now.date(), orders, audit=audit)
+    report = summarise(
+        session.day,
+        orders,
+        audit=audit,
+        starting_equity=points[0].equity if points else None,
+        ending_equity=points[-1].equity if points else None,
+        coverage=session_coverage(watch.stats() if watch.stats is not None else None, session),
+    )
 
     log.info(
         "worker.daily_report",
         day=report.day.isoformat(),
         headline=report.headline(),
         orders_submitted=report.orders_submitted,
+        orders_accepted=report.orders_accepted,
         orders_filled=report.orders_filled,
+        orders_rejected_by_venue=report.orders_rejected_by_venue,
         orders_refused=report.orders_refused,
         refusals_by_rule=report.refusals_by_rule,
         not_measured=[s.name for s in report.absent],
@@ -653,6 +680,46 @@ async def generate_daily_report(watch: SessionWatch) -> DailyReport:
         )
     )
     return report
+
+
+def report_window(calendar: TradingCalendar, now: datetime) -> tuple[Session, datetime] | None:
+    """The session the daily report is about, and where its window starts.
+
+    **The trading day, not the last 24 hours.** The window was `now - 1 day`,
+    labelled with today's date, so day 4's report counted 9 halts from the day
+    before on a session that had none (docs/paper-week/day-4-review.md, F4;
+    day 2's F14). The session is the last one to have closed. The window
+    starts at the previous session's close, so everything between the two bells
+    (an operator's pre-open halt, a boot-time catch-up) belongs to the day it
+    led into.
+
+    None when no session has ever closed before `now`, which the calendar can
+    only say at the start of its range.
+    """
+    session = calendar.previous_session(now)
+    if session is None:
+        return None
+    prior = calendar.previous_session(session.open_at)
+    start = prior.close_at if prior is not None else session.open_at - timedelta(days=1)
+    return session, start
+
+
+def session_coverage(stats: RunnerStats | None, session: Session) -> Coverage:
+    """Regular-hours minutes of `session` in which the runner evaluated (F11).
+
+    No runner is a measured zero, not an absence: this worker was asked to
+    trade nothing, and 0 of 390 is what that looks like.
+    """
+    minutes = int((session.close_at - session.open_at).total_seconds() // 60)
+    if stats is None:
+        return Coverage(evaluated_minutes=0, session_minutes=minutes, open_at=session.open_at)
+    evaluated = sum(1 for m in stats.evaluated_minutes if session.open_at <= m < session.close_at)
+    return Coverage(
+        evaluated_minutes=evaluated,
+        session_minutes=minutes,
+        open_at=session.open_at,
+        visible_from=stats.started_at,
+    )
 
 
 def sweepable_series(

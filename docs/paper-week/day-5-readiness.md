@@ -559,6 +559,31 @@ was**, and an operator reading them would again conclude the risk configuration 
 F3's own severity is observability, not blocking — the blocking weight it was assigned during
 this check is borrowed from §3.1 and belongs there.
 
+> **Closed by #167** (added after §3's fixes and B2), recorded here rather than by editing the
+> finding above.
+>
+> - **Submitted vs accepted.** `analytics.daily.count_outcomes` is now the one count both
+>   reports use. `orders_submitted` means reached the venue, split into `orders_accepted` and
+>   `orders_rejected_by_venue`. Venue rejections get their own section, ranked by the venue's
+>   words.
+> - **Refused vs refused-by-risk.** `orders_refused` is refused before submission only, and the
+>   headline names both kinds.
+> - **The window.** `scheduler.report_window` uses the session that just closed, from the
+>   previous session's close, labelled with that session's date.
+> - **P&L.** Equity comes from the session's first and last snapshots. When one end is missing,
+>   the report lists an absent `equity` section. The `realised_pnl` field, which summed fill cash
+>   flows, is removed.
+> - **RTH coverage.** `RunnerStats.evaluated_minutes` records each minute in which an evaluation
+>   succeeded, and the report counts them inside the session's regular hours. It is in the
+>   worker's memory only: the API's report says so, and a restarted worker names the minutes
+>   before it started as not visible, not as uncovered.
+> - **F3.** `_submit` now separates a venue refusal (an approved decision, not submitted) from a
+>   risk refusal. It counts `orders_rejected_by_venue`, logs `runner.signal_rejected_by_venue`
+>   with the venue's reason, and no longer escalates it as a risk event. The session summary at
+>   the bell names both counts.
+>
+> Proven by unit tests only: no session has produced a report on this code.
+
 ### 4.3 F5 — protection is still submitted against a working parent `medium`
 
 `_protect` is still called on every fill (`runner.py:2001`) with no `is_complete` gate, and
@@ -799,6 +824,7 @@ Then, as code, in this order:
    §3.4's note.)*
 8. **The daily report's four numbers and RTH coverage** (§4.2). It is the only end-of-day
    artifact and it finally runs.
+   *(Done, #167, with F3's venue/risk split. See §4.2's note.)*
 9. **Await the venue's cancel acknowledgement rather than the request** (§6), and add the
    async-cancel test.
 10. **Reconcile the four documentation defects in §4.6** — `FIRST_PAPER_RUN.md` first, because
