@@ -349,7 +349,7 @@ The honest caveat, which #159 states: one daily session is one bar per symbol. A
 five decisions per symbol, not two thousand. This does not make day 5 conclusive. It makes day 5
 worth recording.
 
-> **The documentation half closed by PR_NUMBER.** ADR 0034 made the flip executable, but the
+> **The documentation half closed by #167.** ADR 0034 made the flip executable, but the
 > pages an operator reads before the open still said otherwise. `FIRST_PAPER_RUN.md` ("The
 > strategy's series must match the worker's") now recommends `1d` and lists the steps:
 > backfill, Config tab, preflight, and what to read at the open. The F8 page says its advice
@@ -485,7 +485,7 @@ Redis key, no snapshot field — six hits, all inside `rules.py`. The guarantee 
 docstring, warned about in a second (`engine.py:275`), and implemented nowhere. A restart to
 clear the halt above would grant day 5 a fresh 3% on top of the loss already taken.
 
-> **Closed by PR_NUMBER**, recorded here rather than by editing the finding above.
+> **Closed by #167**, recorded here rather than by editing the finding above.
 >
 > - **The stale anchor.** `warmup` no longer anchors. It records that the session owes one,
 >   and `_anchor_if_pending` takes it on the first evaluation, right after that pass's
@@ -581,7 +581,7 @@ shorts is configured, which is a thing to remember rather than a thing to do now
   bounce in detail. A reader opening the roadmap to ask "has the paper week started?" is told no.
 - **`docs/FIRST_PAPER_RUN.md:302` vs `f8-timeframe-and-stop-sizing.md`** — opposite advice on
   the one setting that decides whether day 5 means anything (§3.2). *(Reconciled by
-  PR_NUMBER: both now say `1d`, and why it is executable.)*
+  #167: both now say `1d`, and why it is executable.)*
 - **`docs/RUNBOOK.md`, "A stop released for a close"** — describes `_close` as cancelling stops
   *"once the venue names one of our own orders as the holder"*, with no qualifier that "our own"
   means *this process's*. For an inherited position that paragraph is false, and it is the
@@ -754,7 +754,7 @@ Before the open, in the session itself — no code:
    closed". Until one of those exists, no configuration of this platform can run the strategy on
    the timeframe it declares.
    *(Reinstated: ADR 0034 (#164) is the real change. The steps are now in
-   `FIRST_PAPER_RUN.md`, whose contrary advice PR_NUMBER removed. It is still an operator's
+   `FIRST_PAPER_RUN.md`, whose contrary advice #167 removed. It is still an operator's
    action, not code.)*
 
 Then, as code, in this order:
@@ -769,7 +769,7 @@ Then, as code, in this order:
    symbol per session, not the ~52 minutes. See §3.3's note.)*
 5. **Mark the book before anchoring the session** (§3.5), or anchor from fresh quotes. And
    persist `day_start_equity`, which two docstrings already promise.
-   *(Done, PR_NUMBER: anchored on the first evaluation's marks, persisted per session date.
+   *(Done, #167: anchored on the first evaluation's marks, persisted per session date.
    See §3.5's note.)*
 6. **B2: snapshot on fill and from the reconcile job, and put the snapshot's age in
    `restored_book`** (§4.1). The shutdown snapshot waits on F10's handler; the other two do not.

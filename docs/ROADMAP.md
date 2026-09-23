@@ -602,7 +602,7 @@ strategy evaluated without them is flattered by 1.3 points over five years on
   .anchor_session` is the named seam. The live runner calls it once per session,
   and the backtest engine at each session in the replay.
 
-  **And the live anchor was taken on a stale book and kept nowhere** (PR_NUMBER).
+  **And the live anchor was taken on a stale book and kept nowhere** (#167).
   `warmup` anchored before anything had marked it, so after a restart the first
   pass would read the repricing of inherited positions as the day's loss. And
   `day_start_equity`'s promise to survive a restart had no storage behind it. The

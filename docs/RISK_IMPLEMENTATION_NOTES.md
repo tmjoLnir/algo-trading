@@ -148,7 +148,7 @@ where the value is persisted across a restart, is still open** — it belongs wi
 consequence: assembling `default_rules()` and never anchoring gives a chain that blocks every
 entry and allows every exit. That is the safe failure, not a working configuration.
 
-**RESOLVED** (PR_NUMBER). `StrategyRunner` anchors once per session, on the first
+**RESOLVED** (#167). `StrategyRunner` anchors once per session, on the first
 evaluation's marks, and not in `warmup` on the book as restored. It keeps the anchor in a
 `risk.ports.SessionAnchorStore` (Redis, keyed by run mode and session date), so a
 mid-session restart restores it instead of re-anchoring to a drawn-down book. A store that
