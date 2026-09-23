@@ -372,7 +372,7 @@ are all entries.
 At `1d` this evaporates: no floor, 51 stored bars, warm at the open. Which is another reason
 §3.2 comes first.
 
-> **Closed by PR_NUMBER, with a correction to the size of the finding**, recorded here rather
+> **Closed by #166, with a correction to the size of the finding**, recorded here rather
 > than by editing it. `_poll_strategy` now lets an `EXIT` through the gate when the book holds
 > a position in that symbol. It logs `runner.cold_exit_admitted` and the exit still passes the
 > whole risk chain. Entries, and an `EXIT` while flat, are discarded and counted as before.
@@ -728,7 +728,7 @@ Then, as code, in this order:
    in it — see §3.1's note. It wants boot-time adoption, together with item 7.)*
 4. **Exempt `EXIT` from the cold gate, or bound it** (§3.3). A position already held is not a
    cold-start decision; discarding its exit is strictly worse than letting it through.
-   *(Done, PR_NUMBER, for held positions only. For `sma_crossover` it recovers one bar per
+   *(Done, #166, for held positions only. For `sma_crossover` it recovers one bar per
    symbol per session, not the ~52 minutes. See §3.3's note.)*
 5. **Mark the book before anchoring the session** (§3.5), or anchor from fresh quotes. And
    persist `day_start_equity`, which two docstrings already promise.
