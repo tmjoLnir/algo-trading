@@ -802,11 +802,25 @@ class BacktestEngine:
         if unadjusted:
             shown = ", ".join(unadjusted[:8])
             more = "" if len(unadjusted) <= 8 else f", and {len(unadjusted) - 8} more"
+            # A command that runs as printed. `backfill_bars.py` requires
+            # `--start` and defaults `--timeframe` to `1d`, so the bare
+            # `--symbols` this used to print exited on an argparse error, and
+            # with the start added would still have refilled the daily series
+            # under an intraday run. The window is the unadjusted candles' own:
+            # first day, to the day after the last, because `--end` is that
+            # day's midnight UTC. Every affected symbol goes in the command,
+            # even where the prose above stops at eight: a command that
+            # repairs eight of twelve leaves a run that is refused again.
+            missing = [c for s in unadjusted for c in bars[s] if c.adj_close is None]
+            first = min(c.ts for c in missing).date()
+            end = max(c.ts for c in missing).date() + timedelta(days=1)
             raise UnadjustedDataError(
                 f"{len(unadjusted)} symbol(s) have bars with no adj_close, and a backtest "
                 f"prices off adjusted closes (CLAUDE.md §5): {shown}{more}. A raw-only "
                 f"backfill leaves the column unset — refill without --raw-only: "
-                f"scripts/backfill_bars.py --symbols {','.join(unadjusted[:8])}"
+                f"scripts/backfill_bars.py --symbols {','.join(unadjusted)} "
+                f"--start {first.isoformat()} --end {end.isoformat()} "
+                f"--timeframe {missing[0].timeframe.value}"
             )
         return {symbol: [candle.adjusted() for candle in series] for symbol, series in bars.items()}
 
@@ -834,7 +848,8 @@ class BacktestEngine:
             f"{symbol} has {len(holes)} hole(s) in its stored history, each longer than the "
             f"{self.config.max_gap_days}-day `max_gap_days`: {shown}{more}. Backfill before "
             f"running: scripts/backfill_bars.py --symbols {symbol} "
-            f"--start {first.date()} --end {second.date()}"
+            f"--start {first.date()} --end {second.date()} "
+            f"--timeframe {self.config.timeframe.value}"
         )
 
     # ── 3. stops ────────────────────────────────────────────────────────────

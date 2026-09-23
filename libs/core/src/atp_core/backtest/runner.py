@@ -669,14 +669,18 @@ def missing_coverage(bars: dict[str, list[Bar]], symbols: tuple[str, ...]) -> li
     return sorted(symbol for symbol in symbols if not bars.get(symbol))
 
 
-def backfill_hint(missing: list[str], start: datetime) -> str:
+def backfill_hint(missing: list[str], start: datetime, *, timeframe: str) -> str:
     """The exact command that fixes missing history.
 
     The CLI names it; a queued run has to name it too, or the API's refusal is a
     dead end. Same shape as `scripts/run_backtest.py`'s message, deliberately.
+
+    `timeframe` is required: `backfill_bars.py` defaults `--timeframe` to `1d`,
+    so a hint without it refills the daily series under an intraday run, and the
+    run is refused again for the same missing bars.
     """
     return (
         f"No stored bars for {', '.join(missing)} in the requested window. "
         f"Backfill first: scripts/backfill_bars.py --symbols {','.join(missing)} "
-        f"--start {start.date()}"
+        f"--start {start.date()} --timeframe {timeframe}"
     )

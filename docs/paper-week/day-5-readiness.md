@@ -362,6 +362,16 @@ worth recording.
 > `1d` path tells an operator to paste before the bell exited on an argparse error. The alert
 > now carries `--start <the missing session>`. Preflight prints a start far enough back for the
 > strategy's warmup, and the runbook says so.
+>
+> The one command left out then, the backtest engine's `UnadjustedDataError`, is fixed in the
+> same PR. It printed `--symbols` alone, so it was missing `--start`, and it relied on the
+> script's `1d` default for `--timeframe` (the wrong series under an intraday run). It also
+> listed only the first eight symbols. It now carries the unadjusted bars' own window
+> (`--start`, and `--end` the day after the last), their timeframe, and every affected symbol.
+> Three more backtest-side commands had `--start` but no `--timeframe`: the engine's own hole
+> refusal, `backtest.runner.backfill_hint` (the API's 400 and the queue's failure), and
+> `scripts/run_backtest.py`. All three now name the series. `backfill_hint` takes `timeframe` as
+> a required keyword, so a new caller cannot leave it out.
 
 ### 3.3 The warmup gate discards exits, not just entries `blocker at 1m`
 

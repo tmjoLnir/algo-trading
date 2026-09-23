@@ -619,7 +619,7 @@ async def _require_coverage(bars: BarRepository, spec: BacktestRunSpec) -> None:
     }
     missing = missing_coverage(loaded, spec.symbols)
     if missing:
-        raise _bad_request(backfill_hint(missing, spec.start))
+        raise _bad_request(backfill_hint(missing, spec.start, timeframe=timeframe.value))
 
 
 async def _store_registered_class(
