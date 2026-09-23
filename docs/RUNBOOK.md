@@ -1083,10 +1083,11 @@ the all-clear.
 
 **Read the venue's open orders for the symbol before placing a stop by hand.**
 A stop placed before a restart counts only because `warmup` adopts the stops it
-restored into the router (`OrderRouter.adopt_protection`). Until that existed,
-every position carried across a restart paged here at the first evaluation,
-over a live GTC stop, and following step 2 above placed a second stop over
-shares that already had one (docs/paper-week/day-5-readiness.md, §3.4). If the
+restored into the router (`OrderRouter.adopt_protection`). Without it, every
+position carried across a restart would page here at the first evaluation, over
+a live GTC stop, and following step 2 above would place a second stop over
+shares that already have one (docs/paper-week/day-5-readiness.md, §3.4 — a
+finding from the code before day 5 ran, not an observed incident). If the
 venue does show a working stop that closes the position, the page is wrong, and
 that is a bug worth an issue. Do not add another stop.
 

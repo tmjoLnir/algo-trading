@@ -808,15 +808,16 @@ class OrderRouter:
         two readers are not lookups:
 
         - `broker_side_protected_qty` feeds `_mark_broker_protection` on every
-          pass. With nothing adopted, every inherited position read as naked
-          while its GTC stop rested at the venue, so the first evaluation after
-          a restart paged a false CRITICAL — *"N position(s) with NO stop at the
-          broker"* — whose runbook procedure is to place a stop by hand, i.e. a
-          second stop over shares that already have one
+          pass. With nothing adopted, every inherited position reads as naked
+          while its GTC stop rests at the venue, so the first evaluation after
+          a restart would page a false CRITICAL — *"N position(s) with NO stop
+          at the broker"* — whose runbook procedure is to place a stop by hand,
+          i.e. a second stop over shares that already have one. Found by reading
+          the code before day 5 ran, not observed
           (docs/paper-week/day-5-readiness.md, §3.4).
         - `_cancel_stale_protection` runs on every fill and deliberately does not
           read the venue (its docstring says why), so an inherited stop left on
-          the wrong side by a flip stayed resting and would *open* a position
+          the wrong side by a flip would stay resting and *open* a position
           (§4.5). Adopting at boot is the fix that docstring names.
 
         **Pass the caller's own instances, not fresh reads.** The runner hands

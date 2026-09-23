@@ -745,7 +745,8 @@ class StrategyRunner:
 
         # The stops among them are protection the venue is holding right now,
         # and the router has to know that or it reports every inherited position
-        # as naked — one false CRITICAL at the first evaluation, whose runbook
+        # as naked — which, predicted by code reading before day 5 ran, would
+        # page one false CRITICAL at the first evaluation, whose runbook
         # procedure places a second stop over shares that already have one
         # (docs/paper-week/day-5-readiness.md, §3.4). **These instances**, not
         # copies: they are what trade updates mutate, so a stop that fires or
@@ -1334,8 +1335,9 @@ class StrategyRunner:
         the venue, or one resting from before a restart, moves the router's
         count and never touches the map — the second only because `warmup`
         adopts it into the router (`OrderRouter.adopt_protection`). Before that
-        existed this docstring claimed it anyway, and every inherited position
-        read as naked (docs/paper-week/day-5-readiness.md, §3.4).
+        existed this docstring claimed it anyway, and the code would have read
+        every inherited position as naked (docs/paper-week/day-5-readiness.md,
+        §3.4 — found by reading, before any session opened holding one).
         """
         naked: dict[str, Decimal] = {}
         for position in portfolio.open_positions:
@@ -1365,9 +1367,10 @@ class StrategyRunner:
         is one thing an operator can act on; 85 pages naming one fill each is a
         silenced phone. But a dedup is a floor as well as a ceiling, and the
         first version had only the ceiling: a set that grew inside the cooldown
-        was dropped on the promise of a later pass, and one that never changed
-        was paged once and then never again, all session
-        (docs/paper-week/day-4-review.md, F1; day-5-readiness.md, §3.4). So:
+        was dropped on the promise of a later pass (day 4, observed:
+        docs/paper-week/day-4-review.md, F1), and one that never changed would
+        be paged once and then never again for the rest of the session
+        (day-5-readiness.md, §3.4, from the code). So:
 
         - **a symbol not in the last page pages now**, cooldown or not — a
           position that has just gone naked is news, and it is the one thing

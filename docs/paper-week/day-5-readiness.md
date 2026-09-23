@@ -418,6 +418,10 @@ to act on that page.
 > (its reason stands), but an inherited wrong-side stop is now in the map it reads. The runbook
 > gained a section for the page itself, which says to read the venue's open orders before
 > placing a stop by hand.
+>
+> **Proven by tests only.** Like the finding, this is established from the code: day 5 has not
+> run, so no session has yet opened holding inventory under either version. Whether the first
+> evaluation of a real open stays quiet is for day 5's own review to confirm.
 
 ### 3.5 The daily-loss anchor is taken on day-4's marks `high`
 

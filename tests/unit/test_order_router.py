@@ -1951,10 +1951,11 @@ class TestAdoptingInheritedProtection:
     they act. Two readers of `_protective` are not lookups and could not be
     fixed that way: `broker_side_protected_qty`, which the runner's
     `_mark_broker_protection` reads on every pass, and `_cancel_stale_protection`,
-    which runs on every fill and deliberately does not read the venue. Both saw
-    an empty map after every restart, so every inherited position paged as naked
-    at the first evaluation and a wrong-side inherited stop stayed resting
-    (docs/paper-week/day-5-readiness.md, §3.4 and §4.5).
+    which runs on every fill and deliberately does not read the venue. Both see
+    an empty map after every restart, so every inherited position would page as
+    naked at the first evaluation and a wrong-side inherited stop would stay
+    resting (docs/paper-week/day-5-readiness.md, §3.4 and §4.5 — found by
+    reading, before day 5 ran).
 
     The restart is modelled as in `TestClosingReleasesInheritedProtection`: a
     second `OrderRouter` over the same `FakeBroker`.
@@ -1981,7 +1982,7 @@ class TestAdoptingInheritedProtection:
         return router(broker, chain()), stop
 
     async def test_an_adopted_stop_counts_as_protection(self) -> None:
-        """**§3.4.** Without adoption this is 0 and the first evaluation pages
+        """**§3.4.** Without adoption this is 0 and the first evaluation would page
         *"1 position(s) with NO stop at the broker"* over a live GTC stop."""
         broker, portfolio = FakeBroker(), book()
         reborn, stop = await self._restarted(broker, portfolio)

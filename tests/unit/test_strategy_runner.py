@@ -2714,8 +2714,8 @@ class TestAPositionWithNoVenueStopReachesAHuman:
         assert "Newly unprotected: PEP" in alerts.sent[1].body
 
     def test_a_set_that_stays_naked_is_rolled_up_once_per_cooldown(self) -> None:
-        """**§3.4's silence.** An unchanged set was paged once and then never
-        again, all session — so a page that was missed or dismissed was the last
+        """**§3.4's silence.** An unchanged set would be paged once and then
+        never again for the rest of the session — so a page that was missed or dismissed was the last
         word. While anything is naked, it is repeated once per cooldown, and
         says how long the oldest has gone without a stop."""
         alerts = RecordingAlertSink()
@@ -3279,8 +3279,9 @@ class TestARestartInheritsItsStops:
     """§3.4 of docs/paper-week/day-5-readiness.md, as assertions.
 
     `_mark_broker_protection` reads the router's protective map, and that map
-    was empty at every boot. So every position carried across a restart read as
-    naked while its GTC stop rested at the venue, and the first evaluation paged
+    was empty at every boot. So every position carried across a restart would
+    read as naked while its GTC stop rests at the venue, and the first
+    evaluation would page
     *"N position(s) with NO stop at the broker"* — a false CRITICAL whose runbook
     procedure is to place a stop by hand, over shares that already have one.
 
@@ -3328,7 +3329,8 @@ class TestARestartInheritsItsStops:
 
     @pytest.mark.asyncio
     async def test_an_inherited_stop_is_not_paged_as_missing(self) -> None:
-        """**The false CRITICAL.** Fails at HEAD~ with one page naming SPY."""
+        """**The false CRITICAL.** Predicted by §3.4 from the code; without the fix this
+        test fails. Day 5 has not run, so this is the only place it has."""
         runner, _router, portfolio, alerts = self._restarted(restored=[self._inherited_stop()])
         await runner.warmup(portfolio)
 

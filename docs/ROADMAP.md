@@ -1084,10 +1084,10 @@ above.
 
   **The map itself is now rebuilt at boot** (#165). `warmup` hands the
   stops it restored to `OrderRouter.adopt_protection` before it catches up on
-  what the venue did, so the per-pass protection count sees them. Before this,
-  every position carried across a restart paged "NO stop at the broker" at the
-  first evaluation, over a live GTC stop (docs/paper-week/day-5-readiness.md,
-  §3.4). The stale-side cancel also sees them now, which closes §4.5 without a
+  what the venue did, so the per-pass protection count sees them. Without it,
+  every position carried across a restart would have paged "NO stop at the
+  broker" at the first evaluation, over a live GTC stop — found by reading the
+  code before day 5, not observed (docs/paper-week/day-5-readiness.md, §3.4). The stale-side cancel also sees them now, which closes §4.5 without a
   venue read on every fill. The same change reworks the unprotected page: a
   newly naked symbol pages at once, a standing set re-pages once per cooldown,
   and the log line carries the venue's refusal text (day-4 F1, F2).
