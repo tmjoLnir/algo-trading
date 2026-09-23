@@ -3814,3 +3814,109 @@ class TestProtectionWaitsForTheEntry:
         await runner.on_fill_event(cancelled, portfolio)
 
         assert [o.client_order_id for o in router.protected] == ["atp-part"]
+
+
+class TestARefusedStopIsAskedForAgain:
+    """docs/paper-week/day-4-review.md, F9 (day-5-readiness.md §4.4). MSFT's
+    stop was refused `stale_data` 1.2 s before the stream connected and never
+    asked for again: 17 minutes with no venue stop."""
+
+    async def _refused_at_fill(
+        self,
+    ) -> tuple[StrategyRunner, FakeRouter, Portfolio, FakeOrderRepository]:
+        strategy = ScriptedStrategy({0: SignalAction.ENTER_LONG})
+        orders = FakeOrderRepository()
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)], order_repo=orders)
+        router.refuse_protection = True
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+        await runner.evaluate(portfolio)
+        await runner.on_fill_event(TestFills.a_fill_update("atp-1"), portfolio)
+        assert SYMBOL in runner._unprotected, "the premise: refused and recorded"
+        return runner, router, portfolio, orders
+
+    @pytest.mark.asyncio
+    async def test_the_next_pass_asks_again_and_the_gap_closes(self) -> None:
+        runner, router, portfolio, _ = await self._refused_at_fill()
+        router.refuse_protection = False  # the quote arrived
+
+        await runner.evaluate(portfolio)
+
+        assert [o.client_order_id for o in router.protected] == ["atp-1", "atp-1"]
+        assert SYMBOL not in runner._unprotected
+        assert SYMBOL not in runner._unprotected_entries
+
+    @pytest.mark.asyncio
+    async def test_a_retry_that_is_refused_again_writes_no_second_row(self) -> None:
+        runner, _router, portfolio, orders = await self._refused_at_fill()
+        rows_before = list(orders.save_calls)
+
+        await runner.evaluate(portfolio)
+
+        refused_rows = [
+            cid
+            for cid in orders.save_calls[len(rows_before) :]
+            if orders.saved[cid].status is OrderStatus.REJECTED_RISK
+        ]
+        assert refused_rows == []
+        assert SYMBOL in runner._unprotected, "still missing, still recorded"
+
+    @pytest.mark.asyncio
+    async def test_a_retry_that_raises_does_not_fail_the_pass(self) -> None:
+        runner, router, portfolio, _ = await self._refused_at_fill()
+        router.protection_raises = RuntimeError("venue unreachable")
+
+        await runner.evaluate(portfolio)
+
+        assert runner.stats.consecutive_errors == 0
+
+    @pytest.mark.asyncio
+    async def test_a_working_entry_is_left_to_finish(self) -> None:
+        """Its stop is deferred on purpose (F5); the event that ends it places it."""
+        runner, router, portfolio, _ = await self._refused_at_fill()
+        entry = runner._unprotected_entries[SYMBOL]
+        entry.status = OrderStatus.PARTIALLY_FILLED
+        router.refuse_protection = False
+
+        await runner.evaluate(portfolio)
+
+        assert [o.client_order_id for o in router.protected] == ["atp-1"]
+
+
+class TestARefusedCloseThatTookTheStopIsWatched:
+    """docs/paper-week/day-5-readiness.md §4.6. A close that released the venue
+    stop, was refused, and could not re-arm left a position with no venue stop,
+    and the engine did not watch the level either, because nothing recorded
+    the gap where `_stop_is_missing` looks."""
+
+    async def _held(self, *, protected: str) -> tuple[StrategyRunner, FakeRouter, Portfolio]:
+        strategy = ScriptedStrategy({0: SignalAction.EXIT})
+        runner, router, _, _, portfolio, _ = build(strategy, bars=[bar(0)])
+        position = portfolio.position(SYMBOL)
+        position.qty = Decimal(10)
+        position.avg_entry_price = Decimal(100)
+        position.stop_loss_price = Decimal(95)
+        router.protected_qty[SYMBOL] = Decimal(protected)
+        router.refuse_signals = True
+        await runner.warmup(portfolio)
+        close_bar(runner, bar(1))
+        return runner, router, portfolio
+
+    @pytest.mark.asyncio
+    async def test_a_refused_exit_with_no_venue_stop_left_is_recorded(self) -> None:
+        runner, _router, portfolio = await self._held(protected="0")
+
+        await runner.evaluate(portfolio)
+
+        assert runner._unprotected[SYMBOL] == Decimal(10)
+        assert runner._stop_is_missing(portfolio.position(SYMBOL)), "the engine watches now"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_exit_that_kept_its_stop_records_nothing(self) -> None:
+        """The ordinary refusal: the stop is still at the venue, and an engine
+        watching as well would close the position twice."""
+        runner, _router, portfolio = await self._held(protected="10")
+
+        await runner.evaluate(portfolio)
+
+        assert SYMBOL not in runner._unprotected

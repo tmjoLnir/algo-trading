@@ -145,11 +145,23 @@ ATR(14).
   trade this whole ordering exists to refuse.
 
   **The residual, named rather than hidden.** Between the cancel and the fill
-  the venue holds no stop: the armed engine-side level is the only one, and it
-  dies with the process. It is bounded by the fill of a market order, the close
-  is GTC so it cannot expire into a position with neither a stop nor a working
-  exit, and it is the same reduced guarantee this chain already accepts for a
-  protective child a rule refused. It closes on the `BrokerPort` bracket item.
+  the venue holds no stop, and neither does the engine: the working close is the
+  exit, and an engine that also watched the level would close the position a
+  second time. This paragraph used to say the armed level covered that gap. It
+  did not, because `_exit_reason` watches it only for a gap the runner has
+  recorded, and this path recorded none (docs/paper-week/day-5-readiness.md,
+  §4.6). The gap is bounded by the fill of a market order, and the close is GTC
+  so it cannot expire into a position with neither a stop nor a working exit.
+  It closes on the `BrokerPort` bracket item.
+
+  **When the retry is refused, the level does cover it.** The release waits
+  for the venue to confirm each cancel before retrying, so the retry does not
+  land in `pending_cancel` and get refused for shares still held. A stop that
+  filled while being cancelled stops the path: no second close, no re-arm
+  (`order.protection_filled_during_release`). If the close is refused and the
+  re-arm is refused too, the runner compares what the venue still holds with
+  the position and records the shortfall (`runner.protection_lost_on_refused_close`),
+  and from then on the engine watches the armed level.
   A re-arm the chain refuses logs `order.position_unprotected`, the same
   `CRITICAL` as a stop refused at entry; a stop with no level to re-arm at logs
   `order.protection_not_rearmed`. Both are docs/RUNBOOK.md, "Position open with

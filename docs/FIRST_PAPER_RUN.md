@@ -5,12 +5,14 @@ wrong. This is the deliberate act that Phase 4's *Verifiable:* line asks for:
 
 > a strategy trades the paper account for a week and reconciles clean
 
-Everything in Phase 4 is built and every test passes against fakes. **Nothing in
-it has met Alpaca.** That is the gap this closes, and the reason to expect
-surprises rather than a clean first attempt: #34 is the standing precedent —
-market-data fixtures written from the vendor's documentation disagreed with the
-real wire in three ways at once, and a parser that rejected every live quote
-still passed 648 unit tests.
+Everything in Phase 4 is built and every test passes against fakes. **It has met
+Alpaca, and the week has not been shown.** Days 1 to 4 of the paper week ran
+against the paper account: day 4 alone placed 209 venue orders, took 236 fills
+and reconciled clean 78 times (docs/paper-week/). Every one of those days was
+voided by a defect it found, which is the reason to expect surprises rather than
+a clean first attempt. #34 is the older precedent: market-data fixtures written
+from the vendor's documentation disagreed with the real wire in three ways at
+once, and a parser that rejected every live quote still passed 648 unit tests.
 
 ---
 

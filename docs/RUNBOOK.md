@@ -917,6 +917,26 @@ stay that way until somebody noticed. Bring the database up and the next restart
 succeeds on its own. `make check-env` and `docker compose ps db` are the two
 things to look at.
 
+## A session that decided nothing
+
+Zero orders is a normal day for a crossover strategy, and it is also what every
+failure below looks like. Before believing it was quiet, check which:
+
+- `runner.signal_discarded_cold` (WARNING): the strategy spoke on a symbol with
+  less history than it declares, and the signal was dropped, as the backtest
+  drops it. Normal for the first `warmup_bars` bars of an intraday session. Many
+  of these all session means history is missing: run `make preflight`.
+  `runner.cold_exit_admitted` is the exception: an exit on a held position,
+  let through because it can only reduce the book.
+- `runner.signal_rejected_by_venue` (WARNING): risk approved it and Alpaca
+  refused it, with Alpaca's reason on the line. Not a risk-configuration
+  problem. `insufficient qty available` means one of our own orders holds the
+  shares, and "A stop released for a close" below applies.
+- `runner.signal_refused` (INFO): the risk chain refused it, with the rule named.
+- `runner.decision_bar_missing`: a `1d` worker had no bar to decide on.
+- The daily report's `RTH coverage` line: how many regular-hours minutes the
+  runner actually evaluated.
+
 ## A saved configuration has not taken effect
 
 Expected, not a fault. The worker reads its configuration **once, at start**, so
@@ -1056,6 +1076,12 @@ acknowledged".
 
 *Symptom:* a `CRITICAL` log with either event name.
 
+`runner.protection_retry` at `INFO` is the runner asking again, on every
+evaluation, for a stop that was refused. A transient refusal (`stale_data`
+before the feed connects, `trading_hours`, `rate_limit`) clears on its own
+within a pass or two. A refusal that repeats every pass is one of the steps
+below.
+
 `order.protection_deferred` / `runner.protection_deferred` at `INFO` are **not** this.
 They mean the entry is still working, so its stop waits for the entry to finish.
 The venue refuses an opposite-side stop against a working order, and the engine
@@ -1133,6 +1159,17 @@ venue does show a working stop that closes the position, the page is wrong, and
 that is a bug worth an issue. Do not add another stop.
 
 ### A stop released for a close
+
+**The release now waits for the venue to confirm each cancel** before retrying
+the close. Alpaca holds the shares through `pending_cancel`, and a retry inside
+that window was refused again. `order.cancel_unconfirmed` (WARNING) means it did
+not confirm within about five seconds and the close was retried anyway.
+`order.protection_filled_during_release` (CRITICAL) means the stop fired first.
+The position is closing at its stop, and the platform sent no second close and
+re-armed nothing. Check the broker's UI that it is flat.
+`runner.protection_lost_on_refused_close` (ERROR) means a refused close left
+shares with no venue stop. The engine is watching the armed level; the steps
+below still apply.
 
 Expect `order.protection_released` immediately before any of this. On the
 ordinary version of the story the stop goes straight back and you get

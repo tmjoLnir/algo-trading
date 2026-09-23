@@ -2138,3 +2138,81 @@ class TestTheRefusalReason:
         result = SubmitResult(order=None, decision=RiskDecision.allow(), submitted=False)
 
         assert result.refusal_reason == ""
+
+
+class TestACancelIsNotReleasedUntilTheVenueSaysSo:
+    """docs/paper-week/day-5-readiness.md, §6 and §8 item 9. Alpaca answers a
+    cancel with 204 and moves the order through `pending_cancel`; its shares
+    are held until `canceled`. `FakeBroker` cancelled in the same call, so every
+    release test saw `available: 100` on the retry and none could fail on it."""
+
+    def _routed(self, broker: FakeBroker, *, polls: int = 50) -> tuple[OrderRouter, list[float]]:
+        slept: list[float] = []
+
+        async def sleep(seconds: float) -> None:
+            slept.append(seconds)
+
+        return (
+            OrderRouter(
+                broker,
+                chain(),
+                StopManager(),
+                SimulatedClock(OPEN_HOURS),
+                sleep=sleep,
+                cancel_ack_polls=polls,
+            ),
+            slept,
+        )
+
+    async def _protected(
+        self, broker: FakeBroker, routed: OrderRouter, portfolio: Portfolio
+    ) -> Order:
+        return await TestClosingReleasesProtection()._open_protected(broker, routed, portfolio)
+
+    async def test_without_waiting_the_retry_lands_in_the_pending_window(self) -> None:
+        """The control, and the failure the finding named: one read, no wait, so
+        the retry is refused for shares the cancelling stop still holds."""
+        broker, portfolio = FakeBroker(), book()
+        routed, _ = self._routed(broker, polls=1)
+        await self._protected(broker, routed, portfolio)
+        broker.cancel_ack_after = 3
+
+        result = await routed.flatten("SPY", portfolio)
+
+        assert not result.submitted
+
+    async def test_the_retry_waits_for_the_cancel_to_be_confirmed(self) -> None:
+        broker, portfolio = FakeBroker(), book()
+        routed, slept = self._routed(broker)
+        stop = await self._protected(broker, routed, portfolio)
+        broker.cancel_ack_after = 3
+
+        result = await routed.flatten("SPY", portfolio)
+
+        assert result.submitted, "the close reached the venue once the stop let go of the shares"
+        assert broker.cancelled == [stop.broker_order_id]
+        assert len(slept) == 2, "read, wait, read, wait, read — confirmed on the third"
+        assert broker.open_stops("SPY") == 0, "and nothing was re-armed over it"
+
+    async def test_a_stop_that_filled_while_cancelling_is_not_closed_over(self) -> None:
+        """The race the cancel can lose. The stop sold the shares; a retried
+        close would sell them again, and a re-armed stop would sit over nothing."""
+        broker, portfolio = FakeBroker(), book()
+        routed, _ = self._routed(broker)
+        stop = await self._protected(broker, routed, portfolio)
+        assert stop.broker_order_id is not None
+        broker.fill_on_cancel.add(stop.broker_order_id)
+        closes_before = len(
+            [o for o in broker.accepted.values() if o.order_type is OrderType.MARKET]
+        )
+
+        with capture_logs() as logs:
+            result = await routed.flatten("SPY", portfolio)
+
+        assert not result.submitted
+        closes_after = len(
+            [o for o in broker.accepted.values() if o.order_type is OrderType.MARKET]
+        )
+        assert closes_after == closes_before, "no second close was sent"
+        assert broker.open_stops("SPY") == 0, "and no stop was re-armed"
+        assert any(e["event"] == "order.protection_filled_during_release" for e in logs)

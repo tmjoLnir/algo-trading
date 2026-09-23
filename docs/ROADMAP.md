@@ -1725,7 +1725,10 @@ above.
 *Verifiable:* a strategy trades the paper account for a week and reconciles clean.
 
 **Not shown, and the two tools that would let it be are built** — @claude (#83).
-Nothing in Phase 4 has met Alpaca; this PR does not change that and could not.
+*(Since corrected: Phase 4 has met Alpaca. Days 1 to 4 of the paper week ran
+against the paper account and each was voided by a defect it found; see
+docs/paper-week/. The week the line asks for has not been shown.)*
+When this was written, nothing in Phase 4 had met Alpaca; this PR did not change that and could not.
 What it changes is what happens on either side of the week, because the input
 this line needs and cannot re-run is calendar time.
 

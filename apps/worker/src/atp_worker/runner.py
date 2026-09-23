@@ -493,6 +493,10 @@ class StrategyRunner:
         #: reversed one with nothing on it. Only a refusal this process actually
         #: saw goes in here.
         self._unprotected: dict[str, Decimal] = {}
+        #: The entry each known gap in `_unprotected` belongs to, so protection
+        #: can be retried against it (`_retry_protection`). Same lifetime: set
+        #: and cleared beside it.
+        self._unprotected_entries: dict[str, Order] = {}
         #: Fills booked since the last pass, awaiting `strategy.on_fill`.
         self._pending_fills: list[_AppliedFill] = []
         #: What the strategy decided lately and what became of it, newest last.
@@ -1263,6 +1267,7 @@ class StrategyRunner:
 
         await self._mark(portfolio)  # 1
         await self._anchor_if_pending(portfolio)  # 1a — on the marks this pass trades on
+        await self._retry_protection(portfolio)  # 1b — a refused stop, asked for again
         await self._check_stops(portfolio, closed)  # 2
         signals = self._drain_fills(portfolio)  # 3
         signals.extend(self._poll_strategy(closed))  # 4
@@ -1851,6 +1856,7 @@ class StrategyRunner:
                 # is still on. Of the four refusals recorded here this is the
                 # one most likely to cost money.
                 await self._record_refusal(result)
+                self._note_protection_gap(position.symbol, portfolio)
             elif result.order is not None:
                 self._track(result.order)
 
@@ -2183,6 +2189,8 @@ class StrategyRunner:
                 # composed — the quantity after sizing, the type, the limit —
                 # and `/orders` is where a person looks for that.
                 await self._record_refusal(result)
+                if signal.action is SignalAction.EXIT:
+                    self._note_protection_gap(signal.symbol, portfolio)
                 continue
 
             self.stats.orders_submitted += 1
@@ -2547,6 +2555,7 @@ class StrategyRunner:
             # make the next entry in this symbol look known-unprotected before
             # `_protect` has had a chance to say otherwise.
             self._unprotected.pop(order.symbol, None)
+            self._unprotected_entries.pop(order.symbol, None)
 
     async def _disarm_if_flat(self, order: Order, portfolio: Portfolio) -> None:
         """Take the protective stop with the position when it closes.
@@ -2579,11 +2588,15 @@ class StrategyRunner:
             return
         await self.router.cancel_protection(order.symbol)
 
-    async def _protect(self, order: Order, portfolio: Portfolio) -> None:
+    async def _protect(self, order: Order, portfolio: Portfolio, *, retry: bool = False) -> None:
         """Arm protection on a position that just opened or grew.
 
         Only for entries. A fill that *reduces* a position needs no new stop —
         and asking for one would place a stop on the way out of a trade.
+
+        `retry` is `_retry_protection` asking again for a gap already recorded.
+        The refusal is still logged, but no second refusal row is written: one
+        row per failed stop is the record, and one per pass would bury it.
         """
         position = portfolio.position(order.symbol)
         if position.is_flat:
@@ -2614,6 +2627,7 @@ class StrategyRunner:
             # the log, and so a caller that chooses to swallow this inherits a
             # position in the "known short" state rather than the unknown one.
             self._unprotected[order.symbol] = abs(position.qty)
+            self._unprotected_entries[order.symbol] = order
             log.critical(
                 "runner.position_unprotected",
                 symbol=order.symbol,
@@ -2631,6 +2645,7 @@ class StrategyRunner:
             # intended. Not an error, and no refusal row: there is nothing to
             # refuse yet.
             self._unprotected[order.symbol] = result.unprotected_qty
+            self._unprotected_entries[order.symbol] = order
             log.info(
                 "runner.protection_deferred",
                 symbol=order.symbol,
@@ -2643,11 +2658,13 @@ class StrategyRunner:
             # short a stop and now is not must stop being treated as one, or the
             # engine keeps watching a level the venue is already holding.
             self._unprotected.pop(order.symbol, None)
+            self._unprotected_entries.pop(order.symbol, None)
         else:
             # Remembered, not only logged. `_exit_reason` needs to know the
             # venue is *not* holding this position's stop, and this is the only
             # moment anything learns it.
             self._unprotected[order.symbol] = result.unprotected_qty
+            self._unprotected_entries[order.symbol] = order
             # Loud: this is docs/SAFETY.md layer 5 not holding, and the position
             # is real whether or not the stop is. `unprotected_qty` is measured
             # after the risk chain, so a stop the chain shrank reports the
@@ -2665,8 +2682,92 @@ class StrategyRunner:
             # one refused child. Each is its own row: "the stop was refused" and
             # "the stop and the target were both refused" are different states
             # of the same position.
-            for refusal in result.refused:
-                await self._record_refusal(refusal)
+            if not retry:
+                for refusal in result.refused:
+                    await self._record_refusal(refusal)
+
+    def _note_protection_gap(self, symbol: str, portfolio: Portfolio) -> None:
+        """After a refused close, record any venue stop the attempt left missing.
+
+        **A close can take the stop with it and still be refused.** `_close`
+        releases the venue stop when the venue names it as what holds the
+        shares, retries, and re-arms if the retry is refused. If the re-arm is
+        refused too, the position has no venue stop. The router logs that at
+        CRITICAL, but nothing told this runner. `_stop_is_missing` only trusts
+        a gap recorded here, so the engine declined to watch the armed level
+        as well. That is no stop anywhere, the state `_disarm_if_flat` calls
+        the worst in the system, and docs/RISK.md described the level as
+        covering it (docs/paper-week/day-5-readiness.md, §4.6).
+
+        Asked of the router rather than inferred: its count is what the venue
+        holds for this process, and since #165 it includes the stops a previous
+        process placed. **Only after a refusal.** After an accepted close, the
+        exit is working, and an engine that also watched the level would close
+        the position a second time.
+        """
+        position = portfolio.positions.get(symbol)
+        if position is None or position.is_flat:
+            return
+        covered = self.router.broker_side_protected_qty(symbol, position)
+        missing = abs(position.qty) - covered
+        if missing <= 0:
+            return
+        self._unprotected[symbol] = missing
+        log.error(
+            "runner.protection_lost_on_refused_close",
+            symbol=symbol,
+            unprotected_qty=str(missing),
+            effect="the engine now watches the armed level; no venue stop covers these shares",
+        )
+
+    async def _retry_protection(self, portfolio: Portfolio) -> None:
+        """Step 1b. Ask again for every venue stop that is known to be missing.
+
+        **A stop refused once was never asked for again.** Day 4's MSFT: a fill
+        booked during boot catch-up, 1.2 seconds before the market-data stream
+        connected, so `stale_data` refused its stop for want of any quote. That
+        refusal is right, because a stop priced off no data is worse than none.
+        But nothing retried it, and the position ran 17 minutes without a venue
+        stop until the strategy happened to exit it
+        (docs/paper-week/day-4-review.md, F9; day-5-readiness.md, §4.4).
+        docs/SAFETY.md's go-live gate is "no unprotected positions".
+
+        Here, after `_mark`, because a fresh quote is exactly what the transient
+        refusals (`stale_data`, `trading_hours`, `rate_limit`) were waiting for.
+        Safe to repeat: the router keys the stop on the range it covers, which
+        has not moved since the refusal, so a retry of an attempt that did reach
+        the venue is that same order to the venue, not a second stop (rule §1.4).
+
+        An entry still working is skipped. Its stop is deferred on purpose
+        (day-4 F5), and the fill or cancel that ends it places the stop. A
+        retry that raises is logged and left for the next pass rather than
+        failing this one: three failed passes halt the strategy, and a missing
+        stop is not a reason to stop managing the positions that have one.
+        """
+        for symbol, entry in list(self._unprotected_entries.items()):
+            position = portfolio.positions.get(symbol)
+            if position is None or position.is_flat:
+                self._unprotected.pop(symbol, None)
+                self._unprotected_entries.pop(symbol, None)
+                continue
+            if not entry.is_complete:
+                continue
+            log.info(
+                "runner.protection_retry",
+                symbol=symbol,
+                entry_order_id=entry.id,
+                uncovered_qty=str(self._unprotected.get(symbol, Decimal(0))),
+            )
+            try:
+                await self._protect(entry, portfolio, retry=True)
+            except Exception as exc:
+                log.error(
+                    "runner.protection_retry_failed",
+                    symbol=symbol,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    effect="still no venue stop — the engine-side level is watching; retried next pass",
+                )
 
     def _track(self, order: Order) -> None:
         """Remember an order we believe is working at the venue."""

@@ -612,6 +612,14 @@ refused MSFT's stop with `stale_data` 1.2 seconds before `stream_connected` is i
 is still no retry. Less likely to bite on day 5 — the inherited orders are closing stops, not
 new entries — but live for anything that fills during the boot window.
 
+> **Closed by #167.** `StrategyRunner._retry_protection` runs every evaluation, after `_mark`,
+> and asks again for each venue stop recorded missing. The runner now remembers the entry each
+> gap belongs to (`_unprotected_entries`). The router keys the stop on the uncovered range,
+> which has not moved since the refusal, so a retry of an attempt that did reach the venue is
+> the same order, not a second stop. A working entry is skipped (its stop is deferred, F5). A
+> retry that raises is logged and does not fail the pass, and repeat refusals write no second
+> row. Day 4's MSFT would have waited one pass for its stop, not 17 minutes.
+
 ### 4.5 A latent hazard that is *not* reachable on this configuration `noted`
 
 `_cancel_stale_protection` (`router.py:988`) reads the same empty `_protective` map, and its own
@@ -653,6 +661,15 @@ shorts is configured, which is a thing to remember rather than a thing to do now
 - **`runner.signal_discarded_cold`** appears in `docs/` zero times. It is now the most likely
   cause of a silent session, and the symptom is indistinguishable from the strategy simply not
   crossing.
+
+> **Reconciled by #167.** `FIRST_PAPER_RUN.md` and `ROADMAP.md` no longer say nothing has met
+> Alpaca. The runbook's "our own orders" was already qualified by #163. The timeframe advice was
+> reconciled earlier in #167. `RUNBOOK.md` gains "A session that decided nothing", with
+> `signal_discarded_cold` in it. **`RISK.md` was right that it was wrong, and the fix is
+> code:** after a refused close the runner records any venue stop the attempt left missing
+> (`runner.protection_lost_on_refused_close`), so the engine watches the armed level. The
+> paragraph now describes that, and says plainly that the gap before an *accepted* close's fill
+> is covered by the working close, not by the level.
 
 ---
 
@@ -696,7 +713,10 @@ Stated separately so it is not lost in the above.
   close through another, assert a cancel was sent.
 - **No test discards an `EXIT` on an open position** (§3.3). The five cold-symbol tests are all
   entries.
-- **The cancel is fire-and-forget and the fake makes it synchronous.**
+- **The cancel is fire-and-forget and the fake makes it synchronous.** *(Closed by #167:
+  `_close` waits for the venue to confirm each cancel; `FakeBroker.cancel_ack_after` and
+  `fill_on_cancel` model `pending_cancel` and the lost race, with a control test showing the
+  retry refused without the wait.)*
   `_release_protection` treats a non-exception as released (`router.py:1055-1062`);
   `AlpacaBroker.cancel_order` returns on 204, and Alpaca moves an order through `pending_cancel`
   before `canceled` — `held_for_orders` is released only at the terminal state.
@@ -840,9 +860,10 @@ Then, as code, in this order:
    artifact and it finally runs.
    *(Done, #167, with F3's venue/risk split. See §4.2's note.)*
 9. **Await the venue's cancel acknowledgement rather than the request** (§6), and add the
-   async-cancel test.
+   async-cancel test. *(Done, #167.)*
 10. **Reconcile the four documentation defects in §4.6** — `FIRST_PAPER_RUN.md` first, because
-    it is the page read before the open and it currently argues against #159.
+    it is the page read before the open and it currently argues against #159. *(Done, #167.
+    The `RISK.md` defect turned out to be code, and is fixed in code. See §4.6's note.)*
 
 Items 1 and 2 are what stand between this commit and a day 5 that can be believed. Item 3 is
 what stands between it and a day 5 that can be believed *twice*, because the first restart

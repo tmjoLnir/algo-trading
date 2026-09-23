@@ -43,6 +43,7 @@ and there is no layer for targets.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field, replace
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -83,7 +84,7 @@ from atp_core.risk.rules import position_size, reference_price
 from atp_core.risk.stops import FROM_ENTRY_TYPES
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Awaitable, Callable, Iterable, Mapping
     from datetime import datetime
 
     from atp_core.brokers.ports import BrokerPort
@@ -124,6 +125,13 @@ def _refusal_stage(order: Order) -> str:
 #: same record. `NO_ACTION` stays local — nothing is refused, so it never
 #: reaches that column.
 NO_ACTION = "no_action"
+
+#: How many times a release reads a cancelled stop back before retrying the
+#: close, and how far apart. Five seconds in all: Alpaca's `pending_cancel`
+#: normally resolves well inside one, and a close held longer than this is a
+#: close whose market has moved (`OrderRouter._await_cancelled`).
+CANCEL_ACK_POLLS = 50
+CANCEL_ACK_POLL_SECONDS = 0.1
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +276,8 @@ class OrderRouter:
         *,
         kill_switch: KillSwitch | None = None,
         instruments: Mapping[str, Instrument] | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        cancel_ack_polls: int = CANCEL_ACK_POLLS,
     ) -> None:
         """
         `clock` supplies submission timestamps. It is injected rather than read
@@ -301,6 +311,12 @@ class OrderRouter:
         self.clock = clock
         self.kill_switch = kill_switch
         self._instruments: Mapping[str, Instrument] = instruments or {}
+        #: How a release waits for the venue to confirm its cancels (see
+        #: `_await_cancelled`). Injected so a test does not sleep.
+        self._sleep: Callable[[float], Awaitable[None]] = (
+            sleep if sleep is not None else asyncio.sleep
+        )
+        self._cancel_ack_polls = cancel_ack_polls
 
         #: entry order id → the protective levels its request asked for. Intent,
         #: not truth: what we were told to protect, never what the venue holds.
@@ -545,6 +561,19 @@ class OrderRouter:
             # Nothing of ours was holding the shares, or the cancels all failed.
             # Either way the venue's answer stands and the position keeps
             # whatever protection it had.
+            return result
+        filled = await self._await_cancelled(request.symbol, released)
+        if filled:
+            # The race the cancel can lose, and it lost: the stop fired first,
+            # so the position is closing at its stop. Retrying the close would
+            # sell shares already sold, and re-arming would put a stop over
+            # them. The fill reaches the book through the trade stream.
+            log.critical(
+                "order.protection_filled_during_release",
+                symbol=request.symbol,
+                broker_order_ids=[o.broker_order_id for o in filled],
+                detail="the stop filled while being cancelled — not retrying the close, not re-arming",
+            )
             return result
 
         retried = await self.submit(request, portfolio, pending=pending)
@@ -1350,6 +1379,63 @@ class OrderRouter:
             detail="freeing the shares the close needs — the armed level covers the gap",
         )
         return released
+
+    async def _await_cancelled(self, symbol: str, released: list[Order]) -> list[Order]:
+        """Wait for the venue to confirm the cancels; return any stop that filled.
+
+        **A cancel request is not a cancel.** Alpaca answers the request with
+        204 and moves the order through `pending_cancel` before `canceled`, and
+        the shares it holds are released only at the end. Retrying the close on
+        the request alone lands inside that window, where it is refused again.
+        That refusal fires `_rearm`, which submits a second stop the venue also
+        refuses. `FakeBroker` used to cancel in the same call, which is why
+        nothing caught it (docs/paper-week/day-5-readiness.md, §6 and §8 item 9).
+
+        Polls `get_order` for each released stop, up to `cancel_ack_polls` reads
+        a stop, `CANCEL_ACK_POLL_SECONDS` apart. Three outcomes per stop:
+
+        - **terminal without a fill**: released, as the caller assumed;
+        - **filled**: the race was lost and returned to the caller, who must not
+          close or re-arm over shares the stop already sold;
+        - **unconfirmed** after the last read, or unreadable: logged, and the
+          caller proceeds as it did before this existed. That is no worse than
+          before, and loud where it was silent. A read that fails stops polling
+          that stop at once: a broker that cannot be read will not become
+          readable in the next second, and a close should not wait on it.
+        """
+        filled: list[Order] = []
+        for stop in released:
+            if stop.broker_order_id is None:
+                continue
+            seen: Order | None = None
+            for poll in range(self._cancel_ack_polls):
+                try:
+                    seen = await self.broker.get_order(stop.broker_order_id)
+                except BrokerError as exc:
+                    log.warning(
+                        "order.cancel_unconfirmed",
+                        symbol=symbol,
+                        broker_order_id=stop.broker_order_id,
+                        error=str(exc),
+                        detail="could not read the cancelled stop back — retrying the close anyway",
+                    )
+                    seen = None
+                    break
+                if seen is None or seen.is_complete or seen.filled_qty > 0:
+                    break
+                if poll + 1 < self._cancel_ack_polls:
+                    await self._sleep(CANCEL_ACK_POLL_SECONDS)
+            if seen is not None and seen.filled_qty > 0:
+                filled.append(stop)
+            elif seen is not None and not seen.is_complete:
+                log.warning(
+                    "order.cancel_unconfirmed",
+                    symbol=symbol,
+                    broker_order_id=stop.broker_order_id,
+                    status=seen.status.value,
+                    detail="the venue has not confirmed the cancel — retrying the close anyway",
+                )
+        return filled
 
     async def _rearm(self, symbol: str, released: list[Order], portfolio: Portfolio) -> None:
         """Put back the stops a refused close left the position without.
