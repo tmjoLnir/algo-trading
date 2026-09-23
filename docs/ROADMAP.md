@@ -1178,12 +1178,11 @@ above.
   order we believe is working". An order our book has already retired *while
   still holding the position it was closing* is outside that set on every boot,
   so the one mechanism built to repair the divergence cannot see the orders
-  that caused it, and a catch-up that books a fill makes the next one blinder
-  still. Ten protective stops armed on 2026-09-11 filled at the venue; three
-  separate boots (09-14, 09-16, 09-17) re-read them, booked them into `orders`
-  and `fills`, and never persisted the position book that reflects them — each
-  time moving the order terminal and out of reach of every later catch-up. The
-  repair ran three times and was thrown away three times
+  that caused it. Ten protective stops armed on 2026-09-11 filled at the venue
+  over six days; every fill reached `orders` and `fills`, by the live stream or
+  by this catch-up, and no position book has been written since 09-11 19:59:05.
+  Each order went terminal without the book write that should have followed
+  it, and so out of reach of every later catch-up
   (docs/paper-week/dropped-stop-fills.md).
 
   It is **not** adoption and the distinction is load-bearing: orders are
