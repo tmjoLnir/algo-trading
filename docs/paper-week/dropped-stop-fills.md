@@ -8,22 +8,23 @@
 
 ## Summary
 
-On Friday 2026-09-11, ten protective stop orders filled at the venue and **none of those ten
-fills reached the runner's in-memory `Portfolio`**. The session ended with a book holding ten
-positions the venue had already closed, overstating the account by $902 and carrying $617.99 of
-realised loss it had never booked.
+Ten protective stops armed on Friday 2026-09-11 filled at the venue — one that evening, the rest
+into Monday's open and after — and **not one of those fills was ever persisted to the runner's
+position book**. The book is frozen at Friday's close, holding ten positions the venue has since
+closed, overstating the account by $902 and carrying $617.99 of realised loss it never booked.
 
 The reconciler caught it on the next session — Monday 2026-09-14 14:37:10Z, an hour after the
 open — and halted. It was right, and it has been right on every boot since.
 
 Two things make this worth a page rather than a line:
 
-1. **Nothing was lost.** `orders` and `fills` are complete and agree with the venue to the cent.
-   The order path, the fill persistence and the snapshot restore are all correct. Only the live
-   position book diverged.
-2. **The divergence cannot heal itself.** `Reconciler.missed_order_updates` exists to repair
-   exactly this, and it is structurally unable to see the orders that caused it. That is why
-   twelve days and a dozen restarts changed nothing.
+1. **The repair ran, and then threw itself away.** Every boot from 09-14 onward re-read the venue,
+   booked some of the missing fills into `orders` and `fills` — and never wrote the position book
+   that reflects them. The booked order then goes terminal and leaves the working set, so the next
+   boot's catch-up cannot see it any more.
+2. **So the quarantines were not identical.** Each one silently converted orders from recoverable
+   into unrecoverable while persisting none of the repair. The system spent twelve days consuming
+   its own recovery path.
 
 ## 1. The state as found
 
@@ -130,60 +131,80 @@ The 48,392.71 is computed from ten venue fill prices that appear in neither cash
 on the discrepancy the reconciler derived from the account. The book is short exactly ten closing
 fills.
 
-## 4. The watchlist bled out one name at a time
+## 4. Friday's book was correct — the stops were still resting
 
-`sma_crossover` emits `ENTER_LONG` only when the position is flat. So the first exit a symbol
-lost was also its last trade: the book believed it still held the position, and never touched
-that name again.
+`sma_crossover` emits `ENTER_LONG` only when the position is flat. So the first exit a symbol lost
+was also its last trade: the book believed it still held the position, and never touched that name
+again.
+
+The stop for each was **armed seconds after its entry filled** — that is `_protect` doing its job,
+and it is why `orders` shows a `stop_loss` sell submitted one to six seconds after each buy. It is
+not a round trip. What each stop then did is a separate question with a separate timestamp.
 
 ```
-KO    15:35:14   <- stuck from here
-DIA   15:38:15
-XOM   15:38:15
-AMZN  17:02:47
-INTC  17:10:52
-WMT   17:44:05
-MSFT  18:01:12
-PEP   19:11:42
-CSCO  19:49:59
-IWM   19:51:00   <- the last order the venue ever saw
+symbol   entry order       stop level   venue execution times we hold
+KO       09-11 15:35:14    87.91        none — booked 09-16 by rest_recovery
+DIA      09-11 15:38:15    525.71       09-11 19:59:32 -> 19:59:33
+XOM      09-11 15:38:15    164.88       none — booked 09-14 by rest_recovery
+AMZN     09-11 17:02:47    255.57       09-14 13:30:54
+INTC     09-11 17:10:52    102.33       09-14 13:30:54 -> 13:35:22  (6 tranches)
+WMT      09-11 17:44:05    106.53       none — booked 09-17 by rest_recovery
+MSFT     09-11 18:01:12    495.15       none — booked 09-16 by rest_recovery
+PEP      09-11 19:11:42    136.24       none — booked 09-14 by rest_recovery
+CSCO     09-11 19:49:59    111.59       09-14 13:31:14 -> 13:34:35  (4 tranches)
+IWM      09-11 19:51:00    288.85       09-14 13:32:24 -> 13:35:10  (5 tranches)
 ```
 
-Four hours and sixteen minutes, ten names, one at a time. By 19:59:05 the whole watchlist was
-frozen, gross exposure read 49,290.64 against a venue that was flat, and equity read 100,138.58
-on an account worth 99,236.19.
+**Friday's book was correct.** Ten positions open, ten stops resting at the venue, and a snapshot
+at 19:59:05 that said exactly that. Nothing was wrong at the close except DIA, whose stop filled at
+19:59:32 — twenty-seven seconds after the last snapshot this platform has ever written.
 
-The snapshot holding **eleven** positions at 19:52–19:56 is an eleventh name closing correctly at
-about 19:56:30. **The failure is intermittent, not total** — which matters for reproducing it.
+The rest went over the weekend and were taken out at **Monday's open**, 09-14 13:30:00Z, in
+tranches: six for INTC across four and a half minutes, five for IWM, four for CSCO. A stop held
+through a weekend gap fills in pieces, well below its level, and that is what these are.
 
+The five marked `rest_recovery` carry no venue execution time of their own — that id is minted by
+`execution.recovery._reconstruct_fill`, whose `ts` is when the catch-up ran, not when the venue
+filled. For those five the venue's own fill time is not in our data; only the date we finally
+booked it is.
 ## 5. The mechanism
 
-`apps/worker/src/atp_worker/runner.py:2491`, the first thing `on_fill_event` does:
+The fills reached `orders` and `fills`. They never reached a persisted position book.
+
+`fills.venue_fill_id` is the evidence, because only two code paths mint one:
+
+- a **real UUID** comes from the venue's own execution id, applied through
+  `trade_updates._apply_fill`
+- **`rest_recovery:<broker_order_id>:<cumulative_qty>`** is minted by
+  `execution.recovery._reconstruct_fill` on a catch-up
+
+Both are present across the ten. So `on_fill_event` was reached, `apply_trade_update` returned
+True, `order.apply_fill` ran, and `order_repo.save` persisted the result. Every one of those steps
+worked.
+
+What did not happen is the write at the end of the same method:
 
 ```python
-order = self._open_orders.get(update.client_order_id)
-if order is None:
-    log.warning("runner.fill_for_unknown_order", client_order_id=..., symbol=...)
-    return  # the position is never touched
+if order.is_complete:
+    # phase 1 — lands, and takes the recovery key with it
+    await self.order_repo.save(order, run_mode=self.run_mode)
+    self._open_orders.pop(order.client_order_id, None)
+if booked:
+    # phase 2 — has not landed since 2026-09-11 19:59:05
+    await self._checkpoint(portfolio, "fill")
 ```
 
-A fill for an order that is not in `_open_orders` is logged at **warning** and discarded. The
-`return` fires before anything else in the method: `_apply_to_portfolio`, `_disarm_if_flat`,
-`_protect`, `_announce` and `_checkpoint` all sit below it and none of them run.
+`position_snapshots` has no row after **2026-09-11 19:59:05**. `orders.filled_at` for these ten
+runs **09-14, 09-16 and 09-17**. Phase one landed on three separate days; phase two never landed at
+all.
 
-That one `return` produces every field of the frozen snapshot simultaneously:
-
-| Observed in `position_snapshots` | Because |
-|---|---|
-| position still open at full qty | `_apply_to_portfolio` never called |
-| `broker_protected_qty` still 56.00 / 9.00 / 30.00 … | `_disarm_if_flat` never called |
-| `stop_loss_price` still armed | same |
-| cash never credited | `portfolio.cash -=` never ran |
-
-All ten rows claim a full-size protective stop resting at a venue that reports **0 working
-orders**. The stops did not vanish; they filled, and the book was never told.
-
+`_checkpoint` cannot report that. It swallows a failed write and logs at ERROR, on the reasoning
+that *"the next write retries it: the evaluate loop writes every pass."* On these boots there is no
+next write — `warmup` runs the catch-up, then reconciles, then quarantines, and the evaluate loop
+is never reached. The retry the comment depends on is downstream of the thing that stops.
 ## 6. Why it never healed
+
+Phase one destroys the key that phase two would have been retried by.
 
 ```python
 # runner.py:2392 — the warmup catch-up
@@ -192,66 +213,84 @@ if not self._open_orders:
 updates = await self.reconciler.missed_order_updates(list(self._open_orders.values()))
 ```
 
-`_open_orders` is rebuilt on boot from `order_repo.open_orders(run_mode)`, whose docstring reads
-*"Every non-terminal order for this run mode"* and whose query is
-`OrderRow.status.notin_(terminal)`. `recovery.read_missed_updates` states the same scope:
+`_open_orders` is rebuilt on boot from `order_repo.open_orders(run_mode)` — *"every non-terminal
+order for this run mode"*, `status.notin_(terminal)`. `recovery.read_missed_updates` says the same:
 *"Ask the venue about every order we believe is working."*
 
-Those ten stop orders are `filled` in `orders` — terminal. So:
+So once phase one has written an order `filled`, that order is invisible to every future catch-up.
+The position it was closing stays open in the book forever, and the fill that would close it can
+never be asked for again.
 
-- they are not restored into `_open_orders`,
-- so they are not in the working set,
-- so the venue is never asked about them,
-- so the fills are never recovered,
-- on every boot, forever.
+**This is a ratchet, and the dates prove it ran.** Each boot took whichever stops were still
+non-terminal, booked them, and quarantined before persisting the book:
 
-The repair mechanism's candidate set is defined by order status; the damage is defined by a
-position that is open while its closing order is terminal. Those two sets do not intersect. That
-is the whole reason twelve days of restarts produced twelve identical quarantines.
+```
+booked into orders/fills on   symbols            (* = rest_recovery id)
+2026-09-11                    DIA
+2026-09-14                    AMZN, INTC, CSCO, IWM, PEP*, XOM*
+2026-09-16                    MSFT*, KO*
+2026-09-17                    WMT*
+```
 
-`docs/ROADMAP.md`'s Reconciliation item says `missed_order_updates` "closes" the day-3 gap. It
-closes it for an order still working in our book. It does not close it for an order our book has
-already retired while still holding the position that order was closing.
+Three separate days of the platform correctly reading the venue, correctly booking what it found,
+and then throwing the result away — each time leaving one fewer order that a later boot could ask
+about. By 09-17 there was nothing left to ask about and the divergence was permanent.
 
+The twelve quarantines were not twelve identical readings of one frozen state. They were the
+mechanism by which the state became unrecoverable.
 ## 7. What it cost
 
 **$617.99** of unbooked realised loss, and twelve trading days halted.
 
-Of that loss, **INTC alone is $365.34** — a stop armed at 102.33 that filled at 95.092499, 7.1%
-through its own level, in a 3.6-second window, on Intel:
+Of that, **INTC alone is $365.34** — and it is not what an earlier draft of this page claimed. The
+stop was armed Friday 09-11 17:10 at 102.33, against an entry of 102.70375. It did not fill that
+day. Monday's open took it out in six tranches between 13:30:54 and 13:35:22:
 
 ```
-INTC buy  17:10:53  @ 102.70375
-INTC sell 17:10:56  @  95.092499     -7.41%,  -365.34
+95.31   95.18   95.11   94.62   94.55   94.79      avg 95.0925
 ```
 
-That is not a market move. It is a market-on-stop order filling against a one-sided book.
-`ALPACA_DATA_FEED` is `iex` — roughly 2–3% of consolidated volume — and `Quote.__post_init__`
-(`libs/core/src/atp_core/domain/market.py`) validates only that the timestamp is UTC. It does not
-require `ask > 0`, `bid > 0`, or `bid <= ask`. `Bar` rejects `low > high`; `Quote` rejects
-nothing. At the time of writing, six watchlist symbols are quoting `ask 0`, and
-`runner.py` marks the book with `quote.mid`, which for a one-sided quote is half price.
+The first tranche is **6.86% below the stop level**. That is a weekend gap, and filling well
+through the level is what a stop does in one — not slippage, not a bad quote, and not something
+better data would have prevented. A stop cannot defend a position while the market is shut.
 
-AMZN (-1.94%) and CSCO (-1.66%) are smaller instances of the same thing. In paper this is an
-accounting annoyance. In live it is the most expensive line on this page.
+AMZN (-1.94%) and CSCO (-1.66%) are the same shape, smaller.
 
+**A correction this page has to carry**, because the first version of it got this wrong: the
+`Quote` validation gap below is real, and it did **not** cause this loss.
 ## 8. The churn underneath is F8, and it is already fixed
 
-Every venue order that day is a buy followed by a sell seconds later, and all nineteen visible
-round trips lose money, median -0.10%:
-
-```
-19 round trips, ALL losing. total -552.20
-```
-
+Separately from the divergence, `sma_crossover` at `timeframe=1m` was stopping itself out all day.
 `f8-timeframe-and-stop-sizing.md` measured `atr x2 period=14` at `1m` as a median **0.121%** of
-price and recorded day 4 closing "41 round trips, all 41 at their stop, none profitable". This is
-the same machine still running. The `worker_config` change of 2026-09-22 21:56:29Z
-(revision 9, `1m` → `1d`) is the fix; at `1d` the same stop is 4.08% wide.
+price and recorded day 4 closing *"41 round trips, all 41 at their stop, none profitable"*.
 
-F8 is the reason the losses were small. It is not the reason the book diverged — a wider stop
-would have produced fewer dropped fills, not zero.
+Friday 09-11 is that again. The stop levels in §4 sit 0.04%–0.36% from their entries, and the
+same-day round trips closed at their stops within minutes: AMZN entered 16:15:30 and stopped out
+16:26:50, CSCO entered 16:29:35 and stopped out 16:30:03, IWM entered 16:41:40 and stopped out
+17:04:39.
 
+The `worker_config` change of 2026-09-22 21:56:29Z (revision 9, `1m` -> `1d`) is the fix; at `1d`
+the same stop is 4.08% wide.
+
+F8 explains why there were ten small positions with tight stops going into a weekend. It does not
+explain the divergence, and a wider stop would not have prevented it.
+
+**A second correction.** An earlier version of this page read `orders.submitted_at` as a fill time
+and reported nineteen round trips "buy and sell seconds apart" totalling -$552.20. That pairing was
+wrong: the sell submitted seconds after each buy is the protective stop being *armed*, not an exit.
+Holding periods were minutes for the same-day round trips and days for the ten that stuck.
+
+## 8a. And the `Quote` gap, which is real and unrelated
+
+`ALPACA_DATA_FEED` is `iex` — roughly 2-3% of consolidated volume — and `Quote.__post_init__`
+(`libs/core/src/atp_core/domain/market.py`) validates only that the timestamp is UTC. It does not
+require `ask > 0`, `bid > 0`, or `bid <= ask`. `Bar` rejects `low > high`; `Quote` rejects nothing.
+At the time of writing, six watchlist symbols are quoting `ask 0`, and `runner.py` marks the book
+with `quote.mid`, which for a one-sided quote is half price.
+
+That is a live defect worth fixing on its own terms — a halved mark feeds equity, the daily-loss
+anchor and every percentage limit. It is recorded here because it was found during this
+investigation, not because it caused any part of this incident.
 ## 9. The halt was cleared over a live divergence
 
 From `audit_log`:
@@ -276,41 +315,45 @@ This cost confusion, not money — the book was already frozen and the venue alr
 
 ## 10. What is not established
 
-**Why each stop order left `_open_orders` before its own fill arrived.** `runner.py:2536` pops an
-order when `order.is_complete`; something marked these complete first. Commit `1038f12`
-("retry a refused stop, confirm a cancel before closing, watch a stop lost to a refused close")
-is working the same area, which suggests a known and not-fully-closed race.
+**Which step between phase one and phase two failed.** §5 shows the order was persisted and the
+book was not, on three separate days. It does not show whether `_checkpoint` was reached and its
+write failed (swallowed, ERROR-logged), or whether something between `_apply_to_portfolio` and
+`_checkpoint` raised and took the runner into `WarmupBlockedError` first. `runner.py`'s own
+catch-up comment names `_protect` as the usual suspect for that second case.
 
-That is the *trigger*. Sections 5 and 6 — why the loss was silent and why it was permanent — hold
-regardless of what the trigger turns out to be.
+The worker log cannot answer it. The container was created 2026-09-23T12:40:40Z with
+`RestartCount=0` and holds 1011 lines, all from today; nothing from 09-11 through 09-17 survives.
+A grep for `runner.fill_for_unknown_order` over it returns nothing, and that result carries no
+information either way — it is a grep over a log that does not reach the incident.
 
-**The falsifiable check, not yet run.** If §5 is right, Friday's worker log contains exactly ten
-`runner.fill_for_unknown_order` warnings, at the symbols and times in §4:
+**What is established** is the shape, from data that does survive: phase one landed on 09-14, 09-16
+and 09-17; phase two has not landed since 09-11 19:59:05; and each landing of phase one removed an
+order from the set any later catch-up can see. Both fixes in §11 follow from that and do not depend
+on which step failed.
 
-```bash
-docker compose logs worker | grep -E "fill_for_unknown_order" | head -20
-```
-
-Ten hits at those timestamps closes the chain end to end. Anything else means §5 is wrong and the
-fill was lost somewhere earlier.
-
+**A falsified hypothesis, recorded so nobody re-runs it.** An earlier version of this page put the
+mechanism at `on_fill_event`'s unknown-order branch — a fill arriving for an order no longer in
+`_open_orders`, discarded with a warning. `fills.venue_fill_id` disproves it: the ids are there, so
+`apply_trade_update` ran, so that branch was not taken.
 ## 11. What to fix
 
 In priority order. None of these are done; this page is the diagnosis, not the repair.
 
-1. **`on_fill_event` must not silently drop a fill.** A fill on an order we have forgotten, for a
-   position we still hold, is a divergence — it belongs in the halt path or a repair path, not in
-   a `log.warning` followed by `return`. This is the bug.
-2. **Widen the catch-up set.** `missed_order_updates` should reach orders that are terminal in our
-   book but whose position is still open. This is what turns the failure from permanent into
-   self-healing, and it is the difference between one bad afternoon and twelve days.
-3. **`Quote` must reject one-sided and crossed quotes at the domain boundary.** `Bar` already
-   rejects `low > high`. A quote with `ask == 0` currently marks the book at half price and prices
-   orders against nothing. This is the $365 of §7 and the only item here that is catastrophic
-   rather than merely wrong in live.
-4. **A resume interlock.** Clearing a `reconciliation_mismatch` halt should re-run the comparison
-   and refuse, or demand explicit confirmation, while the divergence still stands.
-
+1. **Persist the book and the order atomically, or persist the book first.** Today phase one writes
+   the order terminal and drops it from `_open_orders` before phase two writes the position book,
+   and phase two's failure is swallowed. That ordering means any failure between them is both
+   silent and permanent. The comment on it cites `_persist`'s ordering (B2) as the reason; whatever
+   B2 needed, it cannot be worth making the repair path unreachable.
+2. **A catch-up must not be able to leave the book behind.** `missed_order_updates` should reach
+   orders that are terminal in our book but whose position is still open — the exact set that
+   §6 shows is unreachable today. This is what turns the failure from permanent into self-healing.
+3. **`_checkpoint` must not swallow a write failure it cannot retry.** Its own justification is
+   "the next write retries it"; on the `warmup` path there is no next write. Either it retries, or
+   it refuses to be silent there.
+4. **`Quote` must reject one-sided and crossed quotes at the domain boundary** (§8a). Unrelated to
+   this incident, live today.
+5. **A resume interlock.** Clearing a `reconciliation_mismatch` halt should re-run the comparison
+   and refuse, or demand explicit confirmation, while the divergence still stands (§9).
 ## 12. Recovery from this incident
 
 The ten positions have not existed at the venue since Friday 2026-09-11, and the book's numbers
