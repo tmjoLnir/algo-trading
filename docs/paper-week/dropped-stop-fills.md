@@ -2,7 +2,7 @@
 
 **Investigated:** 2026-09-23 · **Incident:** book frozen 2026-09-11 19:59Z; halted from 2026-09-14 through 2026-09-23
 **Evidence:** the venue's own order history; `orders`, `fills`, `position_snapshots`,
-`equity_snapshots`, `audit_log`; the halt record; `runner.quarantined` at every boot since
+`equity_snapshots`, `audit_log`; the halt record; `runner.quarantined` at both boots on 2026-09-23
 
 ---
 
@@ -138,7 +138,7 @@ fills.
 ## 4. Friday's book was correct — the stops were still resting
 
 The stop for each position was **armed seconds after its entry filled** — `_protect` doing its
-job, and the reason `orders` shows a `stop_loss` sell submitted one to six seconds after each buy.
+job, and the reason `orders` shows a `stop_loss` sell submitted one to five seconds after each buy.
 That is not a round trip. When each stop then *filled* is a separate fact, and it is in the data:
 
 ```
@@ -204,9 +204,10 @@ if booked:
 
 And `_checkpoint` can fail without anyone finding out. It catches the exception, logs
 `runner.book_unwritten` at ERROR, and returns, on the reasoning that *"the next write retries it:
-the evaluate loop writes every pass."* Whether the book write here was attempted and failed every
-time, or was never reached, the surviving evidence does not say (§10). Either way, one silent miss
-at this point is enough — because of §6.
+the evaluate loop writes every pass."* The code leaves one credible reading: the write was
+attempted and `_save_book` raised, on every attempt since Friday (§10 says why the alternatives
+fall away, and what is still unknown). And one silent miss at this point is enough, because of
+§6.
 
 ## 6. Why it never healed
 
@@ -308,6 +309,12 @@ From `audit_log`:
 2026-09-22 22:17:28  reconciler re-halts
 ```
 
+`original_reason` is the reason *in force* when the halt was cleared (`cleared.reason`), not
+necessarily the reason it was engaged under: the kill switch's latch can raise a halt's reason and
+keeps the starting one in `escalation`, which this row does not carry. `originally_engaged_by`
+and `originally_engaged_at` never move, so "engaged by the reconciler on 09-14 14:37:10" is
+established; what it named at that moment is not.
+
 Eight days, seven hours and thirty-four minutes of halt, cleared without the book being resynced
 — there is no `adopt_broker_state` row — and re-engaged five minutes and fifty-two seconds later.
 
@@ -323,11 +330,25 @@ This cost confusion, not money — the book was already frozen and the venue alr
 **Why no book write has landed since 2026-09-11 19:59:05.** Ten fills were booked into `orders`
 by two different routes across six days, and no position or equity snapshot followed any of them.
 Once the order write has landed, only two things stand between it and the book write: the
-`pop` and the `if booked:` test. So either the book write was attempted and failed every time —
-`_save_book` raised and `_checkpoint` swallowed it as `runner.book_unwritten` — or `_checkpoint`
-returned before trying, which it does silently whenever `_book_bound` is false. (`_protect` is not
-a candidate here: it returns early for a fill that reduces a position, and every one of these
-did.) Nothing surviving distinguishes the two.
+`pop` and the `if booked:` test. So the book write was attempted, `_save_book` raised, and
+`_checkpoint` swallowed it as `runner.book_unwritten`. (`_protect` is not a candidate: it returns
+early for a fill that reduces a position, and every one of these did. Nor, realistically, is
+`_checkpoint`'s silent return on an unbound book: `_book_bound` is set on the first line of
+`warmup`, which `_loop` calls the moment a runner starts, so it is false only for a fill arriving
+in a process's first instants — not at 19:59:32 or 13:30:54.)
+
+`_save_book` has two halves, and either can be the one that raised. It saves **every order in
+`_open_orders`** first and writes the snapshot second, so a failure on any one working order —
+not necessarily the order being booked — blocks every book write for as long as that order stays
+in the working set. Which half failed, the surviving evidence does not say.
+
+One constraint on the answer: in a live evaluate loop, `_persist` calls `_save_book` every pass,
+and a failed pass counts toward `MAX_CONSECUTIVE_ERRORS`, after which `evaluate` engages a
+**strategy-scope** `unhandled_exception` halt by `strategy_runner`. A process trading normally
+through Monday morning with every book write failing would have produced that halt, not only the
+reconciler's. Automated halts write no audit row, so its absence from `audit_log` proves nothing;
+`scripts/status.py` on 09-23 showed only the global halt standing. Which process booked the stream
+fills, and whether its evaluate loop was running, is unknown.
 
 **When each fill was booked.** `orders.filled_at` and `fills.ts` are the venue's times (§6). No
 table stores when a row was written. Postgres does record the writing transaction, which gives a
@@ -367,7 +388,7 @@ answered the first question on the day it happened.
 ## 11. What to fix
 
 In priority order. None of these are done; this page is the diagnosis, not the repair. None of them
-depend on which of §10's two explanations is the true one.
+depend on which half of `_save_book` failed, or why.
 
 1. **Keep the write order, and make the stale book repairable.** `_persist` explains why the
    order is written before the book: if the process dies between them, a restart reads a stale
@@ -375,9 +396,11 @@ depend on which of §10's two explanations is the true one.
    reverse would restore a book claiming fills whose orders were never recorded, which nothing
    could detect. That reasoning holds, and reconciliation did notice. What B2 did not provide is a
    way back: once halted, the only repair is a human running `adopt_broker_state.py`. But the fills
-   the stale book is missing are already in `fills`. On restore, any fill on an order for a
-   symbol the book holds, dated after the snapshot's instant, can be replayed from our own tables
-   — no venue call — before the first reconcile.
+   the stale book is missing are already in `fills`. On restore they can be replayed from our own
+   tables — no venue call — before the first reconcile. Select them by a watermark the snapshot
+   records (the last fill it reflects), not by comparing `fills.ts` with the snapshot's instant:
+   `fills.ts` is the venue's time and the snapshot's is our clock, so a fill executed just before
+   a snapshot and applied just after it would be skipped by a timestamp rule.
 2. **A catch-up must be able to see what it left behind.** `missed_order_updates` should also reach
    orders that are terminal in our book while the position they were closing is still open — the
    exact set §6 shows is unreachable. This is what turns the failure from permanent into
@@ -385,8 +408,9 @@ depend on which of §10's two explanations is the true one.
 3. **A book write that fails must not be silent.** `_checkpoint` swallows the failure on the
    grounds that the evaluate loop retries it. A book that has not been written for twelve days
    says the retry is not a safety net. At minimum it is a metric and an alert; on the `warmup` path,
-   where there is no next write, it should refuse to continue. Its early return on an unbound book
-   logs nothing at all, and should say so too.
+   where there is no next write, it should refuse to continue. And `_save_book` couples the book
+   to every working order: one order that will not save stops the book being written at all. The
+   snapshot should not be hostage to an unrelated row.
 4. **`Quote` must reject one-sided and crossed quotes at the domain boundary** (§8a). Unrelated to
    this incident, live today.
 5. **A resume interlock.** Clearing a `reconciliation_mismatch` halt should re-run the comparison
